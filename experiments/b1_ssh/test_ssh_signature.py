@@ -63,6 +63,10 @@ class SSHSignatureTests(unittest.TestCase):
         self.assertFalse(verify_signature(
             self.msg.read_bytes(), signature, self.allowed, 'reviewer',
         ))
+        self.allowed.write_text('reviewer cert-authority ' + self.key.with_suffix('.pub').read_text())
+        self.assertFalse(verify_signature(
+            self.msg.read_bytes(), signature, self.allowed, 'reviewer',
+        ))
 
     def test_wrong_namespace_missing_file_and_bad_signature_fail(self):
         signature = self.sign(namespace='other')
