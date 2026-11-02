@@ -32,5 +32,9 @@
       "wording_file": "wording/T39.md",
       "sha256": "6f8f986e482d358f7f110f1f6d336b9b2511c20b73de411e6afca573947a2d54"
     }
-  ]
+  ],
+  "canonical_source": {
+    "page_id": "401a667c-6316-813f-908f-e6e563f4f7eb",
+    "title": "04 · v3 Design Council — Claude ↔ Dolores"
+  }
 }

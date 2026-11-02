@@ -192,13 +192,31 @@ def compare_all(export: str, page_id: str, retrieved_at: int, page_last_edited: 
     }
 
 
+def canonical_page_id(manifest_path: Path = MANIFEST) -> str:
+    return load_manifest(manifest_path)["canonical_source"]["page_id"]
+
+
+def _norm_page(pid: str) -> str:
+    return (pid or "").replace("-", "").lower()
+
+
 def verify_source_check(record: dict, export: str, candidate: str, now: int,
                         manifest_path: Path = MANIFEST) -> list[str]:
-    """L16 (b, d, e) binding and freshness checks; empty list means acceptable.
-    Re-derives the results from the supplied export rather than trusting them."""
+    """L16 (b, d, e) CONSISTENCY checks; empty list means internally consistent.
+
+    NON-AUTHORITATIVE: this proves the record matches the export bytes, the
+    canonical page id, this candidate and manifest. It cannot prove the export
+    really came from Notion or when: the caller supplies both. Provenance and
+    freshness come only from the reviewer's own fetch, bound by the reviewer's
+    T39 signature and re-checked by the receipt gate (B1/B5). Never treat a
+    pass here as the gate."""
     problems = []
     if not isinstance(record, dict) or record.get("schema") != SOURCE_CHECK_SCHEMA:
         return ["unknown or missing schema"]
+    if _norm_page(record.get("page_id")) != _norm_page(canonical_page_id(manifest_path)):
+        problems.append("not the canonical Council page")
+    if not export.strip():
+        problems.append("source unavailable (empty export)")
     if record.get("candidate") != candidate:
         problems.append("bound to a different candidate")
     if record.get("manifest_sha256") != manifest_sha256(manifest_path):

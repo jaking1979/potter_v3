@@ -132,7 +132,7 @@ class SourceCheckTests(unittest.TestCase):
 
     def rec(self, export=None, **kw):
         export = export or fake_export("T37", "T38", "T39")
-        args = dict(page_id="401a667c", retrieved_at=self.T0, page_last_edited=self.T0 - 60,
+        args = dict(page_id="401a667c-6316-813f-908f-e6e563f4f7eb", retrieved_at=self.T0, page_last_edited=self.T0 - 60,
                     candidate="c" * 40)
         args.update(kw)
         return export, di.compare_all(export, **args)
@@ -166,6 +166,24 @@ class SourceCheckTests(unittest.TestCase):
         bad_export = fake_export("T37", "T38", "T39", tamper=("within 1 h", "within 9 h"))
         self.assertIn("export does not match the recorded export hash",
                       di.verify_source_check(r_forged, bad_export, "c" * 40, self.T0 + 60))
+
+    def test_wrong_page_refused(self):
+        export, r = self.rec(page_id="406a667c-6316-819d-b335-d31cb4b8b69a")
+        self.assertIn("not the canonical Council page",
+                      di.verify_source_check(r, export, "c" * 40, self.T0 + 60))
+
+    def test_unavailable_source_fails_closed(self):
+        _, r = self.rec(export=fake_export("T37", "T38", "T39"))
+        problems = di.verify_source_check(r, "", "c" * 40, self.T0 + 60)
+        self.assertIn("source unavailable (empty export)", problems)
+
+    def test_helper_is_not_provenance(self):
+        """Documents the limit Dolores identified: a synthetic export with
+        asserted timestamps is internally consistent and passes this helper.
+        Provenance/freshness must come from the signed reviewer fetch (B1/B5)."""
+        export, r = self.rec()  # built from snapshots, timestamps asserted
+        self.assertEqual(di.verify_source_check(r, export, "c" * 40, self.T0 + 60), [])
+        self.assertIn("NON-AUTHORITATIVE", di.verify_source_check.__doc__)
 
     def test_wrong_manifest_refused(self):
         with Sandbox() as s:
