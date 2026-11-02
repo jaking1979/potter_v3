@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "potter://contracts/v0/approval_record",
+  "title": "ApprovalRecord v0",
+  "description": "Josh's decision on one exact consequential action (T11/T12 item 4; T19 item 4). Issued only by the T19 notifier (E1); verified by the PolicyEngine (C1). Any change to the bound action voids it. Authority comes only from issuer_signature by the trusted E1 issuer key; decided_by/channel are signed claims, not proof.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "approval_id",
+    "task_id",
+    "action_hash",
+    "decision",
+    "decided_by",
+    "channel",
+    "issued_at",
+    "expires_at",
+    "nonce",
+    "issuer_key_id",
+    "issuer_signature"
+  ],
+  "properties": {
+    "schema": {
+      "const": "potter.approval/v0"
+    },
+    "approval_id": {
+      "type": "string",
+      "minLength": 8
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "sha256 of the canonical JSON of the BoundAction (see approval.py)."
+    },
+    "decision": {
+      "enum": [
+        "approve",
+        "deny"
+      ]
+    },
+    "decided_by": {
+      "const": "josh"
+    },
+    "channel": {
+      "enum": [
+        "telegram",
+        "potter_home",
+        "passkey_step_up"
+      ]
+    },
+    "issued_at": {
+      "type": "integer",
+      "description": "Unix seconds."
+    },
+    "expires_at": {
+      "type": "integer",
+      "description": "Unix seconds; must be > issued_at."
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32,}$"
+    },
+    "screenshot_ref": {
+      "type": "string",
+      "description": "Required by T38 for browser/computer acts; evidence store reference."
+    },
+    "issuer_key_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Which pinned E1 issuer key signed this record."
+    },
+    "issuer_signature": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Issuer signature over the canonical JSON of every other field (approval.signing_payload)."
+    }
+  }
+}

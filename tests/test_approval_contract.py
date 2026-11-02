@@ -1,0 +1,448 @@
+"""C0 merge evidence: replay refused; parameters swapped after approval refused;
+unauthenticated/forged records refused; atomic single use under concurrency."""
+import json
+import multiprocessing
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "contracts" / "v0"))
+from approval import (ApprovalRefused, BoundAction, HmacAuthenticator,  # noqa: E402
+                      MemoryApprovalLedger, SqliteApprovalLedger, signing_payload, verify, MAX_VALIDITY_S, EffectIntent)
+
+NOW = 1_800_000_000
+AUTH = HmacAuthenticator({"e1-2026": b"test-only-issuer-key"})
+ACTION = BoundAction("task-1", "gmail.send", "send", "alex@example.com",
+                     {"subject": "Dinner", "body": "7pm works."})
+
+
+def record(action=ACTION, sign=True, **over):
+    r = {"schema": "potter.approval/v0", "approval_id": "appr-0001", "task_id": action.task_id,
+         "action_hash": action.hash(), "decision": "approve", "decided_by": "josh",
+         "channel": "telegram", "issued_at": NOW - 10, "expires_at": NOW + 300,
+         "nonce": "a" * 32, "issuer_key_id": "e1-2026", "issuer_signature": "x"}
+    r.update({k: v for k, v in over.items() if k != "issuer_signature"})
+    if sign:
+        r["issuer_signature"] = AUTH.sign("e1-2026", signing_payload(r))
+    if "issuer_signature" in over:
+        r["issuer_signature"] = over["issuer_signature"]
+    return r
+
+
+def check(r, action=ACTION, store=None, auth=AUTH, now=NOW, effect_id="eff-1"):
+    return verify(r, action, now, store if store is not None else MemoryApprovalLedger(), auth, effect_id)
+
+
+class ApprovalContract(unittest.TestCase):
+    def test_valid_approval_passes_once(self):
+        store = MemoryApprovalLedger()
+        check(record(), store=store)
+        self.assertIn("a" * 32, store)
+
+    def test_replay_refused(self):
+        store = MemoryApprovalLedger()
+        check(record(), store=store)
+        with self.assertRaisesRegex(ApprovalRefused, "replay"):
+            check(record(), store=store, now=NOW + 1)
+
+    def test_swapped_parameters_refused(self):
+        swapped = BoundAction("task-1", "gmail.send", "send", "alex@example.com",
+                              {"subject": "Dinner", "body": "Wire $5,000 today."})
+        with self.assertRaisesRegex(ApprovalRefused, "action changed"):
+            check(record(), action=swapped)
+
+    def test_swapped_target_refused(self):
+        other = BoundAction("task-1", "gmail.send", "send", "mallory@example.com", ACTION.parameters)
+        with self.assertRaises(ApprovalRefused):
+            check(record(), action=other)
+
+    def test_refused_check_does_not_consume_nonce(self):
+        store = MemoryApprovalLedger()
+        with self.assertRaises(ApprovalRefused):
+            check(record(expires_at=NOW - 1), store=store)
+        self.assertNotIn("a" * 32, store)
+
+    def test_expired_and_future_refused(self):
+        with self.assertRaises(ApprovalRefused):
+            check(record(expires_at=NOW))
+        with self.assertRaises(ApprovalRefused):
+            check(record(issued_at=NOW + 5, expires_at=NOW + 50))
+
+    def test_deny_and_wrong_claims_refused(self):
+        for over in ({"decision": "deny"}, {"decided_by": "dolores"}, {"channel": "email"},
+                     {"task_id": "task-2"}, {"schema": "potter.approval/v1"}):
+            with self.subTest(over=over), self.assertRaises(ApprovalRefused):
+                check(record(**over))
+
+    def test_malformed_refused(self):
+        r = record()
+        del r["nonce"]
+        with self.assertRaisesRegex(ApprovalRefused, "malformed"):
+            check(r)
+
+    def test_schema_violations_refused_without_consuming(self):
+        bad = [{"nonce": None}, {"nonce": "short"}, {"approval_id": ""}, {"approval_id": None},
+               {"task_id": ""}, {"action_hash": "ABC"}, {"issued_at": True},
+               {"expires_at": float(NOW + 300)}, {"screenshot_ref": True}, {"screenshot_ref": ""},
+               {"extra_field": 1}, {"issuer_key_id": ""}]
+        for over in bad:
+            store = MemoryApprovalLedger()
+            with self.subTest(over=over), self.assertRaisesRegex(ApprovalRefused, "malformed"):
+                check(record(**over), store=store)
+            self.assertNotIn("a" * 32, store)
+        with self.assertRaisesRegex(ApprovalRefused, "malformed"):
+            check(["not", "a", "dict"])
+
+    def test_hash_is_order_independent_and_exact(self):
+        a = BoundAction("t", "c", "o", "x", {"a": 1, "b": 2})
+        b = BoundAction("t", "c", "o", "x", {"b": 2, "a": 1})
+        c = BoundAction("t", "c", "o", "x", {"a": 1, "b": "2"})
+        self.assertEqual(a.hash(), b.hash())
+        self.assertNotEqual(a.hash(), c.hash())
+
+    def test_computer_approval_needs_screenshot(self):
+        act = BoundAction("task-1", "computer", "click", "app:Finder", {"x": 1, "y": 2})
+        with self.assertRaisesRegex(ApprovalRefused, "screenshot"):
+            check(record(act), action=act)
+        check(record(act, screenshot_ref="evidence://s/1"), action=act)
+
+
+class Validity24h(unittest.TestCase):
+    """T37 S1: an approval after 24 h is refused, even if signed with a longer expiry."""
+
+    def test_signed_oversized_expiry_capped_at_24h(self):
+        r = record(issued_at=NOW, expires_at=NOW + 7 * 24 * 3600)
+        check(r, now=NOW + MAX_VALIDITY_S - 1)
+        with self.assertRaisesRegex(ApprovalRefused, "24 h"):
+            check(r, now=NOW + MAX_VALIDITY_S)
+
+    def test_exact_boundary(self):
+        r = record(issued_at=NOW, expires_at=NOW + MAX_VALIDITY_S)
+        check(r, now=NOW + MAX_VALIDITY_S - 1)
+        with self.assertRaises(ApprovalRefused):
+            check(r, now=NOW + MAX_VALIDITY_S)
+
+    def test_narrower_policy_ttl_preserved(self):
+        r = record(issued_at=NOW, expires_at=NOW + 300)
+        with self.assertRaises(ApprovalRefused):
+            check(r, now=NOW + 300)
+
+
+class StaleState(unittest.TestCase):
+    """T37 S1: a stale-state approval is refused."""
+
+    def test_precondition_change_voids_approval(self):
+        old = BoundAction("task-1", "calendar.update", "move", "event:42", {"to": "15:00"}, {"etag": "v7"})
+        new = BoundAction("task-1", "calendar.update", "move", "event:42", {"to": "15:00"}, {"etag": "v8"})
+        with self.assertRaisesRegex(ApprovalRefused, "action changed"):
+            check(record(old), action=new)
+
+
+class CrashSafety(unittest.TestCase):
+    """Dolores review: consumption must not strand an approval on crash."""
+
+    def test_consume_records_intent_atomically_for_recovery(self):
+        ledger = MemoryApprovalLedger()
+        intent = check(record(), store=ledger, effect_id="eff-77")
+        # Simulated crash after consume, before the effect: recovery finds the bound intent.
+        recovered = ledger.pending("a" * 32)
+        self.assertEqual(recovered, intent)
+        self.assertEqual(recovered.action_hash, ACTION.hash())
+        with self.assertRaisesRegex(ApprovalRefused, "replay"):
+            check(record(), store=ledger, effect_id="eff-78")
+        self.assertEqual(ledger.pending("a" * 32).effect_id, "eff-77")
+
+    def test_refusal_records_nothing(self):
+        ledger = MemoryApprovalLedger()
+        with self.assertRaises(ApprovalRefused):
+            check(record(), action=BoundAction("task-1", "x", "y", "z"), store=ledger)
+        self.assertIsNone(ledger.pending("a" * 32))
+
+    def test_missing_effect_id_refused(self):
+        with self.assertRaisesRegex(ApprovalRefused, "effect id"):
+            check(record(), effect_id="")
+
+
+def _race_worker(db, q):
+    try:
+        verify(record(), ACTION, NOW, SqliteApprovalLedger(db), AUTH, f"eff-{os.getpid()}")
+        q.put(True)
+    except ApprovalRefused:
+        q.put(False)
+
+
+class DurableRecovery(unittest.TestCase):
+    """Dolores review: recovery after restart must reconstruct the exact action."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "ledger.sqlite")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fresh_ledger_after_restart_reconstructs_exact_action(self):
+        act = BoundAction("task-1", "gmail.send", "send", "alex@example.com",
+                          {"subject": "Dinner", "body": "7pm works."}, {"thread_etag": "e3"})
+        verify(record(act), act, NOW, SqliteApprovalLedger(self.db), AUTH, "eff-9")
+        # "Restart": a brand-new ledger object/connection on the same durable file.
+        recovered = SqliteApprovalLedger(self.db).pending("a" * 32)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered.action(), act)
+        self.assertEqual(recovered.effect_id, "eff-9")
+        with self.assertRaisesRegex(ApprovalRefused, "replay"):
+            verify(record(act), act, NOW, SqliteApprovalLedger(self.db), AUTH, "eff-10")
+
+    def test_tampered_stored_action_detected(self):
+        verify(record(), ACTION, NOW, SqliteApprovalLedger(self.db), AUTH, "eff-1")
+        i = SqliteApprovalLedger(self.db).pending("a" * 32)
+        bad = EffectIntent(i.effect_id, i.task_id, i.action_hash, i.approval_id,
+                           i.action_canonical.replace("7pm", "9pm"))
+        with self.assertRaisesRegex(ApprovalRefused, "integrity"):
+            bad.action()
+
+    def test_exactly_one_of_many_processes_succeeds(self):
+        SqliteApprovalLedger(self.db)
+        ctx = multiprocessing.get_context("spawn")
+        q = ctx.Queue()
+        procs = [ctx.Process(target=_race_worker, args=(self.db, q)) for _ in range(8)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(60)
+        results = [q.get(timeout=5) for _ in procs]
+        self.assertEqual(results.count(True), 1)
+
+
+class Provenance(unittest.TestCase):
+    """Dolores review (2): self-asserted fields are not authority."""
+
+    def test_constructed_record_without_issuer_signature_refused(self):
+        forged = record(sign=False, issuer_signature="0" * 64)
+        with self.assertRaisesRegex(ApprovalRefused, "unauthenticated"):
+            check(forged)
+
+    def test_field_edited_after_signing_refused(self):
+        r = record()
+        r["expires_at"] = NOW + 10_000
+        with self.assertRaisesRegex(ApprovalRefused, "unauthenticated"):
+            check(r)
+
+    def test_unknown_issuer_key_refused(self):
+        r = record()
+        r["issuer_key_id"] = "attacker"
+        with self.assertRaisesRegex(ApprovalRefused, "unauthenticated"):
+            check(r)
+
+    def test_signature_from_other_key_refused(self):
+        other = HmacAuthenticator({"e1-2026": b"different-key"})
+        r = record(sign=False)
+        r["issuer_signature"] = other.sign("e1-2026", signing_payload(r))
+        with self.assertRaisesRegex(ApprovalRefused, "unauthenticated"):
+            check(r)
+
+    def test_no_authenticator_fails_closed(self):
+        with self.assertRaisesRegex(ApprovalRefused, "no trusted issuer"):
+            check(record(), auth=None)
+
+
+class Concurrency(unittest.TestCase):
+    """Dolores review (3): single use must be atomic across concurrent consumers."""
+
+    def test_exactly_one_of_many_concurrent_consumers_succeeds(self):
+        store, r = MemoryApprovalLedger(), record()
+        start, results, lock = threading.Barrier(32), [], threading.Lock()
+
+        def worker():
+            start.wait()
+            try:
+                check(dict(r), store=store)
+                ok = True
+            except ApprovalRefused:
+                ok = False
+            with lock:
+                results.append(ok)
+
+        threads = [threading.Thread(target=worker) for _ in range(32)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(len(results), 32)
+
+
+class Immutability(unittest.TestCase):
+    """Dolores review of 0e0a651: the executed/persisted action can never differ
+    from the approved bytes."""
+
+    def test_mutating_source_dicts_after_construction_changes_nothing(self):
+        params = {"subject": "Dinner", "body": "7pm works.", "cc": ["a@x.com"]}
+        act = BoundAction("task-1", "gmail.send", "send", "alex@example.com", params)
+        h = act.hash()
+        params["body"] = "Wire $5,000 today."
+        params["cc"].append("mallory@x.com")
+        self.assertEqual(act.hash(), h)
+        self.assertEqual(act.parameters["body"], "7pm works.")
+
+    def test_exposed_parameters_are_read_only(self):
+        act = BoundAction("task-1", "gmail.send", "send", "alex@example.com", {"cc": ["a@x.com"]})
+        with self.assertRaises(TypeError):
+            act.parameters["body"] = "x"
+        with self.assertRaises((TypeError, AttributeError)):
+            act.parameters["cc"].append("m@x.com")
+
+    def test_mutation_during_verification_cannot_change_intent(self):
+        params = {"subject": "Dinner", "body": "7pm works."}
+        act = BoundAction("task-1", "gmail.send", "send", "alex@example.com", params)
+        approved = act.hash()
+
+        class MutatingAuth(HmacAuthenticator):
+            def verify(self, key_id, payload, signature):
+                params["body"] = "Wire $5,000 today."   # attacker races verification
+                return super().verify(key_id, payload, signature)
+
+        auth = MutatingAuth({"e1-2026": b"test-only-issuer-key"})
+        intent = verify(record(act), act, NOW, MemoryApprovalLedger(), auth, "eff-1")
+        self.assertEqual(intent.action_hash, approved)
+        self.assertEqual(intent.action().parameters["body"], "7pm works.")
+        self.assertEqual(intent.action(), act)
+
+    def test_non_boundaction_refused(self):
+        class Fake:
+            task_id = "task-1"
+            capability = "gmail.send"
+            def hash(self): return ACTION.hash()
+            def canonical_json(self): return ACTION.canonical_json()
+        with self.assertRaisesRegex(ApprovalRefused, "BoundAction"):
+            check(record(), action=Fake())
+
+    def test_non_json_parameters_rejected_at_construction(self):
+        with self.assertRaises((TypeError, ValueError)):
+            BoundAction("t", "c", "o", "x", {"when": object()})
+
+
+class RecordSnapshot(unittest.TestCase):
+    """Dolores review of f8c58c4: post-authentication claims come only from the
+    authenticated snapshot, never from the caller's mutable dict."""
+
+    def mutating_auth(self, mutate):
+        class A(HmacAuthenticator):
+            def verify(self_, key_id, payload, signature):
+                ok = super().verify(key_id, payload, signature)
+                mutate()          # attacker edits the caller's dict after the check
+                return ok
+        return A({"e1-2026": b"test-only-issuer-key"})
+
+    def test_signed_deny_cannot_become_approve(self):
+        r = record(decision="deny")
+        ledger = MemoryApprovalLedger()
+        with self.assertRaisesRegex(ApprovalRefused, "denied"):
+            verify(r, ACTION, NOW, ledger, self.mutating_auth(lambda: r.update(decision="approve")), "e")
+        self.assertNotIn("a" * 32, ledger)
+
+    def test_action_hash_and_task_swap_ignored(self):
+        other = BoundAction("task-2", "gmail.send", "send", "mallory@example.com", {"body": "x"})
+        r = record()
+        swap = lambda: r.update(action_hash=other.hash(), task_id="task-2")
+        intent = verify(r, ACTION, NOW, MemoryApprovalLedger(), self.mutating_auth(swap), "e")
+        self.assertEqual(intent.action(), ACTION)          # original signed claims used
+        with self.assertRaises(ApprovalRefused):           # and the swapped action is refused
+            verify(record(), other, NOW, MemoryApprovalLedger(), self.mutating_auth(swap), "e")
+
+    def test_nonce_swap_consumes_only_signed_nonce(self):
+        r = record()
+        ledger = MemoryApprovalLedger()
+        verify(r, ACTION, NOW, ledger, self.mutating_auth(lambda: r.update(nonce="b" * 32)), "e")
+        self.assertIn("a" * 32, ledger)
+        self.assertNotIn("b" * 32, ledger)
+
+    def test_non_json_record_refused(self):
+        with self.assertRaisesRegex(ApprovalRefused, "malformed"):
+            check({**record(), "approval_id": object()})
+
+    def test_non_string_claims_refused(self):
+        for k in ("schema", "decision", "decided_by", "channel"):
+            with self.subTest(k=k), self.assertRaisesRegex(ApprovalRefused, "malformed"):
+                check(record(**{k: ["approve"]}))
+
+
+class ScreenshotBothCaps(unittest.TestCase):
+    """T38: screenshot required for browser AND computer acts."""
+
+    def test_browser_and_computer(self):
+        for cap in ("browser", "computer"):
+            act = BoundAction("task-1", cap, "click", "target", {"x": 1})
+            with self.subTest(cap=cap):
+                with self.assertRaisesRegex(ApprovalRefused, "screenshot"):
+                    check(record(act), action=act)
+                check(record(act, screenshot_ref="evidence://s/1"), action=act)
+
+
+class SchemaValidation(unittest.TestCase):
+    """Validate the JSON Schemas themselves with a real validator."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import jsonschema
+        except ImportError:  # pragma: no cover - CI installs a pinned version
+            raise unittest.SkipTest("jsonschema not installed")
+        cls.js = jsonschema
+        cls.appr = json.loads((ROOT / "contracts/v0/approval_record.schema.json").read_text())
+        cls.evt = json.loads((ROOT / "contracts/v0/client_event.schema.json").read_text())
+        for sch in (cls.appr, cls.evt):
+            jsonschema.Draft202012Validator.check_schema(sch)
+
+    def ok(self, schema, doc):
+        return self.js.Draft202012Validator(schema).is_valid(doc)
+
+    def evt_doc(self, type_, payload):
+        return {"schema": "potter.client_event/v0", "type": type_, "run_id": "r1",
+                "task_id": "t1", "seq": 0, "ts": NOW, "payload": payload}
+
+    def test_valid_records_pass(self):
+        self.assertTrue(self.ok(self.appr, record()))
+        self.assertTrue(self.ok(self.evt, self.evt_doc("APPROVAL_REQUESTED", {
+            "approval_request_id": "ar-1", "action_hash": ACTION.hash(),
+            "summary": "Send email to Alex", "expires_at": NOW + 300})))
+        self.assertTrue(self.ok(self.evt, self.evt_doc("APPROVAL_RESOLVED",
+                                                       {"approval_request_id": "ar-1", "decision": "approve"})))
+
+    def test_approval_requested_payload_typed(self):
+        base = {"approval_request_id": "ar-1", "action_hash": ACTION.hash(),
+                "summary": "Send", "expires_at": NOW + 300}
+        for bad in ({"action_hash": None}, {"action_hash": "ABC"}, {"summary": 5}, {"summary": ""},
+                    {"expires_at": "soon"}, {"approval_request_id": ""}, {"extra": 1}):
+            with self.subTest(bad=bad):
+                self.assertFalse(self.ok(self.evt, self.evt_doc("APPROVAL_REQUESTED", {**base, **bad})))
+
+    def test_approval_resolved_payload_typed(self):
+        for bad in ({"decision": "yes"}, {"decision": None}, {"approval_request_id": 7}):
+            with self.subTest(bad=bad):
+                p = {"approval_request_id": "ar-1", "decision": "approve", **bad}
+                self.assertFalse(self.ok(self.evt, self.evt_doc("APPROVAL_RESOLVED", p)))
+
+    def test_approval_schema_rejects_invalid_fields(self):
+        for bad in ({"nonce": None}, {"action_hash": "ABC"}, {"decided_by": "dolores"}, {"x": 1}):
+            with self.subTest(bad=bad):
+                self.assertFalse(self.ok(self.appr, {**record(), **bad}))
+
+
+class SchemaFiles(unittest.TestCase):
+    def test_schemas_parse_and_match_verifier(self):
+        appr = json.loads((ROOT / "contracts/v0/approval_record.schema.json").read_text())
+        evt = json.loads((ROOT / "contracts/v0/client_event.schema.json").read_text())
+        from approval import REQUIRED, CHANNELS
+        self.assertEqual(set(appr["required"]), set(REQUIRED))
+        self.assertEqual(set(appr["properties"]["channel"]["enum"]), CHANNELS)
+        self.assertIn("APPROVAL_REQUESTED", evt["properties"]["type"]["enum"])
+        self.assertFalse(appr["additionalProperties"])
+
+
+if __name__ == "__main__":
+    unittest.main()
