@@ -326,6 +326,51 @@ class Immutability(unittest.TestCase):
             BoundAction("t", "c", "o", "x", {"when": object()})
 
 
+class RecordSnapshot(unittest.TestCase):
+    """Dolores review of f8c58c4: post-authentication claims come only from the
+    authenticated snapshot, never from the caller's mutable dict."""
+
+    def mutating_auth(self, mutate):
+        class A(HmacAuthenticator):
+            def verify(self_, key_id, payload, signature):
+                ok = super().verify(key_id, payload, signature)
+                mutate()          # attacker edits the caller's dict after the check
+                return ok
+        return A({"e1-2026": b"test-only-issuer-key"})
+
+    def test_signed_deny_cannot_become_approve(self):
+        r = record(decision="deny")
+        ledger = MemoryApprovalLedger()
+        with self.assertRaisesRegex(ApprovalRefused, "denied"):
+            verify(r, ACTION, NOW, ledger, self.mutating_auth(lambda: r.update(decision="approve")), "e")
+        self.assertNotIn("a" * 32, ledger)
+
+    def test_action_hash_and_task_swap_ignored(self):
+        other = BoundAction("task-2", "gmail.send", "send", "mallory@example.com", {"body": "x"})
+        r = record()
+        swap = lambda: r.update(action_hash=other.hash(), task_id="task-2")
+        intent = verify(r, ACTION, NOW, MemoryApprovalLedger(), self.mutating_auth(swap), "e")
+        self.assertEqual(intent.action(), ACTION)          # original signed claims used
+        with self.assertRaises(ApprovalRefused):           # and the swapped action is refused
+            verify(record(), other, NOW, MemoryApprovalLedger(), self.mutating_auth(swap), "e")
+
+    def test_nonce_swap_consumes_only_signed_nonce(self):
+        r = record()
+        ledger = MemoryApprovalLedger()
+        verify(r, ACTION, NOW, ledger, self.mutating_auth(lambda: r.update(nonce="b" * 32)), "e")
+        self.assertIn("a" * 32, ledger)
+        self.assertNotIn("b" * 32, ledger)
+
+    def test_non_json_record_refused(self):
+        with self.assertRaisesRegex(ApprovalRefused, "malformed"):
+            check({**record(), "approval_id": object()})
+
+    def test_non_string_claims_refused(self):
+        for k in ("schema", "decision", "decided_by", "channel"):
+            with self.subTest(k=k), self.assertRaisesRegex(ApprovalRefused, "malformed"):
+                check(record(**{k: ["approve"]}))
+
+
 class ScreenshotBothCaps(unittest.TestCase):
     """T38: screenshot required for browser AND computer acts."""
 

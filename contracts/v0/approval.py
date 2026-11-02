@@ -271,6 +271,9 @@ def check_shape(record: Any) -> None:
         raise ApprovalRefused("malformed: nonce")
     if not (_int(record["issued_at"]) and _int(record["expires_at"])):
         raise ApprovalRefused("malformed timestamps")
+    for k in ("schema", "decision", "decided_by", "channel"):
+        if not _nonempty_str(record[k]):
+            raise ApprovalRefused(f"malformed: {k}")
     if not (_nonempty_str(record["issuer_key_id"]) and _nonempty_str(record["issuer_signature"])):
         raise ApprovalRefused("malformed: issuer fields")
     if "screenshot_ref" in record and not _nonempty_str(record["screenshot_ref"]):
@@ -282,6 +285,13 @@ def verify(record: dict, action: BoundAction, now: int, ledger: ApprovalLedger,
     """Return the recorded EffectIntent only if `record` is an authentic E1-issued
     approval of exactly `action`, issued at most 24 h ago and unexpired, used for
     the first time. Raises ApprovalRefused otherwise (nothing recorded)."""
+    # Snapshot the caller-owned record ONCE (deep, via canonical JSON). Every
+    # later check, the signature and consumption use only this private copy,
+    # so mutating the caller's dict mid-verification changes nothing.
+    try:
+        record = json.loads(_canon(record))
+    except (TypeError, ValueError):
+        raise ApprovalRefused("malformed: not JSON-serializable")
     check_shape(record)
     if not isinstance(action, BoundAction):
         raise ApprovalRefused("action must be a BoundAction")
