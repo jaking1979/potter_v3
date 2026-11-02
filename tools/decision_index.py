@@ -10,6 +10,10 @@ and its SHA-256 in governance/decisions/manifest.json.
                         from a raw Notion page export (the snapshot source)
   compare ID EXPORT     extract from a fresh Notion export and compare to snapshot
   coverage              list ratified decisions not yet indexed (exit 3 if any)
+  compare-all EXPORT --page-id ID --retrieved-at T --page-last-edited T --candidate SHA
+                        L16 source-check record (JSON) for every indexed decision
+  verify-source-check RECORD EXPORT --candidate SHA --now T
+                        check a record's bindings and freshness (L16 b, d, e)
   rt-ids [ID]           list release-test IDs derived from snapshots
   hash FILE             print the canonical hash of a file
 
@@ -152,6 +156,69 @@ def rt_ids(decision_id: str, text: str) -> list[tuple[str, str]]:
     return out
 
 
+SOURCE_CHECK_SCHEMA = "potter.source-check/v0"
+FRESHNESS_S = 24 * 3600  # L16 (d)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def manifest_sha256(manifest_path: Path = MANIFEST) -> str:
+    return _sha256(manifest_path.read_bytes())
+
+
+def compare_all(export: str, page_id: str, retrieved_at: int, page_last_edited: int,
+                candidate: str, manifest_path: Path = MANIFEST) -> dict:
+    """L16 (b): a source-check record binding the export, page, candidate and
+    manifest to a per-decision result. The reviewer signs it with its T39 key;
+    signature handling belongs to the receipt gate (B1)."""
+    results = {}
+    for entry in load_manifest(manifest_path)["decisions"]:
+        try:
+            results[entry["id"]] = compare(entry["id"], export, manifest_path)
+        except KeyError:
+            results[entry["id"]] = False
+    return {
+        "schema": SOURCE_CHECK_SCHEMA,
+        "page_id": page_id,
+        "export_sha256": _sha256(export.encode("utf-8")),
+        "retrieved_at": int(retrieved_at),
+        "page_last_edited": int(page_last_edited),
+        "candidate": candidate,
+        "manifest_sha256": manifest_sha256(manifest_path),
+        "results": results,
+        "pass": bool(results) and all(results.values()),
+    }
+
+
+def verify_source_check(record: dict, export: str, candidate: str, now: int,
+                        manifest_path: Path = MANIFEST) -> list[str]:
+    """L16 (b, d, e) binding and freshness checks; empty list means acceptable.
+    Re-derives the results from the supplied export rather than trusting them."""
+    problems = []
+    if not isinstance(record, dict) or record.get("schema") != SOURCE_CHECK_SCHEMA:
+        return ["unknown or missing schema"]
+    if record.get("candidate") != candidate:
+        problems.append("bound to a different candidate")
+    if record.get("manifest_sha256") != manifest_sha256(manifest_path):
+        problems.append("bound to a different manifest")
+    if record.get("export_sha256") != _sha256(export.encode("utf-8")):
+        problems.append("export does not match the recorded export hash")
+    ra, le = record.get("retrieved_at"), record.get("page_last_edited")
+    if not (isinstance(ra, int) and isinstance(le, int)):
+        problems.append("missing timestamps")
+    else:
+        if le > ra:
+            problems.append("page edited after retrieval")
+        if not (0 <= now - ra < FRESHNESS_S):
+            problems.append("stale or future-dated retrieval")
+    fresh = compare_all(export, record.get("page_id", ""), ra or 0, le or 0, candidate, manifest_path)
+    if fresh["results"] != record.get("results") or not fresh["pass"] or record.get("pass") is not True:
+        problems.append("comparison failed or results do not reproduce")
+    return problems
+
+
 def coverage(manifest_path: Path = MANIFEST, expected_path: Path = EXPECTED) -> list[str]:
     have = {d["id"] for d in load_manifest(manifest_path)["decisions"]}
     want = json.loads(expected_path.read_text(encoding="utf-8"))["ratified"]
@@ -177,6 +244,22 @@ def main(argv: list[str]) -> int:
     if cmd == "extract" and len(args) == 2:
         sys.stdout.write(extract(args[0], Path(args[1]).read_text(encoding="utf-8")))
         return 0
+    if cmd == "compare-all" and len(args) == 9:
+        opts = dict(zip(args[1::2], args[2::2]))
+        rec = compare_all(Path(args[0]).read_text(encoding="utf-8"), opts["--page-id"],
+                          int(opts["--retrieved-at"]), int(opts["--page-last-edited"]), opts["--candidate"])
+        print(json.dumps(rec, indent=2, sort_keys=True))
+        return 0 if rec["pass"] else 2
+    if cmd == "verify-source-check" and len(args) == 6:
+        opts = dict(zip(args[2::2], args[3::2]))
+        problems = verify_source_check(json.loads(Path(args[0]).read_text(encoding="utf-8")),
+                                       Path(args[1]).read_text(encoding="utf-8"),
+                                       opts["--candidate"], int(opts["--now"]))
+        for p_ in problems:
+            print(f"REFUSED: {p_}")
+        if not problems:
+            print("ok: source check binds this candidate and manifest, fresh, all match")
+        return 2 if problems else 0
     if cmd == "coverage":
         missing = coverage()
         print("ok: all ratified decisions indexed" if not missing else "NOT INDEXED: " + ", ".join(missing))

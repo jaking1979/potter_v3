@@ -126,6 +126,57 @@ class CompareTests(unittest.TestCase):
             di.compare("T999", "x")
 
 
+class SourceCheckTests(unittest.TestCase):
+    """L16: reviewer-produced source-check record; gate-side binding/freshness."""
+    T0 = 1_800_000_000
+
+    def rec(self, export=None, **kw):
+        export = export or fake_export("T37", "T38", "T39")
+        args = dict(page_id="401a667c", retrieved_at=self.T0, page_last_edited=self.T0 - 60,
+                    candidate="c" * 40)
+        args.update(kw)
+        return export, di.compare_all(export, **args)
+
+    def test_pass_and_verify(self):
+        export, r = self.rec()
+        self.assertTrue(r["pass"])
+        self.assertEqual(di.verify_source_check(r, export, "c" * 40, self.T0 + 60), [])
+
+    def test_mismatch_fails(self):
+        export, r = self.rec(export=fake_export("T37", "T38", "T39", tamper=("within 1 h", "within 2 h")))
+        self.assertFalse(r["pass"])
+        self.assertIn("comparison failed or results do not reproduce",
+                      di.verify_source_check(r, export, "c" * 40, self.T0 + 60))
+
+    def test_missing_decision_in_export_fails(self):
+        _, r = self.rec(export=fake_export("T38", "T39"))
+        self.assertFalse(r["pass"])
+
+    def test_wrong_candidate_stale_and_edited_after(self):
+        export, r = self.rec()
+        self.assertIn("bound to a different candidate", di.verify_source_check(r, export, "d" * 40, self.T0 + 60))
+        self.assertIn("stale or future-dated retrieval",
+                      di.verify_source_check(r, export, "c" * 40, self.T0 + di.FRESHNESS_S))
+        export2, r2 = self.rec(page_last_edited=self.T0 + 5)
+        self.assertIn("page edited after retrieval", di.verify_source_check(r2, export2, "c" * 40, self.T0 + 60))
+
+    def test_forged_results_or_swapped_export_refused(self):
+        export, r = self.rec()
+        r_forged = dict(r, results={k: True for k in r["results"]})
+        bad_export = fake_export("T37", "T38", "T39", tamper=("within 1 h", "within 9 h"))
+        self.assertIn("export does not match the recorded export hash",
+                      di.verify_source_check(r_forged, bad_export, "c" * 40, self.T0 + 60))
+
+    def test_wrong_manifest_refused(self):
+        with Sandbox() as s:
+            export, r = self.rec()
+            data = json.loads(s.manifest.read_text())
+            data["note"] = "changed"
+            s.manifest.write_text(json.dumps(data))
+            self.assertIn("bound to a different manifest",
+                          di.verify_source_check(r, export, "c" * 40, self.T0 + 60, s.manifest))
+
+
 class CoverageTests(unittest.TestCase):
     def test_coverage_reports_unindexed(self):
         missing = di.coverage()
