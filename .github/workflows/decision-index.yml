@@ -18,3 +18,5 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Decision wording drift gate
         run: python3 tools/decision_index.py check
+      - name: Coverage of ratified decisions (fails until T1-T39 are all indexed)
+        run: python3 tools/decision_index.py coverage
