@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "potter://contracts/v0/client_event",
+  "title": "Client API event v0",
+  "description": "Backend -> client event stream. Event names adapt AG-UI shapes (T37 B2 ledger: 'Adapt (event shapes)'); approval events are Potter's own because AG-UI interrupts are not yet stable. Clients render; they never mint approvals.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "type", "run_id", "task_id", "seq", "ts", "payload"],
+  "properties": {
+    "schema": {"const": "potter.client_event/v0"},
+    "type": {"enum": [
+      "RUN_STARTED", "RUN_FINISHED", "RUN_ERROR",
+      "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END",
+      "TOOL_CALL_START", "TOOL_CALL_END",
+      "STATE_SNAPSHOT", "STATE_DELTA",
+      "APPROVAL_REQUESTED", "APPROVAL_RESOLVED"
+    ]},
+    "run_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "seq": {"type": "integer", "minimum": 0, "description": "Strictly increasing per run_id; gaps mean the client must resync from STATE_SNAPSHOT."},
+    "ts": {"type": "integer"},
+    "payload": {"type": "object"}
+  },
+  "allOf": [
+    {"if": {"properties": {"type": {"const": "APPROVAL_REQUESTED"}}},
+     "then": {"properties": {"payload": {"required": ["approval_request_id", "action_hash", "summary", "expires_at"]}}}},
+    {"if": {"properties": {"type": {"const": "APPROVAL_RESOLVED"}}},
+     "then": {"properties": {"payload": {"required": ["approval_request_id", "decision"]}}}}
+  ]
+}
