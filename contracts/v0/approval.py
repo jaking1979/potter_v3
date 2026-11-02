@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import json
 import re
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -59,11 +60,24 @@ class Authenticator(Protocol):
 @dataclass(frozen=True)
 class EffectIntent:
     """What will be done under this approval; written atomically with consumption.
-    C2's effect journal is the production home of this record."""
+    Carries the exact canonical action so recovery can reconstruct the external
+    operation after a restart. C2's effect journal is its production home.
+
+    Redaction boundary: action_canonical holds operation parameters (e.g. an email
+    body) and lives only in the local effect journal, never in model context or
+    logs. Secrets never appear in parameters; T11/T12 SecretRefs are used instead.
+    """
     effect_id: str
     task_id: str
     action_hash: str
     approval_id: str
+    action_canonical: str
+
+    def action(self) -> "BoundAction":
+        """Rebuild the exact approved action, refusing if it was altered."""
+        if hashlib.sha256(self.action_canonical.encode("utf-8")).hexdigest() != self.action_hash:
+            raise ApprovalRefused("intent integrity: canonical action does not match approved hash")
+        return BoundAction.from_canonical(self.action_canonical)
 
 
 class ApprovalLedger(Protocol):
@@ -117,6 +131,52 @@ class MemoryApprovalLedger:
             return nonce in self._intents
 
 
+class SqliteApprovalLedger:
+    """Reference durable ledger: one SQLite transaction marks the nonce used and
+    stores the intent (PRIMARY KEY on nonce gives atomic single use across
+    connections and processes). Shows restart-surviving semantics; the
+    production store is C2's effect journal."""
+    SCHEMA = """CREATE TABLE IF NOT EXISTS approval_intents (
+        nonce TEXT PRIMARY KEY, effect_id TEXT NOT NULL, task_id TEXT NOT NULL,
+        action_hash TEXT NOT NULL, approval_id TEXT NOT NULL,
+        action_canonical TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')"""
+
+    def __init__(self, path: str):
+        self._path = path
+        with self._conn() as c:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute(self.SCHEMA)
+
+    def _conn(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._path, timeout=30, isolation_level=None)
+
+    def consume(self, nonce: str, intent: EffectIntent) -> bool:
+        c = self._conn()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.execute("INSERT INTO approval_intents (nonce, effect_id, task_id, action_hash,"
+                          " approval_id, action_canonical) VALUES (?,?,?,?,?,?)",
+                          (nonce, intent.effect_id, intent.task_id, intent.action_hash,
+                           intent.approval_id, intent.action_canonical))
+            except sqlite3.IntegrityError:
+                c.execute("ROLLBACK")
+                return False
+            c.execute("COMMIT")
+            return True
+        finally:
+            c.close()
+
+    def pending(self, nonce: str) -> EffectIntent | None:
+        c = self._conn()
+        try:
+            row = c.execute("SELECT effect_id, task_id, action_hash, approval_id, action_canonical"
+                            " FROM approval_intents WHERE nonce=? AND status='pending'", (nonce,)).fetchone()
+        finally:
+            c.close()
+        return EffectIntent(*row) if row else None
+
+
 @dataclass(frozen=True)
 class BoundAction:
     task_id: str
@@ -134,6 +194,12 @@ class BoundAction:
 
     def hash(self) -> str:
         return hashlib.sha256(self.canonical_json()).hexdigest()
+
+    @classmethod
+    def from_canonical(cls, text: str) -> "BoundAction":
+        d = json.loads(text)
+        return cls(d["task_id"], d["capability"], d["operation"], d["target"],
+                   d["parameters"], d["preconditions"])
 
 
 def _canon(obj: Any) -> bytes:
@@ -210,7 +276,8 @@ def verify(record: dict, action: BoundAction, now: int, ledger: ApprovalLedger,
         raise ApprovalRefused("T38: browser/computer approval needs a screenshot")
     if not _nonempty_str(effect_id):
         raise ApprovalRefused("no effect id")
-    intent = EffectIntent(effect_id, action.task_id, record["action_hash"], record["approval_id"])
+    intent = EffectIntent(effect_id, action.task_id, record["action_hash"], record["approval_id"],
+                          action.canonical_json().decode("utf-8"))
     if not ledger.consume(record["nonce"], intent):
         raise ApprovalRefused("replay")
     return intent

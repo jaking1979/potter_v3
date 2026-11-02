@@ -1,7 +1,10 @@
 """C0 merge evidence: replay refused; parameters swapped after approval refused;
 unauthenticated/forged records refused; atomic single use under concurrency."""
 import json
+import multiprocessing
+import os
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -9,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "contracts" / "v0"))
 from approval import (ApprovalRefused, BoundAction, HmacAuthenticator,  # noqa: E402
-                      MemoryApprovalLedger, signing_payload, verify, MAX_VALIDITY_S)
+                      MemoryApprovalLedger, SqliteApprovalLedger, signing_payload, verify, MAX_VALIDITY_S, EffectIntent)
 
 NOW = 1_800_000_000
 AUTH = HmacAuthenticator({"e1-2026": b"test-only-issuer-key"})
@@ -162,6 +165,57 @@ class CrashSafety(unittest.TestCase):
     def test_missing_effect_id_refused(self):
         with self.assertRaisesRegex(ApprovalRefused, "effect id"):
             check(record(), effect_id="")
+
+
+def _race_worker(db, q):
+    try:
+        verify(record(), ACTION, NOW, SqliteApprovalLedger(db), AUTH, f"eff-{os.getpid()}")
+        q.put(True)
+    except ApprovalRefused:
+        q.put(False)
+
+
+class DurableRecovery(unittest.TestCase):
+    """Dolores review: recovery after restart must reconstruct the exact action."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "ledger.sqlite")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fresh_ledger_after_restart_reconstructs_exact_action(self):
+        act = BoundAction("task-1", "gmail.send", "send", "alex@example.com",
+                          {"subject": "Dinner", "body": "7pm works."}, {"thread_etag": "e3"})
+        verify(record(act), act, NOW, SqliteApprovalLedger(self.db), AUTH, "eff-9")
+        # "Restart": a brand-new ledger object/connection on the same durable file.
+        recovered = SqliteApprovalLedger(self.db).pending("a" * 32)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered.action(), act)
+        self.assertEqual(recovered.effect_id, "eff-9")
+        with self.assertRaisesRegex(ApprovalRefused, "replay"):
+            verify(record(act), act, NOW, SqliteApprovalLedger(self.db), AUTH, "eff-10")
+
+    def test_tampered_stored_action_detected(self):
+        verify(record(), ACTION, NOW, SqliteApprovalLedger(self.db), AUTH, "eff-1")
+        i = SqliteApprovalLedger(self.db).pending("a" * 32)
+        bad = EffectIntent(i.effect_id, i.task_id, i.action_hash, i.approval_id,
+                           i.action_canonical.replace("7pm", "9pm"))
+        with self.assertRaisesRegex(ApprovalRefused, "integrity"):
+            bad.action()
+
+    def test_exactly_one_of_many_processes_succeeds(self):
+        SqliteApprovalLedger(self.db)
+        ctx = multiprocessing.get_context("spawn")
+        q = ctx.Queue()
+        procs = [ctx.Process(target=_race_worker, args=(self.db, q)) for _ in range(8)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(60)
+        results = [q.get(timeout=5) for _ in procs]
+        self.assertEqual(results.count(True), 1)
 
 
 class Provenance(unittest.TestCase):
