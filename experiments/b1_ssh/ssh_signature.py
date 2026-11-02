@@ -4,17 +4,20 @@ The caller must independently establish the authorized key set, claims,
 reviewer identity, revocation, nonce, CI status and exact candidate binding.
 No production consumer may use this experimental helper as authorization.
 """
+import base64
+import binascii
 import re
 import subprocess
 from pathlib import Path
 
 NAMESPACE = 'potter-review'
 MAX_INPUT_FILE_BYTES = 1_048_576
+ALLOWED_KEY_TYPES = frozenset({'ssh-ed25519'})
 _PRINCIPAL = re.compile(r'[A-Za-z0-9._@-]+\Z')
 
 
 def _safe_allowed_signers(allowed_signers: Path) -> bool:
-    """Reject wildcard principals and malformed or oversized local signer files."""
+    """Allow only literal-principal ed25519 signer entries; reject options/CAs."""
     try:
         if not allowed_signers.is_file() or allowed_signers.stat().st_size > MAX_INPUT_FILE_BYTES:
             return False
@@ -23,7 +26,15 @@ def _safe_allowed_signers(allowed_signers: Path) -> bool:
             if not line or line.startswith('#'):
                 continue
             fields = line.split()
-            if len(fields) < 2 or not _PRINCIPAL.fullmatch(fields[0]):
+            if (
+                len(fields) < 3
+                or not _PRINCIPAL.fullmatch(fields[0])
+                or fields[1] not in ALLOWED_KEY_TYPES
+            ):
+                return False
+            try:
+                base64.b64decode(fields[2], validate=True)
+            except (binascii.Error, ValueError):
                 return False
         return True
     except (OSError, UnicodeError):
@@ -37,13 +48,16 @@ def verify_signature(payload: bytes, signature: Path, allowed_signers: Path, pri
         or not isinstance(principal, str)
         or not _PRINCIPAL.fullmatch(principal)
         or not isinstance(signature, Path)
-        or not signature.is_file()
-        or signature.stat().st_size > MAX_INPUT_FILE_BYTES
         or not isinstance(allowed_signers, Path)
-        or not _safe_allowed_signers(allowed_signers)
     ):
         return False
     try:
+        if (
+            not signature.is_file()
+            or signature.stat().st_size > MAX_INPUT_FILE_BYTES
+            or not _safe_allowed_signers(allowed_signers)
+        ):
+            return False
         result = subprocess.run(
             [
                 'ssh-keygen', '-Y', 'verify', '-n', NAMESPACE,
