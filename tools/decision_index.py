@@ -6,12 +6,19 @@ an exact snapshot of each decision's wording in governance/decisions/wording/<ID
 and its SHA-256 in governance/decisions/manifest.json.
 
   check                 verify every snapshot matches its manifest hash (CI gate)
-  compare ID FILE       compare freshly exported Notion wording against the snapshot
-  rt-ids [ID]           list release-test IDs (RT-<ID>-<n>) derived from snapshots
+  extract ID EXPORT     print the verbatim Decision & Reconciliation Record for ID
+                        from a raw Notion page export (the snapshot source)
+  compare ID EXPORT     extract from a fresh Notion export and compare to snapshot
+  coverage              list ratified decisions not yet indexed (exit 3 if any)
+  rt-ids [ID]           list release-test IDs derived from snapshots
   hash FILE             print the canonical hash of a file
 
-CI has no Notion credentials, so `compare` is run by an agent session that can
-read Notion; CI runs `check`. Exit codes: 0 ok, 2 drift/mismatch, 1 usage error.
+Snapshots are produced only by `extract`, so a snapshot is reproducible from
+the canonical Notion export rather than hand-copied. CI has no Notion
+credentials: `compare` runs in an agent session that can read Notion; CI runs
+`check`. A coordinated edit of wording+hash is caught by `compare`, and the
+manifest hash is bound into every T39 attestation.
+Exit codes: 0 ok, 1 usage error, 2 drift/mismatch, 3 incomplete coverage.
 """
 from __future__ import annotations
 
@@ -26,7 +33,11 @@ ROOT = Path(__file__).resolve().parent.parent
 DECISIONS = ROOT / "governance" / "decisions"
 MANIFEST = DECISIONS / "manifest.json"
 ID_RE = re.compile(r"^T\d+(?:-[A-Za-z0-9]+)*$")
-RT_LINE = re.compile(r"^\s*(?:\((\d+)\)|(\d+)\.)\s+(.+)$")
+EXPECTED = DECISIONS / "expected.json"
+RT_LINE = re.compile(r"^\s*(\d+)\.\s+(.+)$")
+RT_INLINE = re.compile(r"\((\d+)\)\s+(.+?)(?=;\s*\(\d+\)\s|$)")
+RT_S = re.compile(r"^\s*-\s*(?:<b>)?(S\d+)\b[^<]*(?:</b>)?\s*(.*)$")
+TAG = re.compile(r"<[^>]+>")
 
 
 def canonical(text: str) -> str:
@@ -83,31 +94,68 @@ def check(manifest_path: Path = MANIFEST) -> list[str]:
     return problems
 
 
-def compare(decision_id: str, notion_text: str, manifest_path: Path = MANIFEST) -> bool:
+def compare(decision_id: str, notion_export: str, manifest_path: Path = MANIFEST) -> bool:
+    """True if the record extracted from a fresh Notion export matches the snapshot."""
     data = load_manifest(manifest_path)
     for entry in data["decisions"]:
         if entry["id"] == decision_id:
             snap = wording_path(entry, manifest_path.parent).read_text(encoding="utf-8")
-            return digest(snap) == digest(notion_text)
+            return digest(snap) == digest(extract(decision_id, notion_export))
     raise KeyError(decision_id)
 
 
+def extract(decision_id: str, export: str) -> str:
+    """Verbatim body of '## Decision & Reconciliation Record — <ID>' up to the next
+    level-1/2 heading or the end of the page content."""
+    head = re.compile(r"^##\s+Decision & Reconciliation Record\s+[—-]\s+" + re.escape(decision_id) + r"\b.*$", re.M)
+    m = head.search(export)
+    if not m:
+        raise KeyError(f"no Decision & Reconciliation Record for {decision_id}")
+    rest = export[m.end():]
+    stop = re.search(r"^#{1,2}\s|^</content>", rest, re.M)
+    body = rest[: stop.start()] if stop else rest
+    return canonical(m.group(0) + "\n" + body)
+
+
 def rt_ids(decision_id: str, text: str) -> list[tuple[str, str]]:
-    """Release-test IDs from the numbered list under '## Acceptance tests'."""
-    out, in_section = [], False
+    """Release-test IDs from a record's acceptance list. Supported forms (as used
+    in the Council record): numbered lines after an 'Acceptance' label
+    (RT-<ID>-<n>), an inline '(1) ...; (2) ...' list (RT-<ID>-<n>), and the T37
+    '- **S<n>**' appendix bullets (RT-<ID>-S<n>)."""
+    out: list[tuple[str, str]] = []
+    in_acc = False
     for ln in canonical(text).split("\n"):
-        if ln.startswith("## "):
-            in_section = ln.strip().lower().startswith("## acceptance tests")
+        plain = TAG.sub("", ln).strip()
+        ms = RT_S.match(ln)
+        if ms:
+            out.append((f"RT-{decision_id}-{ms.group(1)}", TAG.sub("", ms.group(2)).strip()))
             continue
-        if in_section:
-            m = RT_LINE.match(ln)
+        if re.match(r"^(?:#+\s*)?acceptance\b", plain, re.I):
+            in_acc = True
+            after = plain.split(":", 1)[1] if ":" in plain else ""
+            for n, desc in RT_INLINE.findall(after):
+                out.append((f"RT-{decision_id}-{n}", desc.strip().rstrip(".")))
+            continue
+        if in_acc:
+            m = RT_LINE.match(plain)
             if m:
-                n = m.group(1) or m.group(2)
-                out.append((f"RT-{decision_id}-{n}", m.group(3).strip()))
-    nums = [int(i.rsplit("-", 1)[1]) for i, _ in out]
-    if nums != list(range(1, len(nums) + 1)):
-        raise ValueError(f"{decision_id}: acceptance tests must be numbered 1..n, got {nums}")
+                out.append((f"RT-{decision_id}-{m.group(1)}", m.group(2).strip()))
+            elif plain and not out:
+                continue
+            elif plain:
+                in_acc = False
+    num = [int(i.rsplit("-", 1)[1]) for i, _ in out if i.rsplit("-", 1)[1].isdigit()]
+    if num and num != list(range(1, len(num) + 1)):
+        raise ValueError(f"{decision_id}: acceptance tests must be numbered 1..n, got {num}")
+    if len({i for i, _ in out}) != len(out):
+        raise ValueError(f"{decision_id}: duplicate release-test IDs")
     return out
+
+
+def coverage(manifest_path: Path = MANIFEST, expected_path: Path = EXPECTED) -> list[str]:
+    have = {d["id"] for d in load_manifest(manifest_path)["decisions"]}
+    want = json.loads(expected_path.read_text(encoding="utf-8"))["ratified"]
+    return [i for i in want if i not in have]
 
 
 def main(argv: list[str]) -> int:
@@ -126,6 +174,13 @@ def main(argv: list[str]) -> int:
         same = compare(args[0], Path(args[1]).read_text(encoding="utf-8"))
         print("ok: matches snapshot" if same else f"DRIFT: Notion wording for {args[0]} differs from snapshot")
         return 0 if same else 2
+    if cmd == "extract" and len(args) == 2:
+        sys.stdout.write(extract(args[0], Path(args[1]).read_text(encoding="utf-8")))
+        return 0
+    if cmd == "coverage":
+        missing = coverage()
+        print("ok: all ratified decisions indexed" if not missing else "NOT INDEXED: " + ", ".join(missing))
+        return 3 if missing else 0
     if cmd == "rt-ids":
         data = load_manifest()
         for entry in data["decisions"]:

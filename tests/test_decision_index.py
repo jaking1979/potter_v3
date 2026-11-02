@@ -1,4 +1,5 @@
-"""B2 merge evidence: edited canonical wording -> hash mismatch -> check fails."""
+"""B2 merge evidence: edited canonical wording -> hash mismatch -> check fails;
+snapshots are reproducible verbatim extracts of the Notion record."""
 import json
 import shutil
 import sys
@@ -9,6 +10,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import decision_index as di  # noqa: E402
+
+WORDING = ROOT / "governance" / "decisions" / "wording"
+
+
+def fake_export(*ids, tamper=None):
+    """A Notion-page-shaped export containing the current snapshots verbatim,
+    surrounded by other content, optionally with one edit applied."""
+    parts = ["<page>\n<content>\n# Josh Review Queue\n\nstuff\n\n## T40 · Other thread\n\n<b>Claude · x</b>\n\n"]
+    for i in ids:
+        parts.append((WORDING / f"{i}.md").read_text(encoding="utf-8").replace("\n", "\r\n") + "\n")
+    parts.append("## Next section\n\nmore\n</content>\n</page>\n")
+    text = "".join(parts)
+    if tamper:
+        old, new = tamper
+        assert old in text
+        text = text.replace(old, new, 1)
+    return text
 
 
 class Sandbox:
@@ -24,15 +42,33 @@ class Sandbox:
 
 class CanonicalTests(unittest.TestCase):
     def test_presentation_noise_ignored(self):
-        a = "Line one.\nLine two.\n"
-        b = "Line one.  \r\n\r\n\r\nLine two.\r\n\r\n"
-        self.assertEqual(di.digest(a.replace("\n", "\n\n", 1)), di.digest(b))
+        self.assertEqual(di.digest("A.\n\nB.\n"), di.digest("A.  \r\n\r\n\r\nB.\r\n\r\n"))
 
     def test_word_change_detected(self):
         self.assertNotEqual(di.digest("Josh must approve."), di.digest("Josh may approve."))
 
     def test_unicode_nfc(self):
         self.assertEqual(di.digest("café"), di.digest("café"))
+
+
+class ExtractTests(unittest.TestCase):
+    def test_snapshots_are_verbatim_extracts(self):
+        export = fake_export("T37", "T38", "T39")
+        for i in ("T37", "T38", "T39"):
+            with self.subTest(i=i):
+                self.assertEqual(di.extract(i, export), di.canonical((WORDING / f"{i}.md").read_text()))
+
+    def test_t38_keeps_test6_exclusion_clause(self):
+        self.assertIn("If test 6 fails", (WORDING / "T38.md").read_text())
+
+    def test_extract_stops_at_next_section_and_keeps_subsections(self):
+        t37 = di.extract("T37", fake_export("T37"))
+        self.assertIn("### T37 acceptance appendix", t37)
+        self.assertNotIn("## Next section", t37)
+
+    def test_missing_record(self):
+        with self.assertRaises(KeyError):
+            di.extract("T99", fake_export("T39"))
 
 
 class CheckTests(unittest.TestCase):
@@ -43,8 +79,7 @@ class CheckTests(unittest.TestCase):
         with Sandbox() as s:
             f = s.dir / "decisions" / "wording" / "T39.md"
             f.write_text(f.read_text().replace("two distinct-key", "one or more"), encoding="utf-8")
-            problems = di.check(s.manifest)
-            self.assertTrue(any("T39: hash mismatch" in p for p in problems))
+            self.assertTrue(any("T39: hash mismatch" in p for p in di.check(s.manifest)))
 
     def test_missing_and_unlisted_files_block(self):
         with Sandbox() as s:
@@ -68,30 +103,55 @@ class CheckTests(unittest.TestCase):
 
 
 class CompareTests(unittest.TestCase):
-    def test_notion_export_matches_and_drifts(self):
-        snap = (ROOT / "governance/decisions/wording/T39.md").read_text()
-        self.assertTrue(di.compare("T39", snap.replace("\n", "\r\n")))
-        self.assertFalse(di.compare("T39", snap.replace("1 h", "24 h")))
+    def test_coordinated_edit_caught_against_notion(self):
+        """Editing wording AND hash together passes `check`, but `compare`
+        against the Notion export still reports drift."""
+        with Sandbox() as s:
+            f = s.dir / "decisions" / "wording" / "T39.md"
+            f.write_text(f.read_text().replace("within 1 h", "within 24 h"), encoding="utf-8")
+            data = json.loads(s.manifest.read_text())
+            for e in data["decisions"]:
+                if e["id"] == "T39":
+                    e["sha256"] = di.digest(f.read_text())
+            s.manifest.write_text(json.dumps(data))
+            self.assertEqual(di.check(s.manifest), [])
+            self.assertFalse(di.compare("T39", fake_export("T39"), s.manifest))
+
+    def test_notion_edit_detected(self):
+        self.assertTrue(di.compare("T39", fake_export("T39")))
+        self.assertFalse(di.compare("T39", fake_export("T39", tamper=("within 1 h", "within 24 h"))))
 
     def test_unknown_id(self):
         with self.assertRaises(KeyError):
             di.compare("T999", "x")
 
 
+class CoverageTests(unittest.TestCase):
+    def test_coverage_reports_unindexed(self):
+        missing = di.coverage()
+        self.assertNotIn("T39", missing)
+        self.assertIn("T1", missing)  # B2 is not complete until this is empty
+
+    def test_coverage_exit_code(self):
+        self.assertEqual(di.main(["coverage"]), 3 if di.coverage() else 0)
+
+
 class RtIdTests(unittest.TestCase):
-    def test_ids_stable_and_complete(self):
-        text = (ROOT / "governance/decisions/wording/T39.md").read_text()
-        ids = [i for i, _ in di.rt_ids("T39", text)]
-        self.assertEqual(ids, [f"RT-T39-{n}" for n in range(1, 7)])
+    def ids(self, i):
+        return [r for r, _ in di.rt_ids(i, (WORDING / f"{i}.md").read_text())]
+
+    def test_numbered_list(self):
+        self.assertEqual(self.ids("T38"), [f"RT-T38-{n}" for n in range(1, 7)])
+
+    def test_inline_list(self):
+        self.assertEqual(self.ids("T39"), [f"RT-T39-{n}" for n in range(1, 7)])
+
+    def test_s_appendix(self):
+        self.assertEqual(self.ids("T37"), [f"RT-T37-S{n}" for n in range(1, 14)])
 
     def test_gap_in_numbering_rejected(self):
-        text = "## Acceptance tests\n\n1. a\n3. c\n"
         with self.assertRaises(ValueError):
-            di.rt_ids("T1", text)
-
-    def test_parenthesized_numbering(self):
-        text = "## Wording\n(1) not a test\n## Acceptance tests\n(1) a\n(2) b\n"
-        self.assertEqual([i for i, _ in di.rt_ids("T5", text)], ["RT-T5-1", "RT-T5-2"])
+            di.rt_ids("T1", "<b>Acceptance tests:</b>\n\n1. a\n3. c\n")
 
 
 if __name__ == "__main__":

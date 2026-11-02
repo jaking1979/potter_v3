@@ -1,22 +1,36 @@
 {
   "schema": "potter.decision-manifest/v0",
-  "note": "Snapshots of ratified Notion wording; Notion stays canonical. T1-T37 are added by the sync pass.",
+  "note": "Verbatim extracts (tools/decision_index.py extract) of ratified Notion Decision & Reconciliation Records. Notion stays canonical.",
   "decisions": [
+    {
+      "id": "T37",
+      "title": "Build collaboration, release path & Potter operator experience",
+      "status": "RATIFIED",
+      "ratified": "2026-10-27",
+      "source": "https://app.notion.com/p/401a667c6316813f908fe6e563f4f7eb",
+      "source_section": "Decision & Reconciliation Record — T37",
+      "wording_file": "wording/T37.md",
+      "sha256": "973318215211c29d7c371bd845be5dfac7a35dba87b31fbea9326a0a9ab959af"
+    },
     {
       "id": "T38",
       "title": "Agent-owned computer workspace",
       "status": "RATIFIED",
+      "ratified": "2026-11-01",
       "source": "https://app.notion.com/p/401a667c6316813f908fe6e563f4f7eb",
+      "source_section": "Decision & Reconciliation Record — T38",
       "wording_file": "wording/T38.md",
-      "sha256": "011951aa9c2e76fab489a06e65fe3d0d035b7304bca17cf16a4238b23db87ca1"
+      "sha256": "f1a6e61ae3f24a01402153ec99ad5f3e932303723327d28811a9193361f3e131"
     },
     {
       "id": "T39",
       "title": "Repository governance without paid GitHub or new accounts",
       "status": "RATIFIED",
+      "ratified": "2026-11-02",
       "source": "https://app.notion.com/p/401a667c6316813f908fe6e563f4f7eb",
+      "source_section": "Decision & Reconciliation Record — T39",
       "wording_file": "wording/T39.md",
-      "sha256": "afe9b3c1c2cc999a1c390a2bc7f01587cd9fd913a82f59b1180a635ab7371a66"
+      "sha256": "6f8f986e482d358f7f110f1f6d336b9b2511c20b73de411e6afca573947a2d54"
     }
   ]
 }
