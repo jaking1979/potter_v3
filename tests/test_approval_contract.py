@@ -69,6 +69,24 @@ class ApprovalContract(unittest.TestCase):
         with self.assertRaisesRegex(ApprovalRefused, "malformed"):
             verify(r, ACTION, NOW, set())
 
+    def test_schema_violations_refused_without_consuming(self):
+        bad = [{"nonce": None}, {"nonce": "short"}, {"approval_id": ""}, {"approval_id": None},
+               {"task_id": ""}, {"action_hash": "ABC"}, {"issued_at": True},
+               {"expires_at": float(NOW + 300)}, {"screenshot_ref": True}, {"screenshot_ref": ""},
+               {"extra_field": 1}]
+        for over in bad:
+            consumed = set()
+            with self.subTest(over=over), self.assertRaisesRegex(ApprovalRefused, "malformed"):
+                verify(record(**over), ACTION, NOW, consumed)
+            self.assertEqual(consumed, set())
+        with self.assertRaisesRegex(ApprovalRefused, "malformed"):
+            verify(["not", "a", "dict"], ACTION, NOW, set())
+
+    def test_computer_screenshot_must_be_real_string(self):
+        act = BoundAction("task-1", "computer", "click", "app:Finder", {"x": 1})
+        with self.assertRaises(ApprovalRefused):
+            verify(record(act, screenshot_ref=True), act, NOW, set())
+
     def test_hash_is_order_independent_and_exact(self):
         a = BoundAction("t", "c", "o", "x", {"a": 1, "b": 2})
         b = BoundAction("t", "c", "o", "x", {"b": 2, "a": 1})
