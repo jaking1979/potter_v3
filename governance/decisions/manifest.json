@@ -1,0 +1,22 @@
+{
+  "schema": "potter.decision-manifest/v0",
+  "note": "Snapshots of ratified Notion wording; Notion stays canonical. T1-T37 are added by the sync pass.",
+  "decisions": [
+    {
+      "id": "T38",
+      "title": "Agent-owned computer workspace",
+      "status": "RATIFIED",
+      "source": "https://app.notion.com/p/401a667c6316813f908fe6e563f4f7eb",
+      "wording_file": "wording/T38.md",
+      "sha256": "011951aa9c2e76fab489a06e65fe3d0d035b7304bca17cf16a4238b23db87ca1"
+    },
+    {
+      "id": "T39",
+      "title": "Repository governance without paid GitHub or new accounts",
+      "status": "RATIFIED",
+      "source": "https://app.notion.com/p/401a667c6316813f908fe6e563f4f7eb",
+      "wording_file": "wording/T39.md",
+      "sha256": "afe9b3c1c2cc999a1c390a2bc7f01587cd9fd913a82f59b1180a635ab7371a66"
+    }
+  ]
+}
