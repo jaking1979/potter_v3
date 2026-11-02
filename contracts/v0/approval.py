@@ -19,6 +19,8 @@ fixes the semantics both sides test against:
   crash the pending intent is still there, bound to this approval, and C2
   recovery reconciles it per T10 (read external state first; never blind
   retry). A crash therefore can neither replay the approval nor strand it.
+* Execution source: executors run ONLY intent.action() (the persisted,
+  hash-verified snapshot), never the caller's object.
 * Fail closed: any malformed, unauthenticated, stale, mismatched or reused record
   raises ApprovalRefused, and nothing is consumed unless every check passes.
 
@@ -33,7 +35,8 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol
 
 REQUIRED = ("schema", "approval_id", "task_id", "action_hash", "decision",
             "decided_by", "channel", "issued_at", "expires_at", "nonce",
@@ -179,21 +182,33 @@ class SqliteApprovalLedger:
 
 @dataclass(frozen=True)
 class BoundAction:
+    """An action fixed at construction. Its identity is its canonical bytes,
+    computed once in __post_init__ from deep copies of the inputs; parameters
+    and preconditions are exposed read-only. Mutating the caller's original
+    dicts afterwards cannot change what was hashed, approved, persisted or
+    executed (Dolores review, TOCTOU)."""
     task_id: str
     capability: str          # registry capability, e.g. "gmail.send", "computer"
     operation: str
     target: str
-    parameters: dict[str, Any] = field(default_factory=dict)
-    preconditions: dict[str, Any] = field(default_factory=dict)  # state the approval assumed
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+    preconditions: Mapping[str, Any] = field(default_factory=dict)  # state the approval assumed
 
-    def canonical_json(self) -> bytes:
+    def __post_init__(self):
         body = {"task_id": self.task_id, "capability": self.capability,
                 "operation": self.operation, "target": self.target,
-                "parameters": self.parameters, "preconditions": self.preconditions}
-        return _canon(body)
+                "parameters": dict(self.parameters), "preconditions": dict(self.preconditions)}
+        canon = _canon(body)  # also rejects non-JSON values
+        frozen = json.loads(canon)
+        object.__setattr__(self, "parameters", _freeze(frozen["parameters"]))
+        object.__setattr__(self, "preconditions", _freeze(frozen["preconditions"]))
+        object.__setattr__(self, "_canonical", canon)
+
+    def canonical_json(self) -> bytes:
+        return self._canonical
 
     def hash(self) -> str:
-        return hashlib.sha256(self.canonical_json()).hexdigest()
+        return hashlib.sha256(self._canonical).hexdigest()
 
     @classmethod
     def from_canonical(cls, text: str) -> "BoundAction":
@@ -202,8 +217,24 @@ class BoundAction:
                    d["parameters"], d["preconditions"])
 
 
+def _freeze(v: Any) -> Any:
+    if isinstance(v, dict):
+        return MappingProxyType({k: _freeze(x) for k, x in v.items()})
+    if isinstance(v, list):
+        return tuple(_freeze(x) for x in v)
+    return v
+
+
+def _thaw(v: Any) -> Any:
+    if isinstance(v, Mapping):
+        return {k: _thaw(x) for k, x in v.items()}
+    if isinstance(v, tuple):
+        return [_thaw(x) for x in v]
+    return v
+
+
 def _canon(obj: Any) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+    return json.dumps(_thaw(obj), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
@@ -252,6 +283,10 @@ def verify(record: dict, action: BoundAction, now: int, ledger: ApprovalLedger,
     approval of exactly `action`, issued at most 24 h ago and unexpired, used for
     the first time. Raises ApprovalRefused otherwise (nothing recorded)."""
     check_shape(record)
+    if not isinstance(action, BoundAction):
+        raise ApprovalRefused("action must be a BoundAction")
+    canon = action.canonical_json()          # one snapshot, used for hash AND intent
+    action_hash = hashlib.sha256(canon).hexdigest()
     if authenticator is None:
         raise ApprovalRefused("no trusted issuer configured")
     if not authenticator.verify(record["issuer_key_id"], signing_payload(record),
@@ -270,14 +305,14 @@ def verify(record: dict, action: BoundAction, now: int, ledger: ApprovalLedger,
         raise ApprovalRefused("outside validity window (max 24 h)")
     if record["task_id"] != action.task_id:
         raise ApprovalRefused("task mismatch")
-    if record["action_hash"] != action.hash():
+    if record["action_hash"] != action_hash:
         raise ApprovalRefused("action changed after approval")
     if action.capability in SCREENSHOT_CAPS and "screenshot_ref" not in record:
         raise ApprovalRefused("T38: browser/computer approval needs a screenshot")
     if not _nonempty_str(effect_id):
         raise ApprovalRefused("no effect id")
-    intent = EffectIntent(effect_id, action.task_id, record["action_hash"], record["approval_id"],
-                          action.canonical_json().decode("utf-8"))
+    intent = EffectIntent(effect_id, action.task_id, action_hash, record["approval_id"],
+                          canon.decode("utf-8"))
     if not ledger.consume(record["nonce"], intent):
         raise ApprovalRefused("replay")
     return intent

@@ -276,6 +276,118 @@ class Concurrency(unittest.TestCase):
         self.assertEqual(len(results), 32)
 
 
+class Immutability(unittest.TestCase):
+    """Dolores review of 0e0a651: the executed/persisted action can never differ
+    from the approved bytes."""
+
+    def test_mutating_source_dicts_after_construction_changes_nothing(self):
+        params = {"subject": "Dinner", "body": "7pm works.", "cc": ["a@x.com"]}
+        act = BoundAction("task-1", "gmail.send", "send", "alex@example.com", params)
+        h = act.hash()
+        params["body"] = "Wire $5,000 today."
+        params["cc"].append("mallory@x.com")
+        self.assertEqual(act.hash(), h)
+        self.assertEqual(act.parameters["body"], "7pm works.")
+
+    def test_exposed_parameters_are_read_only(self):
+        act = BoundAction("task-1", "gmail.send", "send", "alex@example.com", {"cc": ["a@x.com"]})
+        with self.assertRaises(TypeError):
+            act.parameters["body"] = "x"
+        with self.assertRaises((TypeError, AttributeError)):
+            act.parameters["cc"].append("m@x.com")
+
+    def test_mutation_during_verification_cannot_change_intent(self):
+        params = {"subject": "Dinner", "body": "7pm works."}
+        act = BoundAction("task-1", "gmail.send", "send", "alex@example.com", params)
+        approved = act.hash()
+
+        class MutatingAuth(HmacAuthenticator):
+            def verify(self, key_id, payload, signature):
+                params["body"] = "Wire $5,000 today."   # attacker races verification
+                return super().verify(key_id, payload, signature)
+
+        auth = MutatingAuth({"e1-2026": b"test-only-issuer-key"})
+        intent = verify(record(act), act, NOW, MemoryApprovalLedger(), auth, "eff-1")
+        self.assertEqual(intent.action_hash, approved)
+        self.assertEqual(intent.action().parameters["body"], "7pm works.")
+        self.assertEqual(intent.action(), act)
+
+    def test_non_boundaction_refused(self):
+        class Fake:
+            task_id = "task-1"
+            capability = "gmail.send"
+            def hash(self): return ACTION.hash()
+            def canonical_json(self): return ACTION.canonical_json()
+        with self.assertRaisesRegex(ApprovalRefused, "BoundAction"):
+            check(record(), action=Fake())
+
+    def test_non_json_parameters_rejected_at_construction(self):
+        with self.assertRaises((TypeError, ValueError)):
+            BoundAction("t", "c", "o", "x", {"when": object()})
+
+
+class ScreenshotBothCaps(unittest.TestCase):
+    """T38: screenshot required for browser AND computer acts."""
+
+    def test_browser_and_computer(self):
+        for cap in ("browser", "computer"):
+            act = BoundAction("task-1", cap, "click", "target", {"x": 1})
+            with self.subTest(cap=cap):
+                with self.assertRaisesRegex(ApprovalRefused, "screenshot"):
+                    check(record(act), action=act)
+                check(record(act, screenshot_ref="evidence://s/1"), action=act)
+
+
+class SchemaValidation(unittest.TestCase):
+    """Validate the JSON Schemas themselves with a real validator."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import jsonschema
+        except ImportError:  # pragma: no cover - CI installs a pinned version
+            raise unittest.SkipTest("jsonschema not installed")
+        cls.js = jsonschema
+        cls.appr = json.loads((ROOT / "contracts/v0/approval_record.schema.json").read_text())
+        cls.evt = json.loads((ROOT / "contracts/v0/client_event.schema.json").read_text())
+        for sch in (cls.appr, cls.evt):
+            jsonschema.Draft202012Validator.check_schema(sch)
+
+    def ok(self, schema, doc):
+        return self.js.Draft202012Validator(schema).is_valid(doc)
+
+    def evt_doc(self, type_, payload):
+        return {"schema": "potter.client_event/v0", "type": type_, "run_id": "r1",
+                "task_id": "t1", "seq": 0, "ts": NOW, "payload": payload}
+
+    def test_valid_records_pass(self):
+        self.assertTrue(self.ok(self.appr, record()))
+        self.assertTrue(self.ok(self.evt, self.evt_doc("APPROVAL_REQUESTED", {
+            "approval_request_id": "ar-1", "action_hash": ACTION.hash(),
+            "summary": "Send email to Alex", "expires_at": NOW + 300})))
+        self.assertTrue(self.ok(self.evt, self.evt_doc("APPROVAL_RESOLVED",
+                                                       {"approval_request_id": "ar-1", "decision": "approve"})))
+
+    def test_approval_requested_payload_typed(self):
+        base = {"approval_request_id": "ar-1", "action_hash": ACTION.hash(),
+                "summary": "Send", "expires_at": NOW + 300}
+        for bad in ({"action_hash": None}, {"action_hash": "ABC"}, {"summary": 5}, {"summary": ""},
+                    {"expires_at": "soon"}, {"approval_request_id": ""}, {"extra": 1}):
+            with self.subTest(bad=bad):
+                self.assertFalse(self.ok(self.evt, self.evt_doc("APPROVAL_REQUESTED", {**base, **bad})))
+
+    def test_approval_resolved_payload_typed(self):
+        for bad in ({"decision": "yes"}, {"decision": None}, {"approval_request_id": 7}):
+            with self.subTest(bad=bad):
+                p = {"approval_request_id": "ar-1", "decision": "approve", **bad}
+                self.assertFalse(self.ok(self.evt, self.evt_doc("APPROVAL_RESOLVED", p)))
+
+    def test_approval_schema_rejects_invalid_fields(self):
+        for bad in ({"nonce": None}, {"action_hash": "ABC"}, {"decided_by": "dolores"}, {"x": 1}):
+            with self.subTest(bad=bad):
+                self.assertFalse(self.ok(self.appr, {**record(), **bad}))
+
+
 class SchemaFiles(unittest.TestCase):
     def test_schemas_parse_and_match_verifier(self):
         appr = json.loads((ROOT / "contracts/v0/approval_record.schema.json").read_text())
