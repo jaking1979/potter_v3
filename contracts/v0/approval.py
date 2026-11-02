@@ -8,10 +8,17 @@ fixes the semantics both sides test against:
   `decided_by` and `channel` are claims *inside* that signed envelope, never
   proof by themselves. No authenticator configured -> refuse.
 * Binding: the approval covers exactly sha256(canonical BoundAction).
-* Single use: the nonce is consumed through a NonceStore whose consume_once()
-  must be atomic. Production (C1/C2) consumes it in the same durable transaction
-  that records the effect intent in the effect journal, so a crash or a
-  concurrent consumer cannot use one approval twice.
+* Validity: at most 24 h from issue (T37 S1: "an approval after 24 h is
+  refused"), regardless of the signed expires_at; a narrower policy TTL may
+  apply on top.
+* Stale state: BoundAction.preconditions (e.g. the version/etag of the thing
+  being changed) is inside the hashed action, so an approval given against old
+  state does not match the action computed against new state (T37 S1).
+* Single use, without stranding: consumption and recording of the intended
+  effect are ONE atomic step, ApprovalLedger.consume(nonce, intent). After a
+  crash the pending intent is still there, bound to this approval, and C2
+  recovery reconciles it per T10 (read external state first; never blind
+  retry). A crash therefore can neither replay the approval nor strand it.
 * Fail closed: any malformed, unauthenticated, stale, mismatched or reused record
   raises ApprovalRefused, and nothing is consumed unless every check passes.
 
@@ -33,6 +40,7 @@ REQUIRED = ("schema", "approval_id", "task_id", "action_hash", "decision",
 CHANNELS = {"telegram", "potter_home", "passkey_step_up"}
 SCREENSHOT_CAPS = {"browser", "computer"}
 ALLOWED_KEYS = set(REQUIRED) | {"screenshot_ref"}
+MAX_VALIDITY_S = 24 * 3600   # T37 S1
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 NONCE = re.compile(r"^[0-9a-f]{32,}$")
 
@@ -48,10 +56,26 @@ class Authenticator(Protocol):
     def verify(self, key_id: str, payload: bytes, signature: str) -> bool: ...
 
 
-class NonceStore(Protocol):
-    def consume_once(self, nonce: str) -> bool:
-        """Atomically mark `nonce` used. True only for the first caller, ever,
-        across threads, processes and restarts (production: durable, C2)."""
+@dataclass(frozen=True)
+class EffectIntent:
+    """What will be done under this approval; written atomically with consumption.
+    C2's effect journal is the production home of this record."""
+    effect_id: str
+    task_id: str
+    action_hash: str
+    approval_id: str
+
+
+class ApprovalLedger(Protocol):
+    def consume(self, nonce: str, intent: EffectIntent) -> bool:
+        """Atomically: if `nonce` is unused, mark it used AND durably record
+        `intent` as pending, then return True. Otherwise change nothing and
+        return False. Must hold across threads, processes and restarts
+        (production: one C2 transaction). Mandatory C1/C2 gate."""
+        ...
+
+    def pending(self, nonce: str) -> EffectIntent | None:
+        """The intent recorded at consumption, for crash recovery (T10)."""
         ...
 
 
@@ -70,22 +94,27 @@ class HmacAuthenticator:
         return hmac.compare_digest(hmac.new(key, payload, hashlib.sha256).hexdigest(), signature)
 
 
-class MemoryNonceStore:
-    """Reference single-process store (atomic via lock, not durable)."""
+class MemoryApprovalLedger:
+    """Reference single-process ledger: atomic via one lock, NOT durable.
+    Proves the semantics only; production durability is a C1/C2 gate."""
     def __init__(self):
-        self._used: set[str] = set()
+        self._intents: dict[str, EffectIntent] = {}
         self._lock = threading.Lock()
 
-    def consume_once(self, nonce: str) -> bool:
+    def consume(self, nonce: str, intent: EffectIntent) -> bool:
         with self._lock:
-            if nonce in self._used:
+            if nonce in self._intents:
                 return False
-            self._used.add(nonce)
+            self._intents[nonce] = intent
             return True
+
+    def pending(self, nonce: str) -> EffectIntent | None:
+        with self._lock:
+            return self._intents.get(nonce)
 
     def __contains__(self, nonce: str) -> bool:
         with self._lock:
-            return nonce in self._used
+            return nonce in self._intents
 
 
 @dataclass(frozen=True)
@@ -95,11 +124,12 @@ class BoundAction:
     operation: str
     target: str
     parameters: dict[str, Any] = field(default_factory=dict)
+    preconditions: dict[str, Any] = field(default_factory=dict)  # state the approval assumed
 
     def canonical_json(self) -> bytes:
         body = {"task_id": self.task_id, "capability": self.capability,
                 "operation": self.operation, "target": self.target,
-                "parameters": self.parameters}
+                "parameters": self.parameters, "preconditions": self.preconditions}
         return _canon(body)
 
     def hash(self) -> str:
@@ -150,10 +180,11 @@ def check_shape(record: Any) -> None:
         raise ApprovalRefused("malformed: screenshot_ref")
 
 
-def verify(record: dict, action: BoundAction, now: int,
-           nonces: NonceStore, authenticator: Authenticator | None) -> None:
-    """Pass silently only if `record` is an authentic E1-issued approval of exactly
-    `action`, valid now, used for the first time. Raises ApprovalRefused otherwise."""
+def verify(record: dict, action: BoundAction, now: int, ledger: ApprovalLedger,
+           authenticator: Authenticator | None, effect_id: str) -> EffectIntent:
+    """Return the recorded EffectIntent only if `record` is an authentic E1-issued
+    approval of exactly `action`, issued at most 24 h ago and unexpired, used for
+    the first time. Raises ApprovalRefused otherwise (nothing recorded)."""
     check_shape(record)
     if authenticator is None:
         raise ApprovalRefused("no trusted issuer configured")
@@ -168,13 +199,18 @@ def verify(record: dict, action: BoundAction, now: int,
         raise ApprovalRefused("denied")
     if record["expires_at"] <= record["issued_at"]:
         raise ApprovalRefused("malformed window")
-    if not record["issued_at"] <= now < record["expires_at"]:
-        raise ApprovalRefused("outside validity window")
+    deadline = min(record["expires_at"], record["issued_at"] + MAX_VALIDITY_S)
+    if not record["issued_at"] <= now < deadline:
+        raise ApprovalRefused("outside validity window (max 24 h)")
     if record["task_id"] != action.task_id:
         raise ApprovalRefused("task mismatch")
     if record["action_hash"] != action.hash():
         raise ApprovalRefused("action changed after approval")
     if action.capability in SCREENSHOT_CAPS and "screenshot_ref" not in record:
         raise ApprovalRefused("T38: browser/computer approval needs a screenshot")
-    if not nonces.consume_once(record["nonce"]):
+    if not _nonempty_str(effect_id):
+        raise ApprovalRefused("no effect id")
+    intent = EffectIntent(effect_id, action.task_id, record["action_hash"], record["approval_id"])
+    if not ledger.consume(record["nonce"], intent):
         raise ApprovalRefused("replay")
+    return intent

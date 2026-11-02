@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "contracts" / "v0"))
 from approval import (ApprovalRefused, BoundAction, HmacAuthenticator,  # noqa: E402
-                      MemoryNonceStore, signing_payload, verify)
+                      MemoryApprovalLedger, signing_payload, verify, MAX_VALIDITY_S)
 
 NOW = 1_800_000_000
 AUTH = HmacAuthenticator({"e1-2026": b"test-only-issuer-key"})
@@ -30,18 +30,18 @@ def record(action=ACTION, sign=True, **over):
     return r
 
 
-def check(r, action=ACTION, store=None, auth=AUTH, now=NOW):
-    return verify(r, action, now, store if store is not None else MemoryNonceStore(), auth)
+def check(r, action=ACTION, store=None, auth=AUTH, now=NOW, effect_id="eff-1"):
+    return verify(r, action, now, store if store is not None else MemoryApprovalLedger(), auth, effect_id)
 
 
 class ApprovalContract(unittest.TestCase):
     def test_valid_approval_passes_once(self):
-        store = MemoryNonceStore()
+        store = MemoryApprovalLedger()
         check(record(), store=store)
         self.assertIn("a" * 32, store)
 
     def test_replay_refused(self):
-        store = MemoryNonceStore()
+        store = MemoryApprovalLedger()
         check(record(), store=store)
         with self.assertRaisesRegex(ApprovalRefused, "replay"):
             check(record(), store=store, now=NOW + 1)
@@ -58,7 +58,7 @@ class ApprovalContract(unittest.TestCase):
             check(record(), action=other)
 
     def test_refused_check_does_not_consume_nonce(self):
-        store = MemoryNonceStore()
+        store = MemoryApprovalLedger()
         with self.assertRaises(ApprovalRefused):
             check(record(expires_at=NOW - 1), store=store)
         self.assertNotIn("a" * 32, store)
@@ -87,7 +87,7 @@ class ApprovalContract(unittest.TestCase):
                {"expires_at": float(NOW + 300)}, {"screenshot_ref": True}, {"screenshot_ref": ""},
                {"extra_field": 1}, {"issuer_key_id": ""}]
         for over in bad:
-            store = MemoryNonceStore()
+            store = MemoryApprovalLedger()
             with self.subTest(over=over), self.assertRaisesRegex(ApprovalRefused, "malformed"):
                 check(record(**over), store=store)
             self.assertNotIn("a" * 32, store)
@@ -106,6 +106,62 @@ class ApprovalContract(unittest.TestCase):
         with self.assertRaisesRegex(ApprovalRefused, "screenshot"):
             check(record(act), action=act)
         check(record(act, screenshot_ref="evidence://s/1"), action=act)
+
+
+class Validity24h(unittest.TestCase):
+    """T37 S1: an approval after 24 h is refused, even if signed with a longer expiry."""
+
+    def test_signed_oversized_expiry_capped_at_24h(self):
+        r = record(issued_at=NOW, expires_at=NOW + 7 * 24 * 3600)
+        check(r, now=NOW + MAX_VALIDITY_S - 1)
+        with self.assertRaisesRegex(ApprovalRefused, "24 h"):
+            check(r, now=NOW + MAX_VALIDITY_S)
+
+    def test_exact_boundary(self):
+        r = record(issued_at=NOW, expires_at=NOW + MAX_VALIDITY_S)
+        check(r, now=NOW + MAX_VALIDITY_S - 1)
+        with self.assertRaises(ApprovalRefused):
+            check(r, now=NOW + MAX_VALIDITY_S)
+
+    def test_narrower_policy_ttl_preserved(self):
+        r = record(issued_at=NOW, expires_at=NOW + 300)
+        with self.assertRaises(ApprovalRefused):
+            check(r, now=NOW + 300)
+
+
+class StaleState(unittest.TestCase):
+    """T37 S1: a stale-state approval is refused."""
+
+    def test_precondition_change_voids_approval(self):
+        old = BoundAction("task-1", "calendar.update", "move", "event:42", {"to": "15:00"}, {"etag": "v7"})
+        new = BoundAction("task-1", "calendar.update", "move", "event:42", {"to": "15:00"}, {"etag": "v8"})
+        with self.assertRaisesRegex(ApprovalRefused, "action changed"):
+            check(record(old), action=new)
+
+
+class CrashSafety(unittest.TestCase):
+    """Dolores review: consumption must not strand an approval on crash."""
+
+    def test_consume_records_intent_atomically_for_recovery(self):
+        ledger = MemoryApprovalLedger()
+        intent = check(record(), store=ledger, effect_id="eff-77")
+        # Simulated crash after consume, before the effect: recovery finds the bound intent.
+        recovered = ledger.pending("a" * 32)
+        self.assertEqual(recovered, intent)
+        self.assertEqual(recovered.action_hash, ACTION.hash())
+        with self.assertRaisesRegex(ApprovalRefused, "replay"):
+            check(record(), store=ledger, effect_id="eff-78")
+        self.assertEqual(ledger.pending("a" * 32).effect_id, "eff-77")
+
+    def test_refusal_records_nothing(self):
+        ledger = MemoryApprovalLedger()
+        with self.assertRaises(ApprovalRefused):
+            check(record(), action=BoundAction("task-1", "x", "y", "z"), store=ledger)
+        self.assertIsNone(ledger.pending("a" * 32))
+
+    def test_missing_effect_id_refused(self):
+        with self.assertRaisesRegex(ApprovalRefused, "effect id"):
+            check(record(), effect_id="")
 
 
 class Provenance(unittest.TestCase):
@@ -144,7 +200,7 @@ class Concurrency(unittest.TestCase):
     """Dolores review (3): single use must be atomic across concurrent consumers."""
 
     def test_exactly_one_of_many_concurrent_consumers_succeeds(self):
-        store, r = MemoryNonceStore(), record()
+        store, r = MemoryApprovalLedger(), record()
         start, results, lock = threading.Barrier(32), [], threading.Lock()
 
         def worker():
