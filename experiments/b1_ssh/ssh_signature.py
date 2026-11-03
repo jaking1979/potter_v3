@@ -8,6 +8,7 @@ import base64
 import binascii
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 NAMESPACE = 'potter-review'
@@ -54,21 +55,34 @@ def verify_signature(payload: bytes, signature: Path, allowed_signers: Path, pri
     try:
         if (
             not signature.is_file()
+            or not allowed_signers.is_file()
             or signature.stat().st_size > MAX_INPUT_FILE_BYTES
-            or not _safe_allowed_signers(allowed_signers)
+            or allowed_signers.stat().st_size > MAX_INPUT_FILE_BYTES
         ):
             return False
-        result = subprocess.run(
-            [
-                'ssh-keygen', '-Y', 'verify', '-n', NAMESPACE,
-                '-f', str(allowed_signers), '-I', principal, '-s', str(signature),
-            ],
-            input=payload,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-        )
-        return result.returncode == 0
+        signer_bytes = allowed_signers.read_bytes()
+        signature_bytes = signature.read_bytes()
+        with tempfile.TemporaryDirectory(prefix='potter-b1-') as directory:
+            signer_snapshot = Path(directory) / 'allowed_signers'
+            signature_snapshot = Path(directory) / 'signature'
+            signer_snapshot.write_bytes(signer_bytes)
+            signature_snapshot.write_bytes(signature_bytes)
+            signer_snapshot.chmod(0o600)
+            signature_snapshot.chmod(0o600)
+            if not _safe_allowed_signers(signer_snapshot):
+                return False
+            result = subprocess.run(
+                [
+                    'ssh-keygen', '-Y', 'verify', '-n', NAMESPACE,
+                    '-f', str(signer_snapshot), '-I', principal,
+                    '-s', str(signature_snapshot),
+                ],
+                input=payload,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
         return False
