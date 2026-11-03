@@ -25,9 +25,12 @@ def count_case_agreement(first, second, expected_cases):
     for records in (first, second):
         indexed = {}
         for row in records:
-            if not isinstance(row, dict) or row.get('case_id') not in expected_cases:
+            if not isinstance(row, dict):
                 raise ValueError('unexpected or unidentifiable case')
-            indexed.setdefault(row['case_id'], []).append(row)
+            case_id = row.get('case_id')
+            if not isinstance(case_id, str) or case_id not in expected_cases:
+                raise ValueError('unexpected or unidentifiable case')
+            indexed.setdefault(case_id, []).append(row)
         passes.append(indexed)
     result = {key: {'agreements': 0, 'denominator': 0, 'affected': []}
               for key in ('done', 'reexplaining', 'speed', 'trust', 'follow_through')}
