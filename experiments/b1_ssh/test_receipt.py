@@ -29,6 +29,7 @@ class ReceiptCompositionTests(unittest.TestCase):
         }
         self.consumed = set()
         self.consumptions = []
+        self.sequence = 0
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -39,7 +40,8 @@ class ReceiptCompositionTests(unittest.TestCase):
             "nonce": nonce, "expires_at": 101,
         }
         payload = attestation_bytes(claims, self.expected, 100, 60)
-        message = self.root / (role + "-" + nonce[:4])
+        self.sequence += 1
+        message = self.root / (role + "-" + nonce[:4] + "-" + str(self.sequence))
         message.write_bytes(payload)
         subprocess.run(
             ["ssh-keygen", "-Y", "sign", "-f", str(self.keys[role]),
