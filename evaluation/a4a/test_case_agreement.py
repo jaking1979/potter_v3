@@ -23,6 +23,21 @@ class CaseAgreementTest(unittest.TestCase):
                 self.assertEqual(summary['planned_cases'], 20)
                 self.assertEqual(summary['invalid_over_ten_percent'], invalid)
 
+    def test_malformed_agreement_summary_fails_with_value_error(self):
+        plan = {'case': False}
+        valid = count_case_agreement([record('case')], [record('case')], plan)
+        for malformed in (
+            None,
+            {},
+            {'done': {}},
+            {**valid, 'done': {}},
+            {**valid, 'done': {'affected': 'case'}},
+            {**valid, 'done': {'affected': [{'case_id': []}]}},
+        ):
+            with self.subTest(malformed=repr(malformed)):
+                with self.assertRaises(ValueError):
+                    affected_case_summary(malformed, plan)
+
     def test_both_outputs_must_agree_and_responsibility_denominator(self):
         first = [record('one'), record('two', True)]
         second = copy.deepcopy(first)
