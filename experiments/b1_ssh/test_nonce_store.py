@@ -3,7 +3,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from nonce_store import prepare, consume_pair, lookup
+from nonce_store import prepare, consume_pair, lookup, pair_matches
 
 BINDING = {'commit': 'a' * 40, 'tree': 'b' * 40, 'receipt_hash': 'c' * 64}
 
@@ -17,6 +17,23 @@ class NonceStoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_pair_matching_requires_both_nonces_and_exact_binding(self):
+        pair = ('1' * 64, '2' * 64)
+        other_pair = ('3' * 64, '4' * 64)
+        other = {**BINDING, 'receipt_hash': 'd' * 64}
+        with sqlite3.connect(self.path) as db:
+            self.assertFalse(pair_matches(db, pair, BINDING))
+            self.assertTrue(consume_pair(db, pair, BINDING))
+            self.assertTrue(consume_pair(db, other_pair, other))
+            self.assertTrue(pair_matches(db, pair, BINDING))
+            self.assertFalse(pair_matches(db, pair, other))
+            self.assertFalse(pair_matches(db, (pair[0], other_pair[0]), BINDING))
+            self.assertFalse(pair_matches(db, (pair[0], 'f' * 64), BINDING))
+            with self.assertRaises(ValueError):
+                pair_matches(db, (pair[0], pair[0]), BINDING)
+        with sqlite3.connect(self.path) as reopened:
+            self.assertTrue(pair_matches(reopened, pair, BINDING))
 
     def test_pair_replay_rolls_back_without_burning_other_nonce(self):
         with sqlite3.connect(self.path) as db:
