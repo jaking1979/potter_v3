@@ -30,8 +30,19 @@ class CaseAgreementTest(unittest.TestCase):
         self.assertEqual(result['trust']['agreements'], 0)
         self.assertEqual(len(result['trust']['affected']), 3)
 
+    def test_plan_responsibility_mismatch_is_affected_in_both_directions(self):
+        for planned, recorded in ((True, False), (False, True)):
+            with self.subTest(planned=planned, recorded=recorded):
+                rows = [record('case', recorded)]
+                result = count_case_agreement(rows, copy.deepcopy(rows), {'case': planned})
+                self.assertEqual(result['done']['affected'], [
+                    {'case_id': 'case', 'reason': 'invalid record or responsibility mismatch'},
+                ])
+
     def test_unexpected_cases_and_bad_plan_fail_closed(self):
         with self.assertRaises(ValueError):
             count_case_agreement([record('other')], [], {'one': False})
         with self.assertRaises(ValueError):
             count_case_agreement([], [], {'one': 1})
+        with self.assertRaises(ValueError):
+            count_case_agreement([{'case_id': []}], [], {'one': False})
