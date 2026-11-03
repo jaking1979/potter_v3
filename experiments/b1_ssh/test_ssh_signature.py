@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from ssh_signature import verify_signature
@@ -77,6 +78,23 @@ class SSHSignatureTests(unittest.TestCase):
             self.msg.read_bytes(), self.d / 'missing', self.allowed, 'reviewer',
         ))
         signature.write_text('forged')
+        self.assertFalse(verify_signature(
+            self.msg.read_bytes(), signature, self.allowed, 'reviewer',
+        ))
+
+    def test_source_files_are_snapshotted_before_verification(self):
+        signature = self.sign()
+        real_run = subprocess.run
+
+        def replace_sources(*args, **kwargs):
+            self.allowed.write_text('* ' + self.key.with_suffix('.pub').read_text())
+            signature.write_text('forged')
+            return real_run(*args, **kwargs)
+
+        with patch('ssh_signature.subprocess.run', side_effect=replace_sources):
+            self.assertTrue(verify_signature(
+                self.msg.read_bytes(), signature, self.allowed, 'reviewer',
+            ))
         self.assertFalse(verify_signature(
             self.msg.read_bytes(), signature, self.allowed, 'reviewer',
         ))
