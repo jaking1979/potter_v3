@@ -6,7 +6,9 @@ No production consumer may use this experimental helper as authorization.
 """
 import base64
 import binascii
+import os
 import re
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,6 +17,16 @@ NAMESPACE = 'potter-review'
 MAX_INPUT_FILE_BYTES = 1_048_576
 ALLOWED_KEY_TYPES = frozenset({'ssh-ed25519'})
 _PRINCIPAL = re.compile(r'[A-Za-z0-9._@-]+\Z')
+
+def _read_regular_bounded(path: Path) -> bytes:
+    """Open once without following symlinks or blocking on special files."""
+    if not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_NONBLOCK'):
+        raise OSError('required safe-open flags unavailable')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError('input is not a regular file')
+        return stream.read(MAX_INPUT_FILE_BYTES + 1)
 
 
 def _safe_allowed_signers(allowed_signers: Path) -> bool:
@@ -53,18 +65,10 @@ def verify_signature(payload: bytes, signature: Path, allowed_signers: Path, pri
     ):
         return False
     try:
-        if (
-            not signature.is_file()
-            or signature.stat().st_size > MAX_INPUT_FILE_BYTES
-            or not _safe_allowed_signers(allowed_signers)
-        ):
-            return False
         # Experimental local snapshot: validate and verify the same bytes.
         # Trust and authorization of the source itself remain caller gates.
-        with allowed_signers.open('rb') as f:
-            signer_bytes = f.read(MAX_INPUT_FILE_BYTES + 1)
-        with signature.open('rb') as f:
-            sig_bytes = f.read(MAX_INPUT_FILE_BYTES + 1)
+        signer_bytes = _read_regular_bounded(allowed_signers)
+        sig_bytes = _read_regular_bounded(signature)
         if len(signer_bytes) > MAX_INPUT_FILE_BYTES or len(sig_bytes) > MAX_INPUT_FILE_BYTES:
             return False
         with tempfile.TemporaryDirectory(prefix='potter-b1-') as directory:

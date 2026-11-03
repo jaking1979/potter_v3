@@ -1,5 +1,6 @@
 """Synthetic cross-component test, not a receipt gate or T39 acceptance."""
 import shutil
+import os
 import subprocess
 import tempfile
 import unittest
@@ -43,5 +44,16 @@ class SignedClaimsTest(unittest.TestCase):
             with patch('ssh_signature.subprocess.run',side_effect=replace_source):
                 self.assertTrue(verify_signature(b'fixture',sig,allowed,'reviewer'))
             self.assertFalse(verify_signature(b'fixture',sig,allowed,'reviewer'))
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo') and hasattr(os, 'O_NOFOLLOW'), 'requires POSIX safe-open')
+    def test_symlink_and_fifo_sources_fail_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d); regular=p/'regular'; regular.write_text('not a signature')
+            link=p/'link'; link.symlink_to(regular)
+            fifo=p/'fifo'; os.mkfifo(fifo)
+            self.assertFalse(verify_signature(b'fixture',link,regular,'reviewer'))
+            self.assertFalse(verify_signature(b'fixture',regular,link,'reviewer'))
+            self.assertFalse(verify_signature(b'fixture',fifo,regular,'reviewer'))
+            self.assertFalse(verify_signature(b'fixture',regular,fifo,'reviewer'))
 
 if __name__ == '__main__': unittest.main()
