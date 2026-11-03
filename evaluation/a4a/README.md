@@ -14,6 +14,10 @@ Run all evaluations against snapshots or scratch environments. The eval flag mus
 
 For each task show outputs A and B with the same context. For each output ask: got it done (yes/partly/no); re-explaining needed (none/some/a lot); fast enough (yes/slow/too slow); understandable and trustworthy (yes/somewhat/no). Responsibility cases add follow-through (yes/partly/no). Optional comment. Preserve the separate system-to-label mapping away from the grader. Record time, cost, and interventions automatically; target at most 60 seconds of Josh's grading time per task. Retain outputs until graded, then apply T9's bounded retention and privacy rules.
 
+## L17 reporting boundary
+
+The current case-agreement helper is a preparation aid only; it does not calculate the full L17 report or any acceptance result. When the future report applies L17's more-than-10-percent invalidation rule, it must count the union of distinct affected case IDs, not per-dimension affected entries. It must also retain the fixed prespecified denominator, intervals, flips, prevalence, and separate independent-grader evidence.
+
 ## Evidence still required
 
 - Confirm the task list with Josh; freeze versioned, representative fixtures and success anchors.
