@@ -49,27 +49,27 @@ def _claims(payload, expected, now, max_lifetime, role):
 
 def verify_experimental_receipt(
     author_payload, author_signature, reviewer_payload, reviewer_signature,
-    trusted_keys, trusted_agents, expected, required_checks, check_statuses,
+    agent_keys, trusted_agents, expected, required_checks, check_statuses,
     open_request_changes, now, max_lifetime, consume_nonces,
 ):
     """Return immutable receipt facts after all experimental checks pass.
 
-    trusted_keys and trusted_agents must be pre-candidate mappings for exactly
-    author/reviewer. The trusted agents must differ. consume_nonces must atomically
+    agent_keys must be a pre-candidate agent-to-key mapping; trusted_agents assigns
+    the two roles to different agents in that mapping. consume_nonces must atomically
     consume the whole two-nonce tuple bound to candidate and receipt facts, and
     return true only once. This function does not provide that state or establish origin.
     """
-    if not isinstance(trusted_keys, dict) or set(trusted_keys) != set(_ROLES):
-        raise ValueError("both trusted roles required")
-    keys = {role: _trusted_key(trusted_keys[role]) for role in _ROLES}
-    if keys["author"] == keys["reviewer"]:
-        raise ValueError("same key cannot self-review")
     if not isinstance(trusted_agents, dict) or set(trusted_agents) != set(_ROLES):
         raise ValueError("both trusted agents required")
     if any(not isinstance(trusted_agents[role], str) or not trusted_agents[role] for role in _ROLES):
         raise ValueError("trusted agent identity required")
     if trusted_agents["author"] == trusted_agents["reviewer"]:
         raise ValueError("same agent cannot self-review")
+    if not isinstance(agent_keys, dict) or any(agent not in agent_keys for agent in trusted_agents.values()):
+        raise ValueError("agent key binding missing")
+    keys = {role: _trusted_key(agent_keys[trusted_agents[role]]) for role in _ROLES}
+    if keys["author"] == keys["reviewer"]:
+        raise ValueError("same key cannot self-review")
     if not isinstance(required_checks, (set, frozenset)) or not required_checks:
         raise ValueError("required checks must be nonempty")
     if not isinstance(check_statuses, dict) or any(
@@ -102,7 +102,7 @@ def verify_experimental_receipt(
                 raise ValueError("invalid " + role + " signature")
 
     receipt_hash = hashlib.sha256(
-        b"potter.receipt/v0\\0" + author_payload + b"\\0" + reviewer_payload
+        b"potter.receipt/v0\0" + author_payload + b"\0" + reviewer_payload
     ).hexdigest()
     consumption = {
         "commit": author["commit"], "tree": author["tree"],
