@@ -69,9 +69,19 @@ def affected_case_summary(counts, expected_cases):
     """
     if not isinstance(expected_cases, dict) or not expected_cases:
         raise ValueError('expected case plan required')
+    expected_dimensions = {'done', 'reexplaining', 'speed', 'trust', 'follow_through'}
+    if not isinstance(counts, dict) or set(counts) != expected_dimensions:
+        raise ValueError('invalid agreement counts')
     case_ids = set()
     for dimension in counts.values():
-        for item in dimension['affected']:
+        if not isinstance(dimension, dict) or 'affected' not in dimension:
+            raise ValueError('invalid agreement counts')
+        affected = dimension['affected']
+        if not isinstance(affected, list):
+            raise ValueError('invalid agreement counts')
+        for item in affected:
+            if not isinstance(item, dict) or not isinstance(item.get('case_id'), str):
+                raise ValueError('invalid affected case')
             case_id = item['case_id']
             if case_id not in expected_cases:
                 raise ValueError('affected case not in plan')
