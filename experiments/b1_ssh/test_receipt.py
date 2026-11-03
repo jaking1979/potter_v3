@@ -24,8 +24,8 @@ class ReceiptCompositionTests(unittest.TestCase):
             )
             self.keys[role] = key
         self.trusted = {
-            role: " ".join(self.keys[role].with_suffix(".pub").read_text().split()[:2])
-            for role in self.keys
+            agent: " ".join(self.keys[role].with_suffix(".pub").read_text().split()[:2])
+            for role, agent in (("author", "dolores"), ("reviewer", "claude"))
         }
         self.consumed = set()
         self.consumptions = []
@@ -63,7 +63,7 @@ class ReceiptCompositionTests(unittest.TestCase):
         arguments = {
             "author_payload": author_payload, "author_signature": author_sig,
             "reviewer_payload": reviewer_payload, "reviewer_signature": reviewer_sig,
-            "trusted_keys": self.trusted,
+            "agent_keys": self.trusted,
             "trusted_agents": {"author": "dolores", "reviewer": "claude"},
             "expected": self.expected,
             "required_checks": {"unit", "review"},
@@ -96,9 +96,9 @@ class ReceiptCompositionTests(unittest.TestCase):
 
     def test_self_review_and_missing_authority_evidence_fail_closed(self):
         same = dict(self.trusted)
-        same["reviewer"] = same["author"]
+        same["claude"] = same["dolores"]
         with self.assertRaises(ValueError):
-            self._call(trusted_keys=same)
+            self._call(agent_keys=same)
         self.assertEqual(self.consumed, set())
         with self.assertRaises(ValueError):
             self._call(trusted_agents={"author": "dolores", "reviewer": "dolores"})
@@ -106,6 +106,36 @@ class ReceiptCompositionTests(unittest.TestCase):
             self._call(check_statuses={"unit": True})
         with self.assertRaises(ValueError):
             self._call(open_request_changes=True)
+        self.assertEqual(self.consumed, set())
+
+    def test_borrowed_agent_name_with_wrong_key_fails(self):
+        # Sign the reviewer claim with another key while the pre-candidate
+        # registry still pins Claude's original key.
+        attacker = self.root / 'second-dolores-key'
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(attacker)], check=True)
+        self.keys['reviewer'] = attacker
+        with self.assertRaises(ValueError):
+            self._call()
+        self.assertEqual(self.consumed, set())
+
+    def test_expiry_and_candidate_mismatches_fail_without_consumption(self):
+        bad_commit = {**self.expected, 'commit': '1' * 40}
+        bad_tree = {**self.expected, 'tree': '2' * 40}
+        for changes in ({'now': 101}, {'expected': bad_commit}, {'expected': bad_tree}):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    self._call(**changes)
+                self.assertEqual(self.consumed, set())
+
+    def test_swapped_roles_and_nonapprove_verdict_refused(self):
+        reviewer_payload, reviewer_sig = self._attestation('reviewer', 'e' * 64)
+        with self.assertRaises(ValueError):
+            self._call(author_payload=reviewer_payload, author_signature=reviewer_sig)
+        claims = {**self.expected, 'schema': SCHEMA, 'role': 'author',
+                  'verdict': 'request_changes', 'nonce': 'd' * 64, 'expires_at': 101}
+        payload = attestation_bytes(claims, self.expected, 100, 60)
+        with self.assertRaises(ValueError):
+            self._call(author_payload=payload)
         self.assertEqual(self.consumed, set())
 
 
