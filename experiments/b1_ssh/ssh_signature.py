@@ -6,7 +6,9 @@ No production consumer may use this experimental helper as authorization.
 """
 import base64
 import binascii
+import os
 import re
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,6 +17,22 @@ NAMESPACE = 'potter-review'
 MAX_INPUT_FILE_BYTES = 1_048_576
 ALLOWED_KEY_TYPES = frozenset({'ssh-ed25519'})
 _PRINCIPAL = re.compile(r'[A-Za-z0-9._@-]+\Z')
+
+
+def _read_regular_bounded(path: Path) -> bytes:
+    """Open once without following the final symlink or blocking on a FIFO."""
+    if not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_NONBLOCK'):
+        raise OSError('required safe-open flags unavailable')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        stream = os.fdopen(descriptor, 'rb')
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError('input is not a regular file')
+        return stream.read(MAX_INPUT_FILE_BYTES + 1)
 
 
 def _safe_allowed_signers(allowed_signers: Path) -> bool:
@@ -53,15 +71,13 @@ def verify_signature(payload: bytes, signature: Path, allowed_signers: Path, pri
     ):
         return False
     try:
+        signer_bytes = _read_regular_bounded(allowed_signers)
+        signature_bytes = _read_regular_bounded(signature)
         if (
-            not signature.is_file()
-            or not allowed_signers.is_file()
-            or signature.stat().st_size > MAX_INPUT_FILE_BYTES
-            or allowed_signers.stat().st_size > MAX_INPUT_FILE_BYTES
+            len(signer_bytes) > MAX_INPUT_FILE_BYTES
+            or len(signature_bytes) > MAX_INPUT_FILE_BYTES
         ):
             return False
-        signer_bytes = allowed_signers.read_bytes()
-        signature_bytes = signature.read_bytes()
         with tempfile.TemporaryDirectory(prefix='potter-b1-') as directory:
             signer_snapshot = Path(directory) / 'allowed_signers'
             signature_snapshot = Path(directory) / 'signature'
