@@ -110,5 +110,95 @@
         }
       }
     }
+  },
+  {
+    "name": "follow-through on one-shot",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat",
+          "follow_through": "yes"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
+  },
+  {
+    "name": "string responsibility",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": "true",
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
+  },
+  {
+    "name": "unexpected top-level",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      },
+      "model": "synthetic"
+    }
+  },
+  {
+    "name": "uppercase answer",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "Yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
   }
 ]
