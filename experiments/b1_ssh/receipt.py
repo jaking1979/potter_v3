@@ -50,13 +50,13 @@ def _claims(payload, expected, now, max_lifetime, role):
 def verify_experimental_receipt(
     author_payload, author_signature, reviewer_payload, reviewer_signature,
     trusted_keys, expected, required_checks, check_statuses,
-    open_request_changes, now, max_lifetime, consume_nonce,
+    open_request_changes, now, max_lifetime, consume_nonces,
 ):
     """Return immutable receipt facts after all experimental checks pass.
 
     trusted_keys must be a pre-candidate mapping for exactly author/reviewer.
-    consume_nonce must durably and atomically consume a nonce; it returns true
-    exactly once. This function does not provide that state or establish its origin.
+    consume_nonces must atomically consume the whole two-nonce tuple and return
+    true only once. This function does not provide that state or establish origin.
     """
     if not isinstance(trusted_keys, dict) or set(trusted_keys) != set(_ROLES):
         raise ValueError("both trusted roles required")
@@ -71,14 +71,15 @@ def verify_experimental_receipt(
         raise ValueError("required checks are not green")
     if open_request_changes is not False:
         raise ValueError("request-changes state is not closed")
-    if not callable(consume_nonce):
-        raise ValueError("nonce consumer required")
+    if not callable(consume_nonces):
+        raise ValueError("atomic nonce consumer required")
 
     author = _claims(author_payload, expected, now, max_lifetime, "author")
     reviewer = _claims(reviewer_payload, expected, now, max_lifetime, "reviewer")
     if author["verdict"] != "approve" or reviewer["verdict"] != "approve":
         raise ValueError("approval verdict required")
-    if author["nonce"] == reviewer["nonce"]:
+    nonces = (author["nonce"], reviewer["nonce"])
+    if nonces[0] == nonces[1]:
         raise ValueError("attestations need distinct nonces")
 
     with tempfile.TemporaryDirectory(prefix="potter-b1-receipt-") as directory:
@@ -93,9 +94,8 @@ def verify_experimental_receipt(
             if not verify_signature(payload, signature, allowed, role):
                 raise ValueError("invalid " + role + " signature")
 
-    for nonce in (author["nonce"], reviewer["nonce"]):
-        if consume_nonce(nonce) is not True:
-            raise ValueError("nonce unavailable or already consumed")
+    if consume_nonces(nonces) is not True:
+        raise ValueError("nonce pair unavailable or already consumed")
     return {
         "commit": author["commit"],
         "tree": author["tree"],
