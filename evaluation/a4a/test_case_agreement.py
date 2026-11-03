@@ -1,6 +1,6 @@
 import copy
 import unittest
-from case_agreement import count_case_agreement
+from case_agreement import count_case_agreement, affected_case_summary
 
 
 def record(case, responsibility=False):
@@ -12,6 +12,17 @@ def record(case, responsibility=False):
 
 
 class CaseAgreementTest(unittest.TestCase):
+    def test_invalidity_counts_distinct_cases_and_strict_boundary(self):
+        plan = {'case-' + str(i): i == 0 for i in range(20)}
+        first = [record(case, responsibility) for case, responsibility in plan.items()]
+        for missing, invalid in ((2, False), (3, True)):
+            with self.subTest(missing=missing):
+                counts = count_case_agreement(first, first[missing:], plan)
+                summary = affected_case_summary(counts, plan)
+                self.assertEqual(summary['affected_count'], missing)
+                self.assertEqual(summary['planned_cases'], 20)
+                self.assertEqual(summary['invalid_over_ten_percent'], invalid)
+
     def test_both_outputs_must_agree_and_responsibility_denominator(self):
         first = [record('one'), record('two', True)]
         second = copy.deepcopy(first)
