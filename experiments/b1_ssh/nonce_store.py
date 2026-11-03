@@ -46,3 +46,21 @@ def consume_pair(connection, nonces, binding):
     except BaseException:
         connection.rollback()
         raise
+
+
+def lookup(connection, nonce):
+    """Return a consumed nonce's immutable candidate binding, or None.
+
+    Callers can distinguish an unknown/replayed nonce from a retry whose exact
+    receipt binding was durably committed before the caller observed success.
+    This is read-only scratch-store evidence, not authorization.
+    """
+    if not isinstance(nonce, str) or not _HEX64.fullmatch(nonce):
+        raise ValueError('nonce hash required')
+    row = connection.execute(
+        'SELECT commit_id, tree_id, receipt_hash FROM used_nonces WHERE nonce = ?',
+        (nonce,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {'commit': row[0], 'tree': row[1], 'receipt_hash': row[2]}
