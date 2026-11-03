@@ -3,7 +3,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from nonce_store import prepare, consume_pair
+from nonce_store import prepare, consume_pair, lookup
 
 BINDING = {'commit': 'a' * 40, 'tree': 'b' * 40, 'receipt_hash': 'c' * 64}
 
@@ -24,6 +24,8 @@ class NonceStoreTests(unittest.TestCase):
             self.assertFalse(consume_pair(db, ('3' * 64, '1' * 64), BINDING))
             self.assertTrue(consume_pair(db, ('3' * 64, '4' * 64), BINDING))
         with sqlite3.connect(self.path) as reopened:
+            self.assertEqual(lookup(reopened, '1' * 64), BINDING)
+            self.assertEqual(lookup(reopened, 'f' * 64), None)
             self.assertEqual(reopened.execute('SELECT count(*) FROM used_nonces').fetchone()[0], 4)
             self.assertEqual(reopened.execute('SELECT DISTINCT commit_id, tree_id, receipt_hash FROM used_nonces').fetchall(),
                              [(BINDING['commit'], BINDING['tree'], BINDING['receipt_hash'])])
@@ -44,6 +46,8 @@ class NonceStoreTests(unittest.TestCase):
 
     def test_invalid_and_open_caller_transaction_fail(self):
         with sqlite3.connect(self.path) as db:
+            with self.assertRaises(ValueError):
+                lookup(db, 'not-a-nonce')
             with self.assertRaises(ValueError):
                 consume_pair(db, ('1' * 64, '1' * 64), BINDING)
             db.execute('BEGIN')
