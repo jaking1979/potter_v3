@@ -99,6 +99,26 @@ class SSHSignatureTests(unittest.TestCase):
             self.msg.read_bytes(), signature, self.allowed, 'reviewer',
         ))
 
+    @unittest.skipUnless(hasattr(os, 'O_NOFOLLOW'), 'requires no-follow support')
+    def test_symlinks_to_valid_inputs_are_rejected(self):
+        signature = self.sign()
+        payload = self.msg.read_bytes()
+        self.assertTrue(verify_signature(payload, signature, self.allowed, 'reviewer'))
+        sig_link = self.d / 'signature-link'
+        signer_link = self.d / 'signers-link'
+        sig_link.symlink_to(signature)
+        signer_link.symlink_to(self.allowed)
+        self.assertFalse(verify_signature(payload, sig_link, self.allowed, 'reviewer'))
+        self.assertFalse(verify_signature(payload, signature, signer_link, 'reviewer'))
+
+    def test_oversized_valid_signers_input_is_rejected(self):
+        signature = self.sign()
+        payload = self.msg.read_bytes()
+        self.assertTrue(verify_signature(payload, signature, self.allowed, 'reviewer'))
+        with self.allowed.open('a') as f:
+            f.write('#' + 'x' * 1_048_576 + '\n')
+        self.assertFalse(verify_signature(payload, signature, self.allowed, 'reviewer'))
+
     @unittest.skipUnless(
         hasattr(os, 'mkfifo') and hasattr(os, 'O_NOFOLLOW') and hasattr(os, 'O_NONBLOCK'),
         'requires POSIX safe-open',
