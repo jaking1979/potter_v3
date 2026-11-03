@@ -56,4 +56,16 @@ class SignedClaimsTest(unittest.TestCase):
             self.assertFalse(verify_signature(b'fixture',fifo,regular,'reviewer'))
             self.assertFalse(verify_signature(b'fixture',regular,fifo,'reviewer'))
 
+    def test_fdopen_failure_closes_descriptor(self):
+        with tempfile.TemporaryDirectory() as d:
+            source=Path(d)/'source'; source.write_bytes(b'data')
+            real_close=os.close
+            closed=[]
+            def track_close(fd):
+                closed.append(fd)
+                real_close(fd)
+            with patch('ssh_signature.os.fdopen',side_effect=OSError('synthetic failure')), patch('ssh_signature.os.close',side_effect=track_close):
+                self.assertFalse(verify_signature(b'data',source,source,'reviewer'))
+            self.assertEqual(len(closed),1)
+
 if __name__ == '__main__': unittest.main()

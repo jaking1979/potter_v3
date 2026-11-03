@@ -19,11 +19,19 @@ ALLOWED_KEY_TYPES = frozenset({'ssh-ed25519'})
 _PRINCIPAL = re.compile(r'[A-Za-z0-9._@-]+\Z')
 
 def _read_regular_bounded(path: Path) -> bytes:
-    """Open once without following symlinks or blocking on special files."""
+    """Open once without following the final symlink or blocking on FIFOs.
+
+    Parent symlinks and open-time device effects remain caller/path trust gates.
+    """
     if not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_NONBLOCK'):
         raise OSError('required safe-open flags unavailable')
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, 'rb') as stream:
+    try:
+        stream = os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+    with stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise OSError('input is not a regular file')
         return stream.read(MAX_INPUT_FILE_BYTES + 1)
