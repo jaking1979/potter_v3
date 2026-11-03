@@ -64,3 +64,30 @@ def lookup(connection, nonce):
     if row is None:
         return None
     return {'commit': row[0], 'tree': row[1], 'receipt_hash': row[2]}
+
+
+def pair_matches(connection, nonces, binding):
+    """Check both stored nonces against one expected binding; not authorization.
+
+    A single SQL statement observes one snapshot. The caller must establish the
+    provenance and integrity of the database and binding; this function does
+    not permit a merge, release or replay on its own.
+    """
+    if (not isinstance(nonces, tuple) or len(nonces) != 2
+            or any(not isinstance(x, str) or not _HEX64.fullmatch(x) for x in nonces)
+            or nonces[0] == nonces[1]):
+        raise ValueError('two distinct nonce hashes required')
+    if (not isinstance(binding, dict) or set(binding) != {'commit', 'tree', 'receipt_hash'}
+            or any(not isinstance(binding[k], str) or not _HEX40.fullmatch(binding[k])
+                   for k in ('commit', 'tree'))
+            or not isinstance(binding['receipt_hash'], str)
+            or not _HEX64.fullmatch(binding['receipt_hash'])):
+        raise ValueError('candidate and receipt binding required')
+    rows = connection.execute(
+        'SELECT nonce, commit_id, tree_id, receipt_hash FROM used_nonces WHERE nonce IN (?, ?)',
+        nonces,
+    ).fetchall()
+    expected = (binding['commit'], binding['tree'], binding['receipt_hash'])
+    return len(rows) == 2 and {row[0] for row in rows} == set(nonces) and all(
+        tuple(row[1:]) == expected for row in rows
+    )
