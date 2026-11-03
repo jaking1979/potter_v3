@@ -59,3 +59,23 @@ def count_case_agreement(first, second, expected_cases):
                      for label in ('A', 'B')):
                 item['agreements'] += 1
     return result
+
+
+def affected_case_summary(counts, expected_cases):
+    """Report distinct affected cases and the L17 >10% invalidity condition.
+
+    Only count outputs produced by count_case_agreement from the same plan.
+    This does not detect wrong realignment or make an exercise valid.
+    """
+    if not isinstance(expected_cases, dict) or not expected_cases:
+        raise ValueError('expected case plan required')
+    case_ids = set()
+    for dimension in counts.values():
+        for item in dimension['affected']:
+            case_id = item['case_id']
+            if case_id not in expected_cases:
+                raise ValueError('affected case not in plan')
+            case_ids.add(case_id)
+    n = len(expected_cases)
+    return {'affected_case_ids': sorted(case_ids), 'affected_count': len(case_ids),
+            'planned_cases': n, 'invalid_over_ten_percent': len(case_ids) * 10 > n}
