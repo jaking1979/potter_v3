@@ -99,6 +99,22 @@ class SSHSignatureTests(unittest.TestCase):
             self.msg.read_bytes(), signature, self.allowed, 'reviewer',
         ))
 
+    @unittest.skipUnless(
+        hasattr(os, 'mkfifo') and hasattr(os, 'O_NOFOLLOW') and hasattr(os, 'O_NONBLOCK'),
+        'requires POSIX safe-open',
+    )
+    def test_symlink_and_fifo_sources_fail_closed(self):
+        regular = self.d / 'regular'
+        regular.write_text('not a signature')
+        link = self.d / 'link'
+        link.symlink_to(regular)
+        fifo = self.d / 'fifo'
+        os.mkfifo(fifo)
+        self.assertFalse(verify_signature(b'fixture', link, regular, 'reviewer'))
+        self.assertFalse(verify_signature(b'fixture', regular, link, 'reviewer'))
+        self.assertFalse(verify_signature(b'fixture', fifo, regular, 'reviewer'))
+        self.assertFalse(verify_signature(b'fixture', regular, fifo, 'reviewer'))
+
     def test_host_public_key_cannot_sign(self):
         isolated = self.d / 'public-only'
         isolated.mkdir()
