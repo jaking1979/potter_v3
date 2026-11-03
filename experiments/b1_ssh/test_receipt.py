@@ -28,6 +28,7 @@ class ReceiptCompositionTests(unittest.TestCase):
             for role in self.keys
         }
         self.consumed = set()
+        self.consumptions = []
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -47,10 +48,11 @@ class ReceiptCompositionTests(unittest.TestCase):
         )
         return payload, Path(str(message) + ".sig")
 
-    def _consume_pair(self, nonces):
+    def _consume_pair(self, nonces, binding):
         if any(nonce in self.consumed for nonce in nonces):
             return False
         self.consumed.update(nonces)
+        self.consumptions.append(binding)
         return True
 
     def _call(self, **changes):
@@ -59,7 +61,9 @@ class ReceiptCompositionTests(unittest.TestCase):
         arguments = {
             "author_payload": author_payload, "author_signature": author_sig,
             "reviewer_payload": reviewer_payload, "reviewer_signature": reviewer_sig,
-            "trusted_keys": self.trusted, "expected": self.expected,
+            "trusted_keys": self.trusted,
+            "trusted_agents": {"author": "dolores", "reviewer": "claude"},
+            "expected": self.expected,
             "required_checks": {"unit", "review"},
             "check_statuses": {"unit": True, "review": True},
             "open_request_changes": False, "now": 100, "max_lifetime": 60,
@@ -76,6 +80,10 @@ class ReceiptCompositionTests(unittest.TestCase):
             receipt["key_fingerprints"]["author"],
             receipt["key_fingerprints"]["reviewer"],
         )
+        self.assertEqual(receipt["agents"], {"author": "dolores", "reviewer": "claude"})
+        self.assertEqual(self.consumptions[0]["commit"], self.expected["commit"])
+        self.assertEqual(self.consumptions[0]["tree"], self.expected["tree"])
+        self.assertEqual(self.consumptions[0]["receipt_hash"], receipt["receipt_hash"])
 
     def test_replay_refuses_without_partial_consumption(self):
         self._call()
@@ -90,6 +98,8 @@ class ReceiptCompositionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._call(trusted_keys=same)
         self.assertEqual(self.consumed, set())
+        with self.assertRaises(ValueError):
+            self._call(trusted_agents={"author": "dolores", "reviewer": "dolores"})
         with self.assertRaises(ValueError):
             self._call(check_statuses={"unit": True})
         with self.assertRaises(ValueError):
