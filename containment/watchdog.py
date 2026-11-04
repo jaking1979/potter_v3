@@ -1,11 +1,14 @@
-"""Last-success watchdog (T5(b)) and HA reachability rule (T5(a)).
+"""Last-success watchdog (T5(b)) and HA reachability (T5(a)).
 
 T5(b): any job stale beyond twice its cadence appears in the next brief.
 T5(a): alert after 2 consecutive missed reachability checks per HA instance.
 
-Pure functions over data the host collects; no host access here. The brief's
-health line is produced even when everything is fine, so its absence is
-itself detectable (A1 box 4 counts briefs that contain it).
+Coverage is reported honestly: "reachable" only when the latest check is
+recent and succeeded. No observations, an unavailable check, or checks that
+stopped arriving are "unknown", never healthy. One miss is "degraded" and is
+shown, though it is not yet an alert. The brief's health line is always
+emitted and says OK only when every job was evaluated and every configured HA
+instance is confirmed reachable.
 """
 from __future__ import annotations
 
@@ -29,14 +32,18 @@ class Staleness:
     limit: timedelta
 
 
+def _aware(now: datetime) -> None:
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+
+
 def stale_jobs(jobs: list[JobRecord], now: datetime) -> list[Staleness]:
     """Enabled recurring jobs whose last success is older than 2x cadence.
 
     A job that has never succeeded is stale once 2x cadence has passed since
-    it was created; a fresh job is given one grace window, not forever.
+    it was created; a fresh job gets one grace window, not forever.
     """
-    if now.tzinfo is None:
-        raise ValueError("now must be timezone-aware")
+    _aware(now)
     out = []
     for job in jobs:
         if not job.enabled or job.cadence is None:
@@ -51,26 +58,53 @@ def stale_jobs(jobs: list[JobRecord], now: datetime) -> list[Staleness]:
     return sorted(out, key=lambda s: s.name)
 
 
+# One HA check: when it ran and its result (True reachable, False unreachable,
+# None = the check itself could not run).
+Check = tuple[datetime, "bool | None"]
+
+
+def ha_status(checks: list[Check], cadence: timedelta, now: datetime) -> str:
+    """'reachable' | 'degraded' (1 miss) | 'unreachable' (2+ misses, alert) | 'unknown'."""
+    _aware(now)
+    if not checks:
+        return "unknown"
+    ordered = sorted(checks, key=lambda c: c[0])
+    last_at, last = ordered[-1]
+    if now - last_at > 2 * cadence or last is None:
+        return "unknown"                 # coverage stopped or the check failed to run
+    if last:
+        return "reachable"
+    misses = 0
+    for _, result in reversed(ordered):
+        if result is False:
+            misses += 1
+        else:
+            break
+    return "unreachable" if misses >= 2 else "degraded"
+
+
 def _fmt(delta: timedelta) -> str:
     hours = int(delta.total_seconds() // 3600)
     return f"{hours // 24}d{hours % 24}h" if hours >= 24 else f"{hours}h"
 
 
-def health_line(stale: list[Staleness], ha_alerts: list[str], checked: int) -> str:
-    """One line for the brief. Always emitted, including when all is healthy."""
-    if not stale and not ha_alerts:
-        return f"Health: OK — {checked} jobs within 2x cadence; HA reachable."
-    parts = []
+def health_line(stale: list[Staleness], jobs_checked: int, ha: dict[str, str]) -> str:
+    """One line for the brief. Always emitted."""
+    problems = []
+    if jobs_checked == 0:
+        problems.append("no job data")
     for s in stale:
         age = "never succeeded" if s.age is None else f"last success {_fmt(s.age)} ago"
-        parts.append(f"{s.name} stale ({age}, limit {_fmt(s.limit)})")
-    parts.extend(f"HA {name} unreachable (2+ missed checks)" for name in ha_alerts)
-    return "Health: ATTENTION — " + "; ".join(parts) + "."
-
-
-def ha_alerts(history: dict[str, list[bool]], misses: int = 2) -> list[str]:
-    """Instances whose last `misses` checks all failed (True = reachable)."""
-    return sorted(
-        name for name, results in history.items()
-        if len(results) >= misses and not any(results[-misses:])
-    )
+        problems.append(f"{s.name} stale ({age}, limit {_fmt(s.limit)})")
+    if not ha:
+        problems.append("no HA instances configured for checks")
+    for name, status in sorted(ha.items()):
+        if status == "unreachable":
+            problems.append(f"HA {name} unreachable (2+ missed checks)")
+        elif status == "degraded":
+            problems.append(f"HA {name} missed its last check")
+        elif status != "reachable":
+            problems.append(f"HA {name} status unknown (no current check)")
+    if problems:
+        return "Health: ATTENTION — " + "; ".join(problems) + "."
+    return f"Health: OK — {jobs_checked} jobs within 2x cadence; HA {', '.join(sorted(ha))} reachable."

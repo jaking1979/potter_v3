@@ -15,4 +15,4 @@ jobs:
         with:
           python-version: "3.12"
       - name: Containment unit tests (stdlib only, no network)
-        run: python3 -m unittest -v tests.test_containment_guard tests.test_containment_watchdog
+        run: python3 -m unittest -v tests.test_alpha_guard tests.test_containment_watchdog

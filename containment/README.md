@@ -1,22 +1,47 @@
-# containment — A1 / T32 step 2 / T5 offline package
+# containment — A1 / T32 / T31 PASS 2 row 1 / T5, offline package
 
-This is the offline half of the A1 containment proposal, posted on the Build Execution Plan on 2026-11-04. It is ordinary code under review. **It changes nothing on the OptiPlex.** It contains no mandate values and no credentials, and it makes no network calls.
+This package implements the **ratified** Alpha Bot build spec: T31 PASS 2 row 1, agreed in T34, which carries out T32 without changing it. It also implements the T5(a)/(b) watchdog. It is ordinary code under review and is **not wired to the live account or the host**. It holds no mandate values and no credentials, and it makes no network calls. Josh has directed that Alpha Bot keep trading; nothing here pauses or reconfigures it.
 
-| Module | Ratified rule | What it does |
+| Module | Row 1 item | What it does |
 |---|---|---|
-| `mandate.py` | T32 step 2 | Defines the mandate's shape (ceiling, instruments, max position, loss stop). It refuses anything malformed, including JSON floats, NaN, duplicates, unknown fields, and a max position above the ceiling. **The values themselves are Josh's decision.** |
-| `order_guard.py` | T32 step 2: "a code check before every order" | A fail-closed pre-order check. It refuses unknown tools, options and exercises, out-of-mandate symbols, orders over the position or ceiling limits, buys past the loss stop, shorts, orders without a limit price, missing mandate or account state, and every new order once the kill switch is engaged. Cancels are always allowed. |
-| `guarded_broker.py` | T32 step 2 kill switch; A1 box 2 | Puts the guard in the call path. It writes one audit line per decision and forwards only allowed calls. The kill switch is a file flag: engaging it refuses new orders and cancels open ones. `StubBroker` records calls and has no network access. |
-| `watchdog.py` | T5(a), T5(b) | Flags jobs stale beyond 2× their cadence. A job that has never succeeded gets one grace window. Alerts after 2 missed HA checks. Produces a brief health line that is **always** emitted, so A1 box 4 can count it. |
+| `alpha_guard.py` | 1, 2, 3, 5 | The only caller of `place_equity_order`. It refuses unless all of the conditions below hold. Only the Alpha Bot cron may call it. Market orders are valued at the fresh quote plus a 2% developer safety buffer. An unreadable kill flag or broker-schema drift at startup pauses the guard and raises an alert. |
+| `decision_journal.py` | 3 + `ref_id` addendum | The decision ID is the New York date, ticker, side and signal version. It maps to a UUIDv5 `ref_id` that is reused on every retry. Each order is journaled as `pending` with fsync **before** the call; an error marks it `unknown`, and it is never resubmitted blind. Entries the broker hasn't reported yet are counted as exposure, which also survives a restart. |
+| `kill_switch.py` | 1, 7 | Josh's command path. It is the only holder of `cancel_equity_order`. It takes the guard's lock, so any in-flight order finishes first. It writes the flag `on` atomically, then cancels **only the bot's own** open orders (ref_ids in the journal), attempting each one independently. |
+| `mandate.py` | 2 | A strict parser for the approved mandate file. The guard checks the file's hash before parsing it. |
+| `watchdog.py` | T5(a)/(b) | Flags jobs stale beyond 2× their cadence. HA status is `reachable`, `degraded`, `unreachable` or `unknown`; no observations, a check that couldn't run, or stopped coverage all count as `unknown`, never healthy. The health line is always emitted and reads OK only when every source is confirmed. |
 
-## Negative tests in this package
-- **Level 1** (`tests/test_containment_guard.py::GuardLevel1`): 20 refusal cases, an in-mandate positive control, and an exact ceiling boundary.
-- **Level 3** (`GuardInPathLevel3`): refused calls never reach the stub, and every attempt is audited. The positive control does reach the stub. A corrupt or deleted mandate refuses at once, as does an exception in the account lookup. The kill switch cancels open orders and then blocks.
-- **Open orders and concurrency** (from Codex review): unfilled buys count against the position and ceiling limits, and unfilled sells against holdings. Each forwarded order is reserved until the account reports it. Of 4 concurrent orders that can't all fit, 1 is forwarded and 3 are blocked. The kill switch tries every cancel even if some fail. Cancels work even when the mandate or account state is broken.
-- **Mutation check, done locally:** disabling the instrument check makes 2 tests fail, and disabling the guard's refusal makes 4 fail.
+## Conditions the guard requires before any order (row 1 item 2)
+- The kill flag is readable and reads `off`.
+- The T35 fencing epoch is current.
+- The mandate file's hash matches the approved version.
+- The ticker is on the mandate's list, and the order is an equity market order.
+- Positions and buying power were read within the last 60 seconds.
+- After the trade, exposure is within both the ceiling and the position limit, including orders not yet filled.
+- Account value is above the loss stop.
+- Buying power covers the worst-case fill.
 
-## Not done here (needs host access and Josh's go — see the PLAN)
-- **Confirm the real tool names.** The exact `cancel_*` names and the 5 named Alpha Bot tools have to be confirmed on the host.
-- **Wire it into OpenClaw.** `GuardedBroker` has to become a `potter-guardrails` hook on the Robinhood MCP tools. The account-state provider and the cron-disable half of the kill switch are host-side.
-- **Run negative-test level 3 on the host.** It runs against a disabled clone of the job, with the stub in place of the real MCP server. **It never runs against the live account.**
-- **Set the mandate values.** These are Josh's decision.
+## Release tests (row 1 item 7): `tests/test_alpha_guard.py::test_rt_*`
+- An order from the main agent is refused.
+- An off-list ticker is refused.
+- A stale epoch is refused.
+- A timeout after the order filled remotely is not duplicated.
+- A retried order carries the same `ref_id`.
+- A kill mid-run waits for the in-flight order and then cancels it, deterministically, using events.
+- An unreadable flag starts the guard paused.
+- Schema drift pauses the guard.
+
+Further tests cover the unapproved mandate, state older than 60 seconds or from the future, the ceiling including the price buffer, buying power, a loss stop that blocks buys and sells, sells net of open sells, reservations surviving a restart, audit failure meaning no order, malformed inputs, a kill switch that cancels only the bot's orders, and a kill switch that tries every cancel.
+
+**Mutation checks (done locally):** each of these makes at least one test fail when removed:
+- the lock on the kill switch
+- counting orders the broker hasn't reported yet
+- the block on blind retries
+- the mandate-hash check
+- the kill switch's filter to the bot's own orders
+
+## Not done here (host steps; none change Alpha Bot's behavior or credentials)
+- Replace the cron's direct order tool with this guard.
+- Wire the kill switch to Josh's Telegram command.
+- Wire the T35 epoch source and the schema-hash capture.
+- Run the same release tests on a disabled clone against a stub MCP server.
+- Row 1 items 4 (sell first, then buy) and 6 (Telegram summary) are bot-side and not in the guard.
