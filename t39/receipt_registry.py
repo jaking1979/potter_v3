@@ -349,6 +349,18 @@ class ReceiptRegistry:
             raise RegistryUnavailable(f"registry error: {exc}") from exc
         self._sync_anchor()
 
+    def issued_trees(self, commits: list[str]) -> dict[str, str]:
+        """{commit: tree} for each given commit that has an issued receipt."""
+        if any(not isinstance(c, str) or not _HEX40.fullmatch(c) for c in commits):
+            raise ValueError("40-hex commit SHAs required")
+        out: dict[str, str] = {}
+        for c in commits:
+            for (body,) in self._db.execute(
+                    "SELECT c.body FROM receipts r JOIN chain c ON c.seq = r.seq"
+                    " WHERE r.commit_id = ?", (c,)):
+                out[c] = json.loads(body)["facts"]["tree"]
+        return out
+
     def receipted_commits(self, commits: list[str]) -> set[str]:
         if any(not isinstance(c, str) or not _HEX40.fullmatch(c) for c in commits):
             raise ValueError("40-hex commit SHAs required")

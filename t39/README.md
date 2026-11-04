@@ -34,3 +34,10 @@ This package holds two of the production pieces of the ratified T39 receipt gate
 - **The verifier:** signatures, key policy and revocation (tests 2, 5 and 6), which is Dolores's package.
 - **Where the anchor lives in production.** A file is used in the tests. In production it should be on a different host from the registry, for example the Brooklyn node under T35.
 - **Wiring into the real consumers,** and the hourly detector job with its alerts and reverts.
+
+## Direct-to-main detector (`main_detector.py`, T39 test 1)
+- **Schedule and history:** runs at least hourly and reads `main`'s first-parent history since the last clean checkpoint, using an explicit `--git-dir` and a scrubbed environment so there's no upward search and no inherited redirection.
+- **Merge policy** (proposed on the PLAN): each first-parent commit must be either the receipted commit itself (fast-forward), or a merge commit whose second parent is receipted **and** whose tree equals that receipt's tree.
+- **On an incident:** it alerts, writes the release-block file that the builder and updater check first, and returns a revert plan. It never pushes a revert itself.
+- **Failing loud:** a Git error, a registry error, or `main` no longer descending from the checkpoint (a force-push) all block release and are reported as a failure, never as clean.
+- **Tests** (`tests/test_t39_main_detector.py`, 9): fast-forward clean; direct push gives an incident, a release block and a revert plan, re-reported on later runs; a merge with the reviewed tree is clean; a merge with an extra file is an incident; unreviewed intermediate first-parent commits are incidents; a history rewrite fails loud; an unavailable registry fails loud; a wrong git dir is refused; inherited `GIT_DIR` is ignored.
