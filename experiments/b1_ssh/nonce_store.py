@@ -21,7 +21,16 @@ def prepare(connection):
 
 def _validate(nonces, binding):
     """Validate the shared nonce-pair and exact candidate-binding boundary."""
-    _validate(nonces, binding)
+    if (not isinstance(nonces, tuple) or len(nonces) != 2
+            or any(not isinstance(x, str) or not _HEX64.fullmatch(x) for x in nonces)
+            or nonces[0] == nonces[1]):
+        raise ValueError('two distinct nonce hashes required')
+    if (not isinstance(binding, dict) or set(binding) != {'commit', 'tree', 'receipt_hash'}
+            or any(not isinstance(binding[k], str) or not _HEX40.fullmatch(binding[k])
+                   for k in ('commit', 'tree'))
+            or not isinstance(binding['receipt_hash'], str)
+            or not _HEX64.fullmatch(binding['receipt_hash'])):
+        raise ValueError('candidate and receipt binding required')
 
 
 def consume_pair(connection, nonces, binding):
@@ -69,16 +78,7 @@ def pair_matches(connection, nonces, binding):
     provenance and integrity of the database and binding; this function does
     not permit a merge, release or replay on its own.
     """
-    if (not isinstance(nonces, tuple) or len(nonces) != 2
-            or any(not isinstance(x, str) or not _HEX64.fullmatch(x) for x in nonces)
-            or nonces[0] == nonces[1]):
-        raise ValueError('two distinct nonce hashes required')
-    if (not isinstance(binding, dict) or set(binding) != {'commit', 'tree', 'receipt_hash'}
-            or any(not isinstance(binding[k], str) or not _HEX40.fullmatch(binding[k])
-                   for k in ('commit', 'tree'))
-            or not isinstance(binding['receipt_hash'], str)
-            or not _HEX64.fullmatch(binding['receipt_hash'])):
-        raise ValueError('candidate and receipt binding required')
+    _validate(nonces, binding)
     rows = connection.execute(
         'SELECT nonce, commit_id, tree_id, receipt_hash FROM used_nonces WHERE nonce IN (?, ?)',
         nonces,
