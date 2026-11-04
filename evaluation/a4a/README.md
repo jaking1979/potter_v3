@@ -16,7 +16,7 @@ For each task show outputs A and B with the same context. For each output ask: g
 
 ## L17 reporting boundary
 
-The current case-agreement helper is a preparation aid only; it does not calculate the full L17 report or any acceptance result. When the future report applies L17's more-than-10-percent invalidation rule, it must count the union of distinct affected case IDs, not per-dimension affected entries. It must also retain the fixed prespecified denominator, intervals, flips, prevalence, and separate independent-grader evidence.
+The current case-agreement helper is a preparation aid only; it does not calculate the full L17 report or any acceptance result. When the future report applies L17's more-than-10-percent invalidation rule, it must count the union of distinct affected case IDs, not per-dimension affected entries. It must also retain the fixed prespecified denominator, intervals, flips, prevalence, and separate independent-grader evidence. The agreed prevalence clarification is in `test-retest-protocol-draft.md`: usable cases only, with planned N and exclusions shown; invalid exercises are not scored. The synthetic helper cannot verify protected output alignment or exercise validity.
 
 ## Evidence still required
 
