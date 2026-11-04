@@ -30,6 +30,11 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(facts['evidence'], hashlib.sha256(b'evidence').hexdigest())
         self.manifest.write_text('uncommitted change')
         self.assertEqual(facts, candidate_facts(self.repo, self.commit, b'evidence'))
+    def test_subdirectory_cannot_bind_enclosing_repository(self):
+        subdir = self.repo / 'nested'
+        subdir.mkdir()
+        with self.assertRaises(ValueError):
+            candidate_facts(subdir, self.commit, b'evidence')
     def test_new_commit_changes_binding(self):
         before = candidate_facts(self.repo, self.commit, b'evidence')
         self.manifest.write_text('new')
