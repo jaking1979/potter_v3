@@ -1,67 +1,53 @@
-"""T39 consumer gate: "the release builder and updater refuse any commit without
-a valid receipt."
+"""T39 consumer gates.
 
-One function, `require_receipt`, that every consumer entry point calls before it
-builds, deploys, updates, or rolls back to a commit. It composes three things
-and fails closed on each:
+`admit_merge`  — CI/merge admission. Verifies the attestation pair and ISSUES
+                 the receipt (the one place nonces are consumed).
+`require_issued` — release builder, host updater, rollback, manual deploy.
+                 Each independently re-verifies the signed receipt (T39: "CI
+                 and the host gate both verify receipts"), then requires the
+                 exact issued record in the registry, then logs the use. It
+                 never consumes nonces, so CI -> builder -> host -> rollback
+                 all succeed on one receipt, while a never-issued or
+                 mismatched receipt fails everywhere.
+`unreceipted_main_commits` — detector input; reads issued receipts only.
 
-1. The commit and tree the consumer is about to use, resolved by the consumer
-   from git itself (not taken from the receipt or from the caller's claims).
-2. A verifier (the production T39 verifier, injected) that checks both
-   signatures, keys, checks, verdicts and expiry and returns the receipt's
-   bound facts.
-3. The durable nonce store, which must report first use.
-
-Any exception, mismatch, missing receipt, unavailable store, or replay is a
-refusal. A missing receipt on a main commit is additionally flagged as a
-security incident (T39: "alerted, reverted, and blocks release").
+Every path fails closed: any exception, mismatch, missing receipt or
+unavailable registry is a refusal. A missing or mismatched receipt for a
+`main` commit is flagged as a security incident.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable, Mapping, Protocol
+from datetime import datetime, timezone
+from typing import Callable, Mapping
 
-from t39.nonce_store import Binding, NonceStore, Outcome
+from t39.receipt_registry import Facts, Issue, ReceiptRegistry
 
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
+
+Verifier = Callable[[object], Mapping[str, object]]
+"""Fully verifies a receipt (signatures, distinct keys, roles, verdicts, checks,
+expiry, revocation policy) and returns its facts; raises on any failure.
+Required keys: commit, tree, receipt_hash, nonces, agents, key_fingerprints,
+verifier_version. It must not consume or record anything."""
 
 
 class Refused(Exception):
     def __init__(self, reason: str, *, incident: bool = False) -> None:
         super().__init__(reason)
-        self.reason = reason
-        self.incident = incident
+        self.reason, self.incident = reason, incident
 
 
 @dataclass(frozen=True)
 class Admitted:
     commit: str
-    tree: str
     receipt_hash: str
-    nonces: tuple[str, str]
-    agents: Mapping[str, str]
+    agents: dict
 
 
-class Verifier(Protocol):
-    def __call__(self, receipt: object) -> Mapping[str, object]:
-        """Verify the receipt completely; return its bound facts or raise.
-
-        Required keys: commit, tree, receipt_hash, nonces (2-tuple), agents.
-        It must not consume nonces; the gate does that once, after verifying.
-        """
-
-
-def require_receipt(
-    *,
-    commit: str,
-    tree: str,
-    load_receipt: Callable[[str], object | None],
-    verify: Verifier,
-    store: NonceStore,
-    consumer: str,
-    on_main: bool,
-) -> Admitted:
+def _verified(commit: str, tree: str, load_receipt: Callable[[str], object | None],
+              verify: Verifier, on_main: bool) -> Facts:
     if not (isinstance(commit, str) and _HEX40.fullmatch(commit)
             and isinstance(tree, str) and _HEX40.fullmatch(tree)):
         raise Refused("consumer must pass the 40-hex commit and tree it resolved from git")
@@ -72,32 +58,55 @@ def require_receipt(
     if receipt is None:
         raise Refused("unreceipted commit", incident=on_main)
     try:
-        facts = dict(verify(receipt))
+        raw = dict(verify(receipt))
+        facts = Facts(
+            commit=raw["commit"], tree=raw["tree"], receipt_hash=raw["receipt_hash"],
+            nonces=tuple(raw["nonces"]) if isinstance(raw["nonces"], (list, tuple)) else None,
+            agents=dict(raw["agents"]), key_fingerprints=dict(raw["key_fingerprints"]),
+            verifier_version=raw["verifier_version"])
     except Exception as exc:
         raise Refused(f"receipt invalid: {type(exc).__name__}") from exc
-    if facts.get("commit") != commit or facts.get("tree") != tree:
+    if facts.commit != commit or facts.tree != tree:
         raise Refused("receipt is for a different commit or tree", incident=on_main)
-    nonces = facts.get("nonces")
-    agents = facts.get("agents")
+    return facts
+
+
+def admit_merge(*, commit: str, tree: str, load_receipt, verify: Verifier,
+                registry: ReceiptRegistry, issuer: str,
+                now: datetime | None = None) -> Admitted:
+    facts = _verified(commit, tree, load_receipt, verify, on_main=False)
     try:
-        binding = Binding(commit, tree, facts.get("receipt_hash"))  # type: ignore[arg-type]
-        outcome = store.consume(nonces, binding, consumer)  # type: ignore[arg-type]
+        outcome = registry.issue(facts, issuer, now or datetime.now(timezone.utc))
     except Exception as exc:
-        raise Refused(f"nonce store refused: {type(exc).__name__}") from exc
-    if outcome is not Outcome.CONSUMED:
-        raise Refused(f"nonce already used ({outcome.value})")
-    if not isinstance(agents, Mapping):
-        # Nonce is now spent; that is deliberate. A malformed verifier result
-        # must not become a second attempt with the same nonces.
-        raise Refused("verifier returned no agent identities")
-    return Admitted(commit, tree, binding.receipt_hash, nonces, dict(agents))  # type: ignore[arg-type]
+        raise Refused(f"registry refused: {type(exc).__name__}") from exc
+    if outcome is Issue.REPLAY:
+        raise Refused("attestation nonce already used for a different receipt")
+    # ISSUED, or ALREADY_ISSUED with byte-identical canonical facts (issuer retry
+    # after a crash): either way the one issued record matches this candidate.
+    return Admitted(facts.commit, facts.receipt_hash, dict(facts.agents))
 
 
-def unreceipted_main_commits(main_commits: list[str], store: NonceStore) -> list[str]:
-    """For the direct-push detector (T39 test 1): main commits with no consumed receipt.
+def require_issued(*, commit: str, tree: str, load_receipt, verify: Verifier,
+                   registry: ReceiptRegistry, consumer: str, purpose: str, on_main: bool,
+                   now: datetime | None = None) -> Admitted:
+    facts = _verified(commit, tree, load_receipt, verify, on_main)
+    try:
+        issued = registry.get(facts.receipt_hash)
+    except Exception as exc:
+        raise Refused(f"registry unavailable: {type(exc).__name__}") from exc
+    if issued is None:
+        raise Refused("receipt was never issued at merge admission", incident=on_main)
+    if issued.facts != facts.canonical():
+        raise Refused("issued receipt does not match the presented receipt", incident=on_main)
+    try:
+        registry.record_use(facts.receipt_hash, consumer, purpose,
+                            now or datetime.now(timezone.utc))
+    except Exception as exc:
+        raise Refused(f"could not record use: {type(exc).__name__}") from exc
+    return Admitted(facts.commit, facts.receipt_hash, dict(facts.agents))
 
-    The detector runs at least hourly; anything returned is a security incident.
-    A store error propagates so the detector reports itself failed, not clean.
-    """
-    receipted = store.commits_with_receipts(main_commits)
+
+def unreceipted_main_commits(main_commits: list[str], registry: ReceiptRegistry) -> list[str]:
+    """Main commits with no issued receipt; registry errors propagate (detector fails loud)."""
+    receipted = registry.receipted_commits(main_commits)
     return [c for c in main_commits if c not in receipted]
