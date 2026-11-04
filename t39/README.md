@@ -37,11 +37,31 @@ This package holds two of the production pieces of the ratified T39 receipt gate
 - **Where the anchor lives in production.** A file is used in the tests. In production it should be on a different host from the registry, for example the Brooklyn node under T35.
 - **Wiring into the real consumers,** and the hourly detector job with its alerts and reverts.
 
-## Direct-to-main detector (`main_detector.py`, T39 test 1)
-- **Schedule and history:** runs at least hourly and reads `main`'s first-parent history since the last clean checkpoint, using an explicit `--git-dir` and a scrubbed environment so there's no upward search and no inherited redirection.
-- **Merge policy** (proposed on the PLAN): each first-parent commit must be either the receipted commit itself (fast-forward), or a merge commit whose second parent is receipted **and** whose tree equals that receipt's tree.
-- **On an incident:** it alerts, writes the release-block file that the builder and updater check first, and returns a revert plan. It never pushes a revert itself.
-- **Failing loud:** a Git error, a registry error, or `main` no longer descending from the checkpoint (a force-push) all block release and are reported as a failure, never as clean.
-- **Block and alert are independent:** if the release block can't be written, the alert still goes out and says so.
-- **Tampered registry:** a receipt forged in the database only, or an edited anchor log, makes the detector fail loud and block release; it never reports clean.
-- **Tests** (`tests/test_t39_main_detector.py`, 13): fast-forward clean; direct push gives an incident, a release block and a revert plan, re-reported on later runs; a merge with the reviewed tree is clean; a merge with an extra file is an incident; unreviewed intermediate first-parent commits are incidents; a history rewrite fails loud; an unavailable registry fails loud; a wrong git dir is refused; inherited `GIT_DIR` is ignored.
+## Direct-to-main detector and deploy gate (`main_detector.py`, T39 test 1)
+
+### Merge and update policy (proposed; enforced here)
+1. `main` moves only by (a) a fast-forward to an exact receipted commit, or (b) a `--no-ff` merge whose second parent is receipted and whose tree equals that receipt's tree. Squash and rebase merges are off.
+2. **A force-push or history rewrite** is anything that leaves the last anchored clear tip off `main`'s first-parent chain. That is an incident, even if the old tip survives as a second parent and every new commit happens to be receipted.
+3. **A direct write**, meaning any first-parent commit not covered by rule 1, is an incident.
+4. **Audit trail:** every issuance, use, `clear` and `incident` is an event in the anchor log, which is authoritative, hash-chained, and written with its own credential on a separate host. The log *is* the audit trail; a database-only writer cannot add to it or hide from it.
+
+### Detector (`run_detector`, at least hourly)
+- **Start point:** it starts from the last anchored `clear` tip (or the trusted baseline) and requires that tip to be on `main`'s first-parent chain.
+- **Check:** every first-parent commit after it is checked against rule 1, reading issued receipts from the anchor log.
+- **Clean run:** anchors `clear {branch, tip, at}`.
+- **Otherwise:** anchors `incident {branch, tip, from, unreceipted, revert_plan, error}` and alerts. The alert is sent even if anchoring fails, and the run is then still not clean.
+- **No pushing:** it never pushes a revert.
+
+### Deploy gate (`release_allowed`, called by every builder, updater, rollback or manual deploy)
+- **Fails closed:** it returns True **only** if the latest anchored detector event for the branch is a `clear` of **exactly the commit being deployed**, no older than 65 minutes, and not from the future.
+- **Refusals:** a missing, stale, incident, unreadable or tampered state refuses. A commit pushed after the last clean run is therefore not deployable until the detector clears it. No block file exists whose absence could unblock a deploy.
+
+### Tests (`tests/test_t39_main_detector.py`, 16)
+- **Clean path:** a fast-forward is clean and then deployable.
+- **Gate timing:** a push after clearance isn't deployable; the clearance expires, and a future-dated one is refused.
+- **Merges:** a merge with the reviewed tree is clean; a merge with an extra file is an incident.
+- **Incidents:** a direct push is an incident, isn't deployable, and keeps being reported; unreviewed intermediate commits are incidents.
+- **Rewrites:** **a checkpoint that survives only as a second parent is refused as a rewrite**; a history reset fails loud.
+- **Anchor unreachable:** on a clean run, deploys stay refused; on an incident, the alert still goes out and deploys are refused.
+- **Tampering and environment:** an unavailable registry fails loud; a DB-only forged receipt doesn't hide a push; a tampered anchor fails loud; a wrong git dir is refused; an inherited `GIT_DIR` is ignored.
+- **Mutation checks:** removing the first-parent check, the exact-tip check, or the freshness check each makes a test fail.

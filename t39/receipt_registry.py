@@ -48,6 +48,7 @@ _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _ZERO = "0" * 64
+_KINDS = ("genesis", "issue", "use", "clear", "incident")
 
 
 class RegistryUnavailable(RuntimeError):
@@ -164,7 +165,7 @@ def _verified_log(anchor: Anchor) -> list[dict]:
     prev, issued = _ZERO, set()
     for i, e in enumerate(log):
         if (not isinstance(e, dict) or e.get("seq") != i
-                or e.get("kind") not in ("genesis", "issue", "use")
+                or e.get("kind") not in _KINDS
                 or (i == 0) != (e["kind"] == "genesis")
                 or _link(prev, i, e["kind"], e["body"]) != e.get("head")):
             raise RegistryUnavailable(f"anchor log broken at {i}")
@@ -187,7 +188,8 @@ class IssuedReceipt:
 _DDL = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE chain (
-    seq INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('genesis','issue','use')),
+    seq INTEGER PRIMARY KEY, kind TEXT NOT NULL
+        CHECK (kind IN ('genesis','issue','use','clear','incident')),
     body TEXT NOT NULL, head TEXT NOT NULL);
 CREATE TABLE nonces (nonce TEXT PRIMARY KEY, receipt_hash TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE receipts (
@@ -347,6 +349,22 @@ class ReceiptRegistry:
             self._append(log, "use", {"receipt_hash": receipt_hash, "consumer": consumer,
                                       "purpose": purpose, "at": now.isoformat()})
         self._write(do)
+
+    def record_detector(self, kind: str, body: dict) -> None:
+        """Anchor a detector outcome: 'clear' (branch, tip) or 'incident'."""
+        if kind not in ("clear", "incident"):
+            raise ValueError("detector events are 'clear' or 'incident'")
+        if not (isinstance(body.get("branch"), str) and isinstance(body.get("tip"), str)
+                and isinstance(body.get("at"), str)):
+            raise ValueError("detector event needs branch, tip and at")
+        self._write(lambda log: self._append(log, kind, body))
+
+    def last_detector_event(self, branch: str) -> dict | None:
+        """Latest anchored 'clear' or 'incident' for this branch, from the anchor log."""
+        for e in reversed(_verified_log(self._anchor)):
+            if e["kind"] in ("clear", "incident") and e["body"].get("branch") == branch:
+                return e
+        return None
 
     # ---- reads: answered from the verified anchor log only --------------------
 
