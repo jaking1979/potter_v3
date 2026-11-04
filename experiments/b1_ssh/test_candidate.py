@@ -53,4 +53,23 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             candidate_facts(self.repo, self.git('rev-parse', 'HEAD').strip(), b'')
 
+    def test_oversized_manifest_and_evidence_refused(self):
+        with self.assertRaises(ValueError):
+            candidate_facts(self.repo, self.commit, b'x' * (1024 * 1024 + 1))
+        self.manifest.write_bytes(b'x' * (1024 * 1024 + 1))
+        self.git('add', '.')
+        self.git('commit', '-qm', 'oversized')
+        with self.assertRaises(ValueError):
+            candidate_facts(self.repo, self.git('rev-parse', 'HEAD').strip(), b'')
+
+    def test_manifest_directory_refused(self):
+        self.manifest.unlink()
+        self.manifest.mkdir()
+        (self.manifest / 'entry').write_text('x')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'directory')
+        with self.assertRaises(ValueError):
+            candidate_facts(self.repo, self.git('rev-parse', 'HEAD').strip(), b'')
+
 if __name__ == '__main__': unittest.main()
+
