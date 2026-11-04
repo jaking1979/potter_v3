@@ -10,6 +10,7 @@ import subprocess
 
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _MANIFEST = "governance/decisions/manifest.json"
+_MAX_BYTES = 1024 * 1024
 
 
 def candidate_facts(repo, commit, evidence):
@@ -17,6 +18,8 @@ def candidate_facts(repo, commit, evidence):
         raise ValueError("full lowercase SHA-1 commit required")
     if not isinstance(evidence, bytes):
         raise ValueError("evidence must be immutable bytes")
+    if len(evidence) > _MAX_BYTES:
+        raise ValueError("evidence exceeds experiment limit")
     # Avoid inherited Git environment variables redirecting repository discovery.
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
     env['GIT_CONFIG_NOSYSTEM'] = '1'
@@ -35,7 +38,19 @@ def candidate_facts(repo, commit, evidence):
     if not _SHA1.fullmatch(tree):
         raise ValueError('unsupported tree identity')
     # Read the manifest from the immutable commit tree, never the worktree.
-    manifest = git('show', commit + ':' + _MANIFEST)
+    obj = commit + ':' + _MANIFEST
+    if git('cat-file', '-t', obj).strip() != b'blob':
+        raise ValueError('manifest must be a blob')
+    try:
+        size = int(git('cat-file', '-s', obj).strip())
+    except ValueError as exc:
+        raise ValueError('invalid manifest size') from exc
+    if size < 0 or size > _MAX_BYTES:
+        raise ValueError('manifest exceeds experiment limit')
+    manifest = git('cat-file', 'blob', obj)
+    if len(manifest) != size:
+        raise ValueError('manifest changed during read')
     return {'commit': commit, 'tree': tree,
             'manifest': hashlib.sha256(manifest).hexdigest(),
             'evidence': hashlib.sha256(evidence).hexdigest()}
+
