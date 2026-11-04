@@ -30,7 +30,7 @@ def candidate_facts(repo, commit, evidence):
     # git-dir prevents Git from silently discovering an enclosing repository.
     root = Path(repo).resolve(strict=True)
     git_dir = root / '.git'
-    if not git_dir.is_dir():
+    if git_dir.is_symlink() or not git_dir.is_dir():
         raise ValueError('expected repository root with .git directory')
     git_dir = git_dir.resolve(strict=True)
     env['GIT_CEILING_DIRECTORIES'] = str(root.parent)
