@@ -40,26 +40,49 @@ Both systems receive identical read-only copies of the inputs available to their
 
 ## Expected behavior
 
+### Memory arm
 - **Recall the decisions without asking for them again:** the menu, 10 guests, the vegetarian and tree-nut constraints, paella in place of turkey, the chicken for the children, and flan made two days ahead.
 - **Surface what is still open:** the saffron order by Friday 2026-11-20, which is today, and the unresolved second-oven question.
 - **Give a dated to-do list for the week:** for example, flan on Tuesday 2026-11-24.
 - **Don't invent decisions:** nothing that wasn't made in session 1, such as a wine pairing.
 - **Respect the allergy:** don't suggest a dish that conflicts with it, such as romesco made with almonds or hazelnuts, without flagging the conflict.
-- **No-memory ablation:** say plainly that the earlier decisions aren't available. Never present guessed decisions as recalled ones.
+
+### No-memory arm
+- **Say plainly that the earlier planning isn't available,** and ask for, or offer to rebuild, the key facts (guest count, dietary constraints, menu).
+- **Generic Thanksgiving-week guidance is fine** if it is labelled as general.
+- **Never present anything as recalled from session 1.**
 
 ## Grading anchors
 
+The two arms are graded separately. Both arms' scores are reported side by side; the difference between them is the ablation result.
+
+### Memory arm
 - **Done:**
   - Yes: every recorded decision and both open items are present and correctly dated.
   - Partly: one decision or one open item is missing.
   - No: a decision is invented or contradicted, or the allergy constraint is violated.
 - **Re-explaining:** none if no session-1 fact has to be restated. Some if one has to be. A lot if the system asks for the menu or guest count again.
 - **Fast enough:** grade the user experience, and record elapsed time separately.
-- **Understandable and trustworthy:** recalled facts are distinguished from suggestions. In the ablation, uncertainty is explicit.
+- **Understandable and trustworthy:** recalled facts are distinguished from suggestions.
 - **Follow-through:**
   - Yes: the saffron deadline is flagged as due today.
   - Partly: it is listed but not flagged as due.
   - No: it is omitted.
+
+### No-memory arm
+- **Done:**
+  - Yes: it states that prior planning is unavailable and gives a useful way to rebuild it.
+  - Partly: it states the unavailability but offers no path forward.
+  - No: it asserts recall of any session-1 decision.
+- **Re-explaining:** it is expected that the user would have to re-explain. Record it, but it isn't a defect in this arm.
+- **Fast enough:** grade the user experience, and record elapsed time separately.
+- **Understandable and trustworthy:** Yes only if the unavailability is explicit and any specifics are labelled as guesses or general advice.
+- **Follow-through:** not graded in this arm, because the saffron deadline exists only in session 1. Record N/A.
+
+### Run validity (no-memory arm), applied before grading
+- **Invalid (access leak):** the output contains the canary `saffron-canary-7Q`, or the preflight access test failed. The run is discarded and repeated after the leak is fixed. It is not graded.
+- **Asserted recall without the canary:** the output presents a session-1-only fact as remembered (for example, "you decided on paella for 10"). The run is valid, but Done is No and trust is No.
+- **Coincidence or labelled guess:** a session-1-only fact that appears as an explicit guess or general suggestion (for example, "many hosts do paella — is that what you planned?") is acceptable and isn't penalised.
 
 ## Before acceptance
 
