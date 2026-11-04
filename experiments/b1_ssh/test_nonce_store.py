@@ -1,3 +1,4 @@
+import multiprocessing
 import sqlite3
 import subprocess
 import sys
@@ -8,6 +9,12 @@ from pathlib import Path
 from nonce_store import prepare, consume_pair, lookup, pair_matches
 
 BINDING = {'commit': 'a' * 40, 'tree': 'b' * 40, 'receipt_hash': 'c' * 64}
+
+
+def _process_consumer(path, barrier, outcomes):
+    with sqlite3.connect(path, timeout=5) as db:
+        barrier.wait(timeout=10)
+        outcomes.put(consume_pair(db, ('d' * 64, 'e' * 64), BINDING))
 
 
 class NonceStoreTests(unittest.TestCase):
@@ -106,6 +113,32 @@ os._exit(22)
         for thread in threads:
             thread.join()
         self.assertCountEqual(outcomes, [True, False])
+
+    def test_separate_process_consumers_exactly_one_wins(self):
+        context = multiprocessing.get_context('spawn')
+        barrier = context.Barrier(2)
+        outcomes = context.Queue()
+        processes = [context.Process(target=_process_consumer,
+                                     args=(str(self.path), barrier, outcomes))
+                     for _ in range(2)]
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=15)
+                self.assertEqual(process.exitcode, 0)
+            self.assertCountEqual([outcomes.get(timeout=2), outcomes.get(timeout=2)],
+                                  [True, False])
+            with sqlite3.connect(self.path) as db:
+                self.assertTrue(pair_matches(db, ('d' * 64, 'e' * 64), BINDING))
+                self.assertEqual(db.execute('SELECT count(*) FROM used_nonces').fetchone()[0], 2)
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+            outcomes.close()
+            outcomes.join_thread()
 
     def test_invalid_and_open_caller_transaction_fail(self):
         with sqlite3.connect(self.path) as db:
