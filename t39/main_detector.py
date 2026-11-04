@@ -60,6 +60,7 @@ class Report:
     unreceipted: list[str] = field(default_factory=list)
     revert_plan: list[str] = field(default_factory=list)   # newest first
     error: str | None = None
+    block_error: str | None = None   # set if the release block could not be persisted
 
     @property
     def clean(self) -> bool:
@@ -104,8 +105,8 @@ def run_detector(*, git_dir: Path, branch: str, baseline: str, checkpoint_path: 
             registry.close()
     except Exception as exc:
         report = Report(checked=[], error=f"{type(exc).__name__}: {exc}")
-        _block(block_path, now, f"detector failed: {report.error}")
-        alert(f"T39 detector FAILED on {branch}; release blocked: {report.error}")
+        _raise_incident(report, block_path, alert, now, f"detector failed: {report.error}",
+                        f"T39 detector FAILED on {branch}: {report.error}")
         return report
 
     report = Report(checked=commits)
@@ -118,9 +119,10 @@ def run_detector(*, git_dir: Path, branch: str, baseline: str, checkpoint_path: 
             report.unreceipted.append(c)
     if report.unreceipted:
         report.revert_plan = list(reversed(report.unreceipted))
-        _block(block_path, now, f"unreceipted commits on {branch}: {report.unreceipted}")
-        alert(f"T39 SECURITY INCIDENT: {len(report.unreceipted)} unreceipted commit(s) on "
-              f"{branch}; release blocked; revert {report.revert_plan}")
+        _raise_incident(report, block_path, alert, now,
+                        f"unreceipted commits on {branch}: {report.unreceipted}",
+                        f"T39 SECURITY INCIDENT: {len(report.unreceipted)} unreceipted commit(s) "
+                        f"on {branch}; revert {report.revert_plan}")
         return report
     tmp = checkpoint_path.with_suffix(".tmp")
     tmp.write_text(json.dumps({"last_clean": tip, "at": now.isoformat()}))
@@ -128,8 +130,17 @@ def run_detector(*, git_dir: Path, branch: str, baseline: str, checkpoint_path: 
     return report
 
 
-def _block(block_path: Path, now: datetime, reason: str) -> None:
-    block_path.write_text(json.dumps({"blocked_at": now.isoformat(), "reason": reason}))
+def _raise_incident(report: Report, block_path: Path, alert: Callable[[str], None],
+                    now: datetime, reason: str, message: str) -> None:
+    """Block and alert independently: neither failure may suppress the other."""
+    try:
+        Path(block_path).write_text(json.dumps({"blocked_at": now.isoformat(),
+                                                "reason": reason}))
+    except Exception as exc:
+        report.block_error = f"{type(exc).__name__}: {exc}"
+    suffix = ("; release blocked" if report.block_error is None else
+              f"; RELEASE BLOCK NOT PERSISTED ({report.block_error}), block manually")
+    alert(message + suffix)     # an alert failure propagates: the run must not look clean
 
 
 def release_blocked(block_path: Path) -> bool:

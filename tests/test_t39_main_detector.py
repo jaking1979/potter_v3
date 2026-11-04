@@ -129,6 +129,22 @@ class Detector(unittest.TestCase):
         r = self.run_it(git_dir=sub)
         self.assertIsNotNone(r.error)
 
+    def test_alert_still_sent_when_block_cannot_be_written(self):
+        bad = self.commit_file("direct push")
+        self.block = Path(self.tmp.name) / "missing-dir" / "BLOCK"
+        r = self.run_it()
+        self.assertEqual(r.unreceipted, [bad])
+        self.assertIsNotNone(r.block_error)
+        self.assertIn("RELEASE BLOCK NOT PERSISTED", self.alerts[0])
+
+    def test_failure_alert_sent_when_block_cannot_be_written(self):
+        self.anchor.path.unlink()
+        self.block = Path(self.tmp.name) / "missing-dir" / "BLOCK"
+        r = self.run_it()
+        self.assertIsNotNone(r.error)
+        self.assertIsNotNone(r.block_error)
+        self.assertIn("FAILED", self.alerts[0])
+
     def test_inherited_git_env_cannot_redirect(self):
         self.issue(self.commit_file("reviewed"))
         old = os.environ.get("GIT_DIR")
