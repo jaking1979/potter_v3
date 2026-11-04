@@ -12,9 +12,12 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 from pathlib import Path
 
-from containment.guarded_broker import GuardedBroker, StubBroker
+import threading
+import time
+
+from containment.guarded_broker import GuardedBroker, KillSwitchIncomplete, StubBroker
 from containment.mandate import MandateError, load_mandate, parse_mandate
-from containment.order_guard import AccountState, check
+from containment.order_guard import AccountState, OpenOrder, check
 
 # Synthetic fixture only. The real mandate values are Josh's decision.
 MANDATE = {
@@ -125,6 +128,36 @@ class GuardLevel1(unittest.TestCase):
                                     args={"order_id": "1"}, kill=True).allow)
 
 
+class OpenOrdersCount(unittest.TestCase):
+    """Codex P1 on 2945fa4: unfilled orders must count against the mandate."""
+
+    def setUp(self):
+        self.m = parse_mandate(MANDATE)
+
+    def test_open_buys_count_against_position_and_ceiling(self):
+        acct = AccountState({}, {}, D("0"),
+                            open_orders=(OpenOrder("BBB", "buy", D("3"), D("100")),))
+        # 300 open + 200 new = 500 > 400 position
+        self.assertFalse(check("place_equity_order", order(quantity="2"), self.m, acct, False).allow)
+        acct = AccountState({}, {}, D("0"), open_orders=(
+            OpenOrder("AAA", "buy", D("4"), D("100")), OpenOrder("CCC", "buy", D("4"), D("100"))))
+        # 800 open + 300 new = 1100 > 1000 ceiling
+        self.assertFalse(check("place_equity_order", order(quantity="3"), self.m, acct, False).allow)
+        self.assertTrue(check("place_equity_order", order(quantity="2"), self.m, acct, False).allow)
+
+    def test_open_sells_reduce_quantity_available(self):
+        acct = AccountState({"AAA": D("2")}, {"AAA": D("50")}, D("0"),
+                            open_orders=(OpenOrder("AAA", "sell", D("2"), D("50")),))
+        self.assertFalse(check("place_equity_order",
+                               order(symbol="AAA", side="sell", quantity="1"),
+                               self.m, acct, False).allow)
+
+    def test_malformed_open_order_refuses(self):
+        acct = AccountState({}, {}, D("0"),
+                            open_orders=(OpenOrder("BBB", "hold", D("1"), D("1")),))
+        self.assertFalse(check("place_equity_order", order(), self.m, acct, False).allow)
+
+
 class GuardInPathLevel3(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -180,6 +213,80 @@ class GuardInPathLevel3(unittest.TestCase):
         with self.assertRaises(PermissionError):
             broker.call("place_equity_order", order())
         self.assertEqual(self.stub.calls, [])
+
+    def test_unfilled_orders_cannot_jointly_exceed_mandate(self):
+        # Codex P1 scenario: the account provider never sees the new orders.
+        empty = AccountState({}, {}, D("0"))
+        broker = GuardedBroker(self.stub, self.mandate, self.kill, self.audit, lambda: empty)
+        broker.call("place_equity_order", order(symbol="AAA", quantity="4"))      # 400
+        with self.assertRaises(PermissionError):                                    # AAA 800 > 400
+            broker.call("place_equity_order", order(symbol="AAA", quantity="4"))
+        broker.call("place_equity_order", order(symbol="BBB", quantity="4"))      # total 800
+        with self.assertRaises(PermissionError):                                    # 1100 > 1000
+            broker.call("place_equity_order", order(symbol="CCC", quantity="3"))
+        self.assertEqual(len(self.stub.calls), 2)
+
+    def test_reservation_released_once_account_reports_the_order(self):
+        state = {"acct": AccountState({}, {}, D("0"))}
+        broker = GuardedBroker(self.stub, self.mandate, self.kill, self.audit,
+                               lambda: state["acct"])
+        broker.call("place_equity_order", order(symbol="AAA", quantity="4"))
+        # Provider now reports the order filled and the position held; the
+        # reservation must not be counted a second time.
+        state["acct"] = AccountState({"AAA": D("4")}, {"AAA": D("100")}, D("0"),
+                                     known_order_ids=frozenset({"stub-1"}))
+        broker.call("place_equity_order", order(symbol="BBB", quantity="4"))      # 800 total
+        broker.call("place_equity_order", order(symbol="CCC", quantity="2"))      # 1000 total
+        with self.assertRaises(PermissionError):
+            broker.call("place_equity_order", order(symbol="CCC", quantity="0.01"))
+
+    def test_backend_error_keeps_reservation(self):
+        class Boom(StubBroker):
+            def invoke(self, tool, args):
+                super().invoke(tool, args)
+                raise RuntimeError("timeout after submit")
+        stub = Boom()
+        broker = GuardedBroker(stub, self.mandate, self.kill, self.audit,
+                               lambda: AccountState({}, {}, D("0")))
+        with self.assertRaises(RuntimeError):
+            broker.call("place_equity_order", order(symbol="AAA", quantity="4"))
+        with self.assertRaises(PermissionError):
+            broker.call("place_equity_order", order(symbol="AAA", quantity="1"))
+
+    def test_concurrent_orders_are_serialised(self):
+        class Slow(StubBroker):
+            def invoke(self, tool, args):
+                time.sleep(0.05)
+                return super().invoke(tool, args)
+        stub = Slow()
+        broker = GuardedBroker(stub, self.mandate, self.kill, self.audit,
+                               lambda: AccountState({}, {}, D("0")))
+        results = []
+
+        def attempt():
+            try:
+                broker.call("place_equity_order", order(symbol="AAA", quantity="3"))
+                results.append("ok")
+            except PermissionError:
+                results.append("blocked")
+        threads = [threading.Thread(target=attempt) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(results), ["blocked", "blocked", "blocked", "ok"])
+        self.assertEqual(len(stub.calls), 1)
+
+    def test_kill_switch_attempts_every_cancel_despite_failures(self):
+        # Codex P2 on 2945fa4.
+        stub = StubBroker(open_orders=["o1", "o2", "o3"], fail_cancel={"o1"})
+        broker = GuardedBroker(stub, self.mandate, self.kill, self.audit, lambda: ACCOUNT)
+        with self.assertRaises(KillSwitchIncomplete) as ctx:
+            broker.engage_kill_switch("test")
+        self.assertEqual(ctx.exception.cancelled, ["o2", "o3"])
+        self.assertEqual(ctx.exception.failed, ["o1"])
+        self.assertEqual(stub.open_order_ids(), ["o1"])
+        self.assertTrue(broker.kill_switch_engaged())
 
     def test_kill_switch_cancels_open_orders_then_blocks_new_ones(self):
         cancelled = self.broker.engage_kill_switch("test")

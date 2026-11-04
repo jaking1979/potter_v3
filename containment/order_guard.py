@@ -11,7 +11,7 @@ held, so the bot can always exit; they cannot open a short.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
@@ -24,10 +24,24 @@ _ORDER_FIELDS = {"symbol", "side", "quantity", "limit_price"}
 
 
 @dataclass(frozen=True)
+class OpenOrder:
+    symbol: str
+    side: str                              # "buy" or "sell"
+    quantity: Decimal                      # unfilled quantity
+    limit_price: Decimal
+
+
+@dataclass(frozen=True)
 class AccountState:
     positions: Mapping[str, Decimal]       # symbol -> quantity held
     prices: Mapping[str, Decimal]          # symbol -> latest price used for valuation
     loss_usd: Decimal                      # realised + unrealised loss since mandate start (>= 0)
+    # Unfilled orders count as if they will fill: buys at their limit price
+    # against position and ceiling, sells against the quantity available to sell.
+    open_orders: tuple[OpenOrder, ...] = field(default_factory=tuple)
+    # Broker order ids already reflected above (open or filled). GuardedBroker
+    # keeps its own reservation for each order it forwards until its id shows here.
+    known_order_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -83,10 +97,15 @@ def check(
     if any(qty < 0 for qty in account.positions.values()):
         return _refuse(tool, "account state shows a negative position")
     held = account.positions.get(symbol, Decimal(0))
+    pending = account.open_orders
+    if any(o.side not in ("buy", "sell") or o.quantity <= 0 or o.limit_price <= 0 for o in pending):
+        return _refuse(tool, "account state shows a malformed open order")
 
     if side == "sell":
-        if quantity > held:
-            return _refuse(tool, "sell exceeds quantity held (no shorting)")
+        pending_sells = sum((o.quantity for o in pending
+                             if o.side == "sell" and o.symbol == symbol), Decimal(0))
+        if quantity + pending_sells > held:
+            return _refuse(tool, "sell exceeds quantity held net of open sells (no shorting)")
         return Decision(True, tool, "sell within holdings")
     if side != "buy":
         return _refuse(tool, "side must be buy or sell")
@@ -100,11 +119,15 @@ def check(
         )
     except KeyError:
         return _refuse(tool, "missing price for a held position")
-    # Value the new shares at the limit price: the most the order can cost.
+    # Value new and open buys at their limit price: the most they can cost.
     order_value = quantity * limit_price
-    position_value = held * account.prices.get(symbol, limit_price) + order_value
+    open_buys = [o for o in pending if o.side == "buy"]
+    open_buy_value = sum((o.quantity * o.limit_price for o in open_buys), Decimal(0))
+    open_buy_symbol = sum((o.quantity * o.limit_price for o in open_buys if o.symbol == symbol),
+                          Decimal(0))
+    position_value = held * account.prices.get(symbol, limit_price) + open_buy_symbol + order_value
     if position_value > mandate.max_position_usd:
-        return _refuse(tool, "order exceeds maximum position")
-    if holdings_value + order_value > mandate.ceiling_usd:
-        return _refuse(tool, "order exceeds ceiling")
+        return _refuse(tool, "order exceeds maximum position (including open buys)")
+    if holdings_value + open_buy_value + order_value > mandate.ceiling_usd:
+        return _refuse(tool, "order exceeds ceiling (including open buys)")
     return Decision(True, tool, "buy within mandate")
