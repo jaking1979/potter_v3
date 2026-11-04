@@ -61,6 +61,9 @@ def verify_experimental_receipt(
     """
     if not isinstance(trusted_agents, dict) or set(trusted_agents) != set(_ROLES):
         raise ValueError("both trusted agents required")
+    # Capture the role assignment before any external verification/consumer calls.
+    # Returned facts must describe the same agents whose keys were checked.
+    trusted_agents = dict(trusted_agents)
     if any(not isinstance(trusted_agents[role], str) or not trusted_agents[role] for role in _ROLES):
         raise ValueError("trusted agent identity required")
     if trusted_agents["author"] == trusted_agents["reviewer"]:

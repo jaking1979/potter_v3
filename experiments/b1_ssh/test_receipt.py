@@ -90,6 +90,18 @@ class ReceiptCompositionTests(unittest.TestCase):
         self.assertEqual(self.consumptions[0]["tree"], self.expected["tree"])
         self.assertEqual(self.consumptions[0]["receipt_hash"], receipt["receipt_hash"])
 
+    def test_consumer_mutation_cannot_change_returned_agent_binding(self):
+        agents = {"author": "dolores", "reviewer": "claude"}
+
+        def mutate_after_checks(nonces, binding):
+            agents["reviewer"] = "dolores"
+            return self._consume_pair(nonces, binding)
+
+        receipt = self._call(trusted_agents=agents, consume_nonces=mutate_after_checks)
+        self.assertEqual(agents["reviewer"], "dolores")
+        self.assertEqual(receipt["agents"], {"author": "dolores", "reviewer": "claude"})
+        self.assertEqual(len(self.consumed), 2)
+
     def test_replay_refuses_without_partial_consumption(self):
         self._call()
         before = set(self.consumed)
