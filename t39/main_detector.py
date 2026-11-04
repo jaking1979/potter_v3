@@ -86,7 +86,8 @@ class Report:
 
 def run_detector(*, git_dir: Path, branch: str, baseline: str,
                  registry_open: Callable[[], ReceiptRegistry],
-                 alert: Callable[[str], None], now: datetime) -> Report:
+                 alert: Callable[[str], None], now: datetime,
+                 authoritative_tip: Callable[[], str] | None = None) -> Report:
     git_dir = Path(git_dir).resolve()
     tip = None
     try:
@@ -94,7 +95,14 @@ def run_detector(*, git_dir: Path, branch: str, baseline: str,
             raise DetectorError("bad branch name")
         if Path(_git(git_dir, "rev-parse", "--absolute-git-dir").strip()) != git_dir:
             raise DetectorError("git dir resolved somewhere else")
-        tip = _git(git_dir, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}").strip()
+        if authoritative_tip is not None:
+            tip = authoritative_tip()          # the remote's main, not a local ref
+            if not _HEX40.fullmatch(tip):
+                raise DetectorError("bad authoritative tip")
+            _git(git_dir, "rev-parse", "--verify", f"{tip}^{{commit}}")  # fetched locally?
+        else:
+            tip = _git(git_dir, "rev-parse", "--verify",
+                       f"refs/heads/{branch}^{{commit}}").strip()
         registry = registry_open()
         try:
             last = registry.last_detector_event(branch)
@@ -167,32 +175,74 @@ def _incident(registry: ReceiptRegistry, report: Report, alert: Callable[[str], 
           + "; deploys refused")
 
 
+def ls_remote_tip(git_dir: Path, remote: str, branch: str) -> str:
+    """Authoritative tip of `branch` on `remote` (e.g. GitHub); raises if unreachable."""
+    out = _git(Path(git_dir), "ls-remote", "--exit-code", remote, f"refs/heads/{branch}").split()
+    if len(out) != 2 or not _HEX40.fullmatch(out[0]):
+        raise DetectorError("unexpected ls-remote output")
+    return out[0]
+
+
 def release_allowed(*, git_dir: Path, registry_open: Callable[[], ReceiptRegistry],
                     branch: str, commit: str, now: datetime,
+                    authoritative_tip: Callable[[], str], purpose: str = "deploy",
                     max_age: timedelta = MAX_CLEARANCE_AGE) -> bool:
-    """Fail closed: main's current tip IS this commit, it is receipted, and it
-    has a fresh anchored clear. Never relies on an incident having been recorded."""
+    """Fail-closed gate for every builder, updater, rollback and manual deploy.
+
+    `authoritative_tip` reads main from the authoritative remote at call time
+    (never a possibly stale local ref); if it fails, nothing is allowed.
+
+    purpose="deploy": `commit` IS the authoritative tip, carries an issued
+      receipt for its exact tree, and has a fresh anchored 'clear'.
+    purpose="rollback": `commit` carries an issued receipt for its exact tree
+      and lies on the authoritative main's first-parent chain at or before the
+      last anchored 'clear' tip. No freshness requirement, and it is allowed
+      during an open incident: rolling back to cleared code is the remedy.
+
+    Consumers call this again AFTER deploying (`purpose="deploy"`); if it now
+    fails, main moved during the deploy window and they roll back to the last
+    cleared commit via `purpose="rollback"`.
+    """
     try:
-        if not _HEX40.fullmatch(commit) or ".." in branch:
+        if not _HEX40.fullmatch(commit) or ".." in branch or purpose not in ("deploy", "rollback"):
             return False
         git_dir = Path(git_dir).resolve()
         if Path(_git(git_dir, "rev-parse", "--absolute-git-dir").strip()) != git_dir:
             return False
-        current = _git(git_dir, "rev-parse", "--verify",
-                       f"refs/heads/{branch}^{{commit}}").strip()
-        if current != commit:
-            return False                    # main moved: earlier clears are void
+        tip = authoritative_tip()
+        if not _HEX40.fullmatch(tip):
+            return False
+        # Objects must be present locally (the consumer fetched); never fall back
+        # to the local ref for the tip itself.
+        mainline = _git(git_dir, "rev-list", "--first-parent", tip).split()
         tree = _git(git_dir, "rev-parse", f"{commit}^{{tree}}").strip()
         registry = registry_open()
         try:
             if registry.issued_trees([commit]).get(commit) != tree:
                 return False                # the exact commit must carry a receipt
             last = registry.last_detector_event(branch)
+            last_clear = last if (last is not None and last["kind"] == "clear") else None
+            if last is not None and last_clear is None:
+                # An incident is open: find the last clear before it for rollback.
+                for e in reversed(registry.detector_events(branch)):
+                    if e["kind"] == "clear":
+                        last_clear = e
+                        break
         finally:
             registry.close()
-        if last is None or last["kind"] != "clear" or last["body"]["tip"] != commit:
+        if purpose == "deploy":
+            if commit != tip or last is None or last["kind"] != "clear":
+                return False
+            if last["body"]["tip"] != commit:
+                return False
+            at = datetime.fromisoformat(last["body"]["at"])
+            return -MAX_CLOCK_SKEW <= now - at <= max_age
+        # rollback
+        if last_clear is None:
             return False
-        at = datetime.fromisoformat(last["body"]["at"])
-        return -MAX_CLOCK_SKEW <= now - at <= max_age
+        cleared = last_clear["body"]["tip"]
+        if cleared not in mainline or commit not in mainline:
+            return False
+        return mainline.index(commit) >= mainline.index(cleared)   # at or before cleared tip
     except Exception:
         return False

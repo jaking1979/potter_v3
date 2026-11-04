@@ -72,9 +72,11 @@ class Detector(unittest.TestCase):
                             baseline=self.baseline, registry_open=self.open_reg,
                             alert=self.alerts.append, now=now)
 
-    def allowed(self, commit, now=NOW):
+    def allowed(self, commit, now=NOW, purpose="deploy"):
+        # Here the scratch repo itself plays the authoritative remote.
         return release_allowed(git_dir=self.repo / ".git", registry_open=self.open_reg,
-                               branch="main", commit=commit, now=now)
+                               branch="main", commit=commit, now=now, purpose=purpose,
+                               authoritative_tip=lambda: self.head("refs/heads/main"))
 
     # --- clean paths and the deploy gate ------------------------------------
 
@@ -286,6 +288,199 @@ class Detector(unittest.TestCase):
                 os.environ.pop("GIT_DIR")
             else:
                 os.environ["GIT_DIR"] = old
+
+
+class RemoteClones(unittest.TestCase):
+    """Authoritative remote + separate author and consumer clones (Dolores review on 96b6d77)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.remote = d / "origin.git"
+        subprocess.check_call(["git", "init", "-q", "--bare", "-b", "main", str(self.remote)])
+        self.author = d / "author"
+        subprocess.check_call(["git", "clone", "-q", str(self.remote), str(self.author)],
+                              stderr=subprocess.DEVNULL)
+        self.g(self.author, "config", "user.email", "t@e.invalid")
+        self.g(self.author, "config", "user.name", "T")
+        self.g(self.author, "checkout", "-q", "-b", "main")
+        self.baseline = self.commit(self.author, "base")
+        self.g(self.author, "push", "-q", "origin", "main")
+        self.consumer = d / "consumer"
+        subprocess.check_call(["git", "clone", "-q", str(self.remote), str(self.consumer)],
+                              stderr=subprocess.DEVNULL)
+        self.reg_path, self.anchor = d / "r.db", FlakyAnchor(d / "a.jsonl")
+        ReceiptRegistry.initialize(self.reg_path, self.anchor, "test", NOW).close()
+        self.alerts = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def g(self, repo, *args):
+        return subprocess.check_output(["git", "-C", str(repo), *args],
+                                       stderr=subprocess.DEVNULL).decode().strip()
+
+    def commit(self, repo, text, name="f.txt"):
+        (repo / name).write_text(text)
+        self.g(repo, "add", ".")
+        self.g(repo, "commit", "-qm", text)
+        return self.g(repo, "rev-parse", "HEAD")
+
+    def open_reg(self):
+        return ReceiptRegistry(self.reg_path, self.anchor)
+
+    def issue(self, repo, commit):
+        reg = self.open_reg()
+        reg.issue(Facts(commit=commit, tree=self.g(repo, "rev-parse", f"{commit}^{{tree}}"),
+                        receipt_hash=next(N), nonces=(next(N), next(N)),
+                        agents={"author": "dolores", "reviewer": "claude"},
+                        key_fingerprints={"author": "SHA256:a", "reviewer": "SHA256:b"},
+                        verifier_version="v1"), "ci", NOW)
+        reg.close()
+
+    def tip(self, repo=None):
+        from t39.main_detector import ls_remote_tip
+        return ls_remote_tip((repo or self.consumer) / ".git", str(self.remote), "main")
+
+    def fetch(self, repo):
+        self.g(repo, "fetch", "-q", "origin")
+
+    def detect(self):
+        self.fetch(self.consumer)
+        return run_detector(git_dir=self.consumer / ".git", branch="main",
+                            baseline=self.baseline, registry_open=self.open_reg,
+                            alert=self.alerts.append, now=NOW,
+                            authoritative_tip=self.tip)
+
+    def allowed(self, commit, purpose="deploy", tip=None):
+        return release_allowed(git_dir=self.consumer / ".git", registry_open=self.open_reg,
+                               branch="main", commit=commit, now=NOW, purpose=purpose,
+                               authoritative_tip=tip or self.tip)
+
+    def promote(self, candidate, repo=None):
+        from t39.promote import promote
+        repo = repo or self.author
+        promote(git_dir=repo / ".git", remote=str(self.remote), branch="main",
+                candidate=candidate, registry_open=self.open_reg,
+                authoritative_tip=lambda: self.tip(repo))
+
+    def candidate(self, repo, text, name="f.txt"):
+        """One squashed commit on top of the current remote main, reviewed."""
+        self.fetch(repo)
+        self.g(repo, "checkout", "-q", "-B", "cand", "origin/main")
+        c = self.commit(repo, text, name)
+        self.issue(repo, c)
+        return c
+
+    def test_stale_consumer_ref_cannot_deploy_after_remote_advances(self):
+        c = self.candidate(self.author, "reviewed C")
+        self.promote(c)
+        self.assertTrue(self.detect().clean)
+        self.assertTrue(self.allowed(c))
+        # Unreviewed D lands on the remote; the consumer has NOT fetched.
+        self.g(self.author, "checkout", "-q", "-B", "rogue", c)
+        d = self.commit(self.author, "direct push D")
+        self.g(self.author, "push", "-q", "origin", "rogue:main")
+        self.assertEqual(self.g(self.consumer, "rev-parse", "origin/main"), c)  # stale: still C
+        self.assertFalse(self.allowed(c))               # authoritative tip is D, not C
+        self.fetch(self.consumer)                       # objects present, still refused
+        self.assertFalse(self.allowed(c))
+        self.assertFalse(self.allowed(d))               # D never cleared, no receipt
+
+    def test_remote_unreachable_refuses_everything(self):
+        c = self.candidate(self.author, "reviewed C")
+        self.promote(c)
+        self.detect()
+
+        def down():
+            raise OSError("github unreachable")
+        self.assertFalse(self.allowed(c, tip=down))
+        self.assertFalse(self.allowed(c, purpose="rollback", tip=down))
+
+    def test_post_deploy_recheck_catches_race_and_rollback_is_allowed(self):
+        c = self.candidate(self.author, "reviewed C")
+        self.promote(c)
+        self.detect()
+        self.assertTrue(self.allowed(c))                # pre-deploy check passes
+        self.g(self.author, "checkout", "-q", "-B", "rogue", c)
+        self.commit(self.author, "D lands during the deploy window")
+        self.g(self.author, "push", "-q", "origin", "rogue:main")
+        self.fetch(self.consumer)
+        self.assertFalse(self.allowed(c))               # post-deploy recheck fails
+        self.assertTrue(self.allowed(c, purpose="rollback"))   # remedy: stay on cleared C
+
+    def test_rollback_to_older_cleared_release(self):
+        c1 = self.candidate(self.author, "release 1")
+        self.promote(c1)
+        self.detect()
+        c2 = self.candidate(self.author, "release 2")
+        self.promote(c2)
+        self.detect()
+        self.assertFalse(self.allowed(c1))              # not the tip: deploy refused
+        self.assertTrue(self.allowed(c1, purpose="rollback"))
+        self.assertTrue(self.allowed(c2, purpose="rollback"))
+
+    def test_rollback_allowed_during_incident_but_not_to_uncleared_or_offline_commits(self):
+        c1 = self.candidate(self.author, "release 1")
+        self.promote(c1)
+        self.detect()
+        self.g(self.author, "checkout", "-q", "-B", "rogue", c1)
+        d = self.commit(self.author, "direct push D")
+        self.g(self.author, "push", "-q", "origin", "rogue:main")
+        self.assertEqual(self.detect().unreceipted, [d])
+        self.assertTrue(self.allowed(c1, purpose="rollback"))     # remedy during incident
+        self.assertFalse(self.allowed(d, purpose="rollback"))     # unreceipted
+        side = self.candidate(self.consumer, "receipted but never on main")
+        self.assertFalse(self.allowed(side, purpose="rollback"))  # off the mainline
+
+    def test_rollback_beyond_last_clear_refused(self):
+        c1 = self.candidate(self.author, "release 1")
+        self.promote(c1)
+        self.detect()
+        c2 = self.candidate(self.author, "release 2")
+        self.promote(c2)                                  # receipted, on main, NOT yet cleared
+        self.fetch(self.consumer)
+        self.assertFalse(self.allowed(c2, purpose="rollback"))
+        self.assertTrue(self.allowed(c1, purpose="rollback"))
+
+    def test_multi_commit_candidate_refused_at_promotion(self):
+        self.fetch(self.author)
+        self.g(self.author, "checkout", "-q", "-B", "cand", "origin/main")
+        self.commit(self.author, "wip 1")
+        c = self.commit(self.author, "wip 2")
+        self.issue(self.author, c)
+        from t39.promote import PromotionRefused
+        with self.assertRaises(PromotionRefused):
+            self.promote(c)
+
+    def test_concurrent_promotion_second_must_rebase_and_be_rereviewed(self):
+        from t39.promote import PromotionRefused
+        a = self.candidate(self.author, "change A")
+        self.g(self.consumer, "config", "user.email", "t@e.invalid")
+        self.g(self.consumer, "config", "user.name", "T")
+        b = self.candidate(self.consumer, "change B", "b.txt")  # same base as A
+        self.promote(a)
+        with self.assertRaises(PromotionRefused):
+            self.promote(b, repo=self.consumer)                 # no longer on top of main
+        # Rebase B onto the new main: new SHA, so the old review does not carry over.
+        self.fetch(self.consumer)
+        self.g(self.consumer, "rebase", "-q", "origin/main")
+        b2 = self.g(self.consumer, "rev-parse", "HEAD")
+        self.assertNotEqual(b, b2)
+        with self.assertRaises(PromotionRefused):
+            self.promote(b2, repo=self.consumer)                # stale review
+        self.issue(self.consumer, b2)                           # re-reviewed
+        self.promote(b2, repo=self.consumer)
+        self.assertTrue(self.detect().clean)
+        self.assertTrue(self.allowed(b2))
+
+    def test_unreceipted_candidate_refused_at_promotion(self):
+        from t39.promote import PromotionRefused
+        self.fetch(self.author)
+        self.g(self.author, "checkout", "-q", "-B", "cand", "origin/main")
+        c = self.commit(self.author, "not reviewed")
+        with self.assertRaises(PromotionRefused):
+            self.promote(c)
 
 
 if __name__ == "__main__":

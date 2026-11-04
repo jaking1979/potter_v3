@@ -370,6 +370,11 @@ class ReceiptRegistry:
             self._append(log, kind, body)
         self._write(do)
 
+    def detector_events(self, branch: str) -> list[dict]:
+        """All anchored detector events for this branch, oldest first."""
+        return [e for e in _verified_log(self._anchor)
+                if e["kind"] in ("clear", "incident") and e["body"].get("branch") == branch]
+
     @staticmethod
     def _last_detector_in(log: list[dict], branch: str) -> dict | None:
         for e in reversed(log):

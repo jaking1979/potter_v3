@@ -37,35 +37,43 @@ This package holds two of the production pieces of the ratified T39 receipt gate
 - **Where the anchor lives in production.** A file is used in the tests. In production it should be on a different host from the registry, for example the Brooklyn node under T35.
 - **Wiring into the real consumers,** and the hourly detector job with its alerts and reverts.
 
-## Direct-to-main detector and deploy gate (`main_detector.py`, T39 test 1)
+## Main-branch protocol: promotion, detector, deploy gate (T39 test 1)
 
-### Merge and update policy (proposed; enforced here)
-1. **Fast-forward only.** `main` moves only by fast-forward to an exact receipted commit, whose tree equals the receipt's tree. Merge commits, squash and rebase merges are off. Because of this, the deployed commit is always the exact commit a T39 receipt covers.
-2. **Force-push or history rewrite:** any change that leaves the last anchored clear tip off `main`'s first-parent chain is an incident, even if the old tip survives as a second parent.
-3. **Direct write:** any first-parent commit that isn't receipted is an incident.
-4. **Audit trail:** every issuance, use, `clear` and `incident` is an event in the anchor log, which is authoritative, hash-chained, and written with its own credential on a separate host. Detector writes use compare-and-set on the branch's latest detector event, so a delayed or concurrent run can't record a stale clear over a newer result.
+### 1. Candidate construction and promotion (`promote.py`)
+- **One commit per change.** A change is reviewed as **one commit whose parent is the current authoritative `main` tip**: authors squash, then rebase onto `main`, before requesting review.
+- **How promotion works.** `promote()` fast-forwards `main` to exactly that receipted commit with an ordinary, non-forced push. It is refused if the candidate isn't exactly one commit on top of the authoritative tip, or has no issued receipt for its exact tree. The remote also refuses any push that isn't a fast-forward.
+- **Rebase means re-review.** Rebasing creates a new SHA with no receipt, which must be re-reviewed (T39 test 4).
+- **Concurrent promotion.** The first change wins. The second is no longer on top of `main`, so it's refused and must be rebased and re-reviewed.
 
-### Detector (`run_detector`, at least hourly)
-- **Start point and check:** it starts from the last anchored `clear` tip (or the trusted baseline), requires that tip to be on `main`'s first-parent chain, and checks every later first-parent commit against rule 1.
-- **Clean run:** anchors `clear {branch, tip, at}`.
-- **Otherwise:** anchors `incident {…, revert_plan}` and alerts. The alert is sent even if anchoring fails.
-- **No pushing:** it never pushes a revert.
+### 2. Detector (`run_detector`, at least hourly)
+- **Live main:** it reads `main` from the **authoritative remote** (`ls_remote_tip`), using objects fetched locally, never a local ref.
+- **Start point:** the last anchored `clear` tip (or the baseline) must be on the first-parent chain, or the run is refused as a force-push or rewrite.
+- **Rule:** every first-parent commit after it must be an exact receipted commit, or it's an incident. A `--no-ff` merge commit is not receipted.
+- **Recording:** it anchors `clear` or `incident`, with compare-and-set on the branch's latest detector event, and always alerts on an incident.
 
-### Deploy gate (`release_allowed`, called by every builder, updater, rollback or manual deploy)
-It is fail-closed and independent of whether any incident was recorded. It returns True **only** when all three hold:
-- (a) `main`'s **current** tip, re-read from Git, is exactly the commit being deployed;
-- (b) that commit carries an issued receipt for its exact tree;
-- (c) the latest anchored detector event is a `clear` of that commit, no older than 65 minutes and not future-dated.
+### 3. Deploy gate (`release_allowed`), called by every builder, updater, rollback or manual deploy
+It reads the tip from the **authoritative remote at call time**. If the remote is unreachable, nothing is allowed.
+- **`purpose="deploy"`:** the commit **is** the authoritative tip, carries a receipt for its exact tree, and has a fresh anchored `clear` (≤ 65 min).
+- **`purpose="rollback"`:** the commit carries an exact receipt and lies on the authoritative first-parent chain **at or before the last anchored `clear` tip**. It is allowed during an open incident, because that's the remedy.
+- **The deploy-window race:** consumers call `deploy` again *after* deploying. If it now fails, `main` moved during the window, and they roll back to the last cleared commit with `rollback`. That leaves an exposure window of one deploy duration, which is detected and remedied rather than eliminated. Fencing the remote ref itself would require the protected-branch setting.
 
-Once `main` moves to an unreceipted commit, every earlier clear is void because (a) fails, even if the incident append failed and even after the append service recovers.
+### 4. Audit trail
+Every issuance, use, `clear` and `incident` is an event in the authoritative anchor log.
 
-### Tests (`tests/test_t39_main_detector.py`, 20)
-- **Clean path:** a fast-forward is clean and deployable, and so is fast-forward merging a reviewed branch.
-- **Gate timing:** a push after clearance voids the old clear; the clearance expires, and a future-dated one is refused.
-- **Dolores's exact sequence:** clear C, push an unreceipted D, the incident append fails. Both C and D are refused, before and after the append service recovers.
-- **Stale writes:** stale and out-of-order detector writes are refused by the compare-and-set.
-- **Receipts:** a clear without a receipt doesn't permit a deploy; a `--no-ff` merge commit is an incident.
-- **Incidents and rewrites:** a direct push is an incident and not deployable; unreviewed intermediate commits are incidents; a second-parent-only checkpoint is refused as a rewrite; a history reset fails loud.
-- **Anchor and registry failures:** anchor failures on clean and incident runs, and an unavailable registry, all leave deploys refused.
-- **Tampering and environment:** a DB-forged receipt and a tampered anchor are both handled; a wrong git dir is refused; `GIT_DIR` is ignored.
-- **Mutation checks:** removing the current-tip check, the exact-commit receipt check, or the detector compare-and-set each fails a test.
+### Tests (`tests/test_t39_main_detector.py`, 29)
+**Logic tests, against a scratch repo acting as the authority (20):**
+- **Gate timing:** fast-forward clean and deployable; a push after clearance voids the clear; expiry and future-dated clears refused; prior clear followed by an unrecorded incident, with recovery.
+- **Recording and receipts:** compare-and-set on stale and out-of-order writes; clear-without-receipt refused; a `--no-ff` merge is an incident.
+- **Incidents and rewrites:** intermediate commits; a second-parent rewrite; a reset.
+- **Failure modes:** anchor and registry failures; a forged DB; a tampered anchor; a wrong git dir; `GIT_DIR` ignored.
+
+**End-to-end, with a bare remote plus separate author and consumer clones (9):**
+- **Stale and unreachable remote:** a stale consumer ref can't deploy after the remote advances; an unreachable remote refuses everything.
+- **Deploy race:** the post-deploy recheck catches the race, and the rollback is allowed.
+- **Rollback rules:** rollback to an older cleared release works; rollback during an incident works; rollback to an unreceipted, off-mainline, or beyond-last-clear commit is refused.
+- **Promotion:** a multi-commit candidate is refused; an unreceipted candidate is refused; in a concurrent promotion the second change must rebase, its stale review is refused, and it passes once re-reviewed.
+
+**Mutation checks:**
+- reading the local `origin/main` instead of the remote fails 6 tests;
+- dropping the rollback ordering fails 1;
+- dropping the one-commit promotion rule fails 1.
