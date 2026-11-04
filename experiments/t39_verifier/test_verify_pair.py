@@ -2,8 +2,11 @@ import json
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from verify_pair import verify_pair, _key
+from t39.consumer_gate import admit_merge, require_issued, Refused
+from t39.receipt_registry import FileAnchor, ReceiptRegistry
 
 
 class VerificationTests(unittest.TestCase):
@@ -73,6 +76,44 @@ class VerificationTests(unittest.TestCase):
         self.payloads.reverse()
         self.payloads[1] = self.payload('reviewer', 'f' * 64)
         with self.assertRaises(ValueError): self.verify(agent_keys={'claude': self.keys['dolores'], 'dolores': self.keys['claude']})
+
+    def test_registry_lifecycle_with_real_signed_pair_and_replay(self):
+        """Scratch-only composition, not proof of trusted provenance or deployment."""
+        anchor = FileAnchor(self.root / 'anchor.jsonl')
+        stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        registry = ReceiptRegistry.initialize(self.root / 'registry.sqlite', anchor, 'test', stamp)
+        self.addCleanup(registry.close)
+        receipt = tuple(zip(self.payloads, self.sigs))
+        def verifier(pair):
+            return verify_pair(pair[0][0], pair[0][1], pair[1][0], pair[1][1], **self.kw)
+        common = dict(commit=self.expected['commit'], tree=self.expected['tree'],
+                      load_receipt=lambda _: receipt, verify=verifier, registry=registry, now=stamp)
+        admit_merge(**common, issuer='ci')
+        for consumer in ('ci', 'builder', 'host', 'rollback'):
+            with self.subTest(consumer=consumer):
+                require_issued(**common, consumer=consumer, purpose='deploy', on_main=True)
+        self.kw['revoked_fingerprints'] = {_key(self.keys['claude'])}
+        with self.assertRaises(Refused):
+            require_issued(**common, consumer='host', purpose='deploy', on_main=True)
+
+    def test_signed_distinct_candidate_reusing_nonce_is_rejected(self):
+        anchor = FileAnchor(self.root / 'replay-anchor.jsonl')
+        stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        registry = ReceiptRegistry.initialize(self.root / 'replay.sqlite', anchor, 'test', stamp)
+        self.addCleanup(registry.close)
+        def verifier(pair):
+            return verify_pair(pair[0][0], pair[0][1], pair[1][0], pair[1][1], **self.kw)
+        receipt = tuple(zip(self.payloads, self.sigs))
+        admit_merge(commit=self.expected['commit'], tree=self.expected['tree'], load_receipt=lambda _: receipt,
+                    verify=verifier, registry=registry, issuer='ci', now=stamp)
+        self.expected = dict(self.expected, commit='9' * 40)
+        self.kw['expected'] = self.expected
+        payloads = [self.payload('author', 'e' * 64), self.payload('reviewer', '1' * 64)]
+        signatures = [self.sign(payloads[0], 'dolores', 'replay-a'), self.sign(payloads[1], 'claude', 'replay-b')]
+        replay = tuple(zip(payloads, signatures))
+        with self.assertRaises(Refused):
+            admit_merge(commit=self.expected['commit'], tree=self.expected['tree'], load_receipt=lambda _: replay,
+                        verify=verifier, registry=registry, issuer='ci', now=stamp)
 
 
 if __name__ == '__main__':
