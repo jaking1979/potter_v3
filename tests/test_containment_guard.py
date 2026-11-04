@@ -288,6 +288,17 @@ class GuardInPathLevel3(unittest.TestCase):
         self.assertEqual(stub.open_order_ids(), ["o1"])
         self.assertTrue(broker.kill_switch_engaged())
 
+    def test_cancels_survive_undecodable_mandate_and_broken_account(self):
+        # Codex P2 on 2945fa4: invalid UTF-8 in the mandate must not block cancels.
+        self.mandate.write_bytes(b"\xff\xfe")
+        def boom():
+            raise RuntimeError("api down")
+        broker = GuardedBroker(self.stub, self.mandate, self.kill, self.audit, boom)
+        with self.assertRaises(PermissionError):
+            broker.call("place_equity_order", order())
+        self.assertEqual(broker.engage_kill_switch("test"), ["o1", "o2"])
+        self.assertEqual(self.stub.open_order_ids(), [])
+
     def test_kill_switch_cancels_open_orders_then_blocks_new_ones(self):
         cancelled = self.broker.engage_kill_switch("test")
         self.assertEqual(cancelled, ["o1", "o2"])

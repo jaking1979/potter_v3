@@ -86,7 +86,7 @@ class GuardedBroker:
         # Re-read on every call: an edited or deleted mandate takes effect at once.
         try:
             return load_mandate(self._mandate_path)
-        except MandateError:
+        except Exception:  # any failure to load is "no valid mandate": refuse orders
             return None
 
     def kill_switch_engaged(self) -> bool:
@@ -115,6 +115,15 @@ class GuardedBroker:
 
     def call(self, tool: str, args: object) -> object:
         name = tool[len(SERVER_PREFIX):] if tool.startswith(SERVER_PREFIX) else tool
+        if name.startswith(order_guard.CANCEL_PREFIX):
+            # Cancels never depend on the mandate, account state or audit file:
+            # the kill switch must work when those are broken.
+            decision = order_guard.check(name, args, None, None, True)
+            try:
+                self._audit(decision, args)
+            except Exception:
+                pass
+            return self._backend.invoke(name, args)
         with self._lock:
             account = self._effective_account()
             decision = order_guard.check(

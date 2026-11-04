@@ -70,7 +70,7 @@ def parse_mandate(data: object) -> Mandate:
 def load_mandate(path: Path) -> Mandate:
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise MandateError("mandate file unreadable") from exc
     try:
         # JSON floats become None so _money rejects them; amounts must be strings.

@@ -12,6 +12,7 @@ This is the offline half of the A1 containment proposal, posted on the Build Exe
 ## Negative tests in this package
 - **Level 1** (`tests/test_containment_guard.py::GuardLevel1`): 20 refusal cases, an in-mandate positive control, and an exact ceiling boundary.
 - **Level 3** (`GuardInPathLevel3`): refused calls never reach the stub, and every attempt is audited. The positive control does reach the stub. A corrupt or deleted mandate refuses at once, as does an exception in the account lookup. The kill switch cancels open orders and then blocks.
+- **Open orders and concurrency** (from Codex review): unfilled buys count against the position and ceiling limits, and unfilled sells against holdings. Each forwarded order is reserved until the account reports it. Of 4 concurrent orders that can't all fit, 1 is forwarded and 3 are blocked. The kill switch tries every cancel even if some fail. Cancels work even when the mandate or account state is broken.
 - **Mutation check, done locally:** disabling the instrument check makes 2 tests fail, and disabling the guard's refusal makes 4 fail.
 
 ## Not done here (needs host access and Josh's go — see the PLAN)
