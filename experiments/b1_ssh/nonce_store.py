@@ -19,18 +19,14 @@ def prepare(connection):
     connection.commit()
 
 
+def _validate(nonces, binding):
+    """Validate the shared nonce-pair and exact candidate-binding boundary."""
+    _validate(nonces, binding)
+
+
 def consume_pair(connection, nonces, binding):
     """Atomically record both nonces; reject invalid or previously used inputs."""
-    if (not isinstance(nonces, tuple) or len(nonces) != 2
-            or any(not isinstance(x, str) or not _HEX64.fullmatch(x) for x in nonces)
-            or nonces[0] == nonces[1]):
-        raise ValueError('two distinct nonce hashes required')
-    if (not isinstance(binding, dict) or set(binding) != {'commit', 'tree', 'receipt_hash'}
-            or any(not isinstance(binding[k], str) or not _HEX40.fullmatch(binding[k])
-                   for k in ('commit', 'tree'))
-            or not isinstance(binding['receipt_hash'], str)
-            or not _HEX64.fullmatch(binding['receipt_hash'])):
-        raise ValueError('candidate and receipt binding required')
+    _validate(nonces, binding)
     if connection.in_transaction:
         raise ValueError('caller transaction must be closed')
     try:
