@@ -35,6 +35,12 @@ class CandidateTests(unittest.TestCase):
         subdir.mkdir()
         with self.assertRaises(ValueError):
             candidate_facts(subdir, self.commit, b'evidence')
+    def test_symlinked_git_directory_is_refused(self):
+        other = self.repo / 'other'
+        other.mkdir()
+        (other / '.git').symlink_to(self.repo / '.git', target_is_directory=True)
+        with self.assertRaises(ValueError):
+            candidate_facts(other, self.commit, b'evidence')
     def test_new_commit_changes_binding(self):
         before = candidate_facts(self.repo, self.commit, b'evidence')
         self.manifest.write_text('new')
