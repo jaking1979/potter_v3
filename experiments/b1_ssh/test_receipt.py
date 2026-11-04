@@ -3,6 +3,8 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+import receipt as receipt_module
 from pathlib import Path
 
 from claims import SCHEMA, attestation_bytes
@@ -101,6 +103,29 @@ class ReceiptCompositionTests(unittest.TestCase):
         self.assertEqual(agents["reviewer"], "dolores")
         self.assertEqual(receipt["agents"], {"author": "dolores", "reviewer": "claude"})
         self.assertEqual(len(self.consumed), 2)
+
+    def test_candidate_mutation_between_claims_cannot_mix_two_candidates(self):
+        expected = dict(self.expected)
+        author_payload, author_sig = self._attestation('author', 'd' * 64)
+        alternate = {**expected, 'commit': '1' * 40}
+        self.expected = alternate
+        reviewer_payload, reviewer_sig = self._attestation('reviewer', 'e' * 64)
+        self.expected = expected
+        original_claims = receipt_module._claims
+
+        def mutate_between_checks(payload, bound, now, lifetime, role):
+            result = original_claims(payload, bound, now, lifetime, role)
+            if role == 'author':
+                expected['commit'] = alternate['commit']
+            return result
+
+        with patch('receipt._claims', side_effect=mutate_between_checks):
+            with self.assertRaises(ValueError):
+                self._call(author_payload=author_payload, author_signature=author_sig,
+                           reviewer_payload=reviewer_payload, reviewer_signature=reviewer_sig,
+                           expected=expected)
+        self.assertEqual(expected['commit'], alternate['commit'])
+        self.assertEqual(self.consumed, set())
 
     def test_replay_refuses_without_partial_consumption(self):
         self._call()
