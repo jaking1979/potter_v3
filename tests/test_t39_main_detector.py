@@ -73,8 +73,8 @@ class Detector(unittest.TestCase):
                             alert=self.alerts.append, now=now)
 
     def allowed(self, commit, now=NOW):
-        return release_allowed(registry_open=self.open_reg, branch="main", commit=commit,
-                               now=now)
+        return release_allowed(git_dir=self.repo / ".git", registry_open=self.open_reg,
+                               branch="main", commit=commit, now=now)
 
     # --- clean paths and the deploy gate ------------------------------------
 
@@ -91,7 +91,65 @@ class Detector(unittest.TestCase):
         self.run_it()
         later = self.commit_file("pushed after the run")
         self.assertFalse(self.allowed(later))           # never deployable between runs
-        self.assertTrue(self.allowed(c))                # (old tip still cleared)
+        self.assertFalse(self.allowed(c))               # main moved: old clear is void
+
+    def test_prior_clear_then_unrecorded_incident_stays_blocked(self):
+        # Dolores review on 54cacc9: clear C, push unreceipted D, incident append fails.
+        c = self.commit_file("reviewed")
+        self.issue(c)
+        self.assertTrue(self.run_it().clean)
+        self.assertTrue(self.allowed(c))
+        d = self.commit_file("direct push")
+        self.anchor.fail = True
+        r = self.run_it()
+        self.assertEqual(r.unreceipted, [d])
+        self.assertIn("NOT anchored", self.alerts[-1])
+        self.assertFalse(self.allowed(c))               # without any recorded incident
+        self.assertFalse(self.allowed(d))
+        self.anchor.fail = False                        # append service recovers
+        self.assertFalse(self.allowed(c))
+        self.assertFalse(self.allowed(d))
+        self.run_it()
+        self.assertFalse(self.allowed(d))
+        self.assertEqual(self.open_reg().last_detector_event("main")["kind"], "incident")
+
+    def test_stale_or_concurrent_detector_write_is_refused(self):
+        from t39.receipt_registry import RegistryUnavailable
+        c = self.commit_file("reviewed")
+        self.issue(c)
+        reg = self.open_reg()
+        stale_seq = None                                # a run that started before any result
+        self.run_it()                                   # a newer run records 'clear'
+        with self.assertRaises(RegistryUnavailable):    # the delayed run cannot append
+            reg.record_detector("clear", {"branch": "main", "tip": c,
+                                          "at": NOW.isoformat()}, stale_seq)
+        reg.close()
+
+    def test_out_of_order_run_cannot_clear_over_incident(self):
+        from t39.receipt_registry import RegistryUnavailable
+        c = self.commit_file("reviewed")
+        self.issue(c)
+        self.run_it()
+        reg = self.open_reg()
+        seq_after_clear = reg.last_detector_event("main")["seq"]
+        reg.close()
+        d = self.commit_file("direct push")
+        self.run_it()                                   # newer run records the incident
+        reg = self.open_reg()
+        with self.assertRaises(RegistryUnavailable):    # a delayed run that saw only C
+            reg.record_detector("clear", {"branch": "main", "tip": c,
+                                          "at": NOW.isoformat()}, seq_after_clear)
+        reg.close()
+        self.assertFalse(self.allowed(c))
+        self.assertFalse(self.allowed(d))
+
+    def test_deploy_requires_receipt_for_exact_commit(self):
+        c = self.commit_file("unreceipted")
+        reg = self.open_reg()                           # even a recorded clear is not enough
+        reg.record_detector("clear", {"branch": "main", "tip": c, "at": NOW.isoformat()},
+                            None)
+        reg.close()
+        self.assertFalse(self.allowed(c))
 
     def test_clearance_expires(self):
         c = self.commit_file("reviewed")
@@ -101,13 +159,24 @@ class Detector(unittest.TestCase):
         self.assertFalse(self.allowed(c, NOW + timedelta(minutes=66)))
         self.assertFalse(self.allowed(c, NOW - timedelta(minutes=10)))   # future clearance
 
-    def test_merge_commit_with_reviewed_tree_is_clean(self):
+    def test_no_ff_merge_commit_is_not_itself_receipted(self):
+        # Fast-forward-only policy: the merge commit has no receipt of its own.
         self.git("checkout", "-qb", "feature")
         self.issue(self.commit_file("feature work"))
         self.git("checkout", "-q", "main")
         self.git("merge", "-q", "--no-ff", "-m", "merge", "feature")
+        merge = self.head()
+        self.assertEqual(self.run_it().unreceipted, [merge])
+        self.assertFalse(self.allowed(merge))
+
+    def test_fast_forward_merge_of_reviewed_branch_is_clean(self):
+        self.git("checkout", "-qb", "feature")
+        f = self.commit_file("feature work")
+        self.issue(f)
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--ff-only", "feature")
         self.assertTrue(self.run_it().clean)
-        self.assertTrue(self.allowed(self.head()))
+        self.assertTrue(self.allowed(f))
 
     # --- incidents -----------------------------------------------------------
 
@@ -119,16 +188,6 @@ class Detector(unittest.TestCase):
         self.assertIn("SECURITY INCIDENT", self.alerts[0])
         self.assertFalse(self.allowed(bad))
         self.assertEqual(self.run_it().unreceipted, [bad])   # keeps reporting
-
-    def test_merge_commit_with_changed_tree_is_incident(self):
-        self.git("checkout", "-qb", "feature")
-        self.issue(self.commit_file("feature work"))
-        self.git("checkout", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "--no-commit", "feature")
-        (self.repo / "extra.txt").write_text("sneaked in")
-        self.git("add", ".")
-        self.git("commit", "-qm", "merge plus extra")
-        self.assertEqual(self.run_it().unreceipted, [self.head()])
 
     def test_unreviewed_intermediate_first_parent_commits_are_incidents(self):
         a = self.commit_file("a")

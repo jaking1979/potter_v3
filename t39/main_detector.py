@@ -15,21 +15,26 @@ cannot fake it:
      * that start point to lie ON main's first-parent chain. Mere ancestry is
        not enough: a rewritten mainline that keeps the old tip only as a
        merge's second parent is a rewrite (Dolores review on 68c925b);
-     * every first-parent commit after it to be accounted for by an issued
-       receipt: either the receipted commit itself, or a merge whose second
-       parent is receipted and whose tree equals that receipt's tree.
+     * every first-parent commit after it to BE a receipted commit. main moves
+       only by fast-forward to exactly reviewed commits, so the deployed commit
+       is always the exact commit a T39 receipt covers (Dolores review on
+       54cacc9: a --no-ff merge commit is not itself receipted).
    A clean run anchors a 'clear' event {branch, tip, at}. Anything else
    anchors an 'incident' and alerts. The alert is attempted even if anchoring
    fails, and the run then still reports failure.
 
 2. `release_allowed` (every consumer, before build, deploy, update or
-   rollback). It returns True ONLY when the latest anchored detector event for
-   the branch is a 'clear' whose tip is exactly the commit being deployed and
-   whose time is within MAX_CLEARANCE_AGE. A missing, stale, unreadable or
-   incident state refuses. So a commit pushed after the last clean run is not
-   deployable until the detector has cleared it ("never deployable between
-   runs"), and losing a block file can no longer unblock anything: the
-   positive clearance is what is required.
+   rollback). It independently re-reads main's CURRENT tip from Git and returns
+   True ONLY when (a) that tip is exactly the commit being deployed, (b) that
+   commit has an issued receipt, and (c) the latest anchored detector event
+   for the branch is a 'clear' of that same commit within MAX_CLEARANCE_AGE.
+   It does not depend on an incident having been recorded: once main moves to
+   an unreceipted commit, every earlier clear is useless because (a) fails,
+   and the new tip fails (b) and (c). Missing, stale, unreadable or incident
+   state refuses.
+
+Detector writes are compare-and-set on the branch's latest detector event, so
+a delayed or concurrent run cannot append a stale clear after a newer result.
 
 It never pushes a revert; the revert plan goes into the incident and alert.
 """
@@ -93,6 +98,7 @@ def run_detector(*, git_dir: Path, branch: str, baseline: str,
         registry = registry_open()
         try:
             last = registry.last_detector_event(branch)
+            last_seq = None if last is None else last["seq"]
             start = baseline
             if last is not None and last["kind"] == "clear":
                 start = last["body"]["tip"]
@@ -105,29 +111,21 @@ def run_detector(*, git_dir: Path, branch: str, baseline: str,
                 raise DetectorError("last clean tip is not on main's first-parent chain "
                                     "(force-push or history rewrite)")
             commits = mainline[:mainline.index(start)][::-1]   # oldest first, after start
-            parents, trees = {}, {}
-            for c in commits:
-                parents[c] = _git(git_dir, "rev-list", "--parents", "-n", "1", c).split()[1:]
-                trees[c] = _git(git_dir, "rev-parse", f"{c}^{{tree}}").strip()
-            candidates = sorted(set(commits) |
-                                {p[1] for p in parents.values() if len(p) == 2})
-            issued = registry.issued_trees(candidates) if candidates else {}
-
+            issued = registry.issued_trees(commits) if commits else {}
             report = Report(checked=commits)
             for c in commits:
-                p = parents[c]
-                ok = c in issued or (len(p) == 2 and p[1] in issued and issued[p[1]] == trees[c])
-                if not ok:
+                tree = _git(git_dir, "rev-parse", f"{c}^{{tree}}").strip()
+                if issued.get(c) != tree:          # exact receipted commit and tree
                     report.unreceipted.append(c)
             if report.unreceipted:
                 report.revert_plan = list(reversed(report.unreceipted))
-                _incident(registry, report, alert, branch, tip, start, now,
+                _incident(registry, report, alert, branch, tip, start, now, last_seq,
                           f"T39 SECURITY INCIDENT: {len(report.unreceipted)} unreceipted "
                           f"commit(s) on {branch}; revert {report.revert_plan}")
                 return report
             try:
                 registry.record_detector("clear", {"branch": branch, "tip": tip,
-                                                   "at": now.isoformat()})
+                                                   "at": now.isoformat()}, last_seq)
             except Exception as exc:
                 report.anchor_error = f"{type(exc).__name__}: {exc}"
                 alert(f"T39 detector could not anchor clearance for {branch}; "
@@ -140,7 +138,9 @@ def run_detector(*, git_dir: Path, branch: str, baseline: str,
         try:
             registry = registry_open()
             try:
+                prev = registry.last_detector_event(branch)
                 _incident(registry, report, alert, branch, tip or "", baseline, now,
+                          None if prev is None else prev["seq"],
                           f"T39 detector FAILED on {branch}: {report.error}")
             finally:
                 registry.close()
@@ -152,13 +152,14 @@ def run_detector(*, git_dir: Path, branch: str, baseline: str,
 
 
 def _incident(registry: ReceiptRegistry, report: Report, alert: Callable[[str], None],
-              branch: str, tip: str, start: str, now: datetime, message: str) -> None:
+              branch: str, tip: str, start: str, now: datetime, last_seq: int | None,
+              message: str) -> None:
     """Anchor the incident and alert, independently of each other."""
     try:
         registry.record_detector("incident", {
             "branch": branch, "tip": tip, "from": start, "at": now.isoformat(),
             "unreceipted": report.unreceipted, "revert_plan": report.revert_plan,
-            "error": report.error})
+            "error": report.error}, last_seq)
     except Exception as exc:
         report.anchor_error = f"{type(exc).__name__}: {exc}"
     alert(message + ("" if report.anchor_error is None
@@ -166,15 +167,26 @@ def _incident(registry: ReceiptRegistry, report: Report, alert: Callable[[str], 
           + "; deploys refused")
 
 
-def release_allowed(*, registry_open: Callable[[], ReceiptRegistry], branch: str,
-                    commit: str, now: datetime,
+def release_allowed(*, git_dir: Path, registry_open: Callable[[], ReceiptRegistry],
+                    branch: str, commit: str, now: datetime,
                     max_age: timedelta = MAX_CLEARANCE_AGE) -> bool:
-    """Fail closed: True only for a fresh anchored 'clear' of exactly this commit."""
+    """Fail closed: main's current tip IS this commit, it is receipted, and it
+    has a fresh anchored clear. Never relies on an incident having been recorded."""
     try:
-        if not _HEX40.fullmatch(commit):
+        if not _HEX40.fullmatch(commit) or ".." in branch:
             return False
+        git_dir = Path(git_dir).resolve()
+        if Path(_git(git_dir, "rev-parse", "--absolute-git-dir").strip()) != git_dir:
+            return False
+        current = _git(git_dir, "rev-parse", "--verify",
+                       f"refs/heads/{branch}^{{commit}}").strip()
+        if current != commit:
+            return False                    # main moved: earlier clears are void
+        tree = _git(git_dir, "rev-parse", f"{commit}^{{tree}}").strip()
         registry = registry_open()
         try:
+            if registry.issued_trees([commit]).get(commit) != tree:
+                return False                # the exact commit must carry a receipt
             last = registry.last_detector_event(branch)
         finally:
             registry.close()

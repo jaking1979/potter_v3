@@ -40,28 +40,32 @@ This package holds two of the production pieces of the ratified T39 receipt gate
 ## Direct-to-main detector and deploy gate (`main_detector.py`, T39 test 1)
 
 ### Merge and update policy (proposed; enforced here)
-1. `main` moves only by (a) a fast-forward to an exact receipted commit, or (b) a `--no-ff` merge whose second parent is receipted and whose tree equals that receipt's tree. Squash and rebase merges are off.
-2. **A force-push or history rewrite** is anything that leaves the last anchored clear tip off `main`'s first-parent chain. That is an incident, even if the old tip survives as a second parent and every new commit happens to be receipted.
-3. **A direct write**, meaning any first-parent commit not covered by rule 1, is an incident.
-4. **Audit trail:** every issuance, use, `clear` and `incident` is an event in the anchor log, which is authoritative, hash-chained, and written with its own credential on a separate host. The log *is* the audit trail; a database-only writer cannot add to it or hide from it.
+1. **Fast-forward only.** `main` moves only by fast-forward to an exact receipted commit, whose tree equals the receipt's tree. Merge commits, squash and rebase merges are off. Because of this, the deployed commit is always the exact commit a T39 receipt covers.
+2. **Force-push or history rewrite:** any change that leaves the last anchored clear tip off `main`'s first-parent chain is an incident, even if the old tip survives as a second parent.
+3. **Direct write:** any first-parent commit that isn't receipted is an incident.
+4. **Audit trail:** every issuance, use, `clear` and `incident` is an event in the anchor log, which is authoritative, hash-chained, and written with its own credential on a separate host. Detector writes use compare-and-set on the branch's latest detector event, so a delayed or concurrent run can't record a stale clear over a newer result.
 
 ### Detector (`run_detector`, at least hourly)
-- **Start point:** it starts from the last anchored `clear` tip (or the trusted baseline) and requires that tip to be on `main`'s first-parent chain.
-- **Check:** every first-parent commit after it is checked against rule 1, reading issued receipts from the anchor log.
+- **Start point and check:** it starts from the last anchored `clear` tip (or the trusted baseline), requires that tip to be on `main`'s first-parent chain, and checks every later first-parent commit against rule 1.
 - **Clean run:** anchors `clear {branch, tip, at}`.
-- **Otherwise:** anchors `incident {branch, tip, from, unreceipted, revert_plan, error}` and alerts. The alert is sent even if anchoring fails, and the run is then still not clean.
+- **Otherwise:** anchors `incident {…, revert_plan}` and alerts. The alert is sent even if anchoring fails.
 - **No pushing:** it never pushes a revert.
 
 ### Deploy gate (`release_allowed`, called by every builder, updater, rollback or manual deploy)
-- **Fails closed:** it returns True **only** if the latest anchored detector event for the branch is a `clear` of **exactly the commit being deployed**, no older than 65 minutes, and not from the future.
-- **Refusals:** a missing, stale, incident, unreadable or tampered state refuses. A commit pushed after the last clean run is therefore not deployable until the detector clears it. No block file exists whose absence could unblock a deploy.
+It is fail-closed and independent of whether any incident was recorded. It returns True **only** when all three hold:
+- (a) `main`'s **current** tip, re-read from Git, is exactly the commit being deployed;
+- (b) that commit carries an issued receipt for its exact tree;
+- (c) the latest anchored detector event is a `clear` of that commit, no older than 65 minutes and not future-dated.
 
-### Tests (`tests/test_t39_main_detector.py`, 16)
-- **Clean path:** a fast-forward is clean and then deployable.
-- **Gate timing:** a push after clearance isn't deployable; the clearance expires, and a future-dated one is refused.
-- **Merges:** a merge with the reviewed tree is clean; a merge with an extra file is an incident.
-- **Incidents:** a direct push is an incident, isn't deployable, and keeps being reported; unreviewed intermediate commits are incidents.
-- **Rewrites:** **a checkpoint that survives only as a second parent is refused as a rewrite**; a history reset fails loud.
-- **Anchor unreachable:** on a clean run, deploys stay refused; on an incident, the alert still goes out and deploys are refused.
-- **Tampering and environment:** an unavailable registry fails loud; a DB-only forged receipt doesn't hide a push; a tampered anchor fails loud; a wrong git dir is refused; an inherited `GIT_DIR` is ignored.
-- **Mutation checks:** removing the first-parent check, the exact-tip check, or the freshness check each makes a test fail.
+Once `main` moves to an unreceipted commit, every earlier clear is void because (a) fails, even if the incident append failed and even after the append service recovers.
+
+### Tests (`tests/test_t39_main_detector.py`, 20)
+- **Clean path:** a fast-forward is clean and deployable, and so is fast-forward merging a reviewed branch.
+- **Gate timing:** a push after clearance voids the old clear; the clearance expires, and a future-dated one is refused.
+- **Dolores's exact sequence:** clear C, push an unreceipted D, the incident append fails. Both C and D are refused, before and after the append service recovers.
+- **Stale writes:** stale and out-of-order detector writes are refused by the compare-and-set.
+- **Receipts:** a clear without a receipt doesn't permit a deploy; a `--no-ff` merge commit is an incident.
+- **Incidents and rewrites:** a direct push is an incident and not deployable; unreviewed intermediate commits are incidents; a second-parent-only checkpoint is refused as a rewrite; a history reset fails loud.
+- **Anchor and registry failures:** anchor failures on clean and incident runs, and an unavailable registry, all leave deploys refused.
+- **Tampering and environment:** a DB-forged receipt and a tampered anchor are both handled; a wrong git dir is refused; `GIT_DIR` is ignored.
+- **Mutation checks:** removing the current-tip check, the exact-commit receipt check, or the detector compare-and-set each fails a test.

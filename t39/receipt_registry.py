@@ -350,21 +350,36 @@ class ReceiptRegistry:
                                       "purpose": purpose, "at": now.isoformat()})
         self._write(do)
 
-    def record_detector(self, kind: str, body: dict) -> None:
-        """Anchor a detector outcome: 'clear' (branch, tip) or 'incident'."""
+    def record_detector(self, kind: str, body: dict, expect_last_seq: int | None) -> None:
+        """Anchor a detector outcome: 'clear' (branch, tip) or 'incident'.
+
+        Compare-and-set on the branch's latest detector event: refused if any
+        newer detector event exists than the one this run started from, so a
+        delayed or concurrent run cannot append a stale clear over an incident.
+        """
         if kind not in ("clear", "incident"):
             raise ValueError("detector events are 'clear' or 'incident'")
         if not (isinstance(body.get("branch"), str) and isinstance(body.get("tip"), str)
                 and isinstance(body.get("at"), str)):
             raise ValueError("detector event needs branch, tip and at")
-        self._write(lambda log: self._append(log, kind, body))
 
-    def last_detector_event(self, branch: str) -> dict | None:
-        """Latest anchored 'clear' or 'incident' for this branch, from the anchor log."""
-        for e in reversed(_verified_log(self._anchor)):
+        def do(log):
+            last = self._last_detector_in(log, body["branch"])
+            if (None if last is None else last["seq"]) != expect_last_seq:
+                raise RegistryUnavailable("a newer detector result exists; rerun")
+            self._append(log, kind, body)
+        self._write(do)
+
+    @staticmethod
+    def _last_detector_in(log: list[dict], branch: str) -> dict | None:
+        for e in reversed(log):
             if e["kind"] in ("clear", "incident") and e["body"].get("branch") == branch:
                 return e
         return None
+
+    def last_detector_event(self, branch: str) -> dict | None:
+        """Latest anchored 'clear' or 'incident' for this branch, from the anchor log."""
+        return self._last_detector_in(_verified_log(self._anchor), branch)
 
     # ---- reads: answered from the verified anchor log only --------------------
 
