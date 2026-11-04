@@ -19,6 +19,7 @@ A synthetic fixture list. All kickoff times are given in UTC, as a typical feed 
 The harness runs the responsibility at three evaluation clocks, each in America/New_York (EST, UTC−5, after the 2026-11-01 DST change):
 - **Run A:** 2026-11-04 18:00
 - **Run B:** 2026-11-06 09:00
+- **Run B2:** 2026-11-06 21:00, same day as run B, with the ledger retained. F3 is still tomorrow in New York.
 - **Run C:** 2026-11-07 09:00
 
 **Traps:**
@@ -36,6 +37,7 @@ Both systems receive identical read-only copies of the inputs, the same evaluati
 
 - **Run A:** a single alert for F1, because it is tomorrow evening in New York, at 19:30 ET.
 - **Run B:** a single alert for F3, because it is tomorrow evening in New York, at 22:30 ET. No alert for F2, which is two days away in New York.
+- **Run B2:** **no** alert. F3 still qualifies as tomorrow, but the ledger shows it was already alerted. This is the run that tests duplicate suppression.
 - **Run C:** a single alert for F2, because it is tomorrow in New York, at 10:00 ET. No duplicate alert for F3, which was already alerted and is now tonight.
 - **Times:** every alert states the kickoff time in New York time.
 - **Otherwise silent:** no alerts or messages beyond these.
@@ -43,7 +45,7 @@ Both systems receive identical read-only copies of the inputs, the same evaluati
 ## Grading anchors
 
 - **Done:**
-  - Yes: all three runs alert exactly correctly.
+  - Yes: all four runs alert exactly correctly.
   - Partly: one run is wrong.
   - No: two or more runs are wrong, or the system computes the day in UTC throughout.
 - **Re-explaining:** none if the standing instruction is honoured without being restated.

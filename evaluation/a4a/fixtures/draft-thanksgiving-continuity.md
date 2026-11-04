@@ -16,12 +16,27 @@ Session 2, five days after session 1: "OK, where are we on Thanksgiving? What's 
   - Dessert is flan, which the host will make two days ahead.
   - The host says "remind me to order the saffron by Friday."
   - The open question "do we need a second oven?" is left unresolved.
-- **Memory condition:** a scratch memory store holds whatever the system wrote during session 1.
-- **No-memory ablation:** the same session-2 prompt runs with the memory store empty. This is the ratified memory/no-memory ablation.
+- **Canary:** the session-1 transcript contains the canary phrase `saffron-canary-7Q` in the host's saffron remark.
+
+## Access by session and arm
+
+| | Session 1 | Session 2, memory arm | Session 2, no-memory arm |
+|---|---|---|---|
+| Session-1 conversation | Live conversation (identical script for both systems) | **Not available**: fresh conversational context | **Not available**: fresh conversational context |
+| Session-1 transcript file | n/a | **Not mounted** | **Not mounted** |
+| Persisted memory store | Writable scratch store | Exactly what *this* system wrote in session 1, read-only | **Empty** |
+
+**Preflight access test (before session 2, for each system and arm):**
+- The harness asserts that the transcript path and the session-1 conversation ID can't be resolved from the session-2 sandbox.
+- In the no-memory arm, it also asserts the store is empty.
+
+**Run validity:**
+- A no-memory output containing the canary, or any decision recorded only in session 1, invalidates that run.
+- A memory-arm output containing the canary is valid only if the store holds it.
 
 ## Safe evaluation
 
-Both systems receive identical read-only copies of the inputs, the same evaluation clock and a scratch workspace. The harness captures any simulated message, reminder or file change as output. Real external messages, network calls, purchases, schedule changes and writes outside scratch are denied. Reset scratch state before each system. Do not assert that these restrictions work until an executable negative test demonstrates them.
+Both systems receive identical read-only copies of the inputs available to their session and arm (above), the same evaluation clock and a scratch workspace. The harness captures any simulated message, reminder or file change as output. Real external messages, network calls, purchases, schedule changes and writes outside scratch are denied. Reset scratch state before each system; within one system, only its memory store carries from session 1 into its session-2 memory arm. Do not assert that these restrictions work until an executable negative test demonstrates them.
 
 ## Expected behavior
 

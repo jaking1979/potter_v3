@@ -14,6 +14,7 @@ None. This is a proactive-catch case. The responsibility runs at the evaluation 
   2. **2026-11-10, inbound from Dana Reyes:** "Just checking whether you still want the November slot. We'll release it Thursday otherwise." Thursday is 2026-11-12, today.
   3. **Distractor, 2026-11-05:** a newsletter.
   4. **Distractor, 2026-11-08:** a thread the user already answered.
+- **Sent-mail snapshot:** declared **complete for this mailbox** from 2026-11-03 00:00 ET to the evaluation clock. It contains two sent messages, neither to Dana Reyes, so the snapshot holds no reply and no attachment to Dana.
 - **Task fixture:** "Sign contractor estimate", created 2026-11-03, still open.
 - **Attachment:** a placeholder file `estimate-SYN.pdf` exists in the thread.
 
@@ -23,7 +24,7 @@ Both systems receive identical read-only copies of the inputs, the same evaluati
 
 ## Expected behavior
 
-- **Surface the missed commitment:** the signed estimate was promised by 2026-11-06 and not sent, and the contractor will release the slot today.
+- **Surface the missed commitment:** the signed estimate was promised by 2026-11-06, and **no send to Dana appears in the supplied sent-mail records**. Phrase it that way, not as a proven non-send. The contractor will release the slot today.
 - **Draft but don't send:** a short reply for approval that acknowledges the delay and confirms or asks about the slot. Attaching the real estimate needs the user's action. Nothing is sent or archived.
 - **Leave the distractors alone:** no prompts for the newsletter or the already-answered thread.
 

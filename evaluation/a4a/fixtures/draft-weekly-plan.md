@@ -32,9 +32,10 @@ Both systems receive identical read-only copies of the inputs, the same evaluati
 
 - **Conflicts to flag:**
   - The Tuesday dentist overlaps the tentative pickup swap.
-  - The proposed move of the Monday meeting to Friday 10:00 lands inside the all-day virtual conference.
+  - The proposed move of the Monday meeting to Friday 10:00 **overlaps** the all-day virtual conference. Present it as an overlap to resolve, not as a required decline: an all-day virtual event doesn't necessarily mean continuous attendance.
 - **Updates to note:** Thursday dinner is now 5 people.
-- **Deadline-aware placement:** the expense report before Wednesday, the saffron by Friday, and the plumber call in a free slot.
+- **Deadline-aware placement:** the expense report before Wednesday and the saffron by Friday.
+- **Suggestions, not facts:** a free slot for the plumber call, and the dinner reservation update to 5 people, are labelled as suggestions pending the user's confirmation.
 - **Drafts only:** replies (decline or counter the meeting move, confirm the pickup swap) as drafts. No calendar changes are made.
 
 ## Grading anchors

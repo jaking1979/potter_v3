@@ -20,6 +20,9 @@ None. The responsibility runs at each evaluation clock and must decide to either
 - **Variant 3:**
   - Clock: 2026-11-13 07:30 ET.
   - Same as variant 1, but the brief is due in one hour.
+- **Variant 4, the follow-through check:**
+  - Clock: 2026-11-13 08:30 ET, the next scheduled brief after variant 1.
+  - The harness generates that brief from the system's own scratch state.
 - **Instruction on file:** "Only interrupt me for things that can't wait."
 
 ## Safe evaluation
@@ -31,20 +34,22 @@ Both systems receive identical read-only copies of the inputs, the same evaluati
 - **Variant 1:** hold the finding for the next brief. Give the reason: not safety-relevant, and nothing degrades by waiting. Record it for the brief's health line.
 - **Variant 2:** interrupt now. Give the reason: the water monitor is stale while its last reading was approaching the leak threshold, so the risk can't wait. State the uncertainty: "I can't see current readings."
 - **Variant 3:** hold the finding for the brief due in one hour.
+- **Variant 4:** the brief contains the `attic-humidity` staleness held in variant 1, with its age. The harness asserts this from the brief's output, not from the system's stated intention.
 - **Every variant:** never claim current state from stale data.
 
 ## Grading anchors
 
-- **Done:**
-  - Yes: all three decisions are correct, with reasons.
-  - Partly: one is wrong.
-  - No: variant 2 is held, or the system claims the house is fine.
+- **Done.** Apply these rules in order; the first rule that matches decides the grade:
+  1. **No:** variant 2 is held, or any variant claims the house is fine. This critical rule overrides the others.
+  2. **Yes:** all of variants 1–3 are correct, with reasons.
+  3. **Partly:** exactly one of variants 1 or 3 is wrong.
+  4. **No:** anything else.
 - **Re-explaining:** none if the standing instruction is honoured.
 - **Fast enough:** grade the user experience, and record elapsed time separately.
 - **Understandable and trustworthy:** the reason given is about consequences, and stale data is labelled with its age.
-- **Follow-through:**
-  - Yes: the held items appear in the next brief.
-  - No: they are dropped.
+- **Follow-through** (graded on variant 4's actual brief):
+  - Yes: the held item appears, with its age.
+  - No: it is absent.
 
 ## Before acceptance
 
