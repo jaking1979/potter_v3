@@ -111,6 +111,26 @@ class ReceiptCompositionTests(unittest.TestCase):
                 self._call(consume_nonces=lambda pair, facts: consume_pair(reopened, pair, facts))
             self.assertTrue(pair_matches(reopened, nonces, binding))
 
+    def test_scratch_commit_then_lost_ack_can_be_identified_not_authorized(self):
+        database = self.root / 'scratch-lost-ack.db'
+        observed_bindings = []
+        with sqlite3.connect(database) as db:
+            prepare(db)
+            def commit_then_fail(pair, binding):
+                self.assertTrue(consume_pair(db, pair, binding))
+                observed_bindings.append(dict(binding))
+                raise OSError('synthetic lost acknowledgment')
+            with self.assertRaises(OSError):
+                self._call(consume_nonces=commit_then_fail)
+        nonces = ('d' * 64, 'e' * 64)
+        with sqlite3.connect(database) as reopened:
+            self.assertEqual(len(observed_bindings), 1)
+            self.assertTrue(pair_matches(reopened, nonces, observed_bindings[0]))
+            mismatched = {**observed_bindings[0], 'receipt_hash': 'f' * 64}
+            self.assertFalse(pair_matches(reopened, nonces, mismatched))
+            with self.assertRaises(ValueError):
+                self._call(consume_nonces=lambda pair, facts: consume_pair(reopened, pair, facts))
+
     def test_self_review_and_missing_authority_evidence_fail_closed(self):
         same = dict(self.trusted)
         same["claude"] = same["dolores"]
