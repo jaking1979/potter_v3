@@ -309,6 +309,8 @@ class RemoteClones(unittest.TestCase):
         self.consumer = d / "consumer"
         subprocess.check_call(["git", "clone", "-q", str(self.remote), str(self.consumer)],
                               stderr=subprocess.DEVNULL)
+        self.g(self.consumer, "config", "user.email", "t@e.invalid")   # CI has no global identity
+        self.g(self.consumer, "config", "user.name", "T")
         self.reg_path, self.anchor = d / "r.db", FlakyAnchor(d / "a.jsonl")
         ReceiptRegistry.initialize(self.reg_path, self.anchor, "test", NOW).close()
         self.alerts = []
@@ -456,8 +458,6 @@ class RemoteClones(unittest.TestCase):
     def test_concurrent_promotion_second_must_rebase_and_be_rereviewed(self):
         from t39.promote import PromotionRefused
         a = self.candidate(self.author, "change A")
-        self.g(self.consumer, "config", "user.email", "t@e.invalid")
-        self.g(self.consumer, "config", "user.name", "T")
         b = self.candidate(self.consumer, "change B", "b.txt")  # same base as A
         self.promote(a)
         with self.assertRaises(PromotionRefused):
