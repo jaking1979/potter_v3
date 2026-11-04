@@ -35,6 +35,19 @@ class NonceStoreTests(unittest.TestCase):
         with sqlite3.connect(self.path) as reopened:
             self.assertTrue(pair_matches(reopened, pair, BINDING))
 
+    def test_second_insert_failure_rolls_back_first(self):
+        first, second = '7' * 64, '8' * 64
+        with sqlite3.connect(self.path) as db:
+            db.execute("CREATE TRIGGER injected_failure BEFORE INSERT ON used_nonces "
+                       "WHEN NEW.nonce = '%s' BEGIN SELECT RAISE(ABORT, 'injected'); END" % second)
+            db.commit()
+            self.assertFalse(consume_pair(db, (first, second), BINDING))
+            self.assertIsNone(lookup(db, first))
+            self.assertIsNone(lookup(db, second))
+            db.execute('DROP TRIGGER injected_failure')
+            db.commit()
+            self.assertTrue(consume_pair(db, (first, second), BINDING))
+
     def test_pair_replay_rolls_back_without_burning_other_nonce(self):
         with sqlite3.connect(self.path) as db:
             self.assertTrue(consume_pair(db, ('1' * 64, '2' * 64), BINDING))
