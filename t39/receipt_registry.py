@@ -1,29 +1,33 @@
-"""T39 receipt registry: one-time issuance, durable record, anti-rollback.
+"""T39 receipt registry: one-time issuance against an authoritative anchor log.
 
-Lifecycle (Dolores review on 79e4c0e, finding 1):
+Lifecycle:
   * ISSUANCE happens once, at merge admission. A fully verified attestation
-    pair is turned into an issued receipt; its two nonces are consumed in the
-    same transaction. This is the only place nonces are consumed.
-  * USE by later consumers (release builder, host updater, rollback) does not
-    consume anything. Each consumer independently re-verifies the signed
-    receipt and then requires the exact issued record to exist here. Uses are
-    appended to the log for audit.
+    pair is issued as a receipt; its nonces are consumed by that same event.
+  * USE by later consumers (release builder, host updater, rollback) consumes
+    nothing; each re-verifies the signed receipt and requires the issued
+    record. Uses are appended for audit.
 
-Integrity (findings 2 and 3):
-  * Every event (genesis, issue, use) is a row in one hash chain. Opening the
-    registry re-verifies the whole chain, so an edited, deleted or forged row
-    makes the registry unavailable.
-  * The chain head (seq, hash) is mirrored to an external Anchor after every
-    commit. On open the registry must contain the anchored head; a restored
-    older backup (shorter chain) or a fork is refused. A registry ahead of its
-    anchor by a crash between commit and anchor write is accepted only if it
-    extends the anchored head, and the anchor is then caught up.
-  * Creation is an explicit one-time `initialize`, refused if the file or an
-    anchored head already exists, so state loss cannot silently restart empty.
+Authority (Dolores review on 6f63a67): the ANCHOR LOG is the authority, and
+the local SQLite database is a replica of it.
+  * Every event (genesis, issue, use) is appended to the anchor log FIRST,
+    with compare-and-set on its sequence number, and only then to the local
+    database. The anchor is meant to live on a separate host with its own
+    write credential (production: Brooklyn under T35), so database write
+    access alone cannot add an event.
+  * On open and inside every write transaction, the database must be an exact
+    prefix of the anchor log. Extra or different local rows mean tampering,
+    and the registry refuses. Anchor entries missing locally (a crash after
+    the anchor append, a lost database, or a restored older backup) are
+    replayed from the anchor, so no crash boundary loses or invents history.
+  * Every READ (get, issued_trees, receipted_commits) is answered from the
+    hash-verified anchor log, never from local rows. Tampering with the
+    database while a process is running cannot create a receipt.
+  * `initialize` appends genesis to an empty anchor first. It is refused if
+    the anchor already holds entries; a lost database is rebuilt from the
+    anchor by `restore_from_anchor`, never restarted empty.
 
 The registry stores facts the verifier established; it does not verify
-signatures itself. `issue` is only reachable through consumer_gate after
-verification, and the detector reads issued receipts, never bare nonces.
+signatures. `issue` is reached only through consumer_gate after verification.
 """
 from __future__ import annotations
 
@@ -34,26 +38,30 @@ import json
 import os
 import re
 import sqlite3
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+_ZERO = "0" * 64
 
 
 class RegistryUnavailable(RuntimeError):
-    """Missing, corrupt, rolled back or forked. Every consumer must refuse."""
+    """Missing, tampered, forked or unreachable. Every consumer must refuse."""
+
+
+class AnchorConflict(RegistryUnavailable):
+    """Compare-and-set failed: the anchor's next sequence is not the one offered."""
 
 
 class Issue(enum.Enum):
     ISSUED = "issued"
-    ALREADY_ISSUED = "already_issued"   # exact same receipt already issued (issuer retry)
-    REPLAY = "replay"                   # a nonce was used for something else
+    ALREADY_ISSUED = "already_issued"   # identical receipt already issued (issuer retry)
+    REPLAY = "replay"                   # a nonce or receipt hash was used for something else
 
 
 @dataclass(frozen=True)
@@ -64,7 +72,7 @@ class Facts:
     receipt_hash: str
     nonces: tuple[str, str]
     agents: dict[str, str]              # role -> agent
-    key_fingerprints: dict[str, str]    # role -> SHA256 key fingerprint
+    key_fingerprints: dict[str, str]    # role -> key fingerprint
     verifier_version: str
 
     def __post_init__(self) -> None:
@@ -91,57 +99,81 @@ class Facts:
                 "verifier_version": self.verifier_version}
 
 
+def _link(prev: str, seq: int, kind: str, body: dict) -> str:
+    payload = json.dumps({"prev": prev, "seq": seq, "kind": kind, "body": body},
+                         sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(b"potter.t39.chain/v1\0" + payload).hexdigest()
+
+
+def _entry(prev: str, seq: int, kind: str, body: dict) -> dict:
+    return {"seq": seq, "kind": kind, "body": body, "head": _link(prev, seq, kind, body)}
+
+
 class Anchor(Protocol):
-    def read(self) -> tuple[int, str] | None: ...
-    def advance(self, seq: int, head: str) -> None: ...   # monotonic
+    """Append-only log on an independently controlled host."""
+    def entries(self) -> list[dict]: ...
+    def append(self, entry: dict) -> None: ...   # CAS: entry["seq"] must equal len(log)
 
 
 class FileAnchor:
-    """Anchor kept in a separate file (in production: a separate host/location).
-
-    `advance` is monotonic under an exclusive lock: a slower writer can never
-    move the anchor backwards.
-    """
+    """Anchor log as a JSON-lines file. In production this is a separate host
+    with its own write credential; tests keep it in a separate directory."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._lock = self.path.with_suffix(self.path.suffix + ".lock")
 
-    def read(self) -> tuple[int, str] | None:
+    def entries(self) -> list[dict]:
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            lines = self.path.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
+            return []
+        except OSError as exc:
             raise RegistryUnavailable("anchor unreadable") from exc
-        if (not isinstance(data, dict) or not isinstance(data.get("seq"), int)
-                or not isinstance(data.get("head"), str) or not _HEX64.fullmatch(data["head"])):
-            raise RegistryUnavailable("anchor malformed")
-        return data["seq"], data["head"]
+        try:
+            return [json.loads(line) for line in lines]
+        except ValueError as exc:
+            raise RegistryUnavailable("anchor malformed") from exc
 
-    def advance(self, seq: int, head: str) -> None:
+    def append(self, entry: dict) -> None:
         with open(self._lock, "a") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
-            current = self.read()
-            if current is not None and current[0] >= seq:
-                return
-            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".anchor-")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"seq": seq, "head": head}, fh)
+            if entry["seq"] != len(self.entries()):
+                raise AnchorConflict("anchor sequence moved")
+            new = not self.path.exists()
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
-            dfd = os.open(self.path.parent, os.O_RDONLY)   # make the rename durable
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            if new:
+                dfd = os.open(self.path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
 
 
-def _link(prev: str, seq: int, kind: str, body: dict) -> str:
-    payload = json.dumps({"prev": prev, "seq": seq, "kind": kind, "body": body},
-                         sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(b"potter.t39.chain/v1\0" + payload).hexdigest()
+def _verified_log(anchor: Anchor) -> list[dict]:
+    """Anchor entries with sequence and hash chain checked."""
+    try:
+        log = anchor.entries()
+    except RegistryUnavailable:
+        raise
+    except Exception as exc:
+        raise RegistryUnavailable(f"anchor unreachable: {type(exc).__name__}") from exc
+    prev, issued = _ZERO, set()
+    for i, e in enumerate(log):
+        if (not isinstance(e, dict) or e.get("seq") != i
+                or e.get("kind") not in ("genesis", "issue", "use")
+                or (i == 0) != (e["kind"] == "genesis")
+                or _link(prev, i, e["kind"], e["body"]) != e.get("head")):
+            raise RegistryUnavailable(f"anchor log broken at {i}")
+        if e["kind"] == "issue":
+            issued.add(e["body"]["facts"]["receipt_hash"])
+        if e["kind"] == "use" and e["body"].get("receipt_hash") not in issued:
+            raise RegistryUnavailable("anchor log has a use before its issuance")
+        prev = e["head"]
+    return log
 
 
 @dataclass(frozen=True)
@@ -161,7 +193,6 @@ CREATE TABLE nonces (nonce TEXT PRIMARY KEY, receipt_hash TEXT NOT NULL) WITHOUT
 CREATE TABLE receipts (
     receipt_hash TEXT PRIMARY KEY, commit_id TEXT NOT NULL, seq INTEGER NOT NULL UNIQUE)
     WITHOUT ROWID;
-CREATE INDEX receipts_commit ON receipts (commit_id);
 """
 
 
@@ -169,33 +200,38 @@ class ReceiptRegistry:
     @classmethod
     def initialize(cls, path: Path, anchor: Anchor, registry_id: str,
                    now: datetime) -> "ReceiptRegistry":
-        """One-time trusted bootstrap. Refuses if any prior state exists."""
+        """One-time bootstrap: genesis goes to an EMPTY anchor first."""
         path = Path(path)
-        if path.exists():
-            raise RegistryUnavailable("registry already exists; refusing to re-initialize")
-        if anchor.read() is not None:
-            raise RegistryUnavailable("anchor already set; state was lost, not new")
         if not _NAME.fullmatch(registry_id):
             raise ValueError("registry_id must be a short lower-case identifier")
+        if path.exists():
+            raise RegistryUnavailable("registry already exists; refusing to re-initialize")
+        if _verified_log(anchor):
+            raise RegistryUnavailable("anchor already has history; use restore_from_anchor")
+        anchor.append(_entry(_ZERO, 0, "genesis",
+                             {"registry_id": registry_id, "at": now.isoformat()}))
+        return cls.restore_from_anchor(path, anchor)
+
+    @classmethod
+    def restore_from_anchor(cls, path: Path, anchor: Anchor) -> "ReceiptRegistry":
+        """Build a fresh local replica from the authoritative anchor log."""
+        path = Path(path)
+        if path.exists():
+            raise RegistryUnavailable("refusing to overwrite an existing registry file")
+        if not _verified_log(anchor):
+            raise RegistryUnavailable("anchor is empty; nothing to restore")
         db = sqlite3.connect(str(path), isolation_level=None)
         try:
             db.executescript(_DDL)
-            body = {"registry_id": registry_id, "at": now.isoformat()}
-            head = _link("0" * 64, 0, "genesis", body)
-            db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT INTO meta VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
-            db.execute("INSERT INTO chain VALUES (0, 'genesis', ?, ?)",
-                       (json.dumps(body, sort_keys=True), head))
-            db.execute("COMMIT")
         finally:
             db.close()
-        anchor.advance(0, head)
         return cls(path, anchor)
 
     def __init__(self, path: Path, anchor: Anchor, timeout_s: float = 10.0) -> None:
         path = Path(path)
         if not path.exists():
-            raise RegistryUnavailable("registry missing")
+            raise RegistryUnavailable("registry missing (use restore_from_anchor)")
         self._anchor = anchor
         try:
             self._db = sqlite3.connect(str(path), timeout=timeout_s, isolation_level=None)
@@ -206,168 +242,130 @@ class ReceiptRegistry:
                 raise RegistryUnavailable("registry schema version mismatch")
             if self._db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise RegistryUnavailable("registry failed integrity check")
-            # Read the (monotonic) anchor BEFORE the chain, so a concurrent
-            # writer advancing it cannot make an up-to-date chain look behind.
-            anchored = anchor.read()
-            seq, head = self._verify_chain()
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._reconcile()
+                self._db.execute("COMMIT")
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
         except sqlite3.Error as exc:
             raise RegistryUnavailable(f"registry unusable: {exc}") from exc
-        if anchored is None:
-            raise RegistryUnavailable("anchor missing")
-        a_seq, a_head = anchored
-        row = self._db.execute("SELECT head FROM chain WHERE seq = ?", (a_seq,)).fetchone()
-        if a_seq > seq or row is None or row[0] != a_head:
-            raise RegistryUnavailable("registry is behind or forked from its anchor (rollback)")
-        if seq > a_seq:
-            anchor.advance(seq, head)       # crash between commit and anchor write
 
     def close(self) -> None:
         self._db.close()
 
-    def _verify_chain(self) -> tuple[int, str]:
-        prev, expected_seq = "0" * 64, 0
-        issued, used_nonces = {}, {}
-        for seq, kind, body_text, head in self._db.execute(
-                "SELECT seq, kind, body, head FROM chain ORDER BY seq"):
-            body = json.loads(body_text)
-            if seq != expected_seq or (seq == 0) != (kind == "genesis"):
-                raise RegistryUnavailable("chain sequence broken")
-            if _link(prev, seq, kind, body) != head:
-                raise RegistryUnavailable("chain hash mismatch (edited or forged row)")
-            if kind == "use" and body.get("receipt_hash") not in issued:
-                raise RegistryUnavailable("use event for a receipt not issued earlier in the chain")
-            if kind == "issue":
-                issued[body["facts"]["receipt_hash"]] = (body["facts"]["commit"], seq)
-                for n in body["facts"]["nonces"]:
-                    used_nonces[n] = body["facts"]["receipt_hash"]
-            prev, expected_seq = head, seq + 1
-        if expected_seq == 0:
-            raise RegistryUnavailable("chain empty")
-        # Index tables must be exactly what the chain says.
-        if dict(self._db.execute("SELECT nonce, receipt_hash FROM nonces")) != used_nonces:
-            raise RegistryUnavailable("nonce index disagrees with chain")
-        if {r: (c, s) for r, c, s in self._db.execute(
-                "SELECT receipt_hash, commit_id, seq FROM receipts")} != issued:
-            raise RegistryUnavailable("receipt index disagrees with chain")
-        return expected_seq - 1, prev
+    # ---- replica maintenance (call inside BEGIN IMMEDIATE) -------------------
 
-    def _sync_anchor(self) -> None:
-        """Advance the anchor to the current chain head and confirm it took.
-
-        Every success path calls this, including an ALREADY_ISSUED retry, so a
-        success is never returned while the external anchor is stale.
-        """
-        try:
-            seq, head = self._db.execute(
-                "SELECT seq, head FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
-            self._anchor.advance(seq, head)
-            anchored = self._anchor.read()
-        except RegistryUnavailable:
-            raise
-        except Exception as exc:
-            raise RegistryUnavailable(f"anchor sync failed: {type(exc).__name__}") from exc
-        if anchored is None or anchored[0] < seq:
-            raise RegistryUnavailable("anchor did not advance to the chain head")
-        # Another process may have advanced it further; the anchored head must
-        # still be a row of this chain.
-        row = self._db.execute("SELECT head FROM chain WHERE seq = ?", (anchored[0],)).fetchone()
-        if row is None or row[0] != anchored[1]:
-            raise RegistryUnavailable("anchor disagrees with chain (fork)")
-
-    def _append(self, kind: str, body: dict) -> tuple[int, str]:
-        seq, prev = self._db.execute(
-            "SELECT seq, head FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
-        head = _link(prev, seq + 1, kind, body)
+    def _apply(self, e: dict) -> None:
         self._db.execute("INSERT INTO chain VALUES (?, ?, ?, ?)",
-                         (seq + 1, kind, json.dumps(body, sort_keys=True), head))
-        return seq + 1, head
+                         (e["seq"], e["kind"], json.dumps(e["body"], sort_keys=True), e["head"]))
+        if e["kind"] == "issue":
+            f = e["body"]["facts"]
+            self._db.executemany("INSERT INTO nonces VALUES (?, ?)",
+                                 [(n, f["receipt_hash"]) for n in f["nonces"]])
+            self._db.execute("INSERT INTO receipts VALUES (?, ?, ?)",
+                             (f["receipt_hash"], f["commit"], e["seq"]))
+
+    def _reconcile(self) -> list[dict]:
+        """Local replica must be an exact prefix of the anchor; replay any tail."""
+        log = _verified_log(self._anchor)
+        if not log:
+            raise RegistryUnavailable("anchor empty")
+        local = self._db.execute("SELECT seq, kind, body, head FROM chain ORDER BY seq").fetchall()
+        if len(local) > len(log):
+            raise RegistryUnavailable("local registry has events the anchor never recorded "
+                                      "(tampering)")
+        for (seq, kind, body, head), e in zip(local, log):
+            if (seq, kind, head) != (e["seq"], e["kind"], e["head"]) or json.loads(body) != e["body"]:
+                raise RegistryUnavailable(f"local registry diverges from anchor at {seq}")
+        for e in log[len(local):]:
+            self._apply(e)            # crash tail, lost rows or older backup
+        nonces, receipts = {}, {}
+        for e in log:
+            if e["kind"] == "issue":
+                f = e["body"]["facts"]
+                for n in f["nonces"]:
+                    nonces[n] = f["receipt_hash"]
+                receipts[f["receipt_hash"]] = (f["commit"], e["seq"])
+        if dict(self._db.execute("SELECT nonce, receipt_hash FROM nonces")) != nonces:
+            raise RegistryUnavailable("nonce index diverges from anchor")
+        if {r: (c, s) for r, c, s in self._db.execute(
+                "SELECT receipt_hash, commit_id, seq FROM receipts")} != receipts:
+            raise RegistryUnavailable("receipt index diverges from anchor")
+        return log
+
+    def _append(self, log: list[dict], kind: str, body: dict) -> None:
+        e = _entry(log[-1]["head"], len(log), kind, body)
+        self._anchor.append(e)        # authority first; CAS on seq
+        self._apply(e)
+
+    def _write(self, fn):
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                log = self._reconcile()
+                result = fn(log)
+                self._db.execute("COMMIT")
+                return result
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+        except sqlite3.Error as exc:
+            raise RegistryUnavailable(f"registry error: {exc}") from exc
+
+    # ---- writes ---------------------------------------------------------------
 
     def issue(self, facts: Facts, issuer: str, now: datetime) -> Issue:
         if not isinstance(facts, Facts):
             raise ValueError("Facts required")
         if not _NAME.fullmatch(issuer):
             raise ValueError("issuer must be a short lower-case identifier")
-        self._sync_anchor()      # refuse before writing if the anchor is unreachable
-        try:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                existing = self.get(facts.receipt_hash)
-                if existing is not None:
-                    self._db.execute("ROLLBACK")
-                    if existing.facts != facts.canonical():
-                        return Issue.REPLAY
-                    self._sync_anchor()          # retry must not succeed past a stale anchor
-                    return Issue.ALREADY_ISSUED
-                if self._db.execute("SELECT 1 FROM nonces WHERE nonce IN (?, ?)",
-                                    facts.nonces).fetchone():
-                    self._db.execute("ROLLBACK")
-                    return Issue.REPLAY
-                body = {"facts": facts.canonical(), "issuer": issuer, "at": now.isoformat()}
-                seq, head = self._append("issue", body)
-                self._db.executemany("INSERT INTO nonces VALUES (?, ?)",
-                                     [(n, facts.receipt_hash) for n in facts.nonces])
-                self._db.execute("INSERT INTO receipts VALUES (?, ?, ?)",
-                                 (facts.receipt_hash, facts.commit, seq))
-                self._db.execute("COMMIT")
-            except BaseException:
-                if self._db.in_transaction:
-                    self._db.execute("ROLLBACK")
-                raise
-        except sqlite3.Error as exc:
-            raise RegistryUnavailable(f"registry error: {exc}") from exc
-        self._sync_anchor()
-        return Issue.ISSUED
 
-    def get(self, receipt_hash: str) -> IssuedReceipt | None:
-        row = self._db.execute(
-            "SELECT c.seq, c.body FROM receipts r JOIN chain c ON c.seq = r.seq"
-            " WHERE r.receipt_hash = ?", (receipt_hash,)).fetchone()
-        if row is None:
-            return None
-        body = json.loads(row[1])
-        return IssuedReceipt(row[0], body["facts"], body["issuer"], body["at"])
+        def do(log):
+            existing = self._issued_in(log).get(facts.receipt_hash)
+            if existing is not None:
+                return (Issue.ALREADY_ISSUED if existing.facts == facts.canonical()
+                        else Issue.REPLAY)
+            if self._db.execute("SELECT 1 FROM nonces WHERE nonce IN (?, ?)",
+                                facts.nonces).fetchone():
+                return Issue.REPLAY
+            self._append(log, "issue", {"facts": facts.canonical(), "issuer": issuer,
+                                        "at": now.isoformat()})
+            return Issue.ISSUED
+        return self._write(do)
 
     def record_use(self, receipt_hash: str, consumer: str, purpose: str, now: datetime) -> None:
         if not _NAME.fullmatch(consumer) or not _NAME.fullmatch(purpose):
             raise ValueError("consumer and purpose must be short lower-case identifiers")
-        self._sync_anchor()
-        try:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                if not self._db.execute("SELECT 1 FROM receipts WHERE receipt_hash = ?",
-                                        (receipt_hash,)).fetchone():
-                    raise RegistryUnavailable("use refused: receipt was never issued")
-                seq, head = self._append("use", {"receipt_hash": receipt_hash,
-                                                 "consumer": consumer, "purpose": purpose,
-                                                 "at": now.isoformat()})
-                self._db.execute("COMMIT")
-            except BaseException:
-                if self._db.in_transaction:
-                    self._db.execute("ROLLBACK")
-                raise
-        except sqlite3.Error as exc:
-            raise RegistryUnavailable(f"registry error: {exc}") from exc
-        self._sync_anchor()
+
+        def do(log):
+            if receipt_hash not in self._issued_in(log):
+                raise RegistryUnavailable("use refused: receipt was never issued")
+            self._append(log, "use", {"receipt_hash": receipt_hash, "consumer": consumer,
+                                      "purpose": purpose, "at": now.isoformat()})
+        self._write(do)
+
+    # ---- reads: answered from the verified anchor log only --------------------
+
+    @staticmethod
+    def _issued_in(log: list[dict]) -> dict[str, IssuedReceipt]:
+        return {e["body"]["facts"]["receipt_hash"]:
+                IssuedReceipt(e["seq"], e["body"]["facts"], e["body"]["issuer"], e["body"]["at"])
+                for e in log if e["kind"] == "issue"}
+
+    def get(self, receipt_hash: str) -> IssuedReceipt | None:
+        return self._issued_in(_verified_log(self._anchor)).get(receipt_hash)
 
     def issued_trees(self, commits: list[str]) -> dict[str, str]:
-        """{commit: tree} for each given commit that has an issued receipt."""
         if any(not isinstance(c, str) or not _HEX40.fullmatch(c) for c in commits):
             raise ValueError("40-hex commit SHAs required")
-        out: dict[str, str] = {}
-        for c in commits:
-            for (body,) in self._db.execute(
-                    "SELECT c.body FROM receipts r JOIN chain c ON c.seq = r.seq"
-                    " WHERE r.commit_id = ?", (c,)):
-                out[c] = json.loads(body)["facts"]["tree"]
-        return out
+        wanted = set(commits)
+        return {r.facts["commit"]: r.facts["tree"]
+                for r in self._issued_in(_verified_log(self._anchor)).values()
+                if r.facts["commit"] in wanted}
 
     def receipted_commits(self, commits: list[str]) -> set[str]:
-        if any(not isinstance(c, str) or not _HEX40.fullmatch(c) for c in commits):
-            raise ValueError("40-hex commit SHAs required")
-        found: set[str] = set()
-        for i in range(0, len(commits), 500):
-            chunk = commits[i:i + 500]
-            found.update(r[0] for r in self._db.execute(
-                f"SELECT DISTINCT commit_id FROM receipts WHERE commit_id IN "
-                f"({','.join('?' * len(chunk))})", chunk))
-        return found
+        return set(self.issued_trees(commits))

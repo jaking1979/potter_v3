@@ -25,7 +25,7 @@ class Detector(unittest.TestCase):
         self.git("config", "user.name", "T")
         self.commit_file("base")
         self.baseline = self.head()
-        self.reg_path, self.anchor = d / "r.db", FileAnchor(d / "a.json")
+        self.reg_path, self.anchor = d / "r.db", FileAnchor(d / "a.jsonl")
         ReceiptRegistry.initialize(self.reg_path, self.anchor, "test", NOW).close()
         self.checkpoint, self.block = d / "checkpoint.json", d / "BLOCK"
         self.alerts = []
@@ -144,6 +144,24 @@ class Detector(unittest.TestCase):
         self.assertIsNotNone(r.error)
         self.assertIsNotNone(r.block_error)
         self.assertIn("FAILED", self.alerts[0])
+
+    def test_db_only_forged_receipt_does_not_hide_direct_push(self):
+        from tests.test_t39_store_gate import forge_issue_in_db
+        bad = self.commit_file("direct push")
+        forge_issue_in_db(self.reg_path, "e" * 64, bad, self.head(f"{bad}^{{tree}}"),
+                          ("7" * 64, "8" * 64))
+        r = self.run_it()
+        self.assertFalse(r.clean)               # refused at open (tamper) -> fails loud
+        self.assertTrue(release_blocked(self.block))
+
+    def test_tampered_anchor_log_fails_loud(self):
+        self.issue(self.commit_file("reviewed"))
+        lines = self.anchor.path.read_text().splitlines()
+        lines[-1] = lines[-1].replace('"claude"', '"mallory"')
+        self.anchor.path.write_text("\n".join(lines) + "\n")
+        r = self.run_it()
+        self.assertIsNotNone(r.error)
+        self.assertTrue(release_blocked(self.block))
 
     def test_inherited_git_env_cannot_redirect(self):
         self.issue(self.commit_file("reviewed"))

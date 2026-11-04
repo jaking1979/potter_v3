@@ -12,16 +12,18 @@ This package holds two of the production pieces of the ratified T39 receipt gate
    Nothing is consumed, so the CI → builder → host → rollback sequence all runs on one receipt. A never-issued or mismatched receipt fails at every consumer, and on `main` that is flagged as an incident.
 3. **Detector (`unreceipted_main_commits`):** reads issued receipts only, never bare nonces.
 
-## Integrity (`receipt_registry.py`)
-- **One hash chain:** genesis, every issuance and every use form a single hash chain. On open, the whole chain is re-verified, and the nonce and receipt indexes must match it exactly. An edited, forged, deleted or partial row makes the registry unavailable.
-- **External anchor:** after every commit, the chain head (sequence number and hash) is advanced in an **external anchor**. The anchor only moves forward and is protected by a lock.
-  - On open, the registry must contain the anchored head. A **restored older backup** or a **fork** is refused.
-  - If the process crashed between a commit and the anchor write, a registry ahead of its anchor is accepted only when it extends the anchored head, and the anchor then catches up.
-- **One-time bootstrap:** `initialize` is an explicit, one-time step. It is refused if the file exists **or the anchor is already set**, so losing state can never quietly restart with an empty registry. Opening never creates anything.
-- **Anchor sync on every success:** issuance (including an `ALREADY_ISSUED` retry) and every use check that the anchor is at the chain head before writing and after committing. If the anchor can't be advanced and read back, the call refuses, so a retry can't succeed while the anchor is stale. Anchor renames fsync the parent directory.
-- **Durability:** WAL, `synchronous=FULL`, a schema-version check and `quick_check`.
+## Integrity (`receipt_registry.py`): the anchor log is the authority
+- **Anchor first:** every event (genesis, issue, use) is appended to the **anchor log** before the local database, with compare-and-set on the sequence number. The anchor lives on a separate host with its own write credential (Brooklyn is proposed), so **database write access alone cannot add an event**.
+- **The database is a replica.** On open, and inside every write transaction, the database must be an exact prefix of the anchor log:
+  - extra or different local rows, or index rows the log doesn't explain, mean tampering, and the registry refuses;
+  - anchor entries missing locally (a crash after the anchor append, a lost database, a restored older backup) are **replayed** from the anchor, so recovery never loses consumed nonces.
+- **Reads come from the anchor.** `get`, `issued_trees` and `receipted_commits` are answered from the hash-verified anchor log, never from local rows, so a database tampered with while a process is running can't create a receipt for a consumer or the detector.
+- **Bootstrap and restore:** `initialize` requires an empty anchor. A lost database is rebuilt with `restore_from_anchor`; opening never creates anything.
+- **Durability:** WAL, `synchronous=FULL`, a schema-version check and `quick_check`. The anchor fsyncs each append, and its directory on creation.
 
 ## Tests (`tests/test_t39_store_gate.py`, 24)
+- **Anchor authority:** Dolores's exact attack (a database-only injected issue, with matching indexes, then reopen) is refused and the anchor doesn't advance; the same injection in a running process isn't honoured by `get`, `receipted_commits` or consumers, and the next write refuses; the detector sees the injected commit as unreceipted; deleted nonce rows can't enable a replay.
+- **Crash boundaries:** anchor unreachable (nothing written, retry refused, then recovery); crash after the anchor append but before the local commit (replayed on reopen, with nonces); lost database restored from the anchor; a restored older backup catches up without losing nonces.
 - **Lifecycle:** the full CI → builder → host → rollback sequence, including across a restart; a never-issued receipt refused at every consumer; idempotent issuer retry; replay and partial-overlap replay (T39 test 3); a commit or tree changed after review (T39 test 4); verifier failures and incomplete facts, including identical keys for both roles; detector input; and 5 processes racing so that exactly one issues.
 - **Integrity:** one-time bootstrap including after state loss; a restored older backup; crash recovery; a forked anchor; a forged index row; a deleted nonce; edited and deleted chain rows; a chain edit that leaves the indexes consistent; a garbage or missing anchor; a closed registry.
 - **Mutation checks:** each of these makes at least one test fail when removed:
@@ -41,4 +43,5 @@ This package holds two of the production pieces of the ratified T39 receipt gate
 - **On an incident:** it alerts, writes the release-block file that the builder and updater check first, and returns a revert plan. It never pushes a revert itself.
 - **Failing loud:** a Git error, a registry error, or `main` no longer descending from the checkpoint (a force-push) all block release and are reported as a failure, never as clean.
 - **Block and alert are independent:** if the release block can't be written, the alert still goes out and says so.
-- **Tests** (`tests/test_t39_main_detector.py`, 11): fast-forward clean; direct push gives an incident, a release block and a revert plan, re-reported on later runs; a merge with the reviewed tree is clean; a merge with an extra file is an incident; unreviewed intermediate first-parent commits are incidents; a history rewrite fails loud; an unavailable registry fails loud; a wrong git dir is refused; inherited `GIT_DIR` is ignored.
+- **Tampered registry:** a receipt forged in the database only, or an edited anchor log, makes the detector fail loud and block release; it never reports clean.
+- **Tests** (`tests/test_t39_main_detector.py`, 13): fast-forward clean; direct push gives an incident, a release block and a revert plan, re-reported on later runs; a merge with the reviewed tree is clean; a merge with an extra file is an incident; unreviewed intermediate first-parent commits are incidents; a history rewrite fails loud; an unavailable registry fails loud; a wrong git dir is refused; inherited `GIT_DIR` is ignored.

@@ -46,7 +46,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         d = Path(self.tmp.name)
-        self.path, self.anchor_path = d / "receipts.db", d / "anchor.json"
+        self.path, self.anchor_path = d / "receipts.db", d / "anchor.jsonl"
         self.anchor = FileAnchor(self.anchor_path)
         self.reg = ReceiptRegistry.initialize(self.path, self.anchor, "potter-main", NOW)
 
@@ -147,52 +147,149 @@ class Lifecycle(Base):
         self.assertEqual(results.count("issued"), 1)
         self.assertEqual(results.count("already_issued"), 4)
         self.reg = ReceiptRegistry(self.path, self.anchor)
-        self.assertEqual(self.anchor.read()[0], 1)
+        self.assertEqual(len(self.anchor.entries()), 2)
 
 
 class FlakyAnchor(FileAnchor):
+    """Anchor whose append can be made to fail (host unreachable)."""
+
     def __init__(self, path):
         super().__init__(path)
         self.fail = False
 
-    def advance(self, seq, head):
-        # Fail only real forward moves, so the pre-write sync (a no-op at the
-        # current head) passes and the failure lands AFTER the local commit.
-        current = self.read()
-        if self.fail and (current is None or seq > current[0]):
+    def append(self, entry):
+        if self.fail:
             raise OSError("anchor host unreachable")
-        super().advance(seq, head)
+        super().append(entry)
 
 
-class AnchorFailure(Base):
+def forge_issue_in_db(path, receipt_hash, commit, tree, nonces):
+    """Attacker with registry-DB write access only: append a correctly hashed
+    issue event plus matching index rows. Touches nothing in the anchor."""
+    import json as _json
+    from t39.receipt_registry import _link
+    db = sqlite3.connect(path)
+    seq, prev = db.execute("SELECT seq, head FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
+    body = {"facts": {"commit": commit, "tree": tree, "receipt_hash": receipt_hash,
+                      "nonces": sorted(nonces),
+                      "agents": {"author": "dolores", "reviewer": "claude"},
+                      "key_fingerprints": {"author": "SHA256:aaa", "reviewer": "SHA256:bbb"},
+                      "verifier_version": "t39-verify/1"},
+            "issuer": "ci", "at": NOW.isoformat()}
+    head = _link(prev, seq + 1, "issue", body)
+    db.execute("INSERT INTO chain VALUES (?, 'issue', ?, ?)",
+               (seq + 1, _json.dumps(body, sort_keys=True), head))
+    db.executemany("INSERT INTO nonces VALUES (?, ?)", [(n, receipt_hash) for n in nonces])
+    db.execute("INSERT INTO receipts VALUES (?, ?, ?)", (receipt_hash, commit, seq + 1))
+    db.commit()
+    db.close()
+
+
+class AnchorAuthority(Base):
+    """Dolores review on 6f63a67: the DB alone must never be able to create a receipt."""
+
+    def test_db_only_injection_refused_on_reopen(self):
+        # Exactly the reported attack: close, inject a valid-looking tail, reopen.
+        self.reg.close()
+        forge_issue_in_db(self.path, R2, C2, T2, (N1, N2))
+        with self.assertRaises(RegistryUnavailable):
+            ReceiptRegistry(self.path, self.anchor)
+        self.assertEqual(len(self.anchor.entries()), 1)          # anchor did not advance
+        self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "s.db",
+                                              FileAnchor(Path(self.tmp.name) / "s.jsonl"),
+                                              "scratch", NOW)
+
+    def test_db_injection_in_running_process_is_not_honoured(self):
+        # Inject while the registry is open in this process.
+        forge_issue_in_db(self.path, R2, C2, T2, (N1, N2))
+        self.assertIsNone(self.reg.get(R2))                      # reads come from the anchor
+        self.assertEqual(self.reg.receipted_commits([C2]), set())
+        with self.assertRaises(Refused):                          # consumer refuses
+            self.use("host-updater", f=facts(commit=C2, tree=T2, rh=R2), commit=C2, tree=T2)
+        with self.assertRaises(Refused):                          # next write detects tamper
+            self.admit(facts(commit=C1, tree=T1, rh=R1, nonces=(N3, "4" * 64)))
+        self.assertEqual(len(self.anchor.entries()), 1)
+
+    def test_detector_sees_injected_receipt_as_missing(self):
+        from t39.consumer_gate import unreceipted_main_commits
+        forge_issue_in_db(self.path, R2, C2, T2, (N1, N2))
+        self.assertEqual(unreceipted_main_commits([C2], self.reg), [C2])
+
+    def test_deleted_nonce_rows_cannot_enable_replay(self):
+        self.admit()
+        db = sqlite3.connect(self.path)
+        db.execute("DELETE FROM nonces")
+        db.commit()
+        db.close()
+        with self.assertRaises(Refused):                          # tamper caught in write txn
+            self.admit(facts(commit=C2, tree=T2, rh=R2), commit=C2, tree=T2)
+
+
+class CrashBoundaries(Base):
+    """Recovery at every boundary of append-to-anchor-then-commit-locally."""
+
     def setUp(self):
         super().setUp()
         self.reg.close()
         self.anchor = FlakyAnchor(self.anchor_path)
         self.reg = ReceiptRegistry(self.path, self.anchor)
 
-    def test_failed_anchor_then_retry_while_unavailable_then_recovery(self):
-        self.anchor.fail = True
-        with self.assertRaises(Refused):
-            self.admit()                       # committed locally, anchor not advanced
-        with self.assertRaises(Refused):
-            self.admit()                       # retry takes ALREADY_ISSUED path: still refused
-        self.assertEqual(self.anchor.read()[0], 0)
-        with self.assertRaises(Refused):
-            self.use("host-updater")           # use cannot be anchored either
-        self.anchor.fail = False
-        self.admit()                           # recovery: retry anchors the head
-        self.assertEqual(self.anchor.read()[0], 1)
-        self.use("host-updater")
-        self.assertEqual(self.anchor.read()[0], 2)
-
-    def test_reopen_after_unanchored_commit_catches_up(self):
+    def test_anchor_unreachable_writes_nothing_then_recovers(self):
         self.anchor.fail = True
         with self.assertRaises(Refused):
             self.admit()
+        with self.assertRaises(Refused):
+            self.admit()                                          # retry while unavailable
+        self.assertEqual(len(self.anchor.entries()), 1)
         self.anchor.fail = False
-        self.reopen()
-        self.assertEqual(self.anchor.read()[0], 1)
+        self.admit()
+        self.use("host-updater")
+        self.assertEqual(len(self.anchor.entries()), 3)
+
+    def test_crash_after_anchor_append_before_local_commit(self):
+        real_apply = self.reg._apply
+        calls = {"n": 0}
+
+        def crash(e):
+            calls["n"] += 1
+            raise sqlite3.OperationalError("simulated crash")
+        self.reg._apply = crash
+        with self.assertRaises(Refused):
+            self.admit()
+        self.reg._apply = real_apply
+        self.assertEqual(len(self.anchor.entries()), 2)           # anchored, not local
+        self.reopen()                                             # replays the tail
+        self.admit()                                              # ALREADY_ISSUED
+        self.use("host-updater")
+        with self.assertRaises(Refused):                          # nonces were replayed too
+            self.admit(facts(commit=C2, tree=T2, rh=R2), commit=C2, tree=T2)
+
+    def test_lost_database_restored_from_anchor(self):
+        self.admit()
+        self.reg.close()
+        self.path.unlink()
+        with self.assertRaises(RegistryUnavailable):
+            ReceiptRegistry(self.path, self.anchor)               # never silently empty
+        with self.assertRaises(RegistryUnavailable):
+            ReceiptRegistry.initialize(self.path, self.anchor, "potter-main", NOW)
+        self.reg = ReceiptRegistry.restore_from_anchor(self.path, self.anchor)
+        self.use("host-updater")
+        with self.assertRaises(Refused):
+            self.admit(facts(commit=C2, tree=T2, rh=R2), commit=C2, tree=T2)
+
+    def test_restored_older_backup_catches_up_without_losing_nonces(self):
+        backup = Path(self.tmp.name) / "backup.db"
+        self.reg.close()
+        shutil.copy(self.path, backup)
+        self.reg = ReceiptRegistry(self.path, self.anchor)
+        self.admit()
+        self.reg.close()
+        shutil.copy(backup, self.path)
+        for suffix in ("-wal", "-shm"):
+            Path(str(self.path) + suffix).unlink(missing_ok=True)
+        self.reg = ReceiptRegistry(self.path, self.anchor)        # replays from anchor
+        with self.assertRaises(Refused):                          # replay still refused
+            self.admit(facts(commit=C2, tree=T2, rh=R2), commit=C2, tree=T2)
 
 
 class Integrity(Base):
@@ -203,116 +300,56 @@ class Integrity(Base):
         db.commit()
         db.close()
 
-    def test_bootstrap_is_one_time(self):
-        with self.assertRaises(RegistryUnavailable):
-            ReceiptRegistry.initialize(self.path, self.anchor, "potter-main", NOW)
-        self.reg.close()
-        self.path.unlink()                              # state loss
-        with self.assertRaises(RegistryUnavailable):    # anchor proves prior state existed
-            ReceiptRegistry.initialize(self.path, self.anchor, "potter-main", NOW)
-        with self.assertRaises(RegistryUnavailable):
-            ReceiptRegistry(self.path, self.anchor)
-        self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "x.db",
-                                              FileAnchor(Path(self.tmp.name) / "x.anchor"),
-                                              "scratch", NOW)
-
-    def test_restored_older_backup_refused(self):
-        backup = Path(self.tmp.name) / "backup.db"
-        self.reg.close()
-        shutil.copy(self.path, backup)
-        self.reg = ReceiptRegistry(self.path, self.anchor)
-        self.admit()
-        self.reg.close()
-        shutil.copy(backup, self.path)                  # roll back: nonces forgotten
-        for suffix in ("-wal", "-shm"):
-            Path(str(self.path) + suffix).unlink(missing_ok=True)
-        with self.assertRaises(RegistryUnavailable):
-            ReceiptRegistry(self.path, self.anchor)
-        self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "y.db",
-                                              FileAnchor(Path(self.tmp.name) / "y.anchor"),
-                                              "scratch", NOW)
-
-    def test_crash_between_commit_and_anchor_write_recovers(self):
-        self.admit()
-        self.anchor_path.write_text('{"seq": 0, "head": "%s"}' %
-                                    self.reg._db.execute("SELECT head FROM chain WHERE seq=0")
-                                    .fetchone()[0])
-        self.reopen()
-        self.assertEqual(self.anchor.read()[0], 1)      # caught up
-        self.use("host-updater")
-
-    def test_forked_chain_refused(self):
-        self.admit()
-        self.anchor_path.write_text('{"seq": 1, "head": "%s"}' % ("9" * 64))
-        with self.assertRaises(RegistryUnavailable):
-            self.reopen()
-        self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "z.db",
-                                              FileAnchor(Path(self.tmp.name) / "z.anchor"),
-                                              "scratch", NOW)
-
     def _assert_unavailable_after(self, sql, *args):
         self.admit()
         self.tamper(sql, *args)
         with self.assertRaises(RegistryUnavailable):
             ReceiptRegistry(self.path, self.anchor)
         self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "w.db",
-                                              FileAnchor(Path(self.tmp.name) / "w.anchor"),
+                                              FileAnchor(Path(self.tmp.name) / "w.jsonl"),
                                               "scratch", NOW)
 
     def test_forged_receipt_index_row(self):
         self._assert_unavailable_after("INSERT INTO receipts VALUES (?, ?, 99)", R2, C2)
 
-    def test_deleted_nonce_row(self):
-        self._assert_unavailable_after("DELETE FROM nonces WHERE nonce = ?", N1)
-
-    def test_edited_chain_body(self):
-        self._assert_unavailable_after("UPDATE chain SET body = replace(body, ?, ?) WHERE seq = 1",
-                                       C1, C2)
-
-    def test_use_of_never_issued_receipt_refused(self):
-        with self.assertRaises(RegistryUnavailable):
-            self.reg.record_use(R2, "host-updater", "deploy", NOW)
-        self.reopen()                                   # nothing was appended
-        self.assertEqual(self.anchor.read()[0], 0)
-
-    def test_chain_with_use_before_issue_refused(self):
-        # Forge a correctly hashed chain whose only non-genesis event is a use.
-        import json as _json
-        from t39.receipt_registry import _link
-        self.reg.close()
-        db = sqlite3.connect(self.path)
-        prev = db.execute("SELECT head FROM chain WHERE seq = 0").fetchone()[0]
-        body = {"receipt_hash": R2, "consumer": "x", "purpose": "deploy", "at": NOW.isoformat()}
-        head = _link(prev, 1, "use", body)
-        db.execute("INSERT INTO chain VALUES (1, 'use', ?, ?)", (_json.dumps(body, sort_keys=True), head))
-        db.commit()
-        db.close()
-        self.anchor.advance(1, head)
-        with self.assertRaises(RegistryUnavailable):
-            ReceiptRegistry(self.path, self.anchor)
-        self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "u.db",
-                                              FileAnchor(Path(self.tmp.name) / "u.anchor"),
-                                              "scratch", NOW)
-
-    def test_chain_edit_consistent_with_indexes(self):
-        # Only the hash chain can catch this: indexes are untouched.
+    def test_edited_local_chain_body(self):
         self._assert_unavailable_after(
             "UPDATE chain SET body = replace(body, '\"reviewer\": \"claude\"',"
             " '\"reviewer\": \"dolores\"') WHERE seq = 1")
 
-    def test_deleted_chain_row(self):
-        self._assert_unavailable_after("DELETE FROM chain WHERE seq = 1")
+    def test_tampered_anchor_log_refused(self):
+        self.admit()
+        lines = self.anchor_path.read_text().splitlines()
+        lines[1] = lines[1].replace('"claude"', '"mallory"')
+        self.anchor_path.write_text("\n".join(lines) + "\n")
+        with self.assertRaises(RegistryUnavailable):
+            self.reopen()
+        self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "x.db",
+                                              FileAnchor(Path(self.tmp.name) / "x.jsonl"),
+                                              "scratch", NOW)
 
-    def test_garbage_and_missing_anchor(self):
+    def test_use_of_never_issued_receipt_refused(self):
+        with self.assertRaises(RegistryUnavailable):
+            self.reg.record_use(R2, "host-updater", "deploy", NOW)
+        self.assertEqual(len(self.anchor.entries()), 1)
+
+    def test_bootstrap_is_one_time(self):
+        with self.assertRaises(RegistryUnavailable):
+            ReceiptRegistry.initialize(self.path, self.anchor, "potter-main", NOW)
+        with self.assertRaises(RegistryUnavailable):
+            ReceiptRegistry.initialize(Path(self.tmp.name) / "other.db", self.anchor,
+                                       "potter-main", NOW)
+
+    def test_garbage_or_missing_anchor(self):
         self.reg.close()
-        self.anchor_path.write_text("nope")
+        self.anchor_path.write_text("nope\n")
         with self.assertRaises(RegistryUnavailable):
             ReceiptRegistry(self.path, self.anchor)
         self.anchor_path.unlink()
         with self.assertRaises(RegistryUnavailable):
             ReceiptRegistry(self.path, self.anchor)
         self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "v.db",
-                                              FileAnchor(Path(self.tmp.name) / "v.anchor"),
+                                              FileAnchor(Path(self.tmp.name) / "v.jsonl"),
                                               "scratch", NOW)
 
     def test_closed_registry_refuses_consumers(self):
