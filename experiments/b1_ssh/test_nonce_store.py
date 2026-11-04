@@ -54,14 +54,16 @@ class NonceStoreTests(unittest.TestCase):
         script = '''
 import os, sqlite3, sys
 from nonce_store import consume_pair
-db = sqlite3.connect(sys.argv[1])
+class ExitAfterFirstInsert(sqlite3.Connection):
+    def executemany(self, sql, rows):
+        rows = iter(rows)
+        self.execute(sql, next(rows))
+        os._exit(21)
+
+stage = sys.argv[2]
+db = sqlite3.connect(sys.argv[1], factory=ExitAfterFirstInsert if stage == 'before' else sqlite3.Connection)
 pair = ('9' * 64, 'a' * 64)
 binding = {'commit': 'a' * 40, 'tree': 'b' * 40, 'receipt_hash': 'c' * 64}
-if sys.argv[2] == 'before':
-    db.execute('BEGIN IMMEDIATE')
-    db.execute('INSERT INTO used_nonces VALUES (?, ?, ?, ?)',
-               (pair[0], binding['commit'], binding['tree'], binding['receipt_hash']))
-    os._exit(21)
 if not consume_pair(db, pair, binding):
     os._exit(24)
 os._exit(22)
