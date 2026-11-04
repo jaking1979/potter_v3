@@ -30,9 +30,7 @@ Session 2, five days after session 1: "OK, where are we on Thanksgiving? What's 
 - The harness asserts that the transcript path and the session-1 conversation ID can't be resolved from the session-2 sandbox.
 - In the no-memory arm, it also asserts the store is empty.
 
-**Run validity:**
-- A no-memory output containing the canary, or any decision recorded only in session 1, invalidates that run.
-- A memory-arm output containing the canary is valid only if the store holds it.
+**Run validity:** governed by the single contract under "Run validity (no-memory arm)" in the grading anchors below. A memory-arm output containing the canary is valid only if the store holds it.
 
 ## Safe evaluation
 
