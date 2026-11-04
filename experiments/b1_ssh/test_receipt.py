@@ -1,3 +1,4 @@
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -5,6 +6,7 @@ from pathlib import Path
 
 from claims import SCHEMA, attestation_bytes
 from receipt import verify_experimental_receipt
+from nonce_store import prepare, consume_pair, pair_matches
 
 
 class ReceiptCompositionTests(unittest.TestCase):
@@ -93,6 +95,21 @@ class ReceiptCompositionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._call()
         self.assertEqual(self.consumed, before)
+
+    def test_scratch_sqlite_composition_and_reopened_replay(self):
+        database = self.root / 'scratch.db'
+        nonces = ('d' * 64, 'e' * 64)
+        with sqlite3.connect(database) as db:
+            prepare(db)
+            receipt = self._call(consume_nonces=lambda pair, binding: consume_pair(db, pair, binding))
+            binding = {'commit': receipt['commit'], 'tree': receipt['tree'],
+                       'receipt_hash': receipt['receipt_hash']}
+            self.assertTrue(pair_matches(db, nonces, binding))
+        with sqlite3.connect(database) as reopened:
+            self.assertTrue(pair_matches(reopened, nonces, binding))
+            with self.assertRaises(ValueError):
+                self._call(consume_nonces=lambda pair, facts: consume_pair(reopened, pair, facts))
+            self.assertTrue(pair_matches(reopened, nonces, binding))
 
     def test_self_review_and_missing_authority_evidence_fail_closed(self):
         same = dict(self.trusted)
