@@ -150,6 +150,51 @@ class Lifecycle(Base):
         self.assertEqual(self.anchor.read()[0], 1)
 
 
+class FlakyAnchor(FileAnchor):
+    def __init__(self, path):
+        super().__init__(path)
+        self.fail = False
+
+    def advance(self, seq, head):
+        # Fail only real forward moves, so the pre-write sync (a no-op at the
+        # current head) passes and the failure lands AFTER the local commit.
+        current = self.read()
+        if self.fail and (current is None or seq > current[0]):
+            raise OSError("anchor host unreachable")
+        super().advance(seq, head)
+
+
+class AnchorFailure(Base):
+    def setUp(self):
+        super().setUp()
+        self.reg.close()
+        self.anchor = FlakyAnchor(self.anchor_path)
+        self.reg = ReceiptRegistry(self.path, self.anchor)
+
+    def test_failed_anchor_then_retry_while_unavailable_then_recovery(self):
+        self.anchor.fail = True
+        with self.assertRaises(Refused):
+            self.admit()                       # committed locally, anchor not advanced
+        with self.assertRaises(Refused):
+            self.admit()                       # retry takes ALREADY_ISSUED path: still refused
+        self.assertEqual(self.anchor.read()[0], 0)
+        with self.assertRaises(Refused):
+            self.use("host-updater")           # use cannot be anchored either
+        self.anchor.fail = False
+        self.admit()                           # recovery: retry anchors the head
+        self.assertEqual(self.anchor.read()[0], 1)
+        self.use("host-updater")
+        self.assertEqual(self.anchor.read()[0], 2)
+
+    def test_reopen_after_unanchored_commit_catches_up(self):
+        self.anchor.fail = True
+        with self.assertRaises(Refused):
+            self.admit()
+        self.anchor.fail = False
+        self.reopen()
+        self.assertEqual(self.anchor.read()[0], 1)
+
+
 class Integrity(Base):
     def tamper(self, sql, *args):
         self.reg.close()

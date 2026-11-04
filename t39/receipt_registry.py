@@ -131,6 +131,11 @@ class FileAnchor:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            dfd = os.open(self.path.parent, os.O_RDONLY)   # make the rename durable
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
 
 
 def _link(prev: str, seq: int, kind: str, body: dict) -> str:
@@ -201,10 +206,12 @@ class ReceiptRegistry:
                 raise RegistryUnavailable("registry schema version mismatch")
             if self._db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise RegistryUnavailable("registry failed integrity check")
+            # Read the (monotonic) anchor BEFORE the chain, so a concurrent
+            # writer advancing it cannot make an up-to-date chain look behind.
+            anchored = anchor.read()
             seq, head = self._verify_chain()
         except sqlite3.Error as exc:
             raise RegistryUnavailable(f"registry unusable: {exc}") from exc
-        anchored = anchor.read()
         if anchored is None:
             raise RegistryUnavailable("anchor missing")
         a_seq, a_head = anchored
@@ -244,6 +251,29 @@ class ReceiptRegistry:
             raise RegistryUnavailable("receipt index disagrees with chain")
         return expected_seq - 1, prev
 
+    def _sync_anchor(self) -> None:
+        """Advance the anchor to the current chain head and confirm it took.
+
+        Every success path calls this, including an ALREADY_ISSUED retry, so a
+        success is never returned while the external anchor is stale.
+        """
+        try:
+            seq, head = self._db.execute(
+                "SELECT seq, head FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
+            self._anchor.advance(seq, head)
+            anchored = self._anchor.read()
+        except RegistryUnavailable:
+            raise
+        except Exception as exc:
+            raise RegistryUnavailable(f"anchor sync failed: {type(exc).__name__}") from exc
+        if anchored is None or anchored[0] < seq:
+            raise RegistryUnavailable("anchor did not advance to the chain head")
+        # Another process may have advanced it further; the anchored head must
+        # still be a row of this chain.
+        row = self._db.execute("SELECT head FROM chain WHERE seq = ?", (anchored[0],)).fetchone()
+        if row is None or row[0] != anchored[1]:
+            raise RegistryUnavailable("anchor disagrees with chain (fork)")
+
     def _append(self, kind: str, body: dict) -> tuple[int, str]:
         seq, prev = self._db.execute(
             "SELECT seq, head FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
@@ -257,14 +287,17 @@ class ReceiptRegistry:
             raise ValueError("Facts required")
         if not _NAME.fullmatch(issuer):
             raise ValueError("issuer must be a short lower-case identifier")
+        self._sync_anchor()      # refuse before writing if the anchor is unreachable
         try:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 existing = self.get(facts.receipt_hash)
                 if existing is not None:
                     self._db.execute("ROLLBACK")
-                    same = existing.facts == facts.canonical()
-                    return Issue.ALREADY_ISSUED if same else Issue.REPLAY
+                    if existing.facts != facts.canonical():
+                        return Issue.REPLAY
+                    self._sync_anchor()          # retry must not succeed past a stale anchor
+                    return Issue.ALREADY_ISSUED
                 if self._db.execute("SELECT 1 FROM nonces WHERE nonce IN (?, ?)",
                                     facts.nonces).fetchone():
                     self._db.execute("ROLLBACK")
@@ -282,7 +315,7 @@ class ReceiptRegistry:
                 raise
         except sqlite3.Error as exc:
             raise RegistryUnavailable(f"registry error: {exc}") from exc
-        self._anchor.advance(seq, head)
+        self._sync_anchor()
         return Issue.ISSUED
 
     def get(self, receipt_hash: str) -> IssuedReceipt | None:
@@ -297,6 +330,7 @@ class ReceiptRegistry:
     def record_use(self, receipt_hash: str, consumer: str, purpose: str, now: datetime) -> None:
         if not _NAME.fullmatch(consumer) or not _NAME.fullmatch(purpose):
             raise ValueError("consumer and purpose must be short lower-case identifiers")
+        self._sync_anchor()
         try:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -313,7 +347,7 @@ class ReceiptRegistry:
                 raise
         except sqlite3.Error as exc:
             raise RegistryUnavailable(f"registry error: {exc}") from exc
-        self._anchor.advance(seq, head)
+        self._sync_anchor()
 
     def receipted_commits(self, commits: list[str]) -> set[str]:
         if any(not isinstance(c, str) or not _HEX40.fullmatch(c) for c in commits):
