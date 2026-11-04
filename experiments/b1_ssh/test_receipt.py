@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 import subprocess
 import tempfile
@@ -113,20 +114,26 @@ class ReceiptCompositionTests(unittest.TestCase):
 
     def test_scratch_commit_then_lost_ack_can_be_identified_not_authorized(self):
         database = self.root / 'scratch-lost-ack.db'
-        observed_bindings = []
+        author_payload, author_sig = self._attestation('author', 'd' * 64)
+        reviewer_payload, reviewer_sig = self._attestation('reviewer', 'e' * 64)
+        expected_hash = hashlib.sha256(
+            b'potter.receipt/v0\0' + author_payload + b'\0' + reviewer_payload
+        ).hexdigest()
+        expected_binding = {'commit': self.expected['commit'], 'tree': self.expected['tree'],
+                            'receipt_hash': expected_hash}
         with sqlite3.connect(database) as db:
             prepare(db)
             def commit_then_fail(pair, binding):
                 self.assertTrue(consume_pair(db, pair, binding))
-                observed_bindings.append(dict(binding))
                 raise OSError('synthetic lost acknowledgment')
             with self.assertRaises(OSError):
-                self._call(consume_nonces=commit_then_fail)
+                self._call(author_payload=author_payload, author_signature=author_sig,
+                           reviewer_payload=reviewer_payload, reviewer_signature=reviewer_sig,
+                           consume_nonces=commit_then_fail)
         nonces = ('d' * 64, 'e' * 64)
         with sqlite3.connect(database) as reopened:
-            self.assertEqual(len(observed_bindings), 1)
-            self.assertTrue(pair_matches(reopened, nonces, observed_bindings[0]))
-            mismatched = {**observed_bindings[0], 'receipt_hash': 'f' * 64}
+            self.assertTrue(pair_matches(reopened, nonces, expected_binding))
+            mismatched = {**expected_binding, 'receipt_hash': 'f' * 64}
             self.assertFalse(pair_matches(reopened, nonces, mismatched))
             with self.assertRaises(ValueError):
                 self._call(consume_nonces=lambda pair, facts: consume_pair(reopened, pair, facts))
