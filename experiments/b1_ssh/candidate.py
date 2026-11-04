@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import subprocess
+from pathlib import Path
 
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _MANIFEST = "governance/decisions/manifest.json"
@@ -25,13 +26,23 @@ def candidate_facts(repo, commit, evidence):
     env['GIT_CONFIG_NOSYSTEM'] = '1'
     env['GIT_CONFIG_GLOBAL'] = os.devnull
     env['GIT_NO_REPLACE_OBJECTS'] = '1'
+    # Only a normal repository root is supported in this experiment. Explicit
+    # git-dir prevents Git from silently discovering an enclosing repository.
+    root = Path(repo).resolve(strict=True)
+    git_dir = root / '.git'
+    if not git_dir.is_dir():
+        raise ValueError('expected repository root with .git directory')
+    git_dir = git_dir.resolve(strict=True)
+    env['GIT_CEILING_DIRECTORIES'] = str(root.parent)
     def git(*args):
         try:
-            return subprocess.run(['git', '-C', os.fspath(repo), *args], env=env,
+            return subprocess.run(['git', '--git-dir', str(git_dir), '--work-tree', str(root), *args], env=env,
                                   check=True, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, timeout=10).stdout
         except (subprocess.SubprocessError, OSError) as exc:
             raise ValueError('git object unavailable') from exc
+    if Path(os.fsdecode(git('rev-parse', '--absolute-git-dir').strip())).resolve() != git_dir:
+        raise ValueError('unexpected git directory')
     if git('cat-file', '-t', commit).strip() != b'commit':
         raise ValueError('candidate is not a commit')
     tree = git('rev-parse', '--verify', commit + '^{tree}').strip().decode('ascii')
