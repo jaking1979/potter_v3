@@ -1,4 +1,6 @@
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -47,6 +49,35 @@ class NonceStoreTests(unittest.TestCase):
             db.execute('DROP TRIGGER injected_failure')
             db.commit()
             self.assertTrue(consume_pair(db, (first, second), BINDING))
+
+    def test_abrupt_child_exit_before_and_after_commit(self):
+        script = '''
+import os, sqlite3, sys
+from nonce_store import consume_pair
+db = sqlite3.connect(sys.argv[1])
+pair = ('9' * 64, 'a' * 64)
+binding = {'commit': 'a' * 40, 'tree': 'b' * 40, 'receipt_hash': 'c' * 64}
+if sys.argv[2] == 'before':
+    db.execute('BEGIN IMMEDIATE')
+    db.execute('INSERT INTO used_nonces VALUES (?, ?, ?, ?)',
+               (pair[0], binding['commit'], binding['tree'], binding['receipt_hash']))
+    os._exit(21)
+if not consume_pair(db, pair, binding):
+    os._exit(24)
+os._exit(22)
+'''
+        pair = ('9' * 64, 'a' * 64)
+        for stage, exit_code in (('before', 21), ('after', 22)):
+            child = subprocess.run([sys.executable, '-c', script, str(self.path), stage],
+                                   cwd=str(Path(__file__).resolve().parent), timeout=10)
+            self.assertEqual(child.returncode, exit_code)
+            with sqlite3.connect(self.path) as db:
+                if stage == 'before':
+                    self.assertIsNone(lookup(db, pair[0]))
+                    self.assertIsNone(lookup(db, pair[1]))
+                else:
+                    self.assertTrue(pair_matches(db, pair, BINDING))
+                    self.assertFalse(consume_pair(db, pair, BINDING))
 
     def test_pair_replay_rolls_back_without_burning_other_nonce(self):
         with sqlite3.connect(self.path) as db:
