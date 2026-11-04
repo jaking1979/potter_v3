@@ -1,6 +1,6 @@
 import copy
 import unittest
-from prevalence import category_prevalence
+from prevalence import category_prevalence, synthetic_usable_prevalence
 
 
 def record(i, responsibility=False):
@@ -38,3 +38,33 @@ class PrevalenceTests(unittest.TestCase):
         item = category_prevalence([record(1)], [record(1)])['follow_through']
         self.assertEqual(item['pooled_total'], 0)
         self.assertFalse(item['over_ninety_percent'])
+
+    def test_usable_subset_and_fixed_planned_n(self):
+        plan = {str(i): i == 0 for i in range(20)}
+        first = [record(i, i == 0) for i in range(20)]
+        second = copy.deepcopy(first[1:])
+        result = synthetic_usable_prevalence(first, second, plan)
+        self.assertEqual((result['planned_cases'], result['usable_cases']), (20, 19))
+        self.assertEqual(result['affected_case_ids'], ['0'])
+        self.assertEqual(result['prevalence']['done']['pooled_total'], 76)
+        self.assertEqual(result['prevalence']['follow_through']['pooled_total'], 0)
+
+    def test_invalid_exercise_and_no_usable_cases_have_no_prevalence(self):
+        plan = {str(i): False for i in range(20)}
+        first = [record(i) for i in range(20)]
+        result = synthetic_usable_prevalence(first, first[3:], plan)
+        self.assertEqual(result['usable_cases'], 17)
+        self.assertIsNone(result['prevalence'])
+        result = synthetic_usable_prevalence(first, [], plan)
+        self.assertEqual(result['usable_cases'], 0)
+        self.assertIsNone(result['prevalence'])
+
+    def test_duplicate_and_malformed_cases_are_excluded(self):
+        plan = {str(i): False for i in range(20)}
+        first = [record(i) for i in range(20)]
+        second = copy.deepcopy(first)
+        second.append(copy.deepcopy(second[0]))
+        second[1]['outputs']['A']['trust'] = 'forged'
+        result = synthetic_usable_prevalence(first, second, plan)
+        self.assertEqual(result['affected_case_ids'], ['0', '1'])
+        self.assertEqual(result['prevalence']['trust']['pooled_total'], 72)

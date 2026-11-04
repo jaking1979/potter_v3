@@ -46,3 +46,25 @@ def category_prevalence(first, second):
             'over_ninety_percent': n > 0 and any(count * 10 > n * 9 for count in pooled.values()),
         }
     return result
+
+
+def synthetic_usable_prevalence(first, second, expected_cases):
+    """Experimental usable-case counts; not an exercise or pass verdict.
+
+    Matched, valid cases are counted; affected cases are displayed alongside the
+    planned N. When affected cases exceed 10% or none remain, prevalence is
+    unavailable. Caller must independently verify mapping and exercise validity.
+    """
+    from case_agreement import count_case_agreement, affected_case_summary
+
+    counts = count_case_agreement(first, second, expected_cases)
+    affected = affected_case_summary(counts, expected_cases)
+    excluded = set(affected['affected_case_ids'])
+    usable = set(expected_cases) - excluded
+    values = None
+    if usable and not affected['invalid_over_ten_percent']:
+        filtered = [[row for row in records if row['case_id'] in usable]
+                    for records in (first, second)]
+        values = category_prevalence(*filtered)
+    return {'planned_cases': len(expected_cases), 'usable_cases': len(usable),
+            'affected_case_ids': affected['affected_case_ids'], 'prevalence': values}
