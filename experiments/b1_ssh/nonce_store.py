@@ -34,7 +34,12 @@ def _validate(nonces, binding):
 
 
 def consume_pair(connection, nonces, binding):
-    """Atomically record both nonces; reject invalid or previously used inputs."""
+    """Atomically record both nonces; return false after any integrity rollback.
+
+    False does not distinguish replay from an injected/other SQLite integrity
+    failure. A future consumer must verify both stored bindings with pair_matches
+    before treating an uncertain result as successful prior consumption.
+    """
     _validate(nonces, binding)
     if connection.in_transaction:
         raise ValueError('caller transaction must be closed')
