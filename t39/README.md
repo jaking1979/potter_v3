@@ -20,7 +20,7 @@ This package holds two of the production pieces of the ratified T39 receipt gate
 - **One-time bootstrap:** `initialize` is an explicit, one-time step. It is refused if the file exists **or the anchor is already set**, so losing state can never quietly restart with an empty registry. Opening never creates anything.
 - **Durability:** WAL, `synchronous=FULL`, a schema-version check and `quick_check`.
 
-## Tests (`tests/test_t39_store_gate.py`, 20)
+## Tests (`tests/test_t39_store_gate.py`, 22)
 - **Lifecycle:** the full CI → builder → host → rollback sequence, including across a restart; a never-issued receipt refused at every consumer; idempotent issuer retry; replay and partial-overlap replay (T39 test 3); a commit or tree changed after review (T39 test 4); verifier failures and incomplete facts, including identical keys for both roles; detector input; and 5 processes racing so that exactly one issues.
 - **Integrity:** one-time bootstrap including after state loss; a restored older backup; crash recovery; a forked anchor; a forged index row; a deleted nonce; edited and deleted chain rows; a chain edit that leaves the indexes consistent; a garbage or missing anchor; a closed registry.
 - **Mutation checks:** each of these makes at least one test fail when removed:

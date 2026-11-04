@@ -122,7 +122,8 @@ class Lifecycle(Base):
                         registry=self.reg, issuer="ci", now=NOW)
         for broken in (facts(nonces=(N1,)), facts(nonces=(N1, N1)),
                        facts(key_fingerprints={"author": "k", "reviewer": "k"}),
-                       facts(agents={"author": "dolores"}), facts(verifier_version="")):
+                       facts(agents={"author": "dolores"}), facts(verifier_version=""),
+                       facts(agents={"author": "dolores", "reviewer": "dolores"})):
             with self.subTest(broken=broken), self.assertRaises(Refused):
                 self.admit(broken)
         with self.assertRaises(Refused):
@@ -222,6 +223,31 @@ class Integrity(Base):
     def test_edited_chain_body(self):
         self._assert_unavailable_after("UPDATE chain SET body = replace(body, ?, ?) WHERE seq = 1",
                                        C1, C2)
+
+    def test_use_of_never_issued_receipt_refused(self):
+        with self.assertRaises(RegistryUnavailable):
+            self.reg.record_use(R2, "host-updater", "deploy", NOW)
+        self.reopen()                                   # nothing was appended
+        self.assertEqual(self.anchor.read()[0], 0)
+
+    def test_chain_with_use_before_issue_refused(self):
+        # Forge a correctly hashed chain whose only non-genesis event is a use.
+        import json as _json
+        from t39.receipt_registry import _link
+        self.reg.close()
+        db = sqlite3.connect(self.path)
+        prev = db.execute("SELECT head FROM chain WHERE seq = 0").fetchone()[0]
+        body = {"receipt_hash": R2, "consumer": "x", "purpose": "deploy", "at": NOW.isoformat()}
+        head = _link(prev, 1, "use", body)
+        db.execute("INSERT INTO chain VALUES (1, 'use', ?, ?)", (_json.dumps(body, sort_keys=True), head))
+        db.commit()
+        db.close()
+        self.anchor.advance(1, head)
+        with self.assertRaises(RegistryUnavailable):
+            ReceiptRegistry(self.path, self.anchor)
+        self.reg = ReceiptRegistry.initialize(Path(self.tmp.name) / "u.db",
+                                              FileAnchor(Path(self.tmp.name) / "u.anchor"),
+                                              "scratch", NOW)
 
     def test_chain_edit_consistent_with_indexes(self):
         # Only the hash chain can catch this: indexes are untouched.

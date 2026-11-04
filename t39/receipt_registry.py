@@ -75,6 +75,8 @@ class Facts:
               and all(isinstance(n, str) and _HEX64.fullmatch(n) for n in self.nonces)
               and self.nonces[0] != self.nonces[1]
               and isinstance(self.agents, dict) and set(self.agents) == {"author", "reviewer"}
+              and all(isinstance(v, str) and _NAME.fullmatch(v) for v in self.agents.values())
+              and self.agents["author"] != self.agents["reviewer"]
               and isinstance(self.key_fingerprints, dict)
               and set(self.key_fingerprints) == {"author", "reviewer"}
               and self.key_fingerprints["author"] != self.key_fingerprints["reviewer"]
@@ -225,6 +227,8 @@ class ReceiptRegistry:
                 raise RegistryUnavailable("chain sequence broken")
             if _link(prev, seq, kind, body) != head:
                 raise RegistryUnavailable("chain hash mismatch (edited or forged row)")
+            if kind == "use" and body.get("receipt_hash") not in issued:
+                raise RegistryUnavailable("use event for a receipt not issued earlier in the chain")
             if kind == "issue":
                 issued[body["facts"]["receipt_hash"]] = (body["facts"]["commit"], seq)
                 for n in body["facts"]["nonces"]:
@@ -296,6 +300,9 @@ class ReceiptRegistry:
         try:
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                if not self._db.execute("SELECT 1 FROM receipts WHERE receipt_hash = ?",
+                                        (receipt_hash,)).fetchone():
+                    raise RegistryUnavailable("use refused: receipt was never issued")
                 seq, head = self._append("use", {"receipt_hash": receipt_hash,
                                                  "consumer": consumer, "purpose": purpose,
                                                  "at": now.isoformat()})
