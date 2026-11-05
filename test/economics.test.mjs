@@ -150,3 +150,15 @@ test("rate and call instants reject normalized impossible calendar dates",()=>{
  }
  assert.doesNotThrow(()=>validateCall({...make(),occurred_at:"2024-02-29T12:00:00Z"}));
 });
+
+
+test("equivalent timestamp offsets are canonical before replay comparison",()=>{
+ const first=priceCall(make("same","parent",{occurred_at:"2026-11-05T12:00:00Z"}),rate);
+ const replay=priceCall(make("same","parent",{occurred_at:"2026-11-05T07:00:00-05:00"}),rate);
+ assert.equal(first.occurred_at,"2026-11-05T12:00:00.000Z");
+ assert.equal(replay.occurred_at,first.occurred_at);
+ const totals=rollupTasks([{task_id:"parent",parent_task_id:null}],[first,replay]);
+ assert.equal(totals.parent.calls,1);
+ const midnight=validateCall({...make(),occurred_at:"2026-11-05T24:00:00Z"});
+ assert.equal(midnight.occurred_at,"2026-11-06T00:00:00.000Z");
+});
