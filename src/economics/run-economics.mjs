@@ -39,6 +39,13 @@ function text(x, label) {
   return x;
 }
 
+function instant(x, label) {
+  if (typeof x !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(x) || Number.isNaN(Date.parse(x))) {
+    throw new EconomicsInputError(label + " must be a timestamp with timezone");
+  }
+  return x;
+}
+
 function count(x, label) {
   if (!Number.isSafeInteger(x) || x < 0) {
     throw new EconomicsInputError(`${label} must be a nonnegative safe integer`);
@@ -73,7 +80,7 @@ export function validateCall(raw) {
       counts.cache_read_tokens + counts.cache_write_tokens > counts.input_tokens) {
     throw new EconomicsInputError("cache tokens exceed total input tokens");
   }
-  if (Number.isNaN(Date.parse(raw.occurred_at))) throw new EconomicsInputError("invalid occurred_at");
+  instant(raw.occurred_at, "occurred_at");
   return Object.freeze({
     run_id: text(raw.run_id, "run_id"),
     task_id: text(raw.task_id, "task_id"),
@@ -94,8 +101,8 @@ export function validateRate(raw) {
   const rate = {
     provider: text(raw.provider, "provider"),
     model: text(raw.model, "model"),
-    effective_at: text(raw.effective_at, "effective_at"),
-    expires_at: raw.expires_at == null ? null : text(raw.expires_at, "expires_at"),
+    effective_at: instant(raw.effective_at, "effective_at"),
+    expires_at: raw.expires_at == null ? null : instant(raw.expires_at, "expires_at"),
   };
   if (Number.isNaN(Date.parse(rate.effective_at))) {
     throw new EconomicsInputError("rate effective_at must be a parseable date");
@@ -197,6 +204,7 @@ export function rollupTasks(tasks, pricedCalls) {
   const identities = new Map();
   for (const call of pricedCalls) {
     if (!parent.has(call.task_id)) throw new EconomicsInputError("call references missing task");
+    if (call.parent_task_id !== parent.get(call.task_id)) throw new EconomicsInputError("call parent does not match task lineage");
     const id = `${call.run_id}\u0000${call.task_id}\u0000${call.attempt}\u0000${call.call_id}`;
     const snapshot = JSON.stringify(call);
     if (identities.has(id)) {
