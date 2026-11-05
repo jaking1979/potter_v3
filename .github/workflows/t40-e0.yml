@@ -1,0 +1,23 @@
+name: T40 Economics E0 synthetic tests
+
+on:
+  pull_request:
+    paths:
+      - 'src/economics/**'
+      - 'test/economics.test.mjs'
+      - '.github/workflows/t40-e0.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test pure accounting primitives
+        run: node --test test/economics.test.mjs
