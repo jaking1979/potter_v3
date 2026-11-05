@@ -141,3 +141,12 @@ test("arithmetic overflow fails closed rather than producing invalid totals",()=
  const b=priceCall(make("huge2","parent",{usage:{input_tokens:1,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0}}),rate);
  assert.throws(()=>rollupTasks([{task_id:"parent",parent_task_id:null}],[a,b]),/usage arithmetic overflow/);
 });
+
+
+test("rate and call instants reject normalized impossible calendar dates",()=>{
+ for (const date of ["2026-02-29T12:00:00Z","2026-04-31T12:00:00Z","2025-02-30T01:00:00-05:00"]) {
+  assert.throws(()=>priceCall(make("date","parent",{occurred_at:date}),rate),/valid calendar date/);
+  assert.throws(()=>priceCall(make(),{...rate,effective_at:date}),/valid calendar date/);
+ }
+ assert.doesNotThrow(()=>validateCall({...make(),occurred_at:"2024-02-29T12:00:00Z"}));
+});
