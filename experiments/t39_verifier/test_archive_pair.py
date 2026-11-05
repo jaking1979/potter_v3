@@ -35,6 +35,17 @@ class ArchiveTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.archive(issued, **change)
 
+    def test_verifier_version_is_audit_only_but_binding_is_required(self):
+        issued = self.verify()
+        old_version = dict(issued, verifier_version='older-verifier')
+        self.assertEqual(self.archive(old_version), issued)
+        for forged in (dict(issued, verifier_version=''), dict(issued, extra='x'),
+                       dict(issued, receipt_hash='0' * 64),
+                       dict(issued, agents={'author': 'claude', 'reviewer': 'dolores'}),
+                       dict(issued, key_fingerprints={'author': 'x', 'reviewer': 'y'})):
+            with self.subTest(forged=forged), self.assertRaises(ValueError):
+                self.archive(forged)
+
     def test_signature_or_candidate_change_refused(self):
         issued = self.verify()
         self.sigs[0] = self.sigs[1]
