@@ -119,3 +119,35 @@ def realign_occurrences(first, second, first_map, second_map, outputs):
     return realign_pair(first, second,
                         {label: value[0] for label, value in mappings[0].items()},
                         {label: value[0] for label, value in mappings[1].items()})
+
+
+def synthetic_aligned_report(pairs, expected_cases):
+    """Compose occurrence alignment and descriptive scoring for complete pairs.
+
+    Every planned case must be present exactly once and independently supplied
+    mappings must validate. This deliberately refuses incomplete exercises;
+    it is not the separate L17 missing-case scoring policy. Neither it nor its
+    result authenticates inputs, enforces blindness, or authorizes evaluation.
+    """
+    from report import synthetic_report
+    if type(pairs) is not list or type(expected_cases) is not dict or not expected_cases:
+        raise ValueError('pair list and case plan required')
+    if any(not isinstance(k, str) or not k.strip() or type(v) is not bool
+           for k, v in expected_cases.items()):
+        raise ValueError('invalid case plan')
+    first, second, seen = [], [], set()
+    required = {'first', 'second', 'first_map', 'second_map', 'outputs'}
+    for pair in pairs:
+        if type(pair) is not dict or set(pair) != required:
+            raise ValueError('invalid pair')
+        a, b = realign_occurrences(pair['first'], pair['second'], pair['first_map'],
+                                   pair['second_map'], pair['outputs'])
+        case = a['case_id']
+        if case not in expected_cases or case in seen or a['responsibility'] != expected_cases[case]:
+            raise ValueError('unexpected, duplicate or mistyped case')
+        seen.add(case)
+        first.append(a)
+        second.append(b)
+    if seen != set(expected_cases):
+        raise ValueError('incomplete case plan')
+    return synthetic_report(first, second, expected_cases)
