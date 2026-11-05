@@ -49,6 +49,14 @@ function instant(x, label) {
   return x;
 }
 
+// Limits free-form text; an ID-like secret can still pass, so adapters must redact.
+function identifier(x, label) {
+  if (typeof x !== "string" || !/^[A-Za-z0-9._:/-]{1,128}$/.test(x)) {
+    throw new EconomicsInputError(label + " must be an opaque identifier");
+  }
+  return x;
+}
+
 function count(x, label) {
   if (!Number.isSafeInteger(x) || x < 0) {
     throw new EconomicsInputError(`${label} must be a nonnegative safe integer`);
@@ -85,16 +93,16 @@ export function validateCall(raw) {
   }
   instant(raw.occurred_at, "occurred_at");
   return Object.freeze({
-    run_id: text(raw.run_id, "run_id"),
-    task_id: text(raw.task_id, "task_id"),
-    parent_task_id: raw.parent_task_id == null ? null : text(raw.parent_task_id, "parent_task_id"),
+    run_id: identifier(raw.run_id, "run_id"),
+    task_id: identifier(raw.task_id, "task_id"),
+    parent_task_id: raw.parent_task_id == null ? null : identifier(raw.parent_task_id, "parent_task_id"),
     attempt: count(raw.attempt, "attempt"),
-    call_id: text(raw.call_id, "call_id"),
+    call_id: identifier(raw.call_id, "call_id"),
     occurred_at: text(raw.occurred_at, "occurred_at"),
-    provider: text(raw.provider, "provider"),
-    model: text(raw.model, "model"),
-    context_class: raw.context_class == null ? null : text(raw.context_class, "context_class"),
-    cache_write_class: raw.cache_write_class == null ? null : text(raw.cache_write_class, "cache_write_class"),
+    provider: identifier(raw.provider, "provider"),
+    model: identifier(raw.model, "model"),
+    context_class: raw.context_class == null ? null : identifier(raw.context_class, "context_class"),
+    cache_write_class: raw.cache_write_class == null ? null : identifier(raw.cache_write_class, "cache_write_class"),
     usage: Object.freeze(counts),
     reported_cost_usd: raw.reported_cost_usd == null ? null : dollars(raw.reported_cost_usd, "reported_cost_usd"),
   });
@@ -104,12 +112,12 @@ export function validateRate(raw) {
   object(raw, "rate");
   allowed(raw, rateKeys, "rate");
   const rate = {
-    provider: text(raw.provider, "provider"),
-    model: text(raw.model, "model"),
+    provider: identifier(raw.provider, "provider"),
+    model: identifier(raw.model, "model"),
     effective_at: instant(raw.effective_at, "effective_at"),
     expires_at: raw.expires_at == null ? null : instant(raw.expires_at, "expires_at"),
-    context_class: raw.context_class == null ? null : text(raw.context_class, "context_class"),
-    cache_write_class: raw.cache_write_class == null ? null : text(raw.cache_write_class, "cache_write_class"),
+    context_class: raw.context_class == null ? null : identifier(raw.context_class, "context_class"),
+    cache_write_class: raw.cache_write_class == null ? null : identifier(raw.cache_write_class, "cache_write_class"),
   };
   if (Number.isNaN(Date.parse(rate.effective_at))) {
     throw new EconomicsInputError("rate effective_at must be a parseable date");
@@ -199,9 +207,9 @@ export function rollupTasks(tasks, pricedCalls) {
   const parent = new Map();
   for (const t of tasks) {
     object(t, "task");
-    const id = text(t.task_id, "task_id");
+    const id = identifier(t.task_id, "task_id");
     if (parent.has(id)) throw new EconomicsInputError("duplicate task_id");
-    parent.set(id, t.parent_task_id == null ? null : text(t.parent_task_id, "parent_task_id"));
+    parent.set(id, t.parent_task_id == null ? null : identifier(t.parent_task_id, "parent_task_id"));
   }
   for (const [id, p] of parent) {
     const seen = new Set([id]);
