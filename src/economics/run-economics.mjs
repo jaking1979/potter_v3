@@ -7,6 +7,8 @@ export class EconomicsInputError extends Error {
   }
 }
 
+// In-process provenance guard only; this does not authenticate serialized records.
+const pricedByThisModule = new WeakSet();
 const callKeys = new Set([
   "run_id", "task_id", "parent_task_id", "attempt", "call_id", "occurred_at", "provider",
   "model", "usage", "reported_cost_usd"
@@ -144,7 +146,7 @@ export function priceCall(raw, rawRate = null) {
       u.cache_write_tokens * (rate.cache_write_per_million ?? 0)
     ) / 1_000_000);
   }
-  return Object.freeze({
+  const priced = Object.freeze({
     ...call,
     uncached_input_tokens: uncached,
     computed_cost_usd: computed,
@@ -153,6 +155,8 @@ export function priceCall(raw, rawRate = null) {
     billed_discrepancy_usd: computed == null || call.reported_cost_usd == null
       ? null : rounded(call.reported_cost_usd - computed),
   });
+  pricedByThisModule.add(priced);
+  return priced;
 }
 
 function emptySummary() {
@@ -203,6 +207,7 @@ export function rollupTasks(tasks, pricedCalls) {
   const totals = new Map([...parent.keys()].map(k => [k, emptySummary()]));
   const identities = new Map();
   for (const call of pricedCalls) {
+    if (!pricedByThisModule.has(call)) throw new EconomicsInputError("unverified priced call");
     if (!parent.has(call.task_id)) throw new EconomicsInputError("call references missing task");
     if (call.parent_task_id !== parent.get(call.task_id)) throw new EconomicsInputError("call parent does not match task lineage");
     const id = `${call.run_id}\u0000${call.task_id}\u0000${call.attempt}\u0000${call.call_id}`;
