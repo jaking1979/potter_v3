@@ -104,3 +104,12 @@ test("call parent must match declared task lineage",()=>{
  const correct=priceCall(make("x","child"),rate);
  assert.equal(rollupTasks(tasks,[correct]).parent.calls,1);
 });
+
+test("rollup rejects fabricated, copied and deserialized priced calls",()=>{
+ const valid=priceCall(make(),rate);
+ const tasks=[{task_id:"parent",parent_task_id:null}];
+ for(const untrusted of [{...valid},JSON.parse(JSON.stringify(valid)),{task_id:"parent",computed_cost_usd:0}]) {
+  assert.throws(()=>rollupTasks(tasks,[untrusted]),/unverified priced call/);
+ }
+ assert.equal(rollupTasks(tasks,[valid]).parent.calls,1);
+});
