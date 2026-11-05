@@ -1,6 +1,7 @@
 import copy
 import unittest
 from realign import realign_pair
+from report import synthetic_report
 
 
 def grade(case='case-1', responsibility=False):
@@ -41,6 +42,19 @@ class RealignmentTests(unittest.TestCase):
         for other in (grade(case='different'), grade(responsibility=True), invalid):
             with self.subTest(other=other), self.assertRaises(ValueError):
                 realign_pair(grade(), other, mapping, mapping)
+
+    def test_alignment_feeds_report_without_creating_false_disagreement(self):
+        first = grade()
+        second = copy.deepcopy(first)
+        second['outputs']['A'], second['outputs']['B'] = second['outputs']['B'], second['outputs']['A']
+        plan = {'case-1': False}
+        unaligned = synthetic_report([first], [second], plan)
+        self.assertEqual(unaligned['agreement']['done']['agreements'], 0)
+        a, b = realign_pair(first, second, {'A': '1'*64, 'B': '2'*64},
+                            {'A': '2'*64, 'B': '1'*64})
+        aligned = synthetic_report([a], [b], plan)
+        self.assertEqual(aligned['agreement']['done']['agreements'], 1)
+        self.assertEqual(aligned['observed_flips'], [])
 
 
 if __name__ == '__main__':
