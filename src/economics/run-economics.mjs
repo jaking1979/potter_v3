@@ -11,14 +11,15 @@ export class EconomicsInputError extends Error {
 const pricedByThisModule = new WeakSet();
 const callKeys = new Set([
   "run_id", "task_id", "parent_task_id", "attempt", "call_id", "occurred_at", "provider",
-  "model", "usage", "reported_cost_usd"
+  "model", "usage", "reported_cost_usd", "context_class", "cache_write_class"
 ]);
 const usageKeys = new Set([
   "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"
 ]);
 const rateKeys = new Set([
   "provider", "model", "effective_at", "expires_at", "input_per_million",
-  "output_per_million", "cache_read_per_million", "cache_write_per_million"
+  "output_per_million", "cache_read_per_million", "cache_write_per_million",
+  "context_class", "cache_write_class"
 ]);
 
 function object(x, label) {
@@ -92,6 +93,8 @@ export function validateCall(raw) {
     occurred_at: text(raw.occurred_at, "occurred_at"),
     provider: text(raw.provider, "provider"),
     model: text(raw.model, "model"),
+    context_class: raw.context_class == null ? null : text(raw.context_class, "context_class"),
+    cache_write_class: raw.cache_write_class == null ? null : text(raw.cache_write_class, "cache_write_class"),
     usage: Object.freeze(counts),
     reported_cost_usd: raw.reported_cost_usd == null ? null : dollars(raw.reported_cost_usd, "reported_cost_usd"),
   });
@@ -105,6 +108,8 @@ export function validateRate(raw) {
     model: text(raw.model, "model"),
     effective_at: instant(raw.effective_at, "effective_at"),
     expires_at: raw.expires_at == null ? null : instant(raw.expires_at, "expires_at"),
+    context_class: raw.context_class == null ? null : text(raw.context_class, "context_class"),
+    cache_write_class: raw.cache_write_class == null ? null : text(raw.cache_write_class, "cache_write_class"),
   };
   if (Number.isNaN(Date.parse(rate.effective_at))) {
     throw new EconomicsInputError("rate effective_at must be a parseable date");
@@ -133,6 +138,10 @@ export function priceCall(raw, rawRate = null) {
   else if (Date.parse(call.occurred_at) < Date.parse(rate.effective_at)) reason = "rate_not_yet_effective";
   else if (rate.expires_at && Date.parse(call.occurred_at) >= Date.parse(rate.expires_at)) reason = "rate_expired";
   else if (!fullCounts) reason = "missing_usage";
+  // Explicit class agreement is required; unknown provider tiers never imply standard pricing.
+  else if (call.context_class == null || rate.context_class == null || call.context_class !== rate.context_class ||
+           (u.cache_write_tokens > 0 && (call.cache_write_class == null || rate.cache_write_class == null ||
+                                         call.cache_write_class !== rate.cache_write_class))) reason = "unsupported_charge";
   else if ((uncached > 0 && rate.input_per_million == null) ||
            (u.output_tokens > 0 && rate.output_per_million == null) ||
            (u.cache_read_tokens > 0 && rate.cache_read_per_million == null) ||
