@@ -52,7 +52,8 @@ function instant(x, label) {
   if (month < 1 || month > 12 || day < 1 || day > days[month - 1]) {
     throw new EconomicsInputError(label + " must be a valid calendar date");
   }
-  return x;
+  // Canonical UTC representation makes equivalent instants replay-identical.
+  return new Date(x).toISOString();
 }
 
 // Limits free-form text; an ID-like secret can still pass, so adapters must redact.
@@ -101,14 +102,14 @@ export function validateCall(raw) {
       counts.cache_read_tokens + counts.cache_write_tokens > counts.input_tokens) {
     throw new EconomicsInputError("cache tokens exceed total input tokens");
   }
-  instant(raw.occurred_at, "occurred_at");
+  const occurredAt = instant(raw.occurred_at, "occurred_at");
   return Object.freeze({
     run_id: identifier(raw.run_id, "run_id"),
     task_id: identifier(raw.task_id, "task_id"),
     parent_task_id: raw.parent_task_id == null ? null : identifier(raw.parent_task_id, "parent_task_id"),
     attempt: count(raw.attempt, "attempt"),
     call_id: identifier(raw.call_id, "call_id"),
-    occurred_at: text(raw.occurred_at, "occurred_at"),
+    occurred_at: occurredAt,
     provider: identifier(raw.provider, "provider"),
     model: identifier(raw.model, "model"),
     context_class: raw.context_class == null ? null : identifier(raw.context_class, "context_class"),
