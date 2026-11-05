@@ -2,7 +2,8 @@ import copy
 import hashlib
 import unittest
 from realign import (realign_pair, realign_verified_bytes, realign_occurrences,
-                     prepare_synthetic_occurrences, synthetic_aligned_report)
+                     prepare_synthetic_occurrences, synthetic_aligned_report,
+                     synthetic_report_with_exclusions)
 from report import synthetic_report
 
 
@@ -123,6 +124,33 @@ class RealignmentTests(unittest.TestCase):
         bad['outputs']['1'*64] = b'tampered'
         with self.assertRaises(ValueError):
             synthetic_aligned_report([bad], {'case-1': False})
+
+    def test_exclusion_composition_counts_affected_cases_once(self):
+        snapshots, first_presentation, second_presentation = prepare_synthetic_occurrences(b'a', b'b')
+        plan = {str(i): False for i in range(20)}
+        entries = []
+        for i in range(20):
+            first = grade(case=str(i))
+            second = copy.deepcopy(first)
+            if first_presentation[1]['A']['id'] != second_presentation[1]['A']['id']:
+                second['outputs']['A'], second['outputs']['B'] = second['outputs']['B'], second['outputs']['A']
+            pair = {'first': first, 'second': second, 'first_map': first_presentation[1],
+                    'second_map': second_presentation[1], 'outputs': snapshots}
+            entries.append({'case_id': str(i), 'pair': pair})
+        entries[0]['pair'] = None
+        result = synthetic_report_with_exclusions(entries, plan)
+        self.assertEqual(result['affected_case_ids'], ['0'])
+        self.assertEqual(result['agreement']['done']['denominator'], 20)
+        self.assertEqual(result['agreement']['done']['agreements'], 19)
+        self.assertEqual(result['exclusions'], [{'case_id': '0', 'reason': 'invalid or unalignable'}])
+        entries.append(copy.deepcopy(entries[1]))
+        entries[2]['pair'] = None
+        invalid = synthetic_report_with_exclusions(entries, plan)
+        self.assertTrue(invalid['invalid_over_ten_percent'])
+        self.assertIsNone(invalid['agreement'])
+        self.assertEqual(len(invalid['exclusions']), 3)
+        with self.assertRaises(ValueError):
+            synthetic_report_with_exclusions(entries + [{'case_id': 'unknown', 'pair': None}], plan)
 
 
 if __name__ == '__main__':
