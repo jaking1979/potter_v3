@@ -125,3 +125,11 @@ test("missing or mismatched pricing classes are unknown, never cheap estimates",
  const noWrites=make("zero","parent",{cache_write_class:null,usage:{input_tokens:100,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0}});
  assert.equal(priceCall(noWrites,rate).computed_cost_usd,0.0001);
 });
+
+test("identifiers reject free-form text and unexpected characters",()=>{
+ for(const field of ["run_id","task_id","parent_task_id","call_id","provider","model","context_class","cache_write_class"]) {
+  assert.throws(()=>validateCall({...make(),[field]:"private message content"}),/opaque identifier/);
+ }
+ assert.throws(()=>rollupTasks([{task_id:"private content",parent_task_id:null}],[]),/opaque identifier/);
+ assert.equal(priceCall(make(),rate).computed_cost_usd,0.00118);
+});
