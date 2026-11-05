@@ -4,7 +4,7 @@ This package implements the **ratified** Alpha Bot build spec: T31 PASS 2 row 1,
 
 | Module | Row 1 item | What it does |
 |---|---|---|
-| `alpha_guard.py` | 1, 2, 3, 5 | The only caller of `place_equity_order`. It refuses unless all of the conditions below hold. Only the Alpha Bot cron may call it. Market orders are valued at the fresh quote plus a 2% developer safety buffer. An unreadable kill flag or broker-schema drift at startup pauses the guard and raises an alert. |
+| `alpha_guard.py` | 1, 2, 3, 5 (plus Dolores 0b98bbb review) | The only caller of `place_equity_order`. It refuses unless all of the conditions below hold. Only the Alpha Bot cron may call it. Market orders are valued at the fresh quote plus a 2% developer safety buffer. An unreadable kill flag or broker-schema drift at startup pauses the guard and raises an alert. |
 | `decision_journal.py` | 3 + `ref_id` addendum | The decision ID is the New York date, ticker, side and signal version. It maps to a UUIDv5 `ref_id` that is reused on every retry. Each order is journaled as `pending` with fsync **before** the call; an error marks it `unknown`, and it is never resubmitted blind. Entries the broker hasn't reported yet are counted as exposure, which also survives a restart. |
 | `kill_switch.py` | 1, 7 | Josh's command path. It is the only holder of `cancel_equity_order`. It takes the guard's lock, so any in-flight order finishes first. It writes the flag `on` atomically, then cancels **only the bot's own** open orders (ref_ids in the journal), attempting each one independently. |
 | `mandate.py` | 2 | A strict parser for the approved mandate file. The guard checks the file's hash before parsing it. |
@@ -38,6 +38,11 @@ Further tests cover the unapproved mandate, state older than 60 seconds or from 
 - the block on blind retries
 - the mandate-hash check
 - the kill switch's filter to the bot's own orders
+
+## Review fixes (Dolores, on 0b98bbb)
+- **Own quotes:** every held position and open buy must have its **own** fresh, positive and finite quote. There is no fallback to another ticker's price, and invalid amounts refuse.
+- **The 2% buffer is a margin, not a hard bound:** an overrun after a fill (holdings above the ceiling or the position limit) refuses all buys, raises an alert, and still allows sells. Whether the ratified market-order contract needs a hard dollar bound before each trade is a Rule 12 question for the Council.
+- **Cross-process lock:** check, reservation, broker call and journal update run under a cross-process `flock` on `<journal>.lock`, shared with the kill switch. Tests cover two guard instances in one process and two guard processes; exactly one $204 buy goes through against the $250 ceiling.
 
 ## Not done here (host steps; none change Alpha Bot's behavior or credentials)
 - Replace the cron's direct order tool with this guard.

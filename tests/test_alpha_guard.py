@@ -234,6 +234,121 @@ class Guard(Harness):
                 self.refused(**kw)
 
 
+def _proc_worker(d, symbol, out_q):
+    """Separate process, separate AlphaGuard, separate journal connection."""
+    import json as _j
+    import time as _t
+    from containment.alpha_guard import AlphaGuard, AccountState, Refused
+    from containment.decision_journal import DecisionJournal
+    d = Path(d)
+
+    class SlowStub:
+        def invoke(self, tool, args):
+            _t.sleep(0.3)                    # widen the check-to-call window
+            with open(d / "calls.jsonl", "a") as fh:
+                fh.write(_j.dumps(args) + "\n")
+            return {"order_id": "p-" + args["symbol"]}
+    journal = DecisionJournal(d / "journal.db")
+    guard = AlphaGuard(
+        broker=SlowStub(), journal=journal, mandate_path=d / "mandate.json",
+        approved_mandate_sha256=hashlib.sha256(MANDATE).hexdigest(),
+        kill_flag_path=d / "kill.flag", held_epoch=7, current_epoch=lambda: 7,
+        account_state=lambda: AccountState(NOW - timedelta(seconds=5), {},
+                                           {t: D("10") for t in TICKERS}, D("1000")),
+        expected_schema_sha256=SCHEMA, current_schema_sha256=lambda: SCHEMA,
+        audit_path=d / f"audit-{symbol}.jsonl", alert=lambda m: None, clock=lambda: NOW)
+    try:
+        guard.place(caller="alpha-bot", symbol=symbol, side="buy", quantity="20",
+                    signal_version="s1")
+        out_q.put("placed")
+    except Refused:
+        out_q.put("refused")
+    finally:
+        journal.close()
+
+
+class ReviewFindings(Harness):
+    """Dolores review on 0b98bbb."""
+
+    def test_open_buy_without_its_own_quote_refuses(self):
+        # Her reproduction: open buy of 20 BBB, no BBB quote, AAA at $10, buy 1 AAA.
+        self.state = AccountState(self.state.read_at, {}, {"AAA": D("10")}, D("1000"),
+                                  open_orders=(OpenOrder(None, "BBB", "buy", D("20")),))
+        self.assertIn("missing quote", self.refused(qty="1"))
+        self.assertEqual(self.broker.calls, [])
+
+    def test_invalid_amounts_refuse(self):
+        bad_states = [
+            AccountState(self.state.read_at, {}, {**self.state.prices, "AAA": D("0")}, D("1000")),
+            AccountState(self.state.read_at, {}, {**self.state.prices, "AAA": D("NaN")}, D("1000")),
+            AccountState(self.state.read_at, {"AAA": D("Infinity")}, self.state.prices, D("1000")),
+            AccountState(self.state.read_at, {}, self.state.prices, D("NaN")),
+            AccountState(self.state.read_at, {}, self.state.prices, D("1000"),
+                         open_orders=(OpenOrder(None, "BBB", "buy", D("-1")),)),
+        ]
+        for st in bad_states:
+            self.state = st
+            with self.subTest(st=st):
+                self.refused(qty="1")
+        self.assertEqual(self.broker.calls, [])
+
+    def test_fill_beyond_buffer_is_detected_and_blocks_buys(self):
+        self.buy(qty="24")                                  # reserved 244.8 at $10 + 2%
+        ref = self.broker.placements()[0]["ref_id"]
+        # Stub fill at $10.60 (6% above quote, beyond the buffer): holdings $254.40.
+        self.state = AccountState(self.state.read_at, {"AAA": D("24")},
+                                  {**self.state.prices, "AAA": D("10.60")}, D("745.60"),
+                                  known_ref_ids=frozenset({ref}))
+        self.assertIn("overrun", self.refused(symbol="BBB", qty="1", sig="s2"))
+        self.assertTrue(any("overrun" in a for a in self.alerts))
+        self.buy(side="sell", qty="1", sig="s3")            # can still reduce exposure
+        self.assertEqual(len(self.broker.placements()), 2)
+
+    def test_two_guard_instances_in_one_process_serialise(self):
+        other = self.make_guard(journal=DecisionJournal(self.journal_path))
+        results, started = [], threading.Barrier(2)
+
+        def go(g, sym):
+            started.wait()
+            try:
+                g.place(caller="alpha-bot", symbol=sym, side="buy", quantity="20",
+                        signal_version="s1")
+                results.append("placed")
+            except Refused:
+                results.append("refused")
+        slow = self.broker.invoke
+
+        def slow_invoke(tool, args):
+            time.sleep(0.2)
+            return slow(tool, args)
+        self.broker.invoke = slow_invoke
+        ts = [threading.Thread(target=go, args=(self.guard, "AAA")),
+              threading.Thread(target=go, args=(other, "BBB"))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertEqual(sorted(results), ["placed", "refused"])   # 204 + 204 > 250
+        self.assertEqual(len(self.broker.placements()), 1)
+
+    def test_two_guard_processes_serialise(self):
+        import multiprocessing as mp
+        d = Path(self.tmp.name)
+        self.journal.close()
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        procs = [ctx.Process(target=_proc_worker, args=(str(d), sym, q)) for sym in ("AAA", "BBB")]
+        for p in procs:
+            p.start()
+        results = sorted(q.get(timeout=60) for _ in procs)
+        for p in procs:
+            p.join(60)
+        self.journal = DecisionJournal(self.journal_path)
+        self.assertEqual(results, ["placed", "refused"])
+        calls = (d / "calls.jsonl").read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+
+
 class KillSwitch(Harness):
     def test_rt_kill_cancels_only_bot_orders_then_blocks(self):
         self.buy()

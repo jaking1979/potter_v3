@@ -51,7 +51,8 @@ def write_flag(path: Path, value: str) -> None:
 
 def engage(guard: AlphaGuard, broker: Broker, journal: DecisionJournal) -> list[str]:
     """Flag on, then cancel the bot's open orders. Returns cancelled order ids."""
-    with guard.lock:
+    from containment.alpha_guard import exclusive
+    with guard.lock, exclusive(guard.lock_path):
         write_flag(guard.kill_flag_path, "on")
         bot_ref_ids = journal.all_ref_ids()
         cancelled, failed = [], []

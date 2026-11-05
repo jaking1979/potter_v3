@@ -52,6 +52,7 @@ class JournalUnavailable(RuntimeError):
 class DecisionJournal:
     def __init__(self, path: Path, *, create: bool = False) -> None:
         path = Path(path)
+        self.path = path
         if not create and not path.exists():
             raise JournalUnavailable("decision journal missing")
         try:

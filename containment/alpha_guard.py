@@ -11,14 +11,27 @@ resubmitted blind. Item 5: an unreadable kill flag or a changed broker
 tool-schema hash at startup means paused plus an alert.
 
 Market orders are valued at the fresh quote plus PRICE_BUFFER, a developer
-safety margin so slippage cannot push a filled order past the ceiling. The
-mandate values themselves are not changed.
+margin that absorbs ordinary slippage. It is NOT a hard bound: a market order
+can fill further above the quote (Dolores review on 0b98bbb). Overruns are
+handled after the fact: if fresh holdings already exceed the ceiling or the
+position limit, every buy is refused and an "overrun" alert is raised until
+holdings are back within the mandate; sells stay allowed so exposure can come
+down. Whether the ratified market-order contract needs a hard pre-trade dollar
+bound is a Rule 12 question for the Council, not something this code decides.
+The mandate values themselves are not changed.
+
+Concurrency: check, reservation, broker call and journal update run under an
+exclusive cross-process file lock (fcntl.flock on <journal>.lock), shared with
+the kill switch, so separate guard processes cannot both pass a check against
+the same reserved exposure.
 
 Cancels are not here: only Josh's kill-switch command holds cancel_equity_order
 (containment/kill_switch.py). Nothing here is wired to the live account.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import threading
@@ -42,6 +55,21 @@ NEW_YORK = ZoneInfo("America/New_York")
 
 class Refused(PermissionError):
     pass
+
+
+@contextlib.contextmanager
+def exclusive(lock_path: Path):
+    """Cross-process exclusive lock; also serialises threads (separate open files)."""
+    with open(lock_path, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _ok_amount(x: object) -> bool:
+    return isinstance(x, Decimal) and x.is_finite() and x > 0
 
 
 @dataclass(frozen=True)
@@ -83,7 +111,8 @@ class AlphaGuard:
                  expected_schema_sha256: str, current_schema_sha256: Callable[[], str],
                  audit_path: Path, alert: Callable[[str], None],
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
-        self.lock = threading.RLock()   # shared with the kill switch
+        self.lock = threading.RLock()   # in-process; the file lock below is cross-process
+        self.lock_path = Path(str(journal.path) + ".lock")
         self._broker, self._journal = broker, journal
         self._mandate_path, self._approved = Path(mandate_path), approved_mandate_sha256
         self.kill_flag_path = Path(kill_flag_path)
@@ -112,7 +141,7 @@ class AlphaGuard:
 
     def place(self, *, caller: str, symbol: str, side: str, quantity: str,
               signal_version: str) -> dict:
-        with self.lock:
+        with self.lock, exclusive(self.lock_path):
             now = self._clock()
             record = {"at": now.isoformat(), "caller": caller, "symbol": symbol,
                       "side": side, "quantity": quantity, "signal_version": signal_version}
@@ -185,16 +214,22 @@ class AlphaGuard:
         if acct.read_at.tzinfo is None or not (
                 -MAX_CLOCK_SKEW <= now - acct.read_at <= MAX_STATE_AGE):
             raise Refused("positions/buying power not read within 60 s")
-        if any(q < 0 for q in acct.positions.values()) or acct.cash < 0:
-            raise Refused("account state shows negative holdings")
-        try:
-            holdings = sum((q * acct.prices[s] for s, q in acct.positions.items() if q),
-                           Decimal(0))
-            price = acct.prices[symbol]
-        except KeyError:
-            raise Refused("missing quote") from None
-        if price <= 0:
-            raise Refused("invalid quote")
+        if (not isinstance(acct.cash, Decimal) or not acct.cash.is_finite() or acct.cash < 0
+                or any(not isinstance(q, Decimal) or not q.is_finite() or q < 0
+                       for q in acct.positions.values())
+                or any(not _ok_amount(p) for p in acct.prices.values())
+                or any(o.side not in ("buy", "sell") or not _ok_amount(o.quantity)
+                       for o in acct.open_orders)):
+            raise Refused("account state has invalid amounts")
+        # Every symbol whose exposure is counted needs its OWN fresh quote: never
+        # substitute another ticker's price (Dolores review on 0b98bbb).
+        needed = {s for s, q in acct.positions.items() if q} | {symbol} | {
+            o.symbol for o in acct.open_orders if o.side == "buy"}
+        if not needed <= set(acct.prices):
+            raise Refused("missing quote for a held position or open buy")
+        price = acct.prices[symbol]
+        holdings = sum((q * acct.prices[s] for s, q in acct.positions.items() if q),
+                       Decimal(0))
         if holdings + acct.cash <= mandate.loss_stop_account_value_usd:
             raise Refused("account value at or below loss stop")
 
@@ -221,11 +256,20 @@ class AlphaGuard:
             return Entry(decision, ref_id_for(decision), symbol, side, qty, Decimal(0),
                          "pending", None)
 
+        # Overrun (a fill beyond the buffer, or any other excess): no buys until back in bounds.
+        over_position = any(q * acct.prices[s] > mandate.max_position_usd
+                            for s, q in acct.positions.items() if q)
+        if holdings > mandate.ceiling_usd or over_position:
+            self._alert("Alpha Bot overrun: holdings exceed the mandate; buys refused")
+            raise Refused("holdings already exceed the mandate (overrun)")
+
         def worst(q: Decimal, s: str) -> Decimal:
-            return q * acct.prices.get(s, price) * (1 + PRICE_BUFFER)
+            return q * acct.prices[s] * (1 + PRICE_BUFFER)
 
         open_buys = [(o.symbol, worst(o.quantity, o.symbol)) for o in acct.open_orders
                      if o.side == "buy"]
+        if any(not _ok_amount(e.reserve_usd) for e in unseen if e.side == "buy"):
+            raise Refused("journal reservation invalid")
         open_buys += [(e.symbol, e.reserve_usd) for e in unseen if e.side == "buy"]
         cost = worst(qty, symbol)
         if cost > acct.cash - sum(v for _, v in open_buys):
