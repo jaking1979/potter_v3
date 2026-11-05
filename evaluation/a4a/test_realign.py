@@ -1,7 +1,8 @@
 import copy
 import hashlib
 import unittest
-from realign import realign_pair, realign_verified_bytes, realign_occurrences, prepare_synthetic_occurrences
+from realign import (realign_pair, realign_verified_bytes, realign_occurrences,
+                     prepare_synthetic_occurrences, synthetic_aligned_report)
 from report import synthetic_report
 
 
@@ -100,6 +101,28 @@ class RealignmentTests(unittest.TestCase):
         aligned = realign_occurrences(grade(), grade(), first[1], second[1], snapshots)
         self.assertEqual(aligned[0]['case_id'], aligned[1]['case_id'])
         with self.assertRaises(ValueError): prepare_synthetic_occurrences('not bytes', b'same')
+
+    def test_composed_report_rejects_unaligned_or_incomplete_cases(self):
+        a, b = b'a', b'b'
+        first_map = {'A': {'id': '1'*64, 'sha256': hashlib.sha256(a).hexdigest()},
+                     'B': {'id': '2'*64, 'sha256': hashlib.sha256(b).hexdigest()}}
+        second_map = {'A': first_map['B'].copy(), 'B': first_map['A'].copy()}
+        first = grade()
+        second = copy.deepcopy(first)
+        second['outputs']['A'], second['outputs']['B'] = second['outputs']['B'], second['outputs']['A']
+        pair = {'first': first, 'second': second, 'first_map': first_map,
+                'second_map': second_map, 'outputs': {'1'*64: a, '2'*64: b}}
+        result = synthetic_aligned_report([pair], {'case-1': False})
+        self.assertEqual(result['agreement']['done']['agreements'], 1)
+        self.assertNotIn('outputs', result)
+        for pairs, plan in (([], {'case-1': False}), ([pair, pair], {'case-1': False}),
+                            ([pair], {'case-1': True}), ([pair], {'different': False})):
+            with self.subTest(plan=plan), self.assertRaises(ValueError):
+                synthetic_aligned_report(pairs, plan)
+        bad = copy.deepcopy(pair)
+        bad['outputs']['1'*64] = b'tampered'
+        with self.assertRaises(ValueError):
+            synthetic_aligned_report([bad], {'case-1': False})
 
 
 if __name__ == '__main__':
