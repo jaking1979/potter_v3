@@ -151,3 +151,48 @@ def synthetic_aligned_report(pairs, expected_cases):
     if seen != set(expected_cases):
         raise ValueError('incomplete case plan')
     return synthetic_report(first, second, expected_cases)
+
+
+def synthetic_report_with_exclusions(entries, expected_cases):
+    """Align planned pairs; count missing, duplicate or invalid cases as affected.
+
+    Inputs remain untrusted synthetic data. This does not prove mapping
+    authenticity or exercise validity, and produces no pass/fail verdict.
+    Unknown case IDs refuse the whole input; affected reasons are generic to
+    avoid returning output text or mappings.
+    """
+    from report import synthetic_report
+    if type(entries) is not list or type(expected_cases) is not dict or not expected_cases:
+        raise ValueError('entry list and case plan required')
+    if any(not isinstance(k, str) or not k.strip() or type(v) is not bool
+           for k, v in expected_cases.items()):
+        raise ValueError('invalid case plan')
+    indexed = {case: [] for case in expected_cases}
+    for entry in entries:
+        if (type(entry) is not dict or set(entry) != {'case_id', 'pair'}
+                or not isinstance(entry['case_id'], str)
+                or entry['case_id'] not in expected_cases):
+            raise ValueError('unexpected or unidentifiable case')
+        indexed[entry['case_id']].append(entry['pair'])
+    first, second, exclusions = [], [], []
+    fields = {'first', 'second', 'first_map', 'second_map', 'outputs'}
+    for case, items in indexed.items():
+        if len(items) != 1:
+            exclusions.append({'case_id': case, 'reason': 'missing or duplicate'})
+            continue
+        pair = items[0]
+        try:
+            if type(pair) is not dict or set(pair) != fields:
+                raise ValueError('invalid pair')
+            a, b = realign_occurrences(pair['first'], pair['second'], pair['first_map'],
+                                       pair['second_map'], pair['outputs'])
+            if a['case_id'] != case or a['responsibility'] != expected_cases[case]:
+                raise ValueError('case or responsibility mismatch')
+        except (ValueError, TypeError, KeyError):
+            exclusions.append({'case_id': case, 'reason': 'invalid or unalignable'})
+            continue
+        first.append(a)
+        second.append(b)
+    report = synthetic_report(first, second, expected_cases)
+    report['exclusions'] = sorted(exclusions, key=lambda item: item['case_id'])
+    return report
