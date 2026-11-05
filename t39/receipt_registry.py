@@ -92,6 +92,16 @@ class Facts:
         if not ok:
             raise ValueError("incomplete or malformed verified facts")
 
+    def binding(self) -> dict:
+        """What must match between an issued record and a later presentation.
+
+        Excludes verifier_version, which is recorded for audit only: upgrading
+        the verifier must not invalidate every previously issued receipt.
+        """
+        c = self.canonical()
+        c.pop("verifier_version")
+        return c
+
     def canonical(self) -> dict:
         return {"commit": self.commit, "tree": self.tree, "receipt_hash": self.receipt_hash,
                 "nonces": sorted(self.nonces), "agents": self.agents,
@@ -327,7 +337,8 @@ class ReceiptRegistry:
         def do(log):
             existing = self._issued_in(log).get(facts.receipt_hash)
             if existing is not None:
-                return (Issue.ALREADY_ISSUED if existing.facts == facts.canonical()
+                same = {k: v for k, v in existing.facts.items() if k != "verifier_version"}
+                return (Issue.ALREADY_ISSUED if same == facts.binding()
                         else Issue.REPLAY)
             if self._db.execute("SELECT 1 FROM nonces WHERE nonce IN (?, ?)",
                                 facts.nonces).fetchone():
