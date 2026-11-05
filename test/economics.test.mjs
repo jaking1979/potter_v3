@@ -4,11 +4,11 @@ import {EconomicsInputError, validateCall, priceCall, rollupTasks, estimatePrefl
 
 const rate = {provider:"demo", model:"small", effective_at:"2026-01-01T00:00:00Z",
   expires_at:"2027-01-01T00:00:00Z", input_per_million:1, output_per_million:4,
-  cache_read_per_million:0.1, cache_write_per_million:1.25};
+  cache_read_per_million:0.1, cache_write_per_million:1.25, context_class:"standard", cache_write_class:"short"};
 const make = (call_id="a", task_id="parent", override={}) => ({
   run_id:"run1", task_id, parent_task_id:task_id==="parent"?null:"parent",
   attempt:0, call_id, occurred_at:"2026-11-05T14:00:00Z",
-  provider:"demo", model:"small",
+  provider:"demo", model:"small", context_class:"standard", cache_write_class:"short",
   usage:{input_tokens:1000, output_tokens:100, cache_read_tokens:300, cache_write_tokens:200},
   ...override
 });
@@ -112,4 +112,16 @@ test("rollup rejects fabricated, copied and deserialized priced calls",()=>{
   assert.throws(()=>rollupTasks(tasks,[untrusted]),/unverified priced call/);
  }
  assert.equal(rollupTasks(tasks,[valid]).parent.calls,1);
+});
+
+test("missing or mismatched pricing classes are unknown, never cheap estimates",()=>{
+ for (const changes of [{context_class:null},{context_class:"long"},{cache_write_class:null},{cache_write_class:"long"}]) {
+  const result=priceCall(make("x","parent",changes),rate);
+  assert.equal(result.computed_cost_usd,null);
+  assert.equal(result.unpriced_reason,"unsupported_charge");
+ }
+ assert.equal(priceCall(make(),{...rate,context_class:null}).unpriced_reason,"unsupported_charge");
+ assert.equal(priceCall(make(),{...rate,cache_write_class:"long"}).unpriced_reason,"unsupported_charge");
+ const noWrites=make("zero","parent",{cache_write_class:null,usage:{input_tokens:100,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0}});
+ assert.equal(priceCall(noWrites,rate).computed_cost_usd,0.0001);
 });
