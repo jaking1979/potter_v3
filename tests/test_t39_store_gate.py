@@ -98,10 +98,17 @@ class Lifecycle(Base):
         self.assertIs(self.reg.issue(f2, "ci", NOW), Issue.REPLAY)
         self.assertIsNone(self.reg.get(R2))
 
-    def test_presented_receipt_must_match_issued_record(self):
+    def test_presented_receipt_must_match_issued_binding(self):
         self.admit()
         with self.assertRaises(Refused):
-            self.use("host-updater", f=facts(verifier_version="t39-verify/0"))
+            self.use("host-updater", f=facts(key_fingerprints={"author": "SHA256:aaa",
+                                                                "reviewer": "SHA256:zzz"}))
+
+    def test_verifier_upgrade_does_not_invalidate_issued_receipts(self):
+        # Review note on PR #15: verifier_version is audit-only.
+        self.admit()
+        self.use("host-updater", f=facts(verifier_version="t39-verify/2"))
+        self.admit(facts(verifier_version="t39-verify/2"))      # issuer retry: ALREADY_ISSUED
 
     def test_commit_added_after_review_refused(self):
         # T39 test 4: receipt for C1 presented for C2 / altered tree.

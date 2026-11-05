@@ -96,7 +96,8 @@ def require_issued(*, commit: str, tree: str, load_receipt, verify: Verifier,
         raise Refused(f"registry unavailable: {type(exc).__name__}") from exc
     if issued is None:
         raise Refused("receipt was never issued at merge admission", incident=on_main)
-    if issued.facts != facts.canonical():
+    issued_binding = {k: v for k, v in issued.facts.items() if k != "verifier_version"}
+    if issued_binding != facts.binding():
         raise Refused("issued receipt does not match the presented receipt", incident=on_main)
     try:
         registry.record_use(facts.receipt_hash, consumer, purpose,
