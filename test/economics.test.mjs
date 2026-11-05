@@ -133,3 +133,11 @@ test("identifiers reject free-form text and unexpected characters",()=>{
  assert.throws(()=>rollupTasks([{task_id:"private content",parent_task_id:null}],[]),/opaque identifier/);
  assert.equal(priceCall(make(),rate).computed_cost_usd,0.00118);
 });
+
+
+test("arithmetic overflow fails closed rather than producing invalid totals",()=>{
+ assert.throws(()=>priceCall(make(),{...rate,input_per_million:Number.MAX_VALUE}),/cost arithmetic overflow/);
+ const a=priceCall(make("huge1","parent",{usage:{input_tokens:Number.MAX_SAFE_INTEGER,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0}}),rate);
+ const b=priceCall(make("huge2","parent",{usage:{input_tokens:1,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0}}),rate);
+ assert.throws(()=>rollupTasks([{task_id:"parent",parent_task_id:null}],[a,b]),/usage arithmetic overflow/);
+});
