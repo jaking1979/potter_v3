@@ -7,10 +7,34 @@ blinding, exercise validity or permission to run an evaluation.
 import copy
 import hashlib
 import re
+import secrets
 from blind_grading import validate_grades
 
 _IDENTITY = re.compile(r'[0-9a-f]{64}\Z')
 _MAX_OUTPUT_BYTES = 1_048_576
+
+
+def prepare_synthetic_occurrences(first_bytes, second_bytes):
+    """Create two ephemeral occurrence records and two shuffled presentations.
+
+    Returned mappings are sensitive to evaluator identity and must not be sent
+    to graders. This in-memory experiment does not enforce that separation or
+    establish trusted provenance, secure storage, or experimental blinding.
+    """
+    if any(type(data) is not bytes or len(data) > _MAX_OUTPUT_BYTES
+           for data in (first_bytes, second_bytes)):
+        raise ValueError('bounded output bytes required')
+    ids = [secrets.token_hex(32), secrets.token_hex(32)]
+    if ids[0] == ids[1]:
+        raise ValueError('occurrence ID collision')
+    snapshots = dict(zip(ids, (first_bytes, second_bytes)))
+    def presentation():
+        order = ids[:] if secrets.randbelow(2) == 0 else ids[::-1]
+        visible = {label: snapshots[identity] for label, identity in zip(('A', 'B'), order)}
+        hidden = {label: {'id': identity, 'sha256': hashlib.sha256(snapshots[identity]).hexdigest()}
+                  for label, identity in zip(('A', 'B'), order)}
+        return visible, hidden
+    return snapshots, presentation(), presentation()
 
 
 def realign_pair(first, second, first_map, second_map):
