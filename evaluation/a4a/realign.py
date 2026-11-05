@@ -58,3 +58,40 @@ def realign_verified_bytes(first, second, first_map, second_map, outputs):
     if set(first_map.values()) != set(outputs):
         raise ValueError('output snapshots do not match mapping')
     return aligned
+
+
+def realign_occurrences(first, second, first_map, second_map, outputs):
+    """Align separate output occurrences, including identical byte strings.
+
+    Each label maps to {'id': opaque stable occurrence ID, 'sha256': content
+    digest}. Snapshots are keyed by occurrence ID, not content digest. This
+    verifies consistency only; IDs, mappings and snapshots still require a
+    separately authenticated provenance and protected grader access.
+    """
+    mappings = []
+    for mapping in (first_map, second_map):
+        if type(mapping) is not dict or set(mapping) != {'A', 'B'}:
+            raise ValueError('two-label occurrence mapping required')
+        clean = {}
+        for label, item in mapping.items():
+            if (type(item) is not dict or set(item) != {'id', 'sha256'}
+                    or any(not isinstance(item[k], str) or not _IDENTITY.fullmatch(item[k])
+                           for k in ('id', 'sha256'))):
+                raise ValueError('invalid occurrence')
+            clean[label] = (item['id'], item['sha256'])
+        if clean['A'][0] == clean['B'][0]:
+            raise ValueError('duplicate occurrence ID')
+        mappings.append(clean)
+    first_by_id = {identity: digest for identity, digest in mappings[0].values()}
+    second_by_id = {identity: digest for identity, digest in mappings[1].values()}
+    if first_by_id != second_by_id:
+        raise ValueError('occurrence or digest changed')
+    if type(outputs) is not dict or set(outputs) != set(first_by_id):
+        raise ValueError('two occurrence snapshots required')
+    for identity, data in outputs.items():
+        if (type(data) is not bytes or len(data) > _MAX_OUTPUT_BYTES
+                or hashlib.sha256(data).hexdigest() != first_by_id[identity]):
+            raise ValueError('occurrence bytes do not match digest')
+    return realign_pair(first, second,
+                        {label: value[0] for label, value in mappings[0].items()},
+                        {label: value[0] for label, value in mappings[1].items()})
