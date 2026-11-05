@@ -8,7 +8,7 @@ The report identifies Proxmox VE `pve-manager/9.2.3`, Debian 13.5, Potter contai
 
 ## A1-1 — secrets scan / inventory
 
-**Result: incomplete; findings reported.** A read-only pattern inventory found ten distinct unremediated findings and additional proliferation of account identifiers; a dedicated secrets scanner was unavailable. The inventory excluded several directories and binary/large files and did not cover all systems. It does not establish a clean scan or a complete inventory. No credential was changed. The Plan report contains the redacted scope and limitations. Do not commit secret values or detailed token locations here. A2 owns remediation once its dependencies and authorization permit it.
+**Result: incomplete; findings reported.** A read-only pattern inventory found ten distinct findings, one reported as a probable test-fixture placeholder but unverified, and additional proliferation of account identifiers; a dedicated secrets scanner was unavailable. The inventory excluded several directories and binary/large files and did not cover all systems. It does not establish a clean scan or a complete inventory. No credential was changed. The Plan report contains the redacted scope and limitations. Do not commit secret values or detailed token locations here. A2 owns remediation once its dependencies and authorization permit it.
 
 ## A1-2 — Alpha Bot containment negative test
 
@@ -16,7 +16,7 @@ The report identifies Proxmox VE `pve-manager/9.2.3`, Debian 13.5, Potter contai
 
 ## A1-3 — Home Assistant / watchdog last-success
 
-**Result: partial; monitoring failure reported.** A single read-only check of the Catskills HA endpoint returned HTTP 200. An existing monitor's last recorded success was 2026-10-08 14:37:07 UTC and the report found no active recurring alert covering it; a one-time enabled-job cadence check did not cover that script. An ad-hoc success is not proof of a deployed watchdog. Its exact script/config hashes and a working alert test remain unverified.
+**Result: partial; monitoring failure reported.** A single read-only check of the Catskills HA endpoint returned HTTP 200. An existing monitor's last recorded success was 2026-10-08 14:37:07 UTC and the report found no active recurring alert covering it; a one-time enabled-job cadence check did not cover that script. An ad-hoc success is not proof of a deployed watchdog. The report also identified the Bay Ridge HA peer as offline, last seen 51 days before the report; this is a reported observation, not an independent verification. Its exact script/config hashes and a working alert test remain unverified.
 
 ## A1-4 — seven healthy briefs
 
