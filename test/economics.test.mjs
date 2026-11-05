@@ -88,3 +88,19 @@ test("impossible scenario ordering is rejected",()=>{
  const mk=(label,token)=>make(label,"parent",{usage:{input_tokens:token,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0}});
  assert.throws(()=>estimatePreflight({scenarios:{low:[mk("low",300)],likely:[mk("likely",200)],high:[mk("high",100)]},rateByModel:{"demo/small":rate}}),/ordered/);
 });
+
+test("timestamps require explicit timezone",()=>{
+ for (const date of ["2026-11-05T14:00:00","2026-11-05","bad"]) {
+  assert.throws(()=>priceCall(make("a","parent",{occurred_at:date}),rate),/timezone/);
+  assert.throws(()=>priceCall(make(),{...rate,effective_at:date}),/timezone/);
+  assert.throws(()=>priceCall(make(),{...rate,expires_at:date}),/timezone/);
+ }
+ assert.equal(priceCall(make("a","parent",{occurred_at:"2026-11-05T09:00:00-05:00"}),rate).computed_cost_usd,0.00118);
+});
+test("call parent must match declared task lineage",()=>{
+ const tasks=[{task_id:"parent",parent_task_id:null},{task_id:"child",parent_task_id:"parent"},{task_id:"other",parent_task_id:null}];
+ const wrong=priceCall(make("x","child",{parent_task_id:"other"}),rate);
+ assert.throws(()=>rollupTasks(tasks,[wrong]),/lineage/);
+ const correct=priceCall(make("x","child"),rate);
+ assert.equal(rollupTasks(tasks,[correct]).parent.calls,1);
+});
