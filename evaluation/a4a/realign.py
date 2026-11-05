@@ -5,10 +5,12 @@ visibility from graders. This helper checks consistency, not provenance,
 blinding, exercise validity or permission to run an evaluation.
 """
 import copy
+import hashlib
 import re
 from blind_grading import validate_grades
 
 _IDENTITY = re.compile(r'[0-9a-f]{64}\Z')
+_MAX_OUTPUT_BYTES = 1_048_576
 
 
 def realign_pair(first, second, first_map, second_map):
@@ -36,3 +38,23 @@ def realign_pair(first, second, first_map, second_map):
                       'outputs': {label: copy.deepcopy(second['outputs'][reverse[first_map[label]]])
                                   for label in ('A', 'B')}}
     return aligned_first, aligned_second
+
+
+def realign_verified_bytes(first, second, first_map, second_map, outputs):
+    """Align only when a supplied byte snapshot matches both output hashes.
+
+    Hashing proves consistency with these supplied bytes, not that they are
+    the authentic, complete outputs actually presented to graders. Identical
+    byte outputs remain unsupported because their identities collide.
+    """
+    aligned = realign_pair(first, second, first_map, second_map)
+    if type(outputs) is not dict or len(outputs) != 2:
+        raise ValueError('two output byte snapshots required')
+    for identity, data in outputs.items():
+        if (not isinstance(identity, str) or not _IDENTITY.fullmatch(identity)
+                or type(data) is not bytes or len(data) > _MAX_OUTPUT_BYTES
+                or hashlib.sha256(data).hexdigest() != identity):
+            raise ValueError('output bytes do not match identity')
+    if set(first_map.values()) != set(outputs):
+        raise ValueError('output snapshots do not match mapping')
+    return aligned
