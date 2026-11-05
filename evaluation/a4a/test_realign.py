@@ -1,7 +1,7 @@
 import copy
 import hashlib
 import unittest
-from realign import realign_pair, realign_verified_bytes, realign_occurrences
+from realign import realign_pair, realign_verified_bytes, realign_occurrences, prepare_synthetic_occurrences
 from report import synthetic_report
 
 
@@ -87,6 +87,19 @@ class RealignmentTests(unittest.TestCase):
                 realign_occurrences(first, second, first_map, bad, {'1'*64: data, '2'*64: data})
         with self.assertRaises(ValueError):
             realign_occurrences(first, second, first_map, second_map, {'1'*64: data, '2'*64: b'tampered'})
+
+    def test_prepared_identical_occurrences_remain_distinct(self):
+        snapshots, first, second = prepare_synthetic_occurrences(b'same', b'same')
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(first[0], {'A': b'same', 'B': b'same'})
+        for visible, hidden in (first, second):
+            self.assertEqual(set(hidden), {'A', 'B'})
+            self.assertNotEqual(hidden['A']['id'], hidden['B']['id'])
+            for label in ('A', 'B'):
+                self.assertEqual(visible[label], snapshots[hidden[label]['id']])
+        aligned = realign_occurrences(grade(), grade(), first[1], second[1], snapshots)
+        self.assertEqual(aligned[0]['case_id'], aligned[1]['case_id'])
+        with self.assertRaises(ValueError): prepare_synthetic_occurrences('not bytes', b'same')
 
 
 if __name__ == '__main__':
