@@ -72,7 +72,11 @@ function dollars(x, label) {
 }
 
 function rounded(x) {
-  return Math.round((x + Number.EPSILON) * 1e9) / 1e9;
+  // Refuse overflow before and after scaling rather than emitting Infinity/NaN.
+  if (!Number.isFinite(x)) throw new EconomicsInputError("cost arithmetic overflow");
+  const scaled = (x + Number.EPSILON) * 1e9;
+  if (!Number.isFinite(scaled)) throw new EconomicsInputError("cost arithmetic overflow");
+  return Math.round(scaled) / 1e9;
 }
 
 export function validateCall(raw) {
@@ -192,8 +196,10 @@ function add(summary, call) {
     summary.known_cost_usd = rounded(summary.known_cost_usd + call.computed_cost_usd);
   }
   for (const k of usageKeys) {
-    summary[k] = summary[k] == null || call.usage[k] == null
+    const total = summary[k] == null || call.usage[k] == null
       ? null : summary[k] + call.usage[k];
+    if (total != null && !Number.isSafeInteger(total)) throw new EconomicsInputError("usage arithmetic overflow");
+    summary[k] = total;
   }
   summary.total_cost_usd = summary.unpriced_calls ? null : summary.known_cost_usd;
   summary.reported_cost_usd = summary.unreported_calls ? null : summary.known_reported_cost_usd;
