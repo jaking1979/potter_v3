@@ -1,7 +1,7 @@
 import copy
 import hashlib
 import unittest
-from realign import realign_pair, realign_verified_bytes
+from realign import realign_pair, realign_verified_bytes, realign_occurrences
 from report import synthetic_report
 
 
@@ -69,6 +69,24 @@ class RealignmentTests(unittest.TestCase):
         for bad in ({ha: a, hb: b'changed'}, {ha: a}, {ha: a, hb: b'x' * 1_048_577}):
             with self.subTest(bad_count=len(bad)), self.assertRaises(ValueError):
                 realign_verified_bytes(*args, bad)
+
+    def test_identical_bytes_with_distinct_occurrences_and_swapped_labels(self):
+        data = b'identical answer'
+        digest = hashlib.sha256(data).hexdigest()
+        first_map = {'A': {'id': '1'*64, 'sha256': digest}, 'B': {'id': '2'*64, 'sha256': digest}}
+        second_map = {'A': first_map['B'].copy(), 'B': first_map['A'].copy()}
+        first = grade()
+        second = copy.deepcopy(first)
+        second['outputs']['A'], second['outputs']['B'] = second['outputs']['B'], second['outputs']['A']
+        a, b = realign_occurrences(first, second, first_map, second_map,
+                                   {'1'*64: data, '2'*64: data})
+        self.assertEqual(a, b)
+        for bad in ({'A': first_map['A'], 'B': first_map['A']},
+                    {'A': {'id': '1'*64, 'sha256': '3'*64}, 'B': first_map['B']}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                realign_occurrences(first, second, first_map, bad, {'1'*64: data, '2'*64: data})
+        with self.assertRaises(ValueError):
+            realign_occurrences(first, second, first_map, second_map, {'1'*64: data, '2'*64: b'tampered'})
 
 
 if __name__ == '__main__':
