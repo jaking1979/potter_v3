@@ -1,6 +1,7 @@
 import copy
+import hashlib
 import unittest
-from realign import realign_pair
+from realign import realign_pair, realign_verified_bytes
 from report import synthetic_report
 
 
@@ -55,6 +56,19 @@ class RealignmentTests(unittest.TestCase):
         aligned = synthetic_report([a], [b], plan)
         self.assertEqual(aligned['agreement']['done']['agreements'], 1)
         self.assertEqual(aligned['observed_flips'], [])
+
+    def test_byte_consistency_and_changed_snapshot(self):
+        a, b = b'first output', b'second output'
+        ha, hb = hashlib.sha256(a).hexdigest(), hashlib.sha256(b).hexdigest()
+        first = grade()
+        second = copy.deepcopy(first)
+        second['outputs']['A'], second['outputs']['B'] = second['outputs']['B'], second['outputs']['A']
+        args = (first, second, {'A': ha, 'B': hb}, {'A': hb, 'B': ha})
+        aligned = realign_verified_bytes(*args, {ha: a, hb: b})
+        self.assertEqual(aligned[0], aligned[1])
+        for bad in ({ha: a, hb: b'changed'}, {ha: a}, {ha: a, hb: b'x' * 1_048_577}):
+            with self.subTest(bad_count=len(bad)), self.assertRaises(ValueError):
+                realign_verified_bytes(*args, bad)
 
 
 if __name__ == '__main__':
