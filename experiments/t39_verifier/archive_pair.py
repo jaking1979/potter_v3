@@ -16,7 +16,7 @@ def verify_synthetic_archive(pair, *, issued_facts, issued_at, observed_now,
                              max_lifetime):
     """Recheck a signed pair against a caller-supplied historical snapshot.
 
-    The entire verifier output must match the previously recorded facts. The
+    All receipt binding fields must match; verifier version is audit metadata. The
     caller must independently establish issuance-time provenance and monotonic
     time. A pass is descriptive cryptographic consistency only.
     """
@@ -31,6 +31,11 @@ def verify_synthetic_archive(pair, *, issued_facts, issued_at, observed_now,
                         check_statuses=historical_check_statuses,
                         open_request_changes=historical_open_requests,
                         now=issued_at, max_lifetime=max_lifetime)
-    if facts != issued_facts:
+    if (set(facts) != set(issued_facts)
+            or not isinstance(issued_facts.get('verifier_version'), str)
+            or not issued_facts['verifier_version']):
+        raise ValueError('invalid issued facts')
+    binding = lambda record: {k: v for k, v in record.items() if k != 'verifier_version'}
+    if binding(facts) != binding(issued_facts):
         raise ValueError('archived facts do not match signed pair')
     return facts
