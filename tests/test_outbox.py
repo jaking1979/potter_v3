@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from runtime import (ABANDONED_UNKNOWN, ACKED, ROUTINE, SENT, SUPPRESSED, URGENT,  # noqa: E402
-                     Database, Outbox, OutboxConflict, OutboxMessage, SendFailed,
+                     Database, Outbox, OutboxConflict, OutboxMessage, RelayReport, SendFailed,
                      outbox_idempotency_key)
 
 T = 1_800_000_000.0
@@ -365,6 +365,49 @@ class Relay(_Tmp):
         self.assertEqual(self.ob.relay(self.ch.send, self.ch.reconcile, owner="r", now=T).sent, [])
         self.assertEqual(self.ob.relay(self.ch.send, self.ch.reconcile, owner="r", now=T + 60).sent,
                          ["later"])
+
+    def test_long_drain_refreshes_lease_for_every_claim(self):
+        """Regression: timeout 10 s, three 6 s sends. With one clock sample per
+        relay() the third send ran on a lease that expired at T+10 while the
+        clock read T+12, and a second relay could claim and reconcile it."""
+        clock = [T]
+        ob = Outbox(self.database, clock=lambda: clock[0], dispatch_timeout_s=10)
+        other = Outbox(self.database, clock=lambda: clock[0], dispatch_timeout_s=10)
+        for i in range(3):
+            self.enqueue(msg(f"m{i}"), now=T)
+        probes = []
+
+        def slow_send(m):
+            self.ch.log_call(m)
+            clock[0] += 6                                    # the send takes 6 s
+            row = ob.get(m.message_id)
+            probes.append(row.in_flight_until > clock[0])    # lease still valid at its end
+            if m.message_id == "m2":
+                # Only m2 is left; a concurrent relay may claim it only if its lease expired.
+                r = other.relay(self.ch.send, Channel.blind, owner="relay-2")
+                probes.append(r == RelayReport())
+            self.ch.deliver(m)
+
+        report = ob.relay(slow_send, Channel.blind, owner="relay-1")  # no explicit now
+        self.assertEqual(sorted(report.sent), ["m0", "m1", "m2"])
+        self.assertEqual(probes, [True] * 4)
+        self.assertEqual(sorted(mid for mid, _ in self.ch.calls()), ["m0", "m1", "m2"])
+        for i in range(3):
+            self.assertEqual(self.ch.delivered(outbox_idempotency_key(f"m{i}")), 1)
+        m2 = ob.get("m2")
+        self.assertEqual((m2.status, m2.dispatches, m2.sent_at), (SENT, 1, T + 18))  # claimed at T+12, lease to T+22
+
+    def test_expired_lease_never_authorizes_routine_resend(self):
+        self.enqueue(msg("r1", ROUTINE))
+        with self.database.tx() as c:          # a dispatcher claimed it, then went silent
+            c.execute("UPDATE outbox SET status='unknown', dispatches=1, in_flight_owner='dead',"
+                      " in_flight_until=?", (T + TIMEOUT,))
+        for later in (TIMEOUT + 1, 10 * TIMEOUT, 1000 * TIMEOUT):
+            self.ob.relay(self.ch.send, Channel.blind, owner="r", now=T + later)
+        self.assertEqual(self.ch.calls(), [])
+        m = self.ob.get("r1")
+        self.assertEqual((m.status, m.dispatches), (ABANDONED_UNKNOWN, 1))
+        self.assertEqual([x.message_id for x in self.ob.needs_reconciliation()], ["r1"])
 
     def test_blind_resend_cap_is_a_database_invariant(self):
         self.enqueue(msg("u1", URGENT))

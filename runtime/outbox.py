@@ -315,11 +315,14 @@ class Outbox:
         is one ``BEGIN IMMEDIATE`` transaction."""
         if not owner:
             raise ValueError("owner required")
-        now = self._now(now)
+        # Re-read the clock for every claim, lease, settle and backoff: one
+        # sample per relay() would hand later messages of a long drain leases
+        # that are already expired. An explicit ``now`` (tests) stays fixed.
+        clock: Callable[[], float] = (lambda: now) if now is not None else self._clock
         report = RelayReport()
         handled = 0
         while limit is None or handled < limit:
-            claim = self._claim(owner, now)
+            claim = self._claim(owner, clock())
             if claim is None:
                 break
             kind, msg = claim
@@ -327,9 +330,9 @@ class Outbox:
             if kind == "suppress":
                 report.suppressed.append(msg.message_id)
             elif kind == "send":
-                self._dispatch(msg, send, reconcile, owner, now, report)
+                self._dispatch(msg, send, reconcile, owner, clock, report)
             else:
-                self._resolve_unknown(msg, send, reconcile, owner, now, report)
+                self._resolve_unknown(msg, send, reconcile, owner, clock, report)
         return report
 
     def _claim(self, owner: str, now: float) -> tuple[str, QueuedMessage] | None:
@@ -367,22 +370,22 @@ class Outbox:
                           " WHERE message_id=?", (owner, until, now, msg.message_id))
             return kind, _load(c, msg.message_id)
 
-    def _dispatch(self, msg: QueuedMessage, send, reconcile, owner: str, now: float,
+    def _dispatch(self, msg: QueuedMessage, send, reconcile, owner: str, clock,
                   report: RelayReport) -> None:
         try:
             result = send(msg)
         except SendFailed as exc:
-            self._definite_failure(msg, owner, now, f"send failed: {exc!r}", report)
+            self._definite_failure(msg, owner, clock(), f"send failed: {exc!r}", report)
             return
         except Exception as exc:
             # Ambiguous: stays "unknown" under our claim; resolve it right away.
-            if self._update(msg, owner, "last_error=?", (f"ambiguous: {exc!r}",), now):
-                self._resolve_unknown(msg, send, reconcile, owner, now, report)
+            if self._update(msg, owner, "last_error=?", (f"ambiguous: {exc!r}",), clock()):
+                self._resolve_unknown(msg, send, reconcile, owner, clock, report)
             return
-        if self._settle_sent(msg, owner, result, now):
+        if self._settle_sent(msg, owner, result, clock()):
             report.sent.append(msg.message_id)
 
-    def _resolve_unknown(self, msg: QueuedMessage, send, reconcile, owner: str, now: float,
+    def _resolve_unknown(self, msg: QueuedMessage, send, reconcile, owner: str, clock,
                          report: RelayReport) -> None:
         try:
             verdict = reconcile(msg)
@@ -393,12 +396,12 @@ class Outbox:
         if verdict not in (VERDICT_SUCCEEDED, VERDICT_FAILED, STILL_UNKNOWN):
             verdict, note = STILL_UNKNOWN, f"unrecognised reconcile verdict {verdict!r}"
         if verdict == VERDICT_SUCCEEDED:
-            if self._settle_sent(msg, owner, {"reconciled": True}, now):
+            if self._settle_sent(msg, owner, {"reconciled": True}, clock()):
                 report.sent.append(msg.message_id)
             return
         if verdict == VERDICT_FAILED:
             # A crash, not the channel, stopped it: retry now (still counts to max_attempts).
-            self._definite_failure(msg, owner, now, "reconciled: not delivered", report,
+            self._definite_failure(msg, owner, clock(), "reconciled: not delivered", report,
                                    retry_now=True)
             return
         reason = note or "outcome unknown"
@@ -406,19 +409,19 @@ class Outbox:
             # T19: urgent -> exactly one resend, same idempotency key.
             if self._update(msg, owner, "dispatches=dispatches+1, blind_resends=1,"
                             " in_flight_until=?, last_error=?",
-                            (now + self._dispatch_timeout, reason), now):
+                            (clock() + self._dispatch_timeout, reason), clock()):
                 report.resent_unknown.append(msg.message_id)
                 resent = self.get(msg.message_id)
                 try:
                     result = send(resent)
                 except Exception as exc:
-                    self._abandon(resent, owner, now, f"after one resend: {exc!r}", report)
+                    self._abandon(resent, owner, clock(), f"after one resend: {exc!r}", report)
                     return
-                if self._settle_sent(resent, owner, result, now):
+                if self._settle_sent(resent, owner, result, clock()):
                     report.sent.append(msg.message_id)
             return
         why = reason if msg.urgency == ROUTINE else f"{reason} after one resend"
-        self._abandon(msg, owner, now, why, report)
+        self._abandon(msg, owner, clock(), why, report)
 
     # -- transitions (each conditioned on the claim still being ours) --------
     def _update(self, msg: QueuedMessage, owner: str, assignments: str, args: tuple,
