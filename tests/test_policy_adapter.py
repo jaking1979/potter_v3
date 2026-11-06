@@ -1,6 +1,6 @@
 import json
 import unittest
-from tracing.policy_adapter import emit_policy_event, emit_uncorrelated_denial
+from tracing.policy_adapter import emit_policy_event, emit_uncorrelated_denial, emit_policy_audit
 
 TASK = '12345678-1234-4234-8234-123456789abc'
 TRACE = 'abcdefab-cdef-4def-8def-abcdefabcdef'
@@ -57,6 +57,25 @@ class AdapterTest(unittest.TestCase):
             emit_uncorrelated_denial(event, environment='synthetic', timestamp='2026-11-06T15:00:00Z', sink=fail)
         with self.assertRaises(ValueError):
             emit_uncorrelated_denial(event, environment='synthetic', timestamp='2026-11-06X15:00:00Z', sink=out.append)
+
+    def test_audit_dispatch_preserves_separate_paths(self):
+        out = []
+        ctx = dict(trace_id=TRACE, environment='synthetic', timestamp='2026-11-06T15:00:00Z', sink=out.append)
+        linked = {'decision_id': ID, 'outcome': 'allow', 'task_id': TASK, 'correlation': 'request'}
+        missing = {'decision_id': ID, 'outcome': 'deny', 'task_id': None, 'correlation': 'missing'}
+        emit_policy_audit(linked, task_id=TASK, **ctx)
+        emit_policy_audit(missing, task_id=None, **ctx)
+        self.assertEqual([json.loads(x)['schema'] for x in out],
+                         ['potter.trace.decision/v0', 'potter.trace.uncorrelated-denial/v0'])
+        with self.assertRaises(ValueError):
+            emit_policy_audit(missing, task_id=TASK, **ctx)
+        with self.assertRaises(ValueError):
+            emit_policy_audit(linked, task_id=TRACE, **ctx)
+        self.assertEqual(len(out), 2)
+        def fail(_):
+            raise OSError('unavailable')
+        with self.assertRaises(OSError):
+            emit_policy_audit(missing, **(ctx | {'task_id': None, 'sink': fail}))
 
 
 if __name__ == '__main__':

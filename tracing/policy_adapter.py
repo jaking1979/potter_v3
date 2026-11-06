@@ -58,3 +58,21 @@ def emit_policy_event(event, *, task_id, trace_id, environment, timestamp, sink)
                        outcome=outcome, decision_digest=digest,
                        environment=environment, timestamp=timestamp,
                        subject_id=decision_id), sink)
+
+
+def emit_policy_audit(event, *, task_id, trace_id, environment, timestamp, sink):
+    """Route one policy decision; task_id must be supplied from trusted context.
+
+    Missing correlation is a separate denial record, not a task-linked trace.
+    Do not infer trusted context from the event itself. No runtime binding or
+    durability is supplied by this function.
+    """
+    if not isinstance(event, Mapping):
+        raise ValueError('expected policy event mapping')
+    if event.get('correlation') == 'missing':
+        if task_id is not None:
+            raise ValueError('missing correlation conflicts with task context')
+        return emit_uncorrelated_denial(event, environment=environment,
+                                        timestamp=timestamp, sink=sink)
+    return emit_policy_event(event, task_id=task_id, trace_id=trace_id,
+                             environment=environment, timestamp=timestamp, sink=sink)
