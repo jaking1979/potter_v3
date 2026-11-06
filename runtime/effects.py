@@ -20,7 +20,8 @@ injected ``reconcile(effect)`` reads the external state and returns
 ``"failed"`` AND a late landing of the earlier dispatch is excluded - by a
 ``fence`` (C4 seam; default refuses) or because the effect was first
 dispatched under a trusted ``ConnectorContract`` whose identity AND
-``contract_digest`` (persisted on the effect) still match an entry in the
+``contract_digest`` (persisted on the effect; it covers the verified adapter
+source artifact) still match an entry in the
 ``trusted_idempotent`` registry fixed at construction (default: none). A
 contract rotated across a restart, or a row with no digest, is not trusted.
 No caller-supplied flag or attribute can grant this. ``"succeeded"`` resolves it without
@@ -37,9 +38,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
+import marshal
+import os
 import sqlite3
 import time
+import types
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,20 +83,89 @@ def adapter_name(adapter: Any) -> str:
     return name
 
 
+class AdapterVerificationError(ValueError):
+    """A registry entry's adapter implementation cannot be verified against
+    its declared artifact digest; the registry is not built."""
+
+
+_HEX64 = frozenset("0123456789abcdef")
+
+
+def adapter_artifact_digest(adapter: Any) -> str:
+    """sha256 of the adapter's implementation: the bytes of the source file
+    that defines its function, plus (if different) the file defining the class
+    it is bound to. Raises AdapterVerificationError if any source file cannot
+    be located and read (builtins, C extensions, REPL/exec-defined code), or if
+    the loaded function's bytecode is not what that file compiles to."""
+    owner = getattr(adapter, "__self__", None)
+    func = getattr(adapter, "__func__", adapter)
+    objs = [func if hasattr(func, "__code__") else type(func)]
+    if owner is not None:
+        objs.append(owner if isinstance(owner, type) else type(owner))
+    files: list[str] = []
+    for obj in objs:
+        try:
+            path = inspect.getsourcefile(obj)
+        except (TypeError, OSError):
+            path = None
+        if not path or not os.path.isfile(path):
+            raise AdapterVerificationError(f"no readable source for adapter {adapter_name(adapter)!r}")
+        path = os.path.realpath(path)
+        if path not in files:
+            files.append(path)
+    parts, sources = [], {}
+    for path in files:
+        try:
+            with open(path, "rb") as f:
+                sources[path] = f.read()
+        except OSError as exc:
+            raise AdapterVerificationError(f"cannot read adapter source {path}: {exc}") from exc
+        parts.append(hashlib.sha256(sources[path]).hexdigest())
+    code = getattr(objs[0], "__code__", None)
+    if code is not None:
+        _require_loaded_matches_source(code, sources[files[0]], adapter)
+    return parts[0] if len(parts) == 1 else hashlib.sha256(":".join(parts).encode()).hexdigest()
+
+
+def _require_loaded_matches_source(code: Any, source: bytes, adapter: Any) -> None:
+    """The file on disk is only evidence for the code actually running if the
+    loaded function compiles identically from it; a file rewritten after
+    import (or code patched in memory) is refused."""
+    try:
+        module_code = compile(source, code.co_filename, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError) as exc:
+        raise AdapterVerificationError(f"adapter source does not compile: {exc}") from exc
+    stack, want = [module_code], marshal.dumps(code)
+    while stack:
+        c = stack.pop()
+        if c.co_qualname == code.co_qualname and c.co_firstlineno == code.co_firstlineno \
+                and marshal.dumps(c) == want:
+            return
+        stack.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
+    raise AdapterVerificationError(
+        f"loaded adapter {adapter_name(adapter)!r} differs from its source file")
+
+
 @dataclass(frozen=True)
 class ConnectorContract:
     """A reviewed connector whose provider applies an idempotency key at most
     once. ``adapter`` is the exact perform callable that was reviewed against
     that contract; ``contract_ref`` points at the verification evidence;
+    ``adapter_artifact_digest`` is the sha256 of the reviewed adapter artifact,
+    supplied by trusted configuration (see ``adapter_artifact_digest()``);
     ``idempotency_semantics`` states the verified guarantee.
 
     ``contract_digest`` (computed, immutable) is sha256 over the canonical JSON
-    of (identity, contract_ref, adapter qualified name, semantics). It is
-    persisted on an effect at first dispatch, so a registry rebuilt after a
-    restart must present the SAME contract before its trust applies."""
+    of (identity, contract_ref, adapter qualified name, adapter artifact
+    digest, semantics). It is persisted on an effect at first dispatch, so a
+    registry rebuilt after a restart must present the SAME contract, including
+    the same adapter implementation, before its trust applies.
+    TrustedIdempotentRegistry verifies the declared artifact digest against the
+    adapter's actual source when it is built."""
     identity: str
     adapter: Callable[["Effect"], Any]
     contract_ref: str
+    adapter_artifact_digest: str
     idempotency_semantics: str = DEFAULT_IDEMPOTENCY_SEMANTICS
     contract_digest: str = field(init=False)
 
@@ -104,15 +178,22 @@ class ConnectorContract:
             raise ValueError("idempotency_semantics required")
         if not callable(self.adapter):
             raise TypeError("adapter must be callable")
+        d = self.adapter_artifact_digest
+        if not (isinstance(d, str) and len(d) == 64 and set(d) <= _HEX64):
+            raise ValueError("adapter_artifact_digest must be 64 lowercase hex characters")
         canon = json.dumps([self.identity, self.contract_ref, adapter_name(self.adapter),
-                            self.idempotency_semantics],
+                            self.adapter_artifact_digest, self.idempotency_semantics],
                            separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         object.__setattr__(self, "contract_digest", hashlib.sha256(canon).hexdigest())
 
 
 class TrustedIdempotentRegistry(Mapping):
     """Frozen identity -> ConnectorContract mapping, injected by configuration
-    when an EffectJournal is constructed. It cannot be changed afterwards."""
+    when an EffectJournal is constructed. It cannot be changed afterwards.
+
+    Each entry's declared ``adapter_artifact_digest`` must equal the digest of
+    the adapter's actual source; otherwise (or if the source is unreadable)
+    construction raises AdapterVerificationError."""
 
     def __init__(self, contracts: Iterable[ConnectorContract] = ()):
         entries: dict[str, ConnectorContract] = {}
@@ -121,6 +202,10 @@ class TrustedIdempotentRegistry(Mapping):
                 raise TypeError("registry entries must be ConnectorContract")
             if k.identity in entries:
                 raise ValueError(f"duplicate connector identity {k.identity!r}")
+            actual = adapter_artifact_digest(k.adapter)
+            if not hmac.compare_digest(actual, k.adapter_artifact_digest):
+                raise AdapterVerificationError(
+                    f"adapter for {k.identity!r} does not match its declared artifact digest")
             entries[k.identity] = k
         self._entries = MappingProxyType(entries)
 

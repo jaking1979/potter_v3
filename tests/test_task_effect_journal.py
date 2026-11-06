@@ -7,6 +7,7 @@ Offline only: the "external system" is a local SQLite file standing in for a
 connector that deduplicates on the idempotency key and counts applications.
 """
 import contextlib
+import importlib.util
 import itertools
 import multiprocessing
 import os
@@ -27,6 +28,7 @@ from runtime import (DONE, ESCALATED, FAILED, QUEUED, RUNNING, WAITING_APPROVAL,
                      ConnectorContract, Database, EffectConflict, JournalUnavailable, TrustedIdempotentRegistry, EffectFailed, EffectInFlight, EffectJournal,
                      EffectOutcomeUnknown, InvalidTransition, JournalApprovalLedger, LeaseLost,
                      TaskStore, idempotency_key, task_id_for)
+from runtime import AdapterVerificationError, adapter_artifact_digest  # noqa: E402
 from runtime._contract import ApprovalRefused, BoundAction  # noqa: E402
 
 T = 1_800_000_000.0
@@ -128,9 +130,15 @@ class FlakyDedupe(DedupingExternal):
         return super().perform(effect)
 
 
+def contract(identity, adapter, ref, *args, **kw):
+    """A contract whose artifact digest is declared from the adapter's current
+    source, as trusted configuration would after review."""
+    return ConnectorContract(identity, adapter, ref, adapter_artifact_digest(adapter), *args, **kw)
+
+
 def trusted(ext, identity=DEDUPE):
     """Configuration-time trust: the reviewed adapter is this stub's perform."""
-    return TrustedIdempotentRegistry([ConnectorContract(identity, ext.perform,
+    return TrustedIdempotentRegistry([contract(identity, ext.perform,
                                                         "test: DedupingExternal dedupes on key")])
 
 
@@ -450,7 +458,7 @@ class UnknownOutcome(_EffectFixture):
                 raise TimeoutError("connector timed out")   # first call: ambiguous, not applied
             return self.ext.perform(e)
         journal = EffectJournal(self.db, trusted_idempotent=TrustedIdempotentRegistry(
-            [ConnectorContract(DEDUPE, adapter, "test: provider dedupes on key")]))
+            [contract(DEDUPE, adapter, "test: provider dedupes on key")]))
         with self.assertRaises(EffectOutcomeUnknown):
             journal.execute(self.key, adapter, self.ext.reconcile, owner="w1", connector=DEDUPE, now=T)
         out = journal.execute(self.key, adapter, self.ext.reconcile, owner="w1", connector=DEDUPE, now=T + 1)
@@ -580,7 +588,7 @@ class TrustedIdempotentSeam(_EffectFixture):
         with self.assertRaises(TypeError):
             TrustedIdempotentRegistry([(DEDUPE, dedupe.perform)])
         with self.assertRaises(ValueError):
-            ConnectorContract(DEDUPE, dedupe.perform, "")
+            contract(DEDUPE, dedupe.perform, "")
 
     def test_connector_identity_required_and_recorded(self):
         with self.assertRaises(ValueError):
@@ -602,7 +610,7 @@ class ContractRotation(_EffectFixture):
 
     def _journal(self, adapter, ref="contract:v1", **kw):
         return EffectJournal(self.db, trusted_idempotent=TrustedIdempotentRegistry(
-            [ConnectorContract(DEDUPE, adapter, ref, **kw)]))
+            [contract(DEDUPE, adapter, ref, **kw)]))
 
     def _ambiguous_under_v1(self):
         a = FlakyDedupe(self.ext_path)
@@ -624,23 +632,24 @@ class ContractRotation(_EffectFixture):
 
     def test_digest_is_canonical_and_covers_every_field(self):
         a = FlakyDedupe(self.ext_path)
-        base = ConnectorContract(DEDUPE, a.perform, "contract:v1")
+        base = contract(DEDUPE, a.perform, "contract:v1")
         self.assertEqual(base.contract_digest,
-                         ConnectorContract(DEDUPE, FlakyDedupe(self.ext_path).perform,
+                         contract(DEDUPE, FlakyDedupe(self.ext_path).perform,
                                            "contract:v1").contract_digest)   # same contract, new process
-        variants = [ConnectorContract("fake.other", a.perform, "contract:v1"),
-                    ConnectorContract(DEDUPE, a.perform, "contract:v2"),
-                    ConnectorContract(DEDUPE, DedupingExternal(self.ext_path).perform, "contract:v1"),
-                    ConnectorContract(DEDUPE, a.perform, "contract:v1",
+        variants = [contract("fake.other", a.perform, "contract:v1"),
+                    contract(DEDUPE, a.perform, "contract:v2"),
+                    contract(DEDUPE, DedupingExternal(self.ext_path).perform, "contract:v1"),
+                    ConnectorContract(DEDUPE, a.perform, "contract:v1", "1" * 64),
+                    contract(DEDUPE, a.perform, "contract:v1",
                                       idempotency_semantics="dedupes within 24 h")]
-        self.assertEqual(len({v.contract_digest for v in variants} | {base.contract_digest}), 5)
+        self.assertEqual(len({v.contract_digest for v in variants} | {base.contract_digest}), 6)
         # Same inherited function, different adapter class: different contract.
-        self.assertNotEqual(ConnectorContract(DEDUPE, External(self.ext_path).perform, "c").contract_digest,
-                            ConnectorContract(DEDUPE, DedupingExternal(self.ext_path).perform, "c").contract_digest)
+        self.assertNotEqual(contract(DEDUPE, External(self.ext_path).perform, "c").contract_digest,
+                            contract(DEDUPE, DedupingExternal(self.ext_path).perform, "c").contract_digest)
         with self.assertRaises(Exception):
             base.contract_digest = "0" * 64                       # immutable
         with self.assertRaises(TypeError):
-            ConnectorContract(DEDUPE, a.perform, "contract:v1", contract_digest="0" * 64)
+            ConnectorContract(DEDUPE, a.perform, "contract:v1", "0" * 64, contract_digest="0" * 64)
 
     def test_restart_with_rotated_contract_ref_refused(self):
         self._ambiguous_under_v1()
@@ -696,6 +705,122 @@ class ContractRotation(_EffectFixture):
             c.execute("UPDATE meta SET value='c2.v9' WHERE key='schema'")
         with self.assertRaises(JournalUnavailable):
             Database(self.db)
+
+
+# -- same-name adapter replacement (Dolores review of e4ca880) ---------------
+ADAPTER_SRC = """\
+import os
+import sqlite3
+
+PATH = {path!r}
+
+
+def perform(effect):
+    effect.action()
+    if os.path.exists(PATH + ".timeout"):
+        raise TimeoutError("connector timed out")   # ambiguous; nothing applied
+    c = sqlite3.connect(PATH, timeout=30)
+    try:
+        with c:
+            c.execute({sql!r}, (effect.idempotency_key,))
+    finally:
+        c.close()
+    return {{"applied": effect.idempotency_key}}
+"""
+DEDUPING_SQL = "INSERT OR IGNORE INTO applied VALUES (?, 1)"
+NON_DEDUPING_SQL = "INSERT INTO applied VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET n = n + 1"
+
+
+class SameNameAdapterSwap(_EffectFixture):
+    """The adapter body is replaced under the same module, function name and
+    contract_ref; trust recorded before a restart must not carry over."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = DedupingExternal(os.path.join(self.tmp.name, "provider.sqlite"))
+        self.mod_dir = os.path.join(self.tmp.name, "adapters")
+        os.makedirs(self.mod_dir)
+        self.mod_path = os.path.join(self.mod_dir, "c2_mail_adapter.py")
+
+    def _write(self, sql):
+        with open(self.mod_path, "w") as f:
+            f.write(ADAPTER_SRC.format(path=self.provider.path, sql=sql))
+
+    def _load(self):
+        """A fresh import of the module file, as after a process restart."""
+        spec = importlib.util.spec_from_file_location("c2_mail_adapter", self.mod_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.perform
+
+    def _journal(self, adapter, declared=None):
+        declared = declared or adapter_artifact_digest(adapter)
+        return EffectJournal(self.db, trusted_idempotent=TrustedIdempotentRegistry(
+            [ConnectorContract(DEDUPE, adapter, "contract:mail-v1", declared)]))
+
+    def _ambiguous_v1(self):
+        self._write(DEDUPING_SQL)
+        v1 = self._load()
+        self.v1_artifact = adapter_artifact_digest(v1)
+        open(self.provider.path + ".timeout", "w").close()
+        j = self._journal(v1)
+        with self.assertRaises(EffectOutcomeUnknown):
+            j.execute(self.key, v1, self.provider.reconcile, owner="A", connector=DEDUPE, now=T)
+        os.remove(self.provider.path + ".timeout")
+        self.assertEqual(j.get(self.key).status, "unknown")
+        return j.get(self.key)
+
+    def test_adapter_name_unchanged_but_artifact_differs(self):
+        self._write(DEDUPING_SQL)
+        a = self._load()
+        digest_a = adapter_artifact_digest(a)
+        self._write(NON_DEDUPING_SQL)
+        b = self._load()
+        self.assertEqual(f"{a.__module__}.{a.__qualname__}", f"{b.__module__}.{b.__qualname__}")
+        self.assertNotEqual(digest_a, adapter_artifact_digest(b))
+        # The still-loaded old code no longer matches the rewritten file: refused,
+        # rather than borrowing the new file's digest.
+        with self.assertRaisesRegex(AdapterVerificationError, "differs from its source"):
+            adapter_artifact_digest(a)
+
+    def test_changed_body_with_stale_declared_digest_fails_registry(self):
+        self._ambiguous_v1()
+        self._write(NON_DEDUPING_SQL)
+        v2 = self._load()
+        with self.assertRaises(AdapterVerificationError):
+            self._journal(v2, declared=self.v1_artifact)   # config still names the reviewed v1
+
+    def test_changed_body_redeclared_refuses_historical_retry(self):
+        self._ambiguous_v1()
+        self._write(NON_DEDUPING_SQL)
+        v2 = self._load()
+        j = self._journal(v2)                              # registry builds, but it is a new contract
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "trusted"):
+            j.execute(self.key, v2, self.provider.reconcile, owner="B", connector=DEDUPE, now=T + 1)
+        self.assertEqual(j.reconcile(self.key, self.provider.reconcile, now=T + 1).status, "unknown")
+        self.assertEqual((self.provider.count(self.key), j.get(self.key).dispatches), (0, 1))
+
+    def test_identical_bytes_after_restart_allowed(self):
+        self._ambiguous_v1()
+        self._write(DEDUPING_SQL)                          # same bytes rewritten
+        v1_again = self._load()
+        self.assertEqual(adapter_artifact_digest(v1_again), self.v1_artifact)
+        out = self._journal(v1_again).execute(self.key, v1_again, self.provider.reconcile,
+                                              owner="B", connector=DEDUPE, now=T + 1)
+        self.assertEqual((out.status, out.dispatches), ("succeeded", 2))
+        self.assertEqual(self.provider.count(self.key), 1)
+
+    def test_unverifiable_adapters_rejected(self):
+        exec_ns = {}
+        exec(compile("def perform(effect):\n    return None\n", "<repl>", "exec"), exec_ns)
+        for adapter in (len, exec_ns["perform"], sqlite3.connect):
+            with self.subTest(adapter=adapter):
+                with self.assertRaises(AdapterVerificationError):
+                    adapter_artifact_digest(adapter)
+                with self.assertRaises(AdapterVerificationError):
+                    TrustedIdempotentRegistry([ConnectorContract(DEDUPE, adapter, "c", "0" * 64)])
+        with self.assertRaises(ValueError):
+            ConnectorContract(DEDUPE, self.provider.perform, "c", "not-a-digest")
 
 
 # -- escalation ---------------------------------------------------------------
