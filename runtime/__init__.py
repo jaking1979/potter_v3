@@ -4,8 +4,9 @@ nothing here performs a real external effect; callers inject perform/reconcile."
 from .approval_ledger import JournalApprovalLedger
 from .db import Database, JournalUnavailable
 from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_UNKNOWN,
-                      SUCCEEDED, UNKNOWN, Effect, EffectConflict, EffectError, EffectFailed,
-                      EffectInFlight, EffectJournal, EffectOutcomeUnknown, idempotency_key)
+                      SUCCEEDED, UNKNOWN, Effect, ConnectorContract, EffectConflict, EffectError, EffectFailed,
+                      EffectInFlight, EffectJournal, EffectOutcomeUnknown, TrustedIdempotentRegistry,
+                      idempotency_key)
 from .tasks import (DONE, ESCALATE_AFTER, ESCALATED, FAILED, QUEUED, RUNNING, STATES,
                     TRANSITIONS, WAITING_APPROVAL, Escalation, InvalidTransition, Job,
                     LeaseLost, Task, TaskStore, task_id_for)

@@ -31,12 +31,13 @@ Each worker mutation checks, inside its write transaction, that the worker still
    - `pending` / `failed`: sets the status to `unknown` and commits, then calls `perform` once.
    - `unknown`: calls `reconcile(effect)` first.
      - `succeeded`: the effect is resolved without re-executing.
-     - `failed`: the effect is dispatched exactly once, with the same key, **but only if a late landing of the earlier dispatch is ruled out**. Either the `fence` seam confirms the earlier dispatcher is fenced off (C4 fills this seam; with no fence, or if it errors, the answer is refuse), or the connector declares `enforces_idempotency_key = True`. Without one of these, "not applied yet" is not trusted: the effect stays `unknown` in `unresolved()`, and the call raises `EffectOutcomeUnknown`. A stalled worker or a timed-out request might still land later.
+     - `failed`: the effect is dispatched exactly once, with the same key, **but only if a late landing of the earlier dispatch is ruled out**. Either the `fence` seam confirms the earlier dispatcher is fenced off (C4 fills this seam; with no fence, or if it errors, the answer is refuse), or the connector identity *recorded on the effect* is in the `trusted_idempotent` registry. That registry is a frozen `TrustedIdempotentRegistry` of `ConnectorContract(identity, adapter, contract_ref)` records, injected when the journal is constructed. With no registry, the answer is refuse. No caller flag or callable attribute can grant this. Without one of these, "not applied yet" is not trusted: the effect stays `unknown` in `unresolved()`, and the call raises `EffectOutcomeUnknown`. A stalled worker or a timed-out request might still land later.
      - `still_unknown`, an unrecognised verdict, or an error: the retry is refused (`EffectOutcomeUnknown`).
    - An expired in-flight claim is never permission to re-dispatch on its own.
    - When `perform` raises `EffectFailed`, the effect becomes `failed`. Any other exception leaves it `unknown`.
    - While a live dispatcher holds the effect (`in_flight_until`), other callers get `EffectInFlight`.
-3. `perform` must run `effect.action()`, the hash-checked journaled snapshot, and pass `effect.idempotency_key` to the external system.
+3. `execute(..., connector=<identity>)` records the identity on the first dispatch. Every later dispatch must use the same identity (`EffectConflict` otherwise). For a trusted identity, `perform` must be that contract's registered adapter.
+4. `perform` must run `effect.action()`, the hash-checked journaled snapshot, and pass `effect.idempotency_key` to the external system.
 
 ## Not in this package
 

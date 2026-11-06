@@ -18,8 +18,10 @@ Statuses:
 Never blind retry: an ``unknown`` effect is only re-dispatched after the
 injected ``reconcile(effect)`` reads the external state and returns
 ``"failed"`` AND a late landing of the earlier dispatch is excluded - by a
-``fence`` (C4 seam; default refuses) or a connector that declares
-``enforces_idempotency_key = True``. ``"succeeded"`` resolves it without
+``fence`` (C4 seam; default refuses) or because the effect was dispatched
+through a connector identity in the ``trusted_idempotent`` registry fixed at
+construction (default: none). No caller-supplied flag or attribute can grant
+this. ``"succeeded"`` resolves it without
 re-execution; ``"still_unknown"`` (or anything unrecognised, or an unfenced
 ``"failed"``) refuses the retry and leaves it unresolved.
 
@@ -37,7 +39,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from ._contract import BoundAction, EffectIntent
 from .db import Database, as_database
@@ -50,17 +53,55 @@ STILL_UNKNOWN = "still_unknown"
 RECONCILE_VERDICTS = (SUCCEEDED, FAILED, STILL_UNKNOWN)
 DEFAULT_DISPATCH_TIMEOUT_S = 300.0
 NOT_APPLIED_UNFENCED = ("reconcile reports not applied, but the earlier dispatch may still land;"
-                        " re-dispatch needs a fence (C4) or an idempotency-enforcing connector")
+                        " re-dispatch needs a fence (C4) or a connector in the trusted"
+                        " idempotent registry")
 
 
-def enforces_idempotency_key(connector: Any) -> bool:
-    """True only if the connector (a perform callable, or the object it is
-    bound to) explicitly declares ``enforces_idempotency_key = True``: the
-    external system applies a given idempotency key at most once."""
-    for obj in (connector, getattr(connector, "__self__", None)):
-        if obj is not None and getattr(obj, "enforces_idempotency_key", False) is True:
-            return True
-    return False
+@dataclass(frozen=True)
+class ConnectorContract:
+    """A reviewed connector whose provider applies an idempotency key at most
+    once. ``adapter`` is the exact perform callable that was reviewed against
+    that contract; ``contract_ref`` points at the verification evidence."""
+    identity: str
+    adapter: Callable[["Effect"], Any]
+    contract_ref: str
+
+    def __post_init__(self):
+        if not (isinstance(self.identity, str) and self.identity):
+            raise ValueError("identity required")
+        if not (isinstance(self.contract_ref, str) and self.contract_ref):
+            raise ValueError("contract_ref required")
+        if not callable(self.adapter):
+            raise TypeError("adapter must be callable")
+
+
+class TrustedIdempotentRegistry(Mapping):
+    """Frozen identity -> ConnectorContract mapping, injected by configuration
+    when an EffectJournal is constructed. It cannot be changed afterwards."""
+
+    def __init__(self, contracts: Iterable[ConnectorContract] = ()):
+        entries: dict[str, ConnectorContract] = {}
+        for k in contracts:
+            if not isinstance(k, ConnectorContract):
+                raise TypeError("registry entries must be ConnectorContract")
+            if k.identity in entries:
+                raise ValueError(f"duplicate connector identity {k.identity!r}")
+            entries[k.identity] = k
+        self._entries = MappingProxyType(entries)
+
+    def __getitem__(self, identity: str) -> ConnectorContract:
+        return self._entries[identity]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __setattr__(self, name, value):
+        if name != "_entries" or "_entries" in self.__dict__:
+            raise AttributeError("TrustedIdempotentRegistry is frozen")
+        object.__setattr__(self, name, value)
 
 
 def idempotency_key(task_id: str, effect_id: str, action_hash: str) -> str:
@@ -88,7 +129,8 @@ class EffectInFlight(EffectError):
 
 
 class EffectConflict(EffectError):
-    """This task step is already bound to a different action."""
+    """This task step is already bound to a different action, or a dispatch
+    does not match the connector the effect is bound to."""
 
 
 @dataclass(frozen=True)
@@ -105,6 +147,7 @@ class Effect:
     in_flight_until: float | None
     result: Any
     last_error: str | None
+    connector: str | None = None   # identity the effect was (first) dispatched through
 
     def intent(self) -> EffectIntent:
         return EffectIntent(self.effect_id, self.task_id, self.action_hash,
@@ -116,7 +159,7 @@ class Effect:
 
 
 _COLS = ("idempotency_key, task_id, effect_id, action_hash, action_canonical, approval_id,"
-         " status, dispatches, in_flight_owner, in_flight_until, result, last_error")
+         " status, dispatches, in_flight_owner, in_flight_until, result, last_error, connector")
 
 
 def _effect(row: tuple) -> Effect:
@@ -143,9 +186,15 @@ def insert_intent(c: sqlite3.Connection, intent: EffectIntent, key: str, now: fl
 class EffectJournal:
     def __init__(self, db: Database | str | Path, *, clock: Callable[[], float] = time.time,
                  dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
-                 fence: Callable[[Effect], bool] | None = None):
+                 fence: Callable[[Effect], bool] | None = None,
+                 trusted_idempotent: TrustedIdempotentRegistry | None = None):
         self.db = as_database(db)
         self._fence = fence   # C4 seam; None = no fencing = refuse unfenced re-dispatch
+        if trusted_idempotent is None:
+            trusted_idempotent = TrustedIdempotentRegistry()
+        if not isinstance(trusted_idempotent, TrustedIdempotentRegistry):
+            raise TypeError("trusted_idempotent must be a TrustedIdempotentRegistry")
+        self._trusted = trusted_idempotent   # fixed for this journal's lifetime
         self._clock = clock
         self._dispatch_timeout = dispatch_timeout_s
 
@@ -195,7 +244,7 @@ class EffectJournal:
 
     # -- reconciliation ----------------------------------------------------
     def reconcile(self, key: str, reconcile: Callable[[Effect], str], *,
-                  enforces_idempotency_key: bool = False, now: float | None = None) -> Effect:
+                  now: float | None = None) -> Effect:
         """Resolve an ``unknown`` effect from external state, without dispatching.
         Returns the effect, whose status may still be ``unknown``.
 
@@ -207,8 +256,7 @@ class EffectJournal:
         if eff.status != UNKNOWN:
             return eff
         self._refuse_if_in_flight(eff, now)
-        allow_failed = enforces_idempotency_key is True or self._fenced(eff)
-        return self._reconcile(eff, reconcile, allow_failed, now)
+        return self._reconcile(eff, reconcile, self._late_landing_excluded(eff), now)
 
     def _reconcile(self, eff: Effect, reconcile: Callable[[Effect], str], allow_failed: bool,
                    now: float) -> Effect:
@@ -224,7 +272,7 @@ class EffectJournal:
         if verdict == FAILED and not allow_failed:
             # "Not applied yet" is not "will never apply": the earlier dispatch
             # (a stalled worker, or a timed-out request still on the wire) may
-            # land later. Without a fence or an idempotency-enforcing connector,
+            # land later. Without a fence or a trusted idempotent connector,
             # keep the effect unresolved and leave any in-flight claim in place.
             verdict, err = STILL_UNKNOWN, NOT_APPLIED_UNFENCED
         if verdict == STILL_UNKNOWN:
@@ -244,6 +292,11 @@ class EffectJournal:
                 raise EffectInFlight(f"effect {key} changed during reconciliation")
             return load_effect(c, key)
 
+    def _late_landing_excluded(self, eff: Effect) -> bool:
+        """Only configuration-time trust counts: the C4 fence, or the connector
+        identity RECORDED on the effect being in the trusted registry."""
+        return self._fenced(eff) or (eff.connector is not None and eff.connector in self._trusted)
+
     def _fenced(self, eff: Effect) -> bool:
         """C4 seam: True only if the earlier dispatcher is authoritatively fenced
         off. Default (no fence configured), or any error: refuse."""
@@ -256,7 +309,7 @@ class EffectJournal:
 
     # -- execution ---------------------------------------------------------
     def execute(self, key: str, perform: Callable[[Effect], Any],
-                reconcile: Callable[[Effect], str], *, owner: str,
+                reconcile: Callable[[Effect], str], *, owner: str, connector: str,
                 now: float | None = None) -> Effect:
         """Run the journaled effect at most as often as the external state allows:
 
@@ -266,25 +319,37 @@ class EffectJournal:
           re-execution. ``failed`` permits ONE re-dispatch with the same key, and
           only if a late landing of the earlier dispatch is excluded: the
           configured ``fence`` (C4 seam) confirms the earlier dispatcher is fenced
-          off, or the connector declares ``enforces_idempotency_key = True`` (the
-          external system dedupes on ``effect.idempotency_key``). Otherwise, and
+          off, or the identity the effect was dispatched through is in the
+          ``trusted_idempotent`` registry given at construction. Otherwise, and
           for ``still_unknown``, EffectOutcomeUnknown is raised and the effect
           stays in ``unresolved()`` for authoritative reconciliation. An expired
           in-flight claim is never by itself permission to re-dispatch.
+
+        ``connector`` names the identity ``perform`` dispatches through; it is
+        recorded on the first dispatch and every later dispatch must match it.
+        If it is a trusted identity, ``perform`` must be that contract's
+        registered adapter. Naming an identity grants nothing unless the
+        journal was configured to trust it.
 
         ``perform(effect)`` must use ``effect.action()`` and pass
         ``effect.idempotency_key`` to the external system.
         """
         if not owner:
             raise ValueError("owner required")
+        if not (isinstance(connector, str) and connector):
+            raise ValueError("connector identity required")
         now = self._now(now)
         eff = self._require(key)
         if eff.status == SUCCEEDED:
             return eff
+        if eff.connector is not None and eff.connector != connector:
+            raise EffectConflict(f"effect {key} is bound to connector {eff.connector!r},"
+                                 f" not {connector!r}")
+        if connector in self._trusted and perform != self._trusted[connector].adapter:
+            raise EffectConflict(f"perform is not the registered adapter for {connector!r}")
         if eff.status == UNKNOWN:
             self._refuse_if_in_flight(eff, now)
-            allow_failed = enforces_idempotency_key(perform) or self._fenced(eff)
-            eff = self._reconcile(eff, reconcile, allow_failed, now)
+            eff = self._reconcile(eff, reconcile, self._late_landing_excluded(eff), now)
             if eff.status == SUCCEEDED:
                 return eff
             if eff.status == UNKNOWN:
@@ -293,10 +358,12 @@ class EffectJournal:
         eff.action()  # integrity check BEFORE anything is dispatched
         with self.db.tx() as c:
             cur = c.execute("UPDATE effects SET status=?, dispatches=dispatches+1,"
-                            " in_flight_owner=?, in_flight_until=?, updated_at=?"
-                            " WHERE idempotency_key=? AND status IN (?,?) AND dispatches=?",
-                            (UNKNOWN, owner, now + self._dispatch_timeout, now,
-                             key, PENDING, FAILED, eff.dispatches))
+                            " in_flight_owner=?, in_flight_until=?, updated_at=?,"
+                            " connector=COALESCE(connector, ?)"
+                            " WHERE idempotency_key=? AND status IN (?,?) AND dispatches=?"
+                            " AND (connector IS NULL OR connector=?)",
+                            (UNKNOWN, owner, now + self._dispatch_timeout, now, connector,
+                             key, PENDING, FAILED, eff.dispatches, connector))
             if cur.rowcount != 1:
                 raise EffectInFlight(f"effect {key} was claimed by another dispatcher")
             eff = load_effect(c, key)
