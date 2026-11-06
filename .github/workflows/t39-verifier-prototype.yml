@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - 'experiments/t39_verifier/**'
+      - 't39/**'
       - '.github/workflows/t39-verifier-prototype.yml'
 permissions:
   contents: read
