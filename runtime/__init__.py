@@ -4,8 +4,9 @@ nothing here performs a real external effect; callers inject perform/reconcile."
 from .approval_ledger import JournalApprovalLedger
 from .db import Database, JournalUnavailable
 from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_UNKNOWN,
-                      SUCCEEDED, UNKNOWN, Effect, EffectConflict, EffectError, EffectFailed,
-                      EffectInFlight, EffectJournal, EffectOutcomeUnknown, idempotency_key)
+                      SUCCEEDED, UNKNOWN, ConnectorContract, Effect, EffectConflict, EffectError,
+                      EffectFailed, EffectInFlight, EffectJournal, EffectOutcomeUnknown,
+                      TrustedIdempotentRegistry, idempotency_key)
 from .fencing import (ACTIVE, FENCED, NODE_STATES, PAUSED, AuthorityUnavailable, Epoch,
                       EpochAuthority, FencedEffects, FencingError, FencingToken,
                       FileCopyReplicator, Node, NodeNotActive, Observation, PromotionConflict,

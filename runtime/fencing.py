@@ -459,7 +459,16 @@ class FencedEffects:
         self.journal = node.journal
 
     def execute(self, key: str, perform: Callable[[Effect, FencingToken], Any],
-                reconcile: Callable[[Effect], str], *, now: float | None = None) -> Effect:
+                reconcile: Callable[[Effect], str], *, connector: str,
+                now: float | None = None) -> Effect:
+        """``connector`` is the C2 connector identity (recorded on the effect;
+        every dispatch must match it). Fencing does not depend on it being in
+        the journal's trusted idempotent registry: re-dispatch after an
+        ambiguous or expired claim is cleared by :meth:`Node.c2_fence` alone.
+
+        Because ``perform`` is wrapped (to pass the token and re-check the
+        epoch), a connector in the trusted registry cannot be routed through
+        here: C2 requires ``perform`` to be its registered adapter."""
         token = self.node.require_active()
         refused: list[StaleEpoch] = []
 
@@ -475,7 +484,7 @@ class FencedEffects:
                 raise
 
         eff = self.journal.execute(key, fenced_perform, reconcile, owner=token.owner,
-                                   now=now, guard=fence)
+                                   connector=connector, now=now, guard=fence)
         if refused:   # the journal settled it FAILED (not applied); surface the refusal
             self.node._fence(f"dispatch refused: {refused[0]}")
             raise refused[0]
@@ -494,7 +503,13 @@ class StubConnector:
     promotion never lands, and the new primary's reconcile sees every apply that
     did land."""
 
-    def __init__(self, path: str | Path, authority: EpochAuthority):
+    IDENTITY = "stub.epoch-gateway"
+
+    def __init__(self, path: str | Path, authority: EpochAuthority, *,
+                 identity: str = IDENTITY):
+        if not (isinstance(identity, str) and identity):
+            raise ValueError("identity required")
+        self.identity = identity   # C2 connector identity; NOT trusted-idempotent
         self.path = str(path)
         self.authority = authority
         with self._tx() as c:

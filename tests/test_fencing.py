@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_policy_engine as tpe  # noqa: E402  (C1 fixtures: registry, approvals)
 from runtime import (ACTIVE, FENCED, PAUSED, Database, EffectFailed, EffectJournal,
-                     EffectOutcomeUnknown,  # noqa: E402
+                     EffectConflict, EffectOutcomeUnknown,  # noqa: E402
                      EpochAuthority, FencedEffects, FileCopyReplicator, FencingToken, Node,
                      NodeNotActive, PromotionConflict, StaleEpoch, StaleEpochRefused,
                      StubConnector, UnresolvedEffects, owner_epoch)
@@ -75,7 +75,7 @@ def _node_a(p, mode, stalled, resume, q):
             resume.wait(WAIT)
             out["state_before"] = node.state           # still believes it is ACTIVE
             try:
-                fx.execute(eff.idempotency_key, ext.perform, ext.reconcile)
+                fx.execute(eff.idempotency_key, ext.perform, ext.reconcile, connector=ext.identity)
                 out["first"] = "dispatched"
             except StaleEpoch as e:
                 out["first"] = type(e).__name__
@@ -86,7 +86,7 @@ def _node_a(p, mode, stalled, resume, q):
                 resume.wait(WAIT)                      # GC pause / VM freeze
                 return ext.perform(effect, token)
             try:
-                fx.execute(eff.idempotency_key, perform, ext.reconcile)
+                fx.execute(eff.idempotency_key, perform, ext.reconcile, connector=ext.identity)
                 out["first"] = "dispatched"
             except StaleEpoch as e:
                 out["first"] = type(e).__name__
@@ -94,7 +94,7 @@ def _node_a(p, mode, stalled, resume, q):
         out["status_after"] = node.journal.get(eff.idempotency_key).status
         out["state_after"] = node.state
         try:                                           # it tries again: journal side
-            fx.execute(eff.idempotency_key, ext.perform, ext.reconcile)
+            fx.execute(eff.idempotency_key, ext.perform, ext.reconcile, connector=ext.identity)
             out["second"] = "dispatched"
         except (StaleEpoch, NodeNotActive) as e:
             out["second"] = type(e).__name__
@@ -118,13 +118,13 @@ def _node_b(p, q):
         key = node.journal.for_step(TASK, "send").idempotency_key
         out["restored_status"] = node.journal.get(key).status
         try:
-            fx.execute(key, ext.perform, ext.reconcile)
+            fx.execute(key, ext.perform, ext.reconcile, connector=ext.identity)
             out["paused_dispatch"] = "dispatched"
         except NodeNotActive as e:
             out["paused_dispatch"] = e.state
         out["unpause"] = node.unpause(ext.reconcile)
         out["after_unpause"] = node.state
-        out["final"] = fx.execute(key, ext.perform, ext.reconcile).status
+        out["final"] = fx.execute(key, ext.perform, ext.reconcile, connector=ext.identity).status
         q.put(out)
     except BaseException as e:
         q.put({"error": repr(e)})
@@ -247,7 +247,7 @@ class JournalSideFence(_Tmp):
 
         with self.assertRaises(StaleEpoch):
             a.journal.execute(eff.idempotency_key, lambda e: performed.append(e),
-                              self.ext.reconcile, owner=token.owner, guard=fence)
+                              self.ext.reconcile, owner=token.owner, connector=self.ext.identity, guard=fence)
         self.assertEqual(len(calls), 2)
         self.assertEqual(performed, [])
         after = a.journal.get(eff.idempotency_key)
@@ -257,7 +257,7 @@ class JournalSideFence(_Tmp):
     def test_dispatch_records_epoch_and_connector_rejects_forged_or_old_tokens(self):
         a = self.active_node()
         eff = a.journal.record_intent(TASK, "send", action())
-        done = FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile)
+        done = FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile, connector=self.ext.identity)
         self.assertEqual(done.status, "succeeded")
         self.assertEqual(done.result["epoch"], 1)
         self.assertEqual(owner_epoch("node-a@epoch:7"), 7)
@@ -277,7 +277,7 @@ class JournalSideFence(_Tmp):
         def ambiguous(e):
             raise RuntimeError("timeout")
         with self.assertRaises(Exception):
-            j.execute(eff.idempotency_key, ambiguous, self.ext.reconcile, owner="x@epoch:1")
+            j.execute(eff.idempotency_key, ambiguous, self.ext.reconcile, owner="x@epoch:1", connector="stub.epoch-gateway")
         # an ambiguous outcome keeps the dispatcher's identity (window expired)
         after = j.get(eff.idempotency_key)
         self.assertEqual((after.status, after.in_flight_owner), ("unknown", "x@epoch:1"))
@@ -307,7 +307,7 @@ def _stall_past_timeout(p, stalled, resume, q):
             resume.wait(WAIT)                          # stalls far past the 0.2 s window
             return ext.perform(effect, token)
         try:
-            FencedEffects(node).execute(eff.idempotency_key, perform, ext.reconcile)
+            FencedEffects(node).execute(eff.idempotency_key, perform, ext.reconcile, connector=ext.identity)
             q.put({"late": "applied"})
         except StaleEpoch as e:
             q.put({"late": type(e).__name__, "state": node.state})
@@ -328,23 +328,28 @@ class C2FenceSeam(_Tmp):
             row = EffectJournal(self.p.a).get(key)
             self.assertEqual((row.status, row.in_flight_owner), ("unknown", "node-a@epoch:1"))
             self.assertLess(row.in_flight_until, time.time())
+            self.assertEqual(row.connector, self.ext.identity)  # recorded by C2 on dispatch
 
             # C2 alone: an expired claim is not permission; "not applied yet" is refused
             with self.assertRaises(EffectOutcomeUnknown):
                 EffectJournal(self.p.a).execute(key, self.ext.perform_unfenced,
-                                                self.ext.reconcile, owner="plain-c2")
+                                                self.ext.reconcile, owner="plain-c2", connector=self.ext.identity)
             self.assertEqual(EffectJournal(self.p.a).get(key).status, "unknown")
 
             # B, same journal: promoted to epoch 2, reconciles "failed", fence says True
             b = Node("node-b", self.auth, self.p.a)
+            # the stub is NOT in the trusted idempotent registry: only the fence clears it
+            self.assertNotIn(self.ext.identity, b.journal._trusted)
+            self.assertEqual(len(b.journal._trusted), 0)
             self.assertEqual(b.promote(), 2)
             self.assertFalse(b.c2_fence(row))          # PAUSED and not reconciling
             report = b.unpause(self.ext.reconcile)
             self.assertEqual(report["resolved"], [key])
             self.assertIn((key, "node-a@epoch:1", True), b.fence_log)
             self.assertEqual(b.journal.get(key).status, "failed")
-            done = FencedEffects(b).execute(key, self.ext.perform, self.ext.reconcile)
-            self.assertEqual((done.status, done.dispatches), ("succeeded", 2))
+            done = FencedEffects(b).execute(key, self.ext.perform, self.ext.reconcile, connector=self.ext.identity)
+            self.assertEqual((done.status, done.dispatches, done.connector),
+                             ("succeeded", 2, self.ext.identity))
 
             resume.set()                               # A's late call reaches the boundary
             out = self.get(q)
@@ -366,12 +371,29 @@ class C2FenceSeam(_Tmp):
         eff = j.record_intent(TASK, "send", action())
         with self.assertRaises(Exception):
             j.execute(eff.idempotency_key, lambda e: 1 / 0, self.ext.reconcile,
-                      owner="node-a@epoch:0")
+                      owner="node-a@epoch:0", connector=self.ext.identity)
         b = self.active_node("node-b", self.p.a)     # unpause reconciles it: fence says yes
         self.assertEqual(b.journal.get(eff.idempotency_key).status, "failed")
         self.assertEqual(FencedEffects(b).execute(eff.idempotency_key, self.ext.perform,
-                                                  self.ext.reconcile).status, "succeeded")
+                                                  self.ext.reconcile, connector=self.ext.identity).status, "succeeded")
         self.assertEqual(self.ext.count(), 1)
+
+    def test_fenced_dispatch_bound_to_its_connector_identity(self):
+        a = self.active_node()
+        eff = a.journal.record_intent(TASK, "send", action())
+
+        def ambiguous(e, token):
+            raise RuntimeError("timeout")
+        with self.assertRaises(EffectOutcomeUnknown):
+            FencedEffects(a).execute(eff.idempotency_key, ambiguous, self.ext.reconcile,
+                                     connector=self.ext.identity)
+        with self.assertRaises(EffectConflict):   # C2: later dispatches must match
+            FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
+                                     connector="other.gateway")
+        with self.assertRaises(ValueError):
+            FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
+                                     connector="")
+        self.assertEqual(self.ext.count(), 0)
 
     def test_fence_refuses_unless_epoch_authority_rules_out_late_landing(self):
         b = self.active_node("node-b", self.p.b)      # epoch 1
@@ -409,7 +431,7 @@ class NodeLifecycle(_Tmp):
         self.assertEqual((n.state, n.fence_reason, n.epoch), (FENCED, "new node", None))
         eff = n.journal.record_intent(TASK, "send", action())
         with self.assertRaises(NodeNotActive):
-            FencedEffects(n).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile)
+            FencedEffects(n).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile, connector=self.ext.identity)
         self.assertEqual(self.ext.count(), 0)
 
     def test_returning_node_starts_fenced_then_rejoins_with_fresh_epoch(self):
@@ -427,7 +449,7 @@ class NodeLifecycle(_Tmp):
         # the stalled earlier incarnation (epoch 1) is now fenced too
         eff = old.journal.record_intent(TASK, "send", action())
         with self.assertRaises(StaleEpoch):
-            FencedEffects(old).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile)
+            FencedEffects(old).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile, connector=self.ext.identity)
         self.assertEqual(old.state, FENCED)
         self.assertEqual(self.ext.count(), 0)
 
@@ -447,7 +469,7 @@ class NodeLifecycle(_Tmp):
         def ambiguous(e, token):
             raise RuntimeError("connection reset")        # outcome unknown
         with self.assertRaises(Exception):
-            FencedEffects(a).execute(eff.idempotency_key, ambiguous, self.ext.reconcile)
+            FencedEffects(a).execute(eff.idempotency_key, ambiguous, self.ext.reconcile, connector=self.ext.identity)
         self.assertEqual(a.journal.get(eff.idempotency_key).status, "unknown")
 
         rep = FileCopyReplicator(self.p.replica)
@@ -458,7 +480,7 @@ class NodeLifecycle(_Tmp):
         self.assertEqual(b.state, PAUSED)
         fx = FencedEffects(b)
         with self.assertRaises(NodeNotActive) as cm:
-            fx.execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile)
+            fx.execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile, connector=self.ext.identity)
         self.assertEqual(cm.exception.state, PAUSED)
 
         # reconciliation that cannot decide keeps it paused
@@ -467,7 +489,7 @@ class NodeLifecycle(_Tmp):
         self.assertEqual(cm.exception.keys, [eff.idempotency_key])
         self.assertEqual(b.state, PAUSED)
         with self.assertRaises(NodeNotActive):
-            fx.execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile)
+            fx.execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile, connector=self.ext.identity)
 
         # real reconcile: the external system never applied it -> failed -> unpause
         report = b.unpause(self.ext.reconcile)
@@ -475,7 +497,7 @@ class NodeLifecycle(_Tmp):
         self.assertEqual(b.state, ACTIVE)
         self.assertEqual(b.journal.unresolved(), [])
         self.assertEqual(fx.execute(eff.idempotency_key, self.ext.perform,
-                                    self.ext.reconcile).status, "succeeded")
+                                    self.ext.reconcile, connector=self.ext.identity).status, "succeeded")
         self.assertEqual(self.ext.applied(), [(eff.idempotency_key, "node-b", 2)])
 
     def test_unpause_refused_when_superseded_while_paused(self):
@@ -538,14 +560,14 @@ class ReplicatorSeam(_Tmp):
         a = self.active_node()
         fx = FencedEffects(a)
         ok = a.journal.record_intent(TASK, "s1", action(n=1))
-        fx.execute(ok.idempotency_key, self.ext.perform, self.ext.reconcile)
+        fx.execute(ok.idempotency_key, self.ext.perform, self.ext.reconcile, connector=self.ext.identity)
         a.journal.record_intent(TASK, "s2", action(n=2))   # stays pending
         unk = a.journal.record_intent(TASK, "s3", action(n=3))
 
         def ambiguous(e, token):
             raise RuntimeError("timeout")
         with self.assertRaises(Exception):
-            fx.execute(unk.idempotency_key, ambiguous, self.ext.reconcile)
+            fx.execute(unk.idempotency_key, ambiguous, self.ext.reconcile, connector=self.ext.identity)
         return a
 
     def test_restored_replica_reproduces_journal_and_starts_fenced(self):

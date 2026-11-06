@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = "c2.v0"
+SCHEMA_VERSION = "c2.v1"
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS meta (
@@ -60,6 +60,7 @@ SCHEMA = (
         last_error TEXT,
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL,
+        connector TEXT,
         UNIQUE (task_id, effect_id))""",
     "CREATE INDEX IF NOT EXISTS effects_status ON effects (status)",
     """CREATE TABLE IF NOT EXISTS approval_nonces (
