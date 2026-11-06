@@ -1,0 +1,27 @@
+name: A4a offline scaffold
+
+on:
+  pull_request:
+    paths:
+      - 'evaluation/a4a/**'
+      - '.github/workflows/a4a-offline.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Python grading scaffold
+        run: python3 -m unittest discover -s evaluation/a4a -p 'test_*.py' -v
+      - name: Node grading scaffold
+        run: node --test evaluation/a4a/*.test.mjs

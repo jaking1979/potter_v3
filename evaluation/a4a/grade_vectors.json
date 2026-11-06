@@ -1,0 +1,204 @@
+[
+  {
+    "name": "valid one-shot",
+    "accept": true,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
+  },
+  {
+    "name": "valid responsibility",
+    "accept": true,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": true,
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat",
+          "follow_through": "partly"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no",
+          "follow_through": "yes"
+        }
+      }
+    }
+  },
+  {
+    "name": "missing answer",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
+  },
+  {
+    "name": "identity leak",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no",
+          "model": "identifying"
+        }
+      }
+    }
+  },
+  {
+    "name": "invalid category",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "fast",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
+  },
+  {
+    "name": "follow-through on one-shot",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat",
+          "follow_through": "yes"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
+  },
+  {
+    "name": "string responsibility",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": "true",
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
+  },
+  {
+    "name": "unexpected top-level",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      },
+      "model": "synthetic"
+    }
+  },
+  {
+    "name": "uppercase answer",
+    "accept": false,
+    "record": {
+      "case_id": "synthetic",
+      "responsibility": false,
+      "outputs": {
+        "A": {
+          "done": "Yes",
+          "reexplaining": "none",
+          "speed": "yes",
+          "trust": "somewhat"
+        },
+        "B": {
+          "done": "no",
+          "reexplaining": "a lot",
+          "speed": "too slow",
+          "trust": "no"
+        }
+      }
+    }
+  }
+]
