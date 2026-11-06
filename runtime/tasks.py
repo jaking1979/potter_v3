@@ -13,7 +13,8 @@
 * Escalation: ``escalate_after`` (3) consecutive failures of a task - an
   explicit ``fail`` or an expired lease - move it to ``escalated`` and fire the
   ``escalate`` callback once. A scheduled job escalates after 3 consecutive
-  runs that end failed/escalated; a successful run resets it.
+  runs that end failed/escalated (including a denied or expired approval); a
+  successful run resets it.
 * Watchdog: ``stale_jobs`` lists scheduled jobs whose last success (or, if none,
   registration) is older than cadence x tolerance.
 
@@ -257,16 +258,25 @@ class TaskStore:
 
     def approval_resolved(self, task_id: str, approved: bool, *, error: str | None = None,
                           now: float | None = None) -> Task:
-        """Approved -> back to queued to resume; denied/expired -> failed."""
+        """Approved -> back to queued to resume; denied/expired -> failed. A
+        denied or expired approval ends the run, so it counts toward the job's
+        consecutive failed runs (and job escalation) like any terminal failure."""
         now = self._now(now)
+        fired: list[Escalation] = []
         with self.db.tx() as c:
             t = _load(c, task_id)
             if t is None:
                 raise KeyError(task_id)
             if t.state != WAITING_APPROVAL:
                 raise InvalidTransition(f"{task_id} is {t.state}, not waiting for approval")
-            return self._move(c, task_id, WAITING_APPROVAL, QUEUED if approved else FAILED, now,
-                              error=None if approved else (error or "approval denied"))
+            if approved:
+                out = self._move(c, task_id, WAITING_APPROVAL, QUEUED, now)
+            else:
+                self._record_failure(c, t, error or "approval denied", retryable=False,
+                                     now=now, fired=fired, final=FAILED)
+                out = _load(c, task_id)
+        self._fire(fired)   # only reached once the transaction committed
+        return out
 
     def complete(self, task_id: str, worker_id: str, *, now: float | None = None) -> Task:
         now = self._now(now)
@@ -315,9 +325,15 @@ class TaskStore:
         return _load(c, task_id)
 
     def _record_failure(self, c: sqlite3.Connection, t: Task, error: str, *, retryable: bool,
-                        now: float, fired: list[Escalation]) -> str:
+                        now: float, fired: list[Escalation], final: str | None = None) -> str:
+        """``final`` forces the task's end state (a denied approval is a human
+        decision: the task fails, it is not escalated) while job accounting
+        still applies."""
         failures = t.consecutive_failures + 1
-        dst = ESCALATED if failures >= self._after else (QUEUED if retryable else FAILED)
+        if final is not None:
+            dst = final
+        else:
+            dst = ESCALATED if failures >= self._after else (QUEUED if retryable else FAILED)
         self._move(c, t.id, t.state, dst, now, error=error)
         c.execute("UPDATE tasks SET consecutive_failures=? WHERE id=?", (failures, t.id))
         if dst == ESCALATED:
