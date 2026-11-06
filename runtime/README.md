@@ -7,6 +7,7 @@ Task store + effect journal. Built on the C0 contracts. Staging-only (T22). Noth
 | `db.py` | One SQLite file holds tasks, jobs, effects and approval nonces. It runs in WAL mode with `synchronous=FULL`, so every commit is fsynced. Every write uses `BEGIN IMMEDIATE`, and each operation opens its own connection, so it is safe across threads and processes. |
 | `tasks.py` | `TaskStore` handles trigger-key dedupe (task id = UUIDv5 of the trigger key), the state machine, leases with heartbeats, checkpoints, escalation, and the last-success watchdog. |
 | `effects.py` | `EffectJournal` records the intent before execution, assigns a deterministic UUIDv5 idempotency key, tracks status `pending → unknown → succeeded \| failed`, and reconciles before any retry. |
+| `outbox.py` | **C3 (T4/T17, T19 items 1/3/7).** `Outbox.enqueue(tx, message)` writes the notification in the caller's business transaction. `relay(send, reconcile, owner)` records the dispatch (`unknown`) before `send`. An unknown outcome is reconciled first; if it stays unknown, a routine message becomes `abandoned_unknown` and is not resent, and an urgent one is resent once with the same key. `ack()` suppresses sibling channels. `stale_backlog()` feeds the watchdog. The table and `meta.outbox_schema=c3.v0` are created by `Outbox`, so `db.py`'s C2 schema is unchanged. |
 | `approval_ledger.py` | `JournalApprovalLedger` is the production C0 `ApprovalLedger`. `consume(nonce, intent)` is one transaction: it inserts the pending effect intent and marks the nonce used. |
 
 ## Task states
@@ -43,6 +44,8 @@ Each worker mutation checks, inside its write transaction, that the worker still
 
 - **C3:** the outbox and durable delivery of escalation notifications. The callback is at-most-once after commit.
 - **C4:** the fencing implementation. C2 provides the `fence` seam and refuses unfenced re-dispatch. Leases are checked in the DB only.
+- **Wiring C2 escalations to C3:** `TaskStore`'s escalate callback is still at-most-once after commit. Moving it onto `Outbox.enqueue` in the same transaction is E1's job (the T19 notifier).
+- **C4:** fencing tokens against a dispatcher that is stalled but still alive past its lease or in-flight window. C2 checks leases in the DB only.
 - Real connectors, schedulers, and the worker loop.
 - `contracts/v0` is loaded as top-level module `approval` (see `_contract.py`), so EffectIntent identity matches the C0 tests.
 
