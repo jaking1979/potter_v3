@@ -30,11 +30,12 @@ that with a monotonic **fencing epoch**:
   the external call. The token is passed to ``perform(effect, token)`` so the
   connector can check it too.
 * :class:`StubConnector` is the external-side check ("fencing token at the
-  boundary"). It refuses any token whose epoch is not the authority's current
-  epoch, or is lower than the highest epoch it has seen. The check and the apply
-  run in one write transaction, and ``reconcile`` reads under the same lock, so
-  once a promotion commits, no older token can land and the new primary's
-  reconcile sees everything that did land.
+  boundary"). Its state lives in the authority's DB, and the check plus the
+  apply run inside :meth:`EpochAuthority.boundary`, the same ``BEGIN
+  IMMEDIATE`` lock that promotion takes. It refuses any token below the
+  highest epoch it has seen, or not equal to the committed epoch. Promotion and
+  apply are therefore strictly ordered: once a promotion commits, no older
+  token can land, and the new primary's reconcile sees everything that did.
 
 Limits (documented, not hidden): third-party APIs cannot check our tokens, so
 the boundary in production is an egress gateway with this check, and a window
@@ -171,6 +172,23 @@ class EpochAuthority:
             c.execute("COMMIT")
         finally:
             c.close()
+
+    @contextlib.contextmanager
+    def boundary(self) -> Iterator[tuple[sqlite3.Connection, Epoch]]:
+        """One ``BEGIN IMMEDIATE`` transaction on the authority DB, with the
+        committed epoch read inside it. :meth:`promote` takes the same write
+        lock, so whatever runs in this block linearizes with promotion: no
+        promotion can commit between the epoch read and the block's commit.
+        The external boundary (:class:`StubConnector`) keeps its state in this
+        DB and checks + applies here."""
+        try:
+            with self._tx() as c:
+                row = c.execute("SELECT epoch, holder FROM authority WHERE id = 1").fetchone()
+                if row is None:
+                    raise AuthorityUnavailable("epoch authority has no row")
+                yield c, Epoch(int(row[0]), row[1])
+        except sqlite3.Error as exc:
+            raise AuthorityUnavailable(f"epoch authority boundary failed: {exc}") from exc
 
     def current(self) -> Epoch:
         try:
@@ -495,72 +513,66 @@ class FencedEffects:
 
 class StubConnector:
     """Staging stand-in for the external system behind an epoch-checking egress
-    boundary. SQLite-backed so separate processes share it. It does NOT
-    deduplicate on the idempotency key, so any double execution is visible.
+    boundary. It does NOT deduplicate on the idempotency key, so any double
+    execution is visible.
 
-    ``apply`` checks the token and applies in ONE write transaction; ``reconcile``
-    reads under the same write lock. Hence: a token older than a committed
-    promotion never lands, and the new primary's reconcile sees every apply that
-    did land."""
+    Fencing-token pattern, linearized with promotion: the boundary's state
+    (highest epoch seen, applied and refused rows) lives in the AUTHORITY's
+    SQLite DB, and :meth:`apply` runs entirely inside
+    :meth:`EpochAuthority.boundary`, one ``BEGIN IMMEDIATE`` transaction that
+    :meth:`EpochAuthority.promote` also needs. In that one transaction it
+    refuses a token below the highest epoch seen, or not equal to the
+    authority's committed epoch, and otherwise records the apply. So an apply
+    and a promotion are strictly ordered: once a promotion has committed, no
+    older token lands, and an apply in progress delays the promotion until it
+    has committed. ``reconcile`` reads under the same lock.
+
+    ``after_check`` is a test seam: called inside the transaction after the
+    token passed, before the apply is recorded."""
 
     IDENTITY = "stub.epoch-gateway"
 
-    def __init__(self, path: str | Path, authority: EpochAuthority, *,
-                 identity: str = IDENTITY):
+    def __init__(self, authority: EpochAuthority, *, identity: str = IDENTITY):
+        if not isinstance(authority, EpochAuthority):
+            raise TypeError("StubConnector needs the EpochAuthority whose DB it shares")
         if not (isinstance(identity, str) and identity):
             raise ValueError("identity required")
         self.identity = identity   # C2 connector identity; NOT trusted-idempotent
-        self.path = str(path)
         self.authority = authority
-        with self._tx() as c:
-            c.execute("CREATE TABLE IF NOT EXISTS applied ("
+        self.after_check: Callable[[sqlite3.Connection, FencingToken], None] | None = None
+        with authority.boundary() as (c, _):
+            c.execute("CREATE TABLE IF NOT EXISTS ext_applied ("
                       " seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL,"
                       " node_id TEXT NOT NULL, epoch INTEGER NOT NULL)")
-            c.execute("CREATE TABLE IF NOT EXISTS fence ("
+            c.execute("CREATE TABLE IF NOT EXISTS ext_fence ("
                       " id INTEGER PRIMARY KEY CHECK (id = 1), max_epoch INTEGER NOT NULL)")
-            c.execute("CREATE TABLE IF NOT EXISTS refused ("
+            c.execute("CREATE TABLE IF NOT EXISTS ext_refused ("
                       " seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL,"
                       " node_id TEXT NOT NULL, epoch INTEGER NOT NULL, reason TEXT NOT NULL)")
-            c.execute("INSERT OR IGNORE INTO fence (id, max_epoch) VALUES (1, 0)")
-
-    @contextlib.contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
-        c = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        try:
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("BEGIN IMMEDIATE")
-            try:
-                yield c
-            except BaseException:
-                c.execute("ROLLBACK")
-                raise
-            c.execute("COMMIT")
-        finally:
-            c.close()
+            c.execute("INSERT OR IGNORE INTO ext_fence (id, max_epoch) VALUES (1, 0)")
 
     def apply(self, key: str, token: FencingToken) -> dict[str, Any]:
         if not isinstance(token, FencingToken):
             raise StaleEpochRefused("no fencing token")
         reason = None
-        with self._tx() as c:
-            max_seen = c.execute("SELECT max_epoch FROM fence WHERE id = 1").fetchone()[0]
-            try:
-                auth = self.authority.current()
-            except AuthorityUnavailable:
-                auth = None
-            if auth is None:
-                reason = "authority unavailable"
-            elif token.epoch < max_seen:
-                reason = f"epoch {token.epoch} < highest seen {max_seen}"
-            elif token.epoch != auth.epoch or token.node_id != auth.holder:
-                reason = f"epoch {token.epoch} is not the current epoch {auth.epoch}"
-            if reason:
-                c.execute("INSERT INTO refused (key, node_id, epoch, reason) VALUES (?,?,?,?)",
-                          (key, token.node_id, token.epoch, reason))
-            else:
-                c.execute("UPDATE fence SET max_epoch = ? WHERE id = 1", (token.epoch,))
-                c.execute("INSERT INTO applied (key, node_id, epoch) VALUES (?,?,?)",
-                          (key, token.node_id, token.epoch))
+        try:
+            with self.authority.boundary() as (c, auth):
+                max_seen = c.execute("SELECT max_epoch FROM ext_fence WHERE id = 1").fetchone()[0]
+                if token.epoch < max_seen:
+                    reason = f"epoch {token.epoch} < highest seen {max_seen}"
+                elif token.epoch != auth.epoch or token.node_id != auth.holder:
+                    reason = f"epoch {token.epoch} is not the committed epoch {auth.epoch}"
+                if reason:
+                    c.execute("INSERT INTO ext_refused (key, node_id, epoch, reason)"
+                              " VALUES (?,?,?,?)", (key, token.node_id, token.epoch, reason))
+                else:
+                    if self.after_check is not None:
+                        self.after_check(c, token)
+                    c.execute("UPDATE ext_fence SET max_epoch = ? WHERE id = 1", (token.epoch,))
+                    c.execute("INSERT INTO ext_applied (key, node_id, epoch) VALUES (?,?,?)",
+                              (key, token.node_id, token.epoch))
+        except AuthorityUnavailable as exc:   # fail closed: nothing was applied
+            raise StaleEpochRefused(f"connector refused: {exc}") from exc
         if reason:   # the refusal row is committed before we raise
             raise StaleEpochRefused(f"connector refused: {reason}")
         return {"applied": key, "epoch": token.epoch}
@@ -578,18 +590,19 @@ class StubConnector:
         return "succeeded" if self.count(effect.idempotency_key) else "failed"
 
     def count(self, key: str | None = None) -> int:
-        with self._tx() as c:   # write lock: serialises with in-progress applies
+        with self.authority.boundary() as (c, _):   # serialises with applies and promotions
             if key is None:
-                return c.execute("SELECT COUNT(*) FROM applied").fetchone()[0]
-            return c.execute("SELECT COUNT(*) FROM applied WHERE key = ?", (key,)).fetchone()[0]
+                return c.execute("SELECT COUNT(*) FROM ext_applied").fetchone()[0]
+            return c.execute("SELECT COUNT(*) FROM ext_applied WHERE key = ?",
+                             (key,)).fetchone()[0]
 
     def applied(self) -> list[tuple[str, str, int]]:
-        with self._tx() as c:
-            return c.execute("SELECT key, node_id, epoch FROM applied ORDER BY seq").fetchall()
+        with self.authority.boundary() as (c, _):
+            return c.execute("SELECT key, node_id, epoch FROM ext_applied ORDER BY seq").fetchall()
 
     def refusals(self) -> list[tuple[str, str, int, str]]:
-        with self._tx() as c:
-            return c.execute("SELECT key, node_id, epoch, reason FROM refused"
+        with self.authority.boundary() as (c, _):
+            return c.execute("SELECT key, node_id, epoch, reason FROM ext_refused"
                              " ORDER BY seq").fetchall()
 
 

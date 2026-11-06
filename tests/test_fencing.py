@@ -22,7 +22,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_policy_engine as tpe  # noqa: E402  (C1 fixtures: registry, approvals)
-from runtime import (ACTIVE, FENCED, PAUSED, Database, EffectFailed, EffectJournal,
+from runtime import (ACTIVE, FENCED, PAUSED, AuthorityUnavailable, Database, EffectFailed,
+                     EffectJournal,
                      EffectConflict, EffectOutcomeUnknown,  # noqa: E402
                      EpochAuthority, FencedEffects, FileCopyReplicator, FencingToken, Node,
                      NodeNotActive, PromotionConflict, StaleEpoch, StaleEpochRefused,
@@ -40,7 +41,6 @@ def action(task_id=TASK, n=1):
 
 def paths(tmp):
     return SimpleNamespace(auth=os.path.join(tmp, "authority.sqlite"),
-                           ext=os.path.join(tmp, "external.sqlite"),
                            a=os.path.join(tmp, "node-a.sqlite"),
                            b=os.path.join(tmp, "node-b.sqlite"),
                            replica=os.path.join(tmp, "replica"))
@@ -60,7 +60,7 @@ def _node_a(p, mode, stalled, resume, q):
     perform (after the journal claim, before the external call)."""
     try:
         auth = EpochAuthority(p.auth)
-        ext = StubConnector(p.ext, auth)
+        ext = StubConnector(auth)
         node = Node("node-a", auth, p.a)
         node.promote()
         node.unpause(ext.reconcile)
@@ -108,7 +108,7 @@ def _node_b(p, q):
     """Standby: restore A's replica, take over at epoch 2, reconcile, unpause, run."""
     try:
         auth = EpochAuthority(p.auth)
-        ext = StubConnector(p.ext, auth)
+        ext = StubConnector(auth)
         FileCopyReplicator(p.replica).restore(p.b)
         node = Node("node-b", auth, p.b)
         out = {"start": node.state, "rejoin": node.rejoin()}
@@ -147,7 +147,7 @@ class _Tmp(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.p = paths(self.tmp.name)
         self.auth = EpochAuthority(self.p.auth)
-        self.ext = StubConnector(self.p.ext, self.auth)
+        self.ext = StubConnector(self.auth)
 
     def active_node(self, node_id="node-a", db=None):
         node = Node(node_id, self.auth, db or self.p.a)
@@ -291,12 +291,85 @@ class JournalSideFence(_Tmp):
         self.assertLess(after.in_flight_until, 9e18)
 
 
+# -- 1c. boundary check linearizes with promotion (review fix) ----------------
+class BoundaryLinearization(_Tmp):
+    """Deterministic interleavings, no sleeps: the connector's check + apply and
+    a promotion share one BEGIN IMMEDIATE lock on the authority DB."""
+
+    def test_order_token_read_then_promotion_commits_then_apply_is_refused(self):
+        a = self.active_node()
+        eff = a.journal.record_intent(TASK, "send", action())
+        token = a.token()
+        self.assertTrue(a.is_current(token))              # 1. A reads epoch 1 as current
+        Node("node-b", self.auth, self.p.b).promote()     # 2. promotion to epoch 2 commits
+        with self.assertRaises(StaleEpochRefused):        # 3. A attempts the apply
+            self.ext.apply(eff.idempotency_key, token)
+        self.assertEqual(self.ext.applied(), [])
+        self.assertEqual([(k, n, e) for k, n, e, _ in self.ext.refusals()],
+                         [(eff.idempotency_key, "node-a", 1)])
+
+    def test_order_promotion_between_journal_check_and_connector_call(self):
+        """Same order through FencedEffects: the promotion is injected after the
+        journal's last epoch check (inside perform), before the connector."""
+        a = self.active_node()
+        eff = a.journal.record_intent(TASK, "send", action())
+
+        def perform(effect, token):
+            Node("node-b", self.auth, self.p.b).promote()
+            return self.ext.perform(effect, token)
+        with self.assertRaises(StaleEpochRefused):
+            FencedEffects(a).execute(eff.idempotency_key, perform, self.ext.reconcile,
+                                     connector=self.ext.identity)
+        self.assertEqual(self.ext.count(), 0)
+        self.assertEqual(a.journal.get(eff.idempotency_key).status, "failed")
+        self.assertEqual(a.state, FENCED)
+
+    def test_order_apply_in_progress_then_promotion_cannot_interleave(self):
+        a = self.active_node()
+        eff = a.journal.record_intent(TASK, "send", action())
+        token = a.token()
+        contender = EpochAuthority(self.p.auth, busy_timeout_s=0)   # never waits for the lock
+        seen = {}
+
+        def after_check(conn, tok):        # inside A's apply transaction, token already passed
+            seen["epoch_visible"] = contender.current().epoch
+            try:
+                contender.promote("node-b", 1)
+                seen["promoted"] = True
+            except AuthorityUnavailable:
+                seen["promoted"] = False   # the write lock is held by the apply
+        self.ext.after_check = after_check
+        self.assertEqual(self.ext.apply(eff.idempotency_key, token)["epoch"], 1)
+        self.ext.after_check = None
+        self.assertEqual(seen, {"epoch_visible": 1, "promoted": False})
+        self.assertEqual(self.auth.current().epoch, 1)   # no promotion slipped in mid-apply
+
+        # The apply committed first; now the promotion commits, and epoch 1 is refused.
+        self.assertEqual(contender.promote("node-b", 1), 2)
+        with self.assertRaises(StaleEpochRefused):
+            self.ext.apply("second-key", token)
+        self.assertEqual(self.ext.applied(), [(eff.idempotency_key, "node-a", 1)])
+        self.assertEqual(self.ext.count("second-key"), 0)
+        # and the new primary's reconcile sees the epoch-1 apply: no double application
+        self.assertEqual(self.ext.reconcile(a.journal.get(eff.idempotency_key)), "succeeded")
+
+    def test_connector_shares_the_authority_db(self):
+        with self.assertRaises(TypeError):
+            StubConnector(self.p.auth)                    # a path is not an authority
+        c = sqlite3.connect(self.p.auth)
+        try:
+            tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            c.close()
+        self.assertTrue({"authority", "ext_fence", "ext_applied", "ext_refused"} <= tables)
+
+
 # -- 1b. C2 fence seam filled by the epoch authority ---------------------------
 def _stall_past_timeout(p, stalled, resume, q):
     """Dispatcher A at epoch 1 on the SHARED journal; stalls inside perform."""
     try:
         auth = EpochAuthority(p.auth)
-        ext = StubConnector(p.ext, auth)
+        ext = StubConnector(auth)
         node = Node("node-a", auth, p.a, dispatch_timeout_s=0.2)
         node.promote()
         node.unpause(ext.reconcile)
