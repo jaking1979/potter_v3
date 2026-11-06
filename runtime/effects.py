@@ -23,8 +23,13 @@ injected ``reconcile(effect)`` reads the external state and returns
 Executors run only ``effect.action()``: the persisted canonical action,
 integrity-checked against its hash (C0 "one snapshot" rule).
 
-Not here: fencing tokens against a stalled-but-alive dispatcher (C4); the
-outbox (C3); real connectors.
+Fencing (C4, ``runtime/fencing.py``): ``execute`` takes an optional ``fence``
+callable, run before anything else and again inside the claim transaction; it
+raises to refuse the dispatch. ``release_in_flight`` lets a newly promoted node
+take over an effect whose in-flight window belongs to a fenced (lower-epoch)
+dispatcher. Without ``fence`` the C2 behaviour is unchanged.
+
+Not here: the outbox (C3); real connectors.
 """
 from __future__ import annotations
 
@@ -214,7 +219,8 @@ class EffectJournal:
     # -- execution ---------------------------------------------------------
     def execute(self, key: str, perform: Callable[[Effect], Any],
                 reconcile: Callable[[Effect], str], *, owner: str,
-                now: float | None = None) -> Effect:
+                now: float | None = None,
+                fence: Callable[[], None] | None = None) -> Effect:
         """Run the journaled effect at most as often as the external state allows:
 
         * ``succeeded`` -> returned as is, ``perform`` is not called.
@@ -224,9 +230,14 @@ class EffectJournal:
 
         ``perform(effect)`` must use ``effect.action()`` and pass
         ``effect.idempotency_key`` to the external system.
+
+        ``fence()`` (C4), if given, runs first and again inside the claim
+        transaction; if it raises, nothing is claimed or dispatched.
         """
         if not owner:
             raise ValueError("owner required")
+        if fence is not None:
+            fence()
         now = self._now(now)
         eff = self._require(key)
         if eff.status == SUCCEEDED:
@@ -240,6 +251,8 @@ class EffectJournal:
                     f"effect {key} outcome unknown; retry refused until reconciled")
         eff.action()  # integrity check BEFORE anything is dispatched
         with self.db.tx() as c:
+            if fence is not None:
+                fence()  # under the journal write lock; raising rolls the claim back
             cur = c.execute("UPDATE effects SET status=?, dispatches=dispatches+1,"
                             " in_flight_owner=?, in_flight_until=?, updated_at=?"
                             " WHERE idempotency_key=? AND status IN (?,?) AND dispatches=?",
@@ -268,6 +281,24 @@ class EffectJournal:
                       (status, blob, error, now, eff.idempotency_key,
                        eff.dispatches, eff.in_flight_owner))
             return load_effect(c, eff.idempotency_key)
+
+    def release_in_flight(self, key: str, owner: str, *, now: float | None = None) -> bool:
+        """Clear the in-flight window of an ``unknown`` effect held by ``owner``.
+
+        Only for C4 takeover: the caller must already have fenced ``owner`` at
+        the external boundary (a higher epoch is committed at the authority),
+        so the old dispatcher can no longer land the effect. The status stays
+        ``unknown``: the effect still has to be reconciled before any retry.
+        Returns True if a window was released."""
+        if not owner:
+            raise ValueError("owner required")
+        now = self._now(now)
+        with self.db.tx() as c:
+            cur = c.execute("UPDATE effects SET in_flight_owner=NULL, in_flight_until=NULL,"
+                            " last_error=?, updated_at=?"
+                            " WHERE idempotency_key=? AND status=? AND in_flight_owner=?",
+                            ("in-flight window released: owner fenced", now, key, UNKNOWN, owner))
+            return cur.rowcount == 1
 
     # -- helpers -----------------------------------------------------------
     def _require(self, key: str) -> Effect:

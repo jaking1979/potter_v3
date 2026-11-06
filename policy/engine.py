@@ -17,6 +17,10 @@ Gates, in order (first failure denies):
  2. Clock read.
  3. Capability registry lookup (unknown -> deny).
  4. Forbidden risk class -> deny (an approval cannot unlock it).
+ 4b. Node state (C4, optional seam ``node_state``): any write from a node
+    that is not ``active`` (fenced or paused) is denied, before any approval
+    is verified or consumed. Reads are unaffected. Without the seam, C1
+    behaves exactly as before.
  5. Delegation: the origin principal's grants come from engine configuration,
     never from the request; each delegation hop (sub-agent / cron / retry) can
     only narrow them. Effective grants = intersection of all of them.
@@ -82,6 +86,9 @@ REASONS: Mapping[str, str] = MappingProxyType({
     "approval_action_mismatch": "action changed after approval",
     "approval_screenshot_missing": "browser/computer approval needs a screenshot (T38)",
     "approval_refused": "approval refused",
+    "node_fenced": "this node is fenced; it may not perform writes",
+    "node_paused": "this node's effects are paused; it may not perform writes",
+    "node_not_active": "this node is not active; it may not perform writes",
     "engine_error": "policy engine error; failing closed",
     "trace_error": "decision trace failed; failing closed",
 })
@@ -200,7 +207,8 @@ class PolicyEngine:
                  clock: Callable[[], int],
                  verifier: Callable[..., c0.EffectIntent] = c0.verify,
                  new_id: Callable[[str], str] = _default_id,
-                 trace_hook: Callable[[Mapping[str, Any]], None] = _noop_trace):
+                 trace_hook: Callable[[Mapping[str, Any]], None] = _noop_trace,
+                 node_state: Callable[[], str] | None = None):
         self._registry = registry
         self._grants = MappingProxyType({p: frozenset(g) for p, g in grants.items()})
         self._ledger = ledger
@@ -209,6 +217,7 @@ class PolicyEngine:
         self._verify = verifier
         self._new_id = new_id
         self._trace = trace_hook
+        self._node_state = node_state
 
     # ---- public ----------------------------------------------------------------
 
@@ -259,6 +268,9 @@ class PolicyEngine:
 
         if cap.risk is RiskClass.FORBIDDEN:
             return deny("forbidden_capability")
+        code = self._check_node(cap)
+        if code:
+            return deny(code)
         code = self._check_delegation(req.caller, cap.name)
         if code:
             return deny(code)
@@ -306,6 +318,18 @@ class PolicyEngine:
             raise _Deny("malformed_request")
         if req.retry_intent is not None and not isinstance(req.retry_intent, c0.EffectIntent):
             raise _Deny("malformed_request")
+
+    def _check_node(self, cap: Capability) -> str | None:
+        """C4 seam: writes need an ``active`` node. Any seam failure is fenced."""
+        if self._node_state is None or cap.risk is RiskClass.READ:
+            return None
+        try:
+            state = self._node_state()
+        except Exception:
+            return "node_not_active"
+        if state == "active":
+            return None
+        return {"fenced": "node_fenced", "paused": "node_paused"}.get(state, "node_not_active")
 
     def _check_delegation(self, caller: Caller, capability: str) -> str | None:
         root = self._grants.get(caller.principal)

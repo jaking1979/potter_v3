@@ -16,6 +16,7 @@
 2. **Clock:** it must return an `int`. If it raises or returns anything else, the request is denied.
 3. **Registry:** an unknown capability is denied. Registration itself rejects unsafe declarations, such as a consequential capability that doesn't require approval.
 4. **Forbidden:** always denied. A genuine approval cannot unlock a forbidden capability.
+4b. **Node state (C4, optional `node_state` seam):** a write from a node that isn't `active` is denied (`node_fenced` / `node_paused` / `node_not_active`) before any approval is touched. A seam error is denied. Without the seam, nothing changes.
 5. **Delegation:** root grants come from engine configuration and are never taken from the request. Each hop (`subagent` / `cron` / `retry`) can only narrow them, so the effective grants are the intersection. The maximum depth is 8.
 6. **Live state (stateful capabilities):** preconditions must be non-empty, every declared key must be present, and the values must equal the live state the caller just observed.
 7. **Provenance:** the engine decides trust from the source *kind*. Only `principal_direct` and `system_policy` are trusted. Unknown, missing or mixed sources taint the request. A tainted request for any write needs an approval.
