@@ -4,12 +4,12 @@ from .grants import (ACCESS_REASONS, AccessDecision, CapabilityBinding, Grant, G
                      GrantResolver, Hop)
 from .principals import (IdentityError, Principal, PrincipalDirectory, PrincipalKind, SecretRef,
                          ServiceAccount)
-from .scopes import (CLINICAL_EHR_ROOT, DEFAULT_DENY_ROOTS, DenyRoot, Resource, Scope,
+from .scopes import (CLINICAL_EHR_ROOT, DEFAULT_OUTSIDE_STORES, AncestryResolver, DEFAULT_DENY_ROOTS, DenyRoot, Resource, Scope,
                      ScopeError)
 from .seed import seed_directory
 
 __all__ = ["ScopedPolicyEngine", "build_policy_engine", "ACCESS_REASONS", "AccessDecision",
            "CapabilityBinding", "Grant", "GrantError", "GrantResolver", "Hop", "IdentityError",
            "Principal", "PrincipalDirectory", "PrincipalKind", "SecretRef", "ServiceAccount",
-           "CLINICAL_EHR_ROOT", "DEFAULT_DENY_ROOTS", "DenyRoot", "Resource", "Scope",
+           "CLINICAL_EHR_ROOT", "DEFAULT_OUTSIDE_STORES", "AncestryResolver", "DEFAULT_DENY_ROOTS", "DenyRoot", "Resource", "Scope",
            "ScopeError", "seed_directory"]

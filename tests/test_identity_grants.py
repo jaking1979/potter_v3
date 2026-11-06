@@ -54,9 +54,9 @@ def grants(**extra):
     return g + list(extra.get("more", ()))
 
 
-def resolver(more=(), directory=None, deny_roots=()):
+def resolver(more=(), directory=None, deny_roots=(), ancestry=None):
     return GrantResolver(directory or seed_directory(), grants(more=more), BINDINGS,
-                         deny_roots=deny_roots)
+                         deny_roots=deny_roots, ancestry=ancestry)
 
 
 def engine(res=None, **kw):
@@ -135,49 +135,180 @@ class Scopes(unittest.TestCase):
         self.assertFalse(Scope("josh/mail/*").covers_path(("josh", "mailbox", "x")))
 
 
+class FakeAncestry:
+    """Test double for the trusted, injected AncestryResolver (a connector's own
+    page-tree lookup). Unknown resources -> None."""
+
+    def __init__(self, tree):
+        self.tree = dict(tree)
+        self.calls = []
+
+    def ancestors_of(self, resource):
+        self.calls.append(resource.resource_id)
+        return self.tree.get(resource.resource_id)
+
+
+TREE = FakeAncestry({
+    "josh/notion/abc123": ("ws",),
+    "josh/notion/abc": ("ws",),
+    # A descendant whose ID reveals nothing about its ancestry.
+    "josh/notion/child-page-1": ("p2", EHR_HYPHEN, "ws"),
+    f"josh/notion/{EHR}": ("ws",),
+})
+
+
 class DenyRoots(unittest.TestCase):
     def setUp(self):
         # Josh gets an *explicit* grant naming the EHR root and the whole notion tree.
-        self.res = resolver(more=[Grant(JOSH, ALL, (f"josh/notion/{EHR}", "josh/notion/*"))])
+        self.more = [Grant(JOSH, ALL, (f"josh/notion/{EHR}", "josh/notion/*"))]
+        self.res = resolver(more=self.more, ancestry=TREE)
 
     def test_root_itself_denied_even_with_explicit_grant(self):
         for rid in (EHR, EHR_HYPHEN, EHR.upper()):
-            d = self.res.can_access(JOSH, (), Resource(f"josh/notion/{rid}",
-                                                       ancestry_verified=True))
+            d = self.res.can_access(JOSH, (), f"josh/notion/{rid}")
             self.assertEqual((d.allowed, d.reason_code), (False, "deny_root"), rid)
 
     def test_descendants_denied(self):
-        d = self.res.can_access(JOSH, (), Resource(
-            "josh/notion/child-page-1", ancestors=("p2", EHR_HYPHEN, "ws"),
-            ancestry_verified=True))
+        d = self.res.can_access(JOSH, (), "josh/notion/child-page-1")
         self.assertEqual(d.reason_code, "deny_root")
         d = self.res.can_access(JOSH, (), Resource(f"josh/notion/{EHR}/sub/page"))
         self.assertEqual(d.reason_code, "deny_root")
+        # A caller *claiming* the EHR root as ancestor is denied (claims can only deny).
+        d = self.res.can_access(JOSH, (), Resource("josh/notion/abc", (EHR,)))
+        self.assertEqual(d.reason_code, "deny_root")
 
-    def test_unverified_notion_ancestry_denied(self):
-        self.assertEqual(self.res.can_access(JOSH, (), "josh/notion/abc123").reason_code,
+    def test_known_outside_resource_allowed(self):
+        self.assertTrue(self.res.can_access(JOSH, (), "josh/notion/abc123").allowed)
+
+    def test_unknown_to_resolver_denied(self):
+        self.assertEqual(self.res.can_access(JOSH, (), "josh/notion/never-seen").reason_code,
                          "ancestry_unverified")
-        ok = self.res.can_access(JOSH, (), Resource("josh/notion/abc123", ("ws",), True))
-        self.assertTrue(ok.allowed)
+
+    def test_no_resolver_fails_closed(self):
+        res = resolver(more=self.more)       # no AncestryResolver injected
+        for r in ("josh/notion/abc123", "josh/notion/abc", "josh/files/notion/x",
+                  "josh/unknownstore/x", "josh/x"):
+            self.assertEqual(res.can_access(JOSH, (), r).reason_code, "ancestry_unverified", r)
+        # Positively-outside stores still work without a resolver.
+        self.assertTrue(res.can_access(JOSH, (), "josh/mail/msg-1").allowed)
+
+    def test_forged_ancestry_regression(self):
+        # Dolores review: a descendant whose ID does not reveal ancestry, with a
+        # caller-claimed "verified" flag and innocent-looking ancestors, is denied.
+        with self.assertRaises(TypeError):
+            Resource("josh/notion/child-page-1", ancestors=("ws",), ancestry_verified=True)
+        forged = Resource("josh/notion/child-page-1", ancestors=("ws",))
+        self.assertEqual(self.res.can_access(JOSH, (), forged).reason_code, "deny_root")
+        no_resolver = resolver(more=self.more)
+        self.assertEqual(no_resolver.can_access(JOSH, (), forged).reason_code,
+                         "ancestry_unverified")
+        scoped = ScopedPolicyEngine(engine(self.res), self.res)
+        d = scoped.decide(request("josh.notion.read", JOSH, target="josh/notion/child-page-1"),
+                          forged)
+        self.assertEqual(d.outcome, DENY)
+        scoped_t = ScopedPolicyEngine(engine(no_resolver), no_resolver, test_mode=True)
+        d = scoped_t.decide(request("josh.notion.read", JOSH,
+                                    target="josh/notion/child-page-1"), forged)
+        self.assertEqual(d.outcome, DENY)
+
+    def test_resolver_garbage_fails_closed(self):
+        class Bad:
+            def __init__(self, out):
+                self.out = out
+
+            def ancestors_of(self, r):
+                if isinstance(self.out, Exception):
+                    raise self.out
+                return self.out
+        for out, code in ((["ws"], "ancestry_unverified"), (("ws", 3), "ancestry_unverified"),
+                          (("",), "ancestry_unverified"), (RuntimeError("x"), "engine_error")):
+            res = resolver(more=self.more, ancestry=Bad(out))
+            self.assertEqual(res.can_access(JOSH, (), "josh/notion/abc").reason_code, code)
 
     def test_every_identity_denied(self):
-        res = Resource(f"josh/notion/{EHR}", ancestry_verified=True)
+        res = Resource(f"josh/notion/{EHR}")
         for pid in seed_directory().ids() | {"human:nobody"}:
             self.assertFalse(self.res.can_access(pid, (), res).allowed, pid)
 
     def test_ehr_root_cannot_be_configured_away(self):
         r = GrantResolver(seed_directory(), grants(), BINDINGS, deny_roots=())
         self.assertIn(CLINICAL_EHR_ROOT, r.deny_roots)
+        with self.assertRaises(GrantError):
+            GrantResolver(seed_directory(), grants(), BINDINGS, outside_stores={"notion"})
+
+    def test_scoped_engine_requires_resolver_or_explicit_test_mode(self):
+        res = resolver()
+        with self.assertRaises(ValueError):
+            ScopedPolicyEngine(engine(res), res)
+        with self.assertRaises(ValueError):
+            ScopedPolicyEngine(engine(res), res, test_mode=1)
+        ScopedPolicyEngine(engine(res), res, test_mode=True)
+        ScopedPolicyEngine(engine(self.res), self.res)
 
     def test_scoped_engine_denies_ehr_target_before_c1(self):
-        res = self.res
-        scoped = ScopedPolicyEngine(engine(res), res)
-        d = scoped.decide(request("josh.notion.read", JOSH, target=f"josh/notion/{EHR}"),
-                          Resource(f"josh/notion/{EHR}", ancestry_verified=True))
+        scoped = ScopedPolicyEngine(engine(self.res), self.res)
+        d = scoped.decide(request("josh.notion.read", JOSH, target=f"josh/notion/{EHR}"))
         self.assertEqual((d.outcome, d.reason_code), (DENY, "not_granted"))
-        ok = scoped.decide(request("josh.notion.read", JOSH, target="josh/notion/abc"),
-                           Resource("josh/notion/abc", ("ws",), True))
+        ok = scoped.decide(request("josh.notion.read", JOSH, target="josh/notion/abc"))
         self.assertEqual(ok.outcome, ALLOW)
+
+
+class GrantPairing(unittest.TestCase):
+    """Dolores review: grants are (capability, scope) pairs end to end."""
+    CROSS = (
+        Capability("notes.write", R.REVERSIBLE_WRITE, False, False),
+        Capability("mail.read", R.READ, False, False),
+    )
+    CROSS_BINDINGS = (CapabilityBinding("notes.write", "josh/notes/*", True),
+                      CapabilityBinding("mail.read", "josh/mail/*", True))
+
+    def make(self, grants_):
+        res = GrantResolver(seed_directory(), grants_, self.CROSS_BINDINGS)
+        e = build_policy_engine(res, registry=CapabilityRegistry(self.CROSS),
+                                ledger=c0.MemoryApprovalLedger(), authenticator=None,
+                                clock=lambda: NOW)
+        return res, e
+
+    def test_independent_grants_never_combine(self):
+        res, _ = self.make([Grant(JOSH, {"notes.write"}, {"josh/notes/*"}),
+                            Grant(JOSH, {"mail.read"}, {"josh/mail/*"})])
+        self.assertTrue(res.can_access(JOSH, (), "josh/notes/n", "notes.write").allowed)
+        self.assertTrue(res.can_access(JOSH, (), "josh/mail/m", "mail.read").allowed)
+        self.assertFalse(res.can_access(JOSH, (), "josh/mail/m", "notes.write").allowed)
+        self.assertFalse(res.can_access(JOSH, (), "josh/notes/n", "mail.read").allowed)
+
+    def test_cross_paired_grants_confer_neither_capability(self):
+        # notes.write only on mail, mail.read only on notes: neither covers its binding.
+        res, e = self.make([Grant(JOSH, {"notes.write"}, {"josh/mail/*"}),
+                            Grant(JOSH, {"mail.read"}, {"josh/notes/*"})])
+        self.assertEqual(res.policy_grants()[JOSH], frozenset())
+        for cap in ("notes.write", "mail.read"):
+            self.assertEqual(e.decide(request(cap, JOSH)).reason_code, "not_granted")
+
+    def test_hop_narrows_pairs_not_unions(self):
+        # Origin: notes.write@notes + mail.read@mail. Hop: the cross-paired opposite.
+        # A union-based intersection would let both through; pairwise, nothing does.
+        res, e = self.make([
+            Grant(JOSH, {"notes.write"}, {"josh/notes/*"}),
+            Grant(JOSH, {"mail.read"}, {"josh/mail/*"}),
+            Grant("agent:research", {"notes.write"}, {"josh/mail/*"}),
+            Grant("agent:research", {"mail.read"}, {"josh/notes/*"})])
+        chain = (Hop("agent:research", "subagent"),)
+        for r in ("josh/notes/n", "josh/mail/m"):
+            d = res.can_access(JOSH, chain, r)
+            self.assertEqual((d.allowed, d.reason_code), (False, "out_of_scope"), r)
+        hop = res.delegation_hop("agent:research", "subagent")
+        self.assertEqual(hop.grants, frozenset())
+        for cap in ("notes.write", "mail.read"):
+            self.assertEqual(e.decide(request(cap, JOSH, (hop,))).reason_code, "not_granted")
+
+    def test_hop_capability_narrowing(self):
+        res, _ = self.make([Grant(JOSH, {"notes.write", "mail.read"}, {"josh/*"}),
+                            Grant("agent:potter", {"notes.write", "mail.read"}, {"josh/*"})])
+        chain = (Hop("agent:potter", "subagent", capabilities=frozenset({"mail.read"})),)
+        self.assertTrue(res.can_access(JOSH, chain, "josh/mail/m", "mail.read").allowed)
+        self.assertFalse(res.can_access(JOSH, chain, "josh/notes/n", "notes.write").allowed)
+        self.assertFalse(res.can_access(JOSH, chain, "josh/notes/n").allowed)
 
 
 class TestDomainIsolation(unittest.TestCase):
@@ -380,7 +511,7 @@ class EndToEndWithC1(unittest.TestCase):
 
     def test_scoped_engine_blocks_cross_domain_target(self):
         res = resolver()
-        scoped = ScopedPolicyEngine(engine(res), res)
+        scoped = ScopedPolicyEngine(engine(res), res, test_mode=True)
         # test-scoped capability aimed at a Josh resource: denied before C1.
         d = scoped.decide(request("test.files.read", "test:fixture-runner",
                                   target="josh/files/a.txt"))
@@ -396,7 +527,7 @@ class EndToEndWithC1(unittest.TestCase):
     def test_scoped_engine_trace_has_no_target(self):
         res = resolver()
         seen = []
-        scoped = ScopedPolicyEngine(engine(res), res, trace_hook=seen.append)
+        scoped = ScopedPolicyEngine(engine(res), res, trace_hook=seen.append, test_mode=True)
         scoped.decide(request("test.files.read", "test:fixture-runner",
                               target="josh/files/secret-plan.txt"))
         self.assertEqual(seen[0]["identity_reason_code"], "out_of_scope")

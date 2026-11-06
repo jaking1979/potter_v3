@@ -8,6 +8,13 @@
   down the chain) *before* C1. A resource denial reuses C1's existing
   ``not_granted`` reason (no new C1 reason codes); the identity-side code is
   available from ``resolver.can_access`` for C6 tracing.
+
+Ancestry gate: ``ScopedPolicyEngine`` refuses to construct unless the
+resolver has a trusted ``AncestryResolver`` injected, or ``test_mode=True``
+is passed explicitly. Test mode only permits construction; resources that
+are not positively outside every deny root are still denied
+(``ancestry_unverified``). Caller-supplied ``Resource`` ancestry is never
+trusted: it can only add denials.
 """
 from __future__ import annotations
 
@@ -35,8 +42,14 @@ def _noop(record: Mapping[str, Any]) -> None:
 
 
 class ScopedPolicyEngine:
-    def __init__(self, engine: PolicyEngine, resolver: GrantResolver,
-                 trace_hook: Callable[[Mapping[str, Any]], None] = _noop):
+    def __init__(self, engine: PolicyEngine, resolver: GrantResolver, *,
+                 trace_hook: Callable[[Mapping[str, Any]], None] = _noop,
+                 test_mode: bool = False):
+        if not isinstance(resolver, GrantResolver):
+            raise TypeError("resolver must be a GrantResolver")
+        if not resolver.has_ancestry_resolver and test_mode is not True:
+            raise ValueError("ScopedPolicyEngine needs a trusted AncestryResolver "
+                             "(or explicit test_mode=True)")
         self._engine = engine
         self._resolver = resolver
         self._trace = trace_hook
@@ -72,5 +85,5 @@ class ScopedPolicyEngine:
         if not binding.scope.covers_path(resource.segments):
             return "out_of_scope"
         access = self._resolver.can_access(request.caller.principal, request.caller.chain,
-                                           resource)
+                                           resource, capability=request.capability)
         return None if access.allowed else access.reason_code

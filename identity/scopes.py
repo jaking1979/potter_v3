@@ -1,15 +1,19 @@
 """Data-domain scopes, resources and deny roots (package C5, T11; T37 clause 5).
 
-* A **resource** is a path ``<domain>/<seg>/...`` (e.g. ``josh/mail/msg-1``,
-  ``josh/notion/<page-id>``) plus optional declared ancestors for stores whose
-  hierarchy is not visible in the ID (Notion pages).
+* A **resource** is a path ``<domain>/<store>/...`` (e.g. ``josh/mail/msg-1``,
+  ``josh/notion/<page-id>``). It may carry caller-*claimed* ``ancestors``;
+  claims can only add denials, never establish that a resource is safe.
 * A **scope** is either an exact resource path or a subtree ``<prefix>/*``.
   ``*`` alone, unknown domains, empty / ``.`` / ``..`` segments are malformed.
 * A **deny root** is an opaque resource ID (e.g. a Notion page ID). Any
-  resource whose path or declared ancestry contains it is denied, before any
-  grant is consulted, and no grant can override it. Resources in a deny root's
-  namespace (e.g. ``*/notion/*``) must also carry *verified* ancestry, or they
-  are denied: an unverifiable Notion page might sit beneath the EHR root.
+  resource whose path, claimed ancestry or *trusted* ancestry contains it is
+  denied, before any grant is consulted, and no grant can override it.
+* Trusted ancestry comes only from an injected ``AncestryResolver`` at the
+  enforcement boundary. A resource is positively outside every deny root only
+  if its store is in ``outside_stores`` (stores whose connectors never address
+  Notion pages) and no segment names a deny-root namespace. Anything else
+  needs the resolver; with none configured, or when it does not know the
+  resource, it is denied.
 
 Nothing here contacts any external system.
 """
@@ -17,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Protocol
 
 KNOWN_DOMAINS = frozenset({"josh", "household", "test", "system"})
 _SEG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$")
@@ -88,17 +92,17 @@ class Scope:
 
 @dataclass(frozen=True)
 class Resource:
+    """A resource as named by a caller. ``ancestors`` is an untrusted claim:
+    it is consulted only to *deny*. There is deliberately no "verified" flag
+    a caller could set."""
     resource_id: str
-    ancestors: tuple[str, ...] = ()        # opaque ancestor IDs, nearest first
-    ancestry_verified: bool = False        # set only by a connector that resolved it
+    ancestors: tuple[str, ...] = ()        # caller-claimed opaque ancestor IDs
 
     def __post_init__(self):
         segs = _segments(self.resource_id, allow_star=False)
         if not isinstance(self.ancestors, tuple) or not all(
                 isinstance(a, str) and _SEG.match(a) for a in self.ancestors):
             raise ScopeError("ancestors must be a tuple of opaque ids")
-        if not isinstance(self.ancestry_verified, bool):
-            raise ScopeError("ancestry_verified must be bool")
         object.__setattr__(self, "_segs", segs)
 
     @property
@@ -127,10 +131,19 @@ class DenyRoot:
     def in_namespace(self, res: Resource) -> bool:
         return self.namespace in res.segments[1:]
 
-    def contains(self, res: Resource) -> bool:
+    def contains(self, res: Resource, extra_ancestors: tuple[str, ...] = ()) -> bool:
         ids = [canonical_opaque_id(s) for s in res.segments[1:]]
-        ids += [canonical_opaque_id(a) for a in res.ancestors]
+        ids += [canonical_opaque_id(a) for a in res.ancestors + tuple(extra_ancestors)]
         return self.root_id in ids
+
+
+class AncestryResolver(Protocol):
+    """Trusted, injected at the enforcement boundary (e.g. the Notion
+    connector's own page-tree lookup). Returns the *complete* opaque ancestor
+    chain up to the workspace root, nearest first, or ``None`` if it cannot
+    establish it. Never constructed from request data."""
+
+    def ancestors_of(self, resource: Resource) -> tuple[str, ...] | None: ...
 
 
 # Clinical EHR Notion root (AGENTS.md rule 11). Opaque ID only; never contacted.
@@ -138,13 +151,28 @@ CLINICAL_EHR_ROOT = DenyRoot("2fba667c631680c5a852c40b076e3c46", "notion", "clin
 DEFAULT_DENY_ROOTS: tuple[DenyRoot, ...] = (CLINICAL_EHR_ROOT,)
 
 
-def deny_root_code(res: Resource, roots: Iterable[DenyRoot]) -> str | None:
-    """Return a deny code if ``res`` is (or may be) beneath a deny root."""
+# Stores whose connectors never address Notion pages. A Notion-backed store
+# must use the ``notion`` store segment so it always goes through ancestry.
+DEFAULT_OUTSIDE_STORES = frozenset({"mail", "calendar", "contacts", "files", "notes"})
+
+
+def deny_root_code(res: Resource, roots: Iterable[DenyRoot],
+                   ancestry: AncestryResolver | None,
+                   outside_stores: frozenset[str] = DEFAULT_OUTSIDE_STORES) -> str | None:
+    """Return a deny code unless ``res`` is positively outside every deny root."""
     roots = tuple(roots)
-    for root in roots:
-        if root.contains(res):
-            return "deny_root"
-    for root in roots:
-        if root.in_namespace(res) and not res.ancestry_verified:
-            return "ancestry_unverified"
+    if any(root.contains(res) for root in roots):
+        return "deny_root"
+    segs = res.segments
+    positively_outside = (len(segs) >= 3 and segs[1] in outside_stores
+                          and not any(root.in_namespace(res) for root in roots))
+    if positively_outside:
+        return None
+    if ancestry is None:
+        return "ancestry_unverified"
+    chain = ancestry.ancestors_of(res)
+    if not isinstance(chain, tuple) or not all(isinstance(a, str) and a for a in chain):
+        return "ancestry_unverified"
+    if any(root.contains(res, chain) for root in roots):
+        return "deny_root"
     return None

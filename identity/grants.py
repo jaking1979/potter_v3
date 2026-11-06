@@ -1,21 +1,27 @@
 """Grant model and GrantResolver (package C5, T11; T37 clause 5).
 
-A ``Grant`` gives one principal a set of capability names and a set of
-data-domain scopes. A ``CapabilityBinding`` says which data scope a
-capability touches. The resolver combines them:
+A ``Grant`` gives one principal a set of capabilities over a set of
+data-domain scopes. It authorizes exactly the pairs ``capabilities x scopes``
+*of that grant*. The resolver keeps every grant as (capability, scope) pairs
+end to end; two independent grants never combine into a pair that neither
+authorized (Dolores review, PR #26).
+
+A ``CapabilityBinding`` says which data scope a capability touches.
 
 * ``policy_grants()`` -> the ``{principal_id: frozenset[capability]}`` mapping
-  C1's ``PolicyEngine`` consumes. A capability is included only if it is
-  granted, bound, and its bound scope is covered by the principal's scopes.
-  So a test-domain principal can never hold a ``josh/*`` capability, even if a
-  grant names it.
+  C1's ``PolicyEngine`` consumes. A capability is included only if a single
+  pair grants it on a scope covering its bound scope. So a test-domain
+  principal can never hold a ``josh/*`` capability.
 * ``delegation_hop()`` -> a C1 ``DelegationHop`` whose grants come from the
-  hop principal's *configured* ceiling (never from the request), optionally
-  narrowed further. C1 intersects it with the caller's grants.
-* ``can_access(principal, chain, resource)`` -> resource-level check. Deny
-  roots first; then the resource must be covered at *every* level of the
-  chain (origin, each hop principal's ceiling, each hop's own narrowing), so
-  a sub-agent / cron / retry can only narrow.
+  hop principal's *configured* pairs (never from the request), optionally
+  narrowed. C1 intersects names; because every name is derived from pairs
+  against the same per-capability bound scope, the intersection is pairwise.
+* ``can_access(principal, chain, resource, capability=None)`` -> resource
+  check. Deny roots first (trusted ancestry only from the injected
+  ``AncestryResolver``); then the set of capabilities that cover the resource
+  is computed per level and intersected down the chain (origin, each hop
+  principal, each hop's own narrowing). Allowed iff a capability survives
+  every level (the requested one, if given). Hops can only narrow.
 
 Fail closed throughout: unknown or disabled principals, malformed grants (the
 whole principal is quarantined, not partially granted), malformed chains or
@@ -31,16 +37,16 @@ from policy import DelegationHop
 
 from .principals import (HOP_PRINCIPAL_KINDS, Principal, PrincipalDirectory, PrincipalKind,
                          valid_principal_id)
-from .scopes import (DEFAULT_DENY_ROOTS, DenyRoot, Resource, Scope, ScopeError,
-                     deny_root_code)
+from .scopes import (DEFAULT_DENY_ROOTS, DEFAULT_OUTSIDE_STORES, AncestryResolver, DenyRoot,
+                     Resource, Scope, ScopeError, deny_root_code)
 
 HOP_KINDS = frozenset(HOP_PRINCIPAL_KINDS)
 MAX_DELEGATION_DEPTH = 8   # mirrors policy.engine.MAX_DELEGATION_DEPTH
 
 ACCESS_REASONS: Mapping[str, str] = MappingProxyType({
-    "ok": "resource is within every scope in the chain",
+    "ok": "a capability covering the resource survives every level of the chain",
     "deny_root": "resource is beneath a deny root",
-    "ancestry_unverified": "resource ancestry is unverified in a deny-root namespace",
+    "ancestry_unverified": "resource is not positively outside every deny root",
     "malformed_resource": "resource is malformed",
     "unknown_principal": "principal is not configured",
     "principal_disabled": "principal is disabled",
@@ -50,6 +56,8 @@ ACCESS_REASONS: Mapping[str, str] = MappingProxyType({
     "out_of_scope": "resource is outside the effective scope",
     "engine_error": "identity resolver error; failing closed",
 })
+
+Pair = tuple[str, Scope]
 
 
 class GrantError(ValueError):
@@ -65,8 +73,18 @@ def _name_set(values: Any, what: str) -> frozenset[str]:
     return out
 
 
+def _scope_set(values: Any) -> frozenset[Scope]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (set, frozenset, tuple, list)):
+        raise GrantError("scopes must be a collection")
+    try:
+        return frozenset(s if isinstance(s, Scope) else Scope(s) for s in values)
+    except ScopeError as e:
+        raise GrantError("malformed scope") from e
+
+
 @dataclass(frozen=True)
 class Grant:
+    """Authorizes ``capabilities x scopes`` of this grant only."""
     principal_id: str
     capabilities: frozenset[str]
     scopes: frozenset[Scope]
@@ -75,14 +93,11 @@ class Grant:
         if not valid_principal_id(self.principal_id):
             raise GrantError("grant principal id is malformed")
         object.__setattr__(self, "capabilities", _name_set(self.capabilities, "capabilities"))
-        if isinstance(self.scopes, (str, bytes)) or not isinstance(
-                self.scopes, (set, frozenset, tuple, list)):
-            raise GrantError("scopes must be a collection")
-        try:
-            scopes = frozenset(s if isinstance(s, Scope) else Scope(s) for s in self.scopes)
-        except ScopeError as e:
-            raise GrantError("malformed scope") from e
-        object.__setattr__(self, "scopes", scopes)
+        object.__setattr__(self, "scopes", _scope_set(self.scopes))
+
+    @property
+    def pairs(self) -> frozenset[Pair]:
+        return frozenset((c, s) for c in self.capabilities for s in self.scopes)
 
     @classmethod
     def from_config(cls, raw: Mapping[str, Any]) -> "Grant":
@@ -118,10 +133,12 @@ class CapabilityBinding:
 
 @dataclass(frozen=True)
 class Hop:
-    """Identity-side delegation hop. ``scopes`` (optional) narrows further."""
+    """Identity-side delegation hop. ``scopes`` / ``capabilities`` (optional)
+    narrow further; ``None`` means "no extra narrowing" on that axis."""
     agent_id: str
     kind: str
     scopes: frozenset[Scope] | None = None
+    capabilities: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -141,14 +158,15 @@ def _deny(code: str) -> AccessDecision:
 @dataclass(frozen=True)
 class _Resolved:
     principal: Principal
-    capabilities: frozenset[str]
-    scopes: frozenset[Scope]
+    pairs: frozenset[Pair]
 
 
 class GrantResolver:
     def __init__(self, directory: PrincipalDirectory, grants: Iterable[Any],
                  bindings: Iterable[CapabilityBinding],
-                 deny_roots: Iterable[DenyRoot] = DEFAULT_DENY_ROOTS):
+                 deny_roots: Iterable[DenyRoot] = DEFAULT_DENY_ROOTS, *,
+                 ancestry: AncestryResolver | None = None,
+                 outside_stores: Iterable[str] = DEFAULT_OUTSIDE_STORES):
         if not isinstance(directory, PrincipalDirectory):
             raise GrantError("directory must be a PrincipalDirectory")
         self._dir = directory
@@ -157,6 +175,12 @@ class GrantResolver:
             raise GrantError("deny roots must be DenyRoot")
         # The clinical EHR root cannot be configured away.
         self._roots = tuple(dict.fromkeys(DEFAULT_DENY_ROOTS + roots))
+        if ancestry is not None and not callable(getattr(ancestry, "ancestors_of", None)):
+            raise GrantError("ancestry must be an AncestryResolver")
+        self._ancestry = ancestry
+        self._outside = _name_set(outside_stores, "outside_stores")
+        if any(r.namespace in self._outside for r in self._roots):
+            raise GrantError("a deny-root namespace cannot be an outside store")
 
         table: dict[str, CapabilityBinding] = {}
         for b in bindings:
@@ -165,8 +189,7 @@ class GrantResolver:
             table[b.capability] = b
         self._bindings: Mapping[str, CapabilityBinding] = MappingProxyType(table)
 
-        caps: dict[str, set[str]] = {}
-        scopes: dict[str, set[Scope]] = {}
+        pairs: dict[str, set[Pair]] = {}
         quarantined: set[str] = set()
         for raw in grants:
             try:
@@ -183,20 +206,20 @@ class GrantResolver:
             if p.kind is PrincipalKind.TEST and any(s.domain != "test" for s in g.scopes):
                 quarantined.add(g.principal_id)   # test principals live in test/* only
                 continue
-            caps.setdefault(g.principal_id, set()).update(g.capabilities)
-            scopes.setdefault(g.principal_id, set()).update(g.scopes)
+            pairs.setdefault(g.principal_id, set()).update(g.pairs)
         self._quarantined = frozenset(quarantined)
-        resolved = {}
-        for pid in caps:
-            resolved[pid] = _Resolved(self._dir.get(pid), frozenset(caps[pid]),
-                                      frozenset(scopes[pid]))
-        self._resolved: Mapping[str, _Resolved] = MappingProxyType(resolved)
+        self._resolved: Mapping[str, _Resolved] = MappingProxyType({
+            pid: _Resolved(self._dir.get(pid), frozenset(ps)) for pid, ps in pairs.items()})
 
-    # ---- capability view (feeds C1) -------------------------------------------
+    # ---- configuration -----------------------------------------------------------
 
     @property
     def deny_roots(self) -> tuple[DenyRoot, ...]:
         return self._roots
+
+    @property
+    def has_ancestry_resolver(self) -> bool:
+        return self._ancestry is not None
 
     def binding(self, capability: str) -> CapabilityBinding | None:
         return self._bindings.get(capability) if isinstance(capability, str) else None
@@ -207,18 +230,24 @@ class GrantResolver:
             return None
         return r
 
+    def _pairs_of(self, pid: str) -> frozenset[Pair]:
+        r = self._usable(pid)
+        return r.pairs if r is not None else frozenset()
+
+    # ---- capability view (feeds C1) -------------------------------------------
+
     def capabilities_for(self, principal_id: str,
                          registered: frozenset[str] | None = None) -> frozenset[str]:
-        """Capabilities ``principal_id`` may hold: granted, bound, in scope."""
+        """Capabilities with a single granted pair covering their bound scope."""
         r = self._usable(principal_id)
         if r is None or r.principal.kind is PrincipalKind.SERVICE_ACCOUNT:
             return frozenset()
         out = set()
-        for cap in r.capabilities:
+        for cap, scope in r.pairs:
             b = self._bindings.get(cap)
             if b is None or (registered is not None and cap not in registered):
                 continue
-            if any(s.covers_scope(b.scope) for s in r.scopes):
+            if scope.covers_scope(b.scope):
                 out.add(cap)
         return frozenset(out)
 
@@ -234,7 +263,7 @@ class GrantResolver:
         return MappingProxyType(out)
 
     def delegation_hop(self, agent_id: str, kind: str,
-                       narrow_to: Iterable[str] | None = None):
+                       narrow_to: Iterable[str] | None = None) -> DelegationHop:
         """A C1 ``DelegationHop`` carrying the hop principal's configured
         ceiling (optionally narrowed). Unknown / wrong-kind principals get an
         empty grant set, so C1 denies."""
@@ -249,13 +278,13 @@ class GrantResolver:
     # ---- resource view ---------------------------------------------------------
 
     def can_access(self, principal_id: str, chain: Iterable[Any],
-                   resource: Resource | str) -> AccessDecision:
+                   resource: Resource | str, capability: str | None = None) -> AccessDecision:
         try:
-            return self._can_access(principal_id, tuple(chain), resource)
+            return self._can_access(principal_id, tuple(chain), resource, capability)
         except Exception:
             return _deny("engine_error")
 
-    def _can_access(self, principal_id, chain, resource) -> AccessDecision:
+    def _can_access(self, principal_id, chain, resource, capability) -> AccessDecision:
         # 1. Resource shape, then deny roots: before any principal or grant.
         if isinstance(resource, str):
             try:
@@ -264,9 +293,11 @@ class GrantResolver:
                 return _deny("malformed_resource")
         if not isinstance(resource, Resource):
             return _deny("malformed_resource")
-        code = deny_root_code(resource, self._roots)
+        code = deny_root_code(resource, self._roots, self._ancestry, self._outside)
         if code:
             return _deny(code)
+        if capability is not None and not isinstance(capability, str):
+            return _deny("out_of_scope")
 
         # 2. Origin principal.
         p = self._dir.get(principal_id)
@@ -278,10 +309,17 @@ class GrantResolver:
             return _deny("not_a_caller")
         if principal_id in self._quarantined:
             return _deny("principal_quarantined")
-        levels = [self._scopes_of(principal_id)]
 
-        # 3. Chain: every hop is a configured principal of the right kind; its
-        #    configured scopes and any hop narrowing are further levels.
+        segs = resource.segments
+
+        # A capability counts only where its binding touches this resource and a
+        # single granted pair covers it; unbound capabilities confer nothing.
+        def covering(pid: str) -> set[str]:
+            return {c for c, s in self._pairs_of(pid) if s.covers_path(segs)
+                    and (b := self._bindings.get(c)) is not None and b.scope.covers_path(segs)}
+
+        # 3. Pairwise intersection: capabilities covering the resource at every level.
+        live = covering(principal_id)
         if len(chain) > MAX_DELEGATION_DEPTH:
             return _deny("invalid_delegation")
         for hop in chain:
@@ -293,21 +331,22 @@ class GrantResolver:
                 return _deny("invalid_delegation")
             if agent_id in self._quarantined:
                 return _deny("principal_quarantined")
-            levels.append(self._scopes_of(agent_id))
-            narrow = getattr(hop, "scopes", None) if isinstance(hop, Hop) else None
-            if narrow is not None:
-                if not isinstance(narrow, frozenset) or not all(
-                        isinstance(s, Scope) for s in narrow):
-                    return _deny("invalid_delegation")
-                levels.append(narrow)
-
-        # 4. Intersection: covered at every level.
-        segs = resource.segments
-        for scopes in levels:
-            if not any(s.covers_path(segs) for s in scopes):
+            live &= covering(agent_id)
+            if isinstance(hop, Hop):
+                if hop.scopes is not None:
+                    if not isinstance(hop.scopes, frozenset) or not all(
+                            isinstance(s, Scope) for s in hop.scopes):
+                        return _deny("invalid_delegation")
+                    if not any(s.covers_path(segs) for s in hop.scopes):
+                        live = set()
+                if hop.capabilities is not None:
+                    if not isinstance(hop.capabilities, frozenset) or not all(
+                            isinstance(c, str) for c in hop.capabilities):
+                        return _deny("invalid_delegation")
+                    live &= hop.capabilities
+        if capability is not None:
+            b = self._bindings.get(capability)
+            if b is None or not b.scope.covers_path(segs):
                 return _deny("out_of_scope")
-        return AccessDecision(True, "ok")
-
-    def _scopes_of(self, pid: str) -> frozenset[Scope]:
-        r = self._usable(pid)
-        return r.scopes if r is not None else frozenset()
+            live &= {capability}
+        return AccessDecision(True, "ok") if live else _deny("out_of_scope")
