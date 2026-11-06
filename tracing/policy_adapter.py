@@ -2,11 +2,10 @@
 import hashlib
 import json
 from collections.abc import Mapping
-from datetime import datetime, timezone
 import re
 
 from .emitter import emit
-from .trace import DecisionTrace
+from .trace import DecisionTrace, validate_timestamp
 
 _DECISION = re.compile(r'^dec-[0-9a-f]{32}$')
 
@@ -24,12 +23,7 @@ def emit_uncorrelated_denial(event, *, environment, timestamp, sink):
         raise ValueError('expected bounded denial')
     if environment not in ('synthetic', 'replay', 'staging', 'production'):
         raise ValueError('invalid environment')
-    try:
-        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        if dt.tzinfo is None or dt.utcoffset() != timezone.utc.utcoffset(dt):
-            raise ValueError()
-    except (ValueError, AttributeError) as exc:
-        raise ValueError('timestamp must be UTC ISO 8601') from exc
+    validate_timestamp(timestamp)
     sink(json.dumps({'schema': 'potter.trace.uncorrelated-denial/v0',
                      'decision.id': decision_id, 'potter.environment': environment,
                      'time': timestamp}, sort_keys=True, separators=(',', ':')) + '\n')

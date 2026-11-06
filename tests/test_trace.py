@@ -22,6 +22,14 @@ class TraceTest(unittest.TestCase):
         with self.assertRaises(AttributeError):
             record.task_id = 'changed'
 
+    def test_timestamp_has_no_free_form_separator(self):
+        for timestamp in ('2026-11-06X15:00:00Z', '2026-11-06 15:00:00Z',
+                          '2026-11-06T15:00:00Zprivate', '2026-02-31T15:00:00Z'):
+            with self.subTest(timestamp=timestamp), self.assertRaises(ValueError):
+                DecisionTrace(**(BASE | {'timestamp': timestamp}))
+        for timestamp in ('2026-11-06T15:00:00Z', '2026-11-06T15:00:00.123456+00:00'):
+            DecisionTrace(**(BASE | {'timestamp': timestamp}))
+
     def test_subject_ids_are_bounded_and_linkable(self):
         for component, subject in [('policy', 'dec-' + 'a' * 32),
                                    ('task', BASE['task_id']),

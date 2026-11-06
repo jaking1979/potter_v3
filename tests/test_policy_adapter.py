@@ -55,6 +55,8 @@ class AdapterTest(unittest.TestCase):
             raise OSError('unavailable')
         with self.assertRaises(OSError):
             emit_uncorrelated_denial(event, environment='synthetic', timestamp='2026-11-06T15:00:00Z', sink=fail)
+        with self.assertRaises(ValueError):
+            emit_uncorrelated_denial(event, environment='synthetic', timestamp='2026-11-06X15:00:00Z', sink=out.append)
 
 
 if __name__ == '__main__':
