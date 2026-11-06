@@ -35,7 +35,14 @@ def verify_synthetic_archive(pair, *, issued_facts, issued_at, observed_now,
             or not isinstance(issued_facts.get('verifier_version'), str)
             or not issued_facts['verifier_version']):
         raise ValueError('invalid issued facts')
-    binding = lambda record: {k: v for k, v in record.items() if k != 'verifier_version'}
+    def binding(record):
+        result = {k: v for k, v in record.items() if k != 'verifier_version'}
+        nonces = result.get('nonces')
+        if type(nonces) not in (tuple, list) or len(nonces) != 2 or any(type(n) is not str for n in nonces):
+            raise ValueError('invalid issued nonces')
+        result['nonces'] = sorted(nonces)
+        return result
     if binding(facts) != binding(issued_facts):
         raise ValueError('archived facts do not match signed pair')
     return facts
+
