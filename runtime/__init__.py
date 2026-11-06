@@ -6,12 +6,15 @@ from .db import Database, JournalUnavailable
 from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_UNKNOWN,
                       SUCCEEDED, UNKNOWN, ConnectorContract, Effect, EffectConflict, EffectError,
                       EffectFailed, EffectInFlight, EffectJournal, EffectOutcomeUnknown,
-                      TrustedIdempotentRegistry, idempotency_key)
+                      TrustedIdempotentRegistry, adapter_name, idempotency_key)
 from .fencing import (ACTIVE, FENCED, NODE_STATES, PAUSED, AuthorityUnavailable, Epoch,
                       EpochAuthority, FencedEffects, FencingError, FencingToken,
                       FileCopyReplicator, Node, NodeNotActive, Observation, PromotionConflict,
                       Replicator, StaleEpoch, StaleEpochRefused, StubConnector,
                       UnresolvedEffects, owner_epoch)
+from .outbox import (ABANDONED_UNKNOWN, ACKED, OUTBOX_NAMESPACE, ROUTINE, SENT, SUPPRESSED,
+                     URGENT, Outbox, OutboxConflict, OutboxError, OutboxMessage, QueuedMessage,
+                     RelayReport, SendFailed, outbox_idempotency_key)
 from .tasks import (DONE, ESCALATE_AFTER, ESCALATED, FAILED, QUEUED, RUNNING, STATES,
                     TRANSITIONS, WAITING_APPROVAL, Escalation, InvalidTransition, Job,
                     LeaseLost, Task, TaskStore, task_id_for)

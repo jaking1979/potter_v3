@@ -329,6 +329,7 @@ class C2FenceSeam(_Tmp):
             self.assertEqual((row.status, row.in_flight_owner), ("unknown", "node-a@epoch:1"))
             self.assertLess(row.in_flight_until, time.time())
             self.assertEqual(row.connector, self.ext.identity)  # recorded by C2 on dispatch
+            self.assertIsNone(row.connector_digest)   # untrusted: no contract digest at all
 
             # C2 alone: an expired claim is not permission; "not applied yet" is refused
             with self.assertRaises(EffectOutcomeUnknown):
@@ -350,6 +351,7 @@ class C2FenceSeam(_Tmp):
             done = FencedEffects(b).execute(key, self.ext.perform, self.ext.reconcile, connector=self.ext.identity)
             self.assertEqual((done.status, done.dispatches, done.connector),
                              ("succeeded", 2, self.ext.identity))
+            self.assertIsNone(done.connector_digest)  # cleared by the fence, not by trust
 
             resume.set()                               # A's late call reaches the boundary
             out = self.get(q)
