@@ -14,4 +14,4 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test with ephemeral Ed25519 keys
         working-directory: experiments/t39_verifier
-        run: PYTHONPATH=../.. python3 -m unittest -v test_verify_pair
+        run: PYTHONPATH=../.. python3 -m unittest -v test_verify_pair test_archive_pair
