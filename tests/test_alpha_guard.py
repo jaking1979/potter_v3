@@ -184,6 +184,44 @@ class Guard(Harness):
         self.assertIn("already placed", self.refused())
         self.assertEqual(len(self.broker._by_ref), 1)
 
+    def test_unrecognized_broker_responses_stay_unknown(self):
+        """Dolores review on 03cc996: only a verified ack may mark `placed`."""
+        from containment.alpha_guard import UnknownOutcome
+        did = decision_id("2026-11-04", "AAA", "buy", "s1")
+        bad = [{"error": "indeterminate"}, None, {}, {"order_id": None},
+               {"order_id": ""}, {"order_id": 7}, {"order_id": "x" * 65},
+               {"order_id": "o 1"}, {"order_id": "o1", "error": "rejected"}, "ok"]
+        real = self.broker.invoke
+        for i, response in enumerate(bad):
+            with self.subTest(response=response):
+                self.journal.mark_failed(did, NOW) if i else None
+                self.broker.invoke = lambda tool, args, r=response: (real(tool, args), r)[1]
+                self.alerts.clear()
+                with self.assertRaises(UnknownOutcome):
+                    self.buy()
+                e = self.journal.get(did)
+                self.assertEqual((e.status, e.order_id), ("unknown", None))
+                self.assertTrue(any("unrecognized" in a for a in self.alerts))
+                self.assertIn("unresolved", self.refused())   # reservation kept, no retry
+        self.broker.invoke = real
+
+    def test_valid_ack_marks_placed_with_order_id(self):
+        self.buy()
+        e = self.journal.get(decision_id("2026-11-04", "AAA", "buy", "s1"))
+        self.assertEqual((e.status, e.order_id), ("placed", "o1"))
+
+    def test_journal_write_failure_after_call_alerts_and_stays_unresolved(self):
+        def broken(*a, **k):
+            raise OSError("disk full")
+        self.journal.set_status = broken
+        with self.assertRaises(OSError):
+            self.buy()
+        self.assertTrue(any("journal write failed" in a for a in self.alerts))
+        del self.journal.set_status
+        e = self.journal.get(decision_id("2026-11-04", "AAA", "buy", "s1"))
+        self.assertEqual(e.status, "pending")
+        self.assertIn("unresolved", self.refused())
+
     def test_rt_retried_order_carries_same_ref_id(self):
         self.broker.fail_before_submit = True
         with self.assertRaises(ConnectionError):

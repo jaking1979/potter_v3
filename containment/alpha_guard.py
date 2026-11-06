@@ -53,6 +53,31 @@ PRICE_BUFFER = Decimal("0.02")
 NEW_YORK = ZoneInfo("America/New_York")
 
 
+class UnknownOutcome(RuntimeError):
+    """The broker call returned, but not a recognized acknowledgment.
+
+    The decision stays `unknown` (reservation kept, never blind-retried) until
+    reconciliation against the broker's own order list resolves it.
+    """
+
+
+# Acknowledgment contract ASSUMED until verified against the real broker
+# response schema at host integration (Dolores review on 03cc996). Anything
+# else, including error-shaped or empty responses, is an unknown outcome.
+_ACK_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+_ERROR_KEYS = ("error", "errors", "detail", "reject_reason", "message")
+
+
+def acknowledged_order_id(result: object) -> str | None:
+    """Order ID iff `result` is an unambiguous success acknowledgment."""
+    if type(result) is not dict or any(k in result for k in _ERROR_KEYS):
+        return None
+    oid = result.get("order_id")
+    if type(oid) is not str or not 1 <= len(oid) <= 64 or not set(oid) <= _ACK_ID_CHARS:
+        return None
+    return oid
+
+
 class Refused(PermissionError):
     pass
 
@@ -162,12 +187,33 @@ class AlphaGuard:
             try:
                 result = self._broker.invoke("place_equity_order", args)
             except BaseException:
-                self._journal.set_status(entry.decision_id, "unknown", self._clock())
+                self._mark(entry, "unknown", None, "broker call raised; outcome unknown")
                 raise
-            order_id = result.get("order_id") if isinstance(result, dict) else None
-            self._journal.set_status(entry.decision_id, "placed", self._clock(),
-                                     order_id if isinstance(order_id, str) else None)
+            order_id = acknowledged_order_id(result)
+            if order_id is None:
+                self._mark(entry, "unknown", None,
+                           "broker returned an unrecognized response; outcome unknown")
+                raise UnknownOutcome(f"unrecognized broker response for {entry.ref_id}")
+            self._mark(entry, "placed", order_id, None)
             return result
+
+    def _mark(self, entry: Entry, status: str, order_id: str | None,
+              alert: str | None) -> None:
+        """Journal the post-call status; any failure leaves it unresolved and alerts.
+
+        If the journal write itself fails the entry stays `pending`, which is
+        still unresolved: the reservation holds and no retry is possible.
+        """
+        try:
+            self._journal.set_status(entry.decision_id, status, self._clock(), order_id)
+        except Exception as exc:
+            self._alert(f"Alpha Bot journal write failed after broker call for "
+                        f"{entry.ref_id} ({type(exc).__name__}); decision left unresolved")
+            raise
+        finally:
+            if alert is not None:
+                self._alert(f"Alpha Bot {alert}: {entry.symbol} {entry.side} "
+                            f"ref {entry.ref_id}; reservation kept, reconcile before any retry")
 
     def _check(self, caller: str, symbol: str, side: str, quantity: str,
                signal_version: str, now: datetime) -> Entry:

@@ -3,7 +3,8 @@
 Each order gets a decision ID (New York date + ticker + side + signal version)
 and a deterministic UUIDv5 ref_id derived from it, reused on every attempt so
 the broker deduplicates. The entry is written `pending` and fsynced BEFORE the
-broker call; success sets `placed`, any error or timeout sets `unknown`. An
+broker call; only a recognized acknowledgment with a well-formed order ID
+sets `placed`; any error, timeout or unrecognized response sets `unknown`. An
 unresolved (`pending`/`unknown`) or `placed` decision is never resubmitted; only
 a reconciled `failed` decision may retry, with the same ref_id.
 
