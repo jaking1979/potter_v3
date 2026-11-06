@@ -160,7 +160,9 @@ class ApprovalIssuer:
         now = self._now(now)
         if decision not in (APPROVE, DENY):
             raise ApprovalRefusal("bad_decision")
-        if not self._auth.vouches(sender) or sender.principal != JOSH:
+        # Verify and retire the voucher in one step: a voucher drives at most
+        # one approval decision, and a lookalike never passes.
+        if not self._auth.consume(sender) or sender.principal != JOSH:
             raise ApprovalRefusal("unauthenticated")
         if sender.channel not in c0.CHANNELS:
             raise ApprovalRefusal("channel_not_approval_capable")

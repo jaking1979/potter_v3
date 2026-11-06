@@ -253,9 +253,11 @@ class Notifier:
 
     def _housekeeping(self, report: RunReport) -> None:
         now = self._now()
-        if self.kill.is_set():
+        killed = self.kill.is_set()
+        if killed:
+            # Everything but the /stop confirmation is cancelled; the outage
+            # handling below still runs so that confirmation can fall back.
             self._sweep(now)
-            return
         with self.db.read() as c:
             h = self._health(c)
         if h["down_since"] is None:
@@ -283,13 +285,15 @@ class Notifier:
                       " AND status=? AND next_attempt_at<?",
                       (until, now, self._primary, PENDING, until))
             # Urgent notifications not yet delivered go via the fallback channel.
+            # While stopped, only the explicitly permitted stop_ack may fall back.
+            only_stop = " AND o.notification_id LIKE ?" if killed else ""
             rows = c.execute(
                 "SELECT o.notification_id, o.body FROM outbox o WHERE o.channel=? AND"
                 " o.urgency=? AND o.status IN (?,?,?,?) AND NOT EXISTS (SELECT 1 FROM outbox s"
                 " WHERE s.notification_id=o.notification_id AND (s.channel=? OR"
-                " s.acked_at IS NOT NULL))",
+                " s.acked_at IS NOT NULL))" + only_stop,
                 (self._primary, URGENT, PENDING, UNKNOWN, FAILED, ABANDONED_UNKNOWN,
-                 self._fallback)).fetchall()
+                 self._fallback) + ((STOP_PREFIX + "%",) if killed else ())).fetchall()
             for nid, body in rows:
                 self._put(c, nid, self._fallback, json.loads(body), URGENT, now)
                 report.fallback_enqueued.append(nid)
@@ -359,6 +363,11 @@ class Notifier:
         if stale and not self.kill.is_set():
             nid = f"watchdog:backlog:{int(now // max_age)}"
             with self.db.tx() as c:
+                # One alert per bucket: its first content stands, even if the
+                # backlog changes later in the same bucket.
+                if c.execute("SELECT 1 FROM outbox WHERE notification_id=? LIMIT 1",
+                             (nid,)).fetchone():
+                    return stale
                 self.enqueue(c, notification_id=nid, kind="watchdog", urgency=URGENT, now=now,
                              text=f"Notifier backlog: {len(stale)} message(s) older than"
                                   f" {int(max_age // 60)} min.",
@@ -413,40 +422,78 @@ class JobHandle:
 
 class LongWork:
     """T19 item 5: one ack after 30 s, updates only on state change, final
-    message with receipt link. Message ids are deterministic, so replaying a
-    tick after a crash cannot duplicate a message."""
+    message with receipt link.
+
+    Durable: what has been sent lives in the outbox, and every tick reads it
+    back inside its own transaction. The ack records the state at ack time;
+    update ``n`` is ``work:<id>:state:<n>`` with ``n`` = 1 + the highest
+    update already queued. A fresh ``LongWork`` after a restart therefore
+    continues the numbering and compares against the last state Josh was
+    told, so a replayed tick sends nothing and no id is reused."""
 
     def __init__(self, notifier: Notifier, work_id: str, started_at: float, *,
                  silent: bool = False):
         self._n, self._id, self._start, self._silent = notifier, work_id, started_at, silent
-        self._acked = False
-        self._state: str | None = None
-        self._changes = 0
+        self._state: str | None = None      # in-memory only before the ack
         self._done = False
 
-    def _put(self, suffix: str, kind: str, text: str, now: float, extra=None) -> None:
-        if self._silent:
-            return
-        with self._n.db.tx() as c:
-            self._n.enqueue(c, notification_id=f"work:{self._id}:{suffix}", kind=kind,
-                            text=text, now=now, extra=extra)
+    @property
+    def _prefix(self) -> str:
+        return f"work:{self._id}:"
+
+    def _durable(self, c: sqlite3.Connection) -> tuple[str | None, int, str | None, bool]:
+        """(state at ack or None if no ack, last update seq, its state, finished)."""
+        prefix = self._prefix
+        rows = c.execute("SELECT DISTINCT notification_id, body FROM outbox"
+                         " WHERE substr(notification_id, 1, ?)=?",
+                         (len(prefix), prefix)).fetchall()
+        ack_state, seq, last, done = None, 0, None, False
+        for nid, body in rows:
+            suffix, b = nid[len(prefix):], json.loads(body)
+            if suffix == "ack":
+                ack_state = b.get("state", "")
+            elif suffix == "final":
+                done = True
+            elif suffix.startswith("state:") and suffix[6:].isdigit():
+                n = int(suffix[6:])
+                if n > seq:
+                    seq, last = n, b.get("state")
+        return ack_state, seq, last, done
+
+    def _enqueue(self, c, suffix: str, kind: str, text: str, now: float, extra) -> None:
+        self._n.enqueue(c, notification_id=f"{self._prefix}{suffix}", kind=kind, text=text,
+                        now=now, extra=extra)
 
     def tick(self, state: str, now: float) -> None:
         if self._done:
             raise NotifierError("work already finished")
-        if not self._acked and now - self._start >= LONG_WORK_ACK_S:
-            self._acked = True
-            self._put("ack", "work_ack", "Still working on this; I'll update you on changes.",
-                      now)
-        if self._state is not None and state != self._state and self._acked:
-            self._changes += 1
-            self._put(f"state:{self._changes}", "work_update", f"Now: {state}", now,
-                      {"state": state})
-        self._state = state
+        if self._silent:
+            self._state = state
+            return
+        with self._n.db.tx() as c:
+            ack_state, seq, last, done = self._durable(c)
+            if done:
+                self._done = True
+                raise NotifierError("work already finished")
+            if ack_state is None:
+                if now - self._start >= LONG_WORK_ACK_S:
+                    self._enqueue(c, "ack", "work_ack",
+                                  "Still working on this; I'll update you on changes.", now,
+                                  {"state": state})
+                self._state = state
+                return
+            told = last if seq else ack_state
+            if state != told:
+                self._enqueue(c, f"state:{seq + 1}", "work_update", f"Now: {state}", now,
+                              {"state": state})
+            self._state = state
 
     def finish(self, receipt_link: str, now: float, *, outcome: str = "done") -> None:
         if not receipt_link:
             raise ValueError("final message needs a receipt link")
         self._done = True
-        self._put("final", "work_final", f"Finished ({outcome}).", now,
-                  {"receipt": receipt_link, "outcome": outcome})
+        if self._silent:
+            return
+        with self._n.db.tx() as c:
+            self._enqueue(c, "final", "work_final", f"Finished ({outcome}).", now,
+                          {"receipt": receipt_link, "outcome": outcome})
