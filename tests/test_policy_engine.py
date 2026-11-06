@@ -325,6 +325,46 @@ class Retry(Base):
         self.assertDecision(late.decide(req(SEND, record(SEND), retry_intent=first.intent)),
                             DENY, "approval_window")
 
+    def test_stateful_retry_after_state_changed_reconciles(self):
+        """P1 regression: the effect succeeded and moved balance_version b1 -> b2,
+        then the worker crashed before recording completion. The retry with the
+        original intent must reconcile, not be stranded by the live-state gate."""
+        act = BoundAction("task-1", "payments.transfer", "pay", "acct:9", {"amount": 50},
+                          {"balance_version": "b1"})
+        ledger = c0.MemoryApprovalLedger()
+        e = engine(ledger)
+        first = e.decide(req(act, record(act), live_state={"balance_version": "b1"}))
+        self.assertDecision(first, ALLOW, "ok_approved")
+        moved = {"balance_version": "b2"}
+        retry = e.decide(req(act, record(act), live_state=moved, retry_intent=first.intent))
+        self.assertDecision(retry, RECONCILE, "reconcile_pending_intent")
+        self.assertEqual(retry.intent, first.intent)
+        # Fresh execution against the moved state is still gated.
+        self.assertDecision(e.decide(req(act, record(act), live_state=moved)),
+                            DENY, "stale_preconditions")
+
+    def test_stateful_retry_skipping_live_state_still_fails_closed(self):
+        act = BoundAction("task-1", "payments.transfer", "pay", "acct:9", {"amount": 50},
+                          {"balance_version": "b1"})
+        moved = {"balance_version": "b2"}
+        e = engine()
+        first = e.decide(req(act, record(act), live_state={"balance_version": "b1"}))
+        wrong = EffectIntent("eff-other", first.intent.task_id, first.intent.action_hash,
+                             first.intent.approval_id, first.intent.action_canonical)
+        self.assertDecision(e.decide(req(act, record(act), live_state=moved, retry_intent=wrong)),
+                            DENY, "retry_intent_mismatch")
+        self.assertDecision(e.decide(req(act, record(act, auth=ATTACKER), live_state=moved,
+                                         retry_intent=first.intent)),
+                            DENY, "approval_unauthenticated")
+        self.assertDecision(e.decide(req(act, None, live_state=moved, retry_intent=first.intent)),
+                            DENY, "retry_without_consumption")
+        # Never consumed: a fresh engine/ledger with a claimed intent.
+        ledger = c0.MemoryApprovalLedger()
+        self.assertDecision(engine(ledger).decide(req(act, record(act), live_state=moved,
+                                                      retry_intent=first.intent)),
+                            DENY, "retry_without_consumption")
+        self.assertNotIn("a" * 32, ledger)
+
     def test_retry_hop_routes_to_reconcile(self):
         e = engine()
         first = e.decide(req(SEND, record(SEND)))
