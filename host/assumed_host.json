@@ -2,20 +2,115 @@
   "schema": "potter.assumed-host/v0",
   "updated": "2026-11-06",
   "facts": {
-    "proxmox_version":       {"value": "pve-manager/9.2.3", "status": "reported", "source": "A1 host report 2026-11-04"},
-    "host_os":               {"value": "Debian 13.5",       "status": "reported", "source": "A1 host report 2026-11-04"},
-    "potter_container_os":   {"value": "Debian 13.5",       "status": "reported", "source": "A1 host report 2026-11-04"},
-    "openclaw_version":      {"value": "2026.8.33",         "status": "reported", "source": "A1 host report 2026-11-04"},
-    "haos_version":          {"value": "18.1",              "status": "reported", "source": "A1 host report 2026-11-04"},
-    "catskills_ha_reachable":{"value": true,                "status": "reported", "source": "A1-3 single HTTP 200 check"},
-    "bay_ridge_ha_online":   {"value": false,               "status": "reported", "source": "A1-3, last seen 51 days before report"},
-    "ac_power_recovery":     {"value": "off",               "status": "reported", "source": "Josh 2026-11-06: host did not restart after outage"},
-    "guest_onboot":          {"value": "unknown",           "status": "assumed",  "source": "not yet collected"},
-    "python_version":        {"value": "3.13",              "status": "assumed",  "source": "Debian 13 default"},
-    "scheduler":             {"value": "systemd-timers-or-cron", "status": "assumed", "source": "A1-3 mentions enabled-job cadence; mechanism unverified"},
-    "broker_ack_shapes":     {"value": [["order_id"], ["order_id", "ref_id"]], "status": "assumed", "source": "containment/alpha_guard.py ACK_SHAPES; real schema unverified"},
-    "brief_job":             {"value": "daily morning brief, 15 consecutive successes to 2026-11-04", "status": "reported", "source": "A1-4"},
-    "external_alert_path":   {"value": "none", "status": "reported", "source": "A1-3: no active recurring alert; outage went unnoticed 2026-11-06"},
-    "ups_present":           {"value": false, "status": "assumed", "source": "host stayed off after a short outage"}
+    "proxmox_version": {
+      "value": "pve-manager/9.2.3",
+      "status": "reported",
+      "source": "A1 host report 2026-11-04",
+      "type": "str"
+    },
+    "host_os": {
+      "value": "Debian 13.5",
+      "status": "reported",
+      "source": "A1 host report 2026-11-04",
+      "type": "str"
+    },
+    "potter_container_os": {
+      "value": "Debian 13.5",
+      "status": "reported",
+      "source": "A1 host report 2026-11-04",
+      "type": "str"
+    },
+    "openclaw_version": {
+      "value": "2026.8.33",
+      "status": "reported",
+      "source": "A1 host report 2026-11-04",
+      "type": "str"
+    },
+    "haos_version": {
+      "value": "18.1",
+      "status": "reported",
+      "source": "A1 host report 2026-11-04",
+      "type": "str"
+    },
+    "catskills_ha_reachable": {
+      "value": true,
+      "status": "reported",
+      "source": "A1-3 single HTTP 200 check",
+      "type": "bool"
+    },
+    "bay_ridge_ha_online": {
+      "value": false,
+      "status": "reported",
+      "source": "A1-3, last seen 51 days before report",
+      "type": "bool"
+    },
+    "ac_power_recovery": {
+      "value": "unknown",
+      "status": "assumed",
+      "source": "BIOS setting not read; see restarted_after_outage",
+      "type": "str"
+    },
+    "guest_onboot": {
+      "value": "unknown",
+      "status": "assumed",
+      "source": "not yet collected",
+      "type": "str"
+    },
+    "python_version": {
+      "value": "3.13",
+      "status": "assumed",
+      "source": "Debian 13 default",
+      "type": "str"
+    },
+    "scheduler": {
+      "value": "systemd-timers-or-cron",
+      "status": "assumed",
+      "source": "A1-3 mentions enabled-job cadence; mechanism unverified",
+      "type": "str"
+    },
+    "broker_ack_shapes": {
+      "value": [
+        [
+          "order_id"
+        ],
+        [
+          "order_id",
+          "ref_id"
+        ]
+      ],
+      "status": "assumed",
+      "source": "containment/alpha_guard.py ACK_SHAPES; real schema unverified",
+      "type": "list"
+    },
+    "brief_job": {
+      "value": "daily morning brief, 15 consecutive successes to 2026-11-04",
+      "status": "reported",
+      "source": "A1-4",
+      "type": "str"
+    },
+    "ups_present": {
+      "value": false,
+      "status": "assumed",
+      "source": "host stayed off after a short outage",
+      "type": "bool"
+    },
+    "restarted_after_outage": {
+      "value": false,
+      "status": "reported",
+      "source": "Josh 2026-11-06: host did not come back after a short outage",
+      "type": "bool"
+    },
+    "recurring_ha_alert": {
+      "value": false,
+      "status": "reported",
+      "source": "A1-3: no active recurring alert covering the HA monitor",
+      "type": "bool"
+    },
+    "other_external_alert_paths": {
+      "value": "unknown",
+      "status": "assumed",
+      "source": "not inventoried",
+      "type": "str"
+    }
   }
 }
