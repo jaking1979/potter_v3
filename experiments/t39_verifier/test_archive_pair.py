@@ -2,6 +2,8 @@ import unittest
 from archive_pair import verify_synthetic_archive
 from test_verify_pair import VerificationTests
 from verify_pair import _key
+from datetime import datetime, timezone
+from t39.receipt_registry import Facts, FileAnchor, ReceiptRegistry
 
 
 class ArchiveTests(unittest.TestCase):
@@ -51,6 +53,21 @@ class ArchiveTests(unittest.TestCase):
         self.sigs[0] = self.sigs[1]
         with self.assertRaises(ValueError): self.archive(issued)
 
+    def test_registry_serialized_facts_match_archive_binding(self):
+        facts = self.verify()
+        stamp = datetime.fromtimestamp(100, timezone.utc)
+        registry = ReceiptRegistry.initialize(self.root / 'archive-registry.sqlite',
+                                              FileAnchor(self.root / 'archive-anchor.jsonl'),
+                                              'test', stamp)
+        self.addCleanup(registry.close)
+        registry.issue(Facts(**facts), 'ci', stamp)
+        issued = registry.get(facts['receipt_hash']).facts
+        self.assertIsInstance(issued['nonces'], list)
+        self.assertEqual(self.archive(issued), facts)
+        issued['nonces'][0] = '0' * 64
+        with self.assertRaises(ValueError): self.archive(issued)
+
 
 if __name__ == '__main__':
     unittest.main()
+
