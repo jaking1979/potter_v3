@@ -2,9 +2,37 @@
 import hashlib
 import json
 from collections.abc import Mapping
+from datetime import datetime, timezone
+import re
 
 from .emitter import emit
 from .trace import DecisionTrace
+
+_DECISION = re.compile(r'^dec-[0-9a-f]{32}$')
+
+
+def emit_uncorrelated_denial(event, *, environment, timestamp, sink):
+    """Record a malformed-request denial without inventing a task identity.
+
+    This separate audit format is not a task-linked DecisionTrace. Callers
+    must account for it explicitly; sink errors propagate.
+    """
+    if not isinstance(event, Mapping) or event.get('correlation') != 'missing' or event.get('task_id') is not None:
+        raise ValueError('expected missing correlation')
+    decision_id = event.get('decision_id')
+    if not isinstance(decision_id, str) or not _DECISION.fullmatch(decision_id) or event.get('outcome') != 'deny':
+        raise ValueError('expected bounded denial')
+    if environment not in ('synthetic', 'replay', 'staging', 'production'):
+        raise ValueError('invalid environment')
+    try:
+        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        if dt.tzinfo is None or dt.utcoffset() != timezone.utc.utcoffset(dt):
+            raise ValueError()
+    except (ValueError, AttributeError) as exc:
+        raise ValueError('timestamp must be UTC ISO 8601') from exc
+    sink(json.dumps({'schema': 'potter.trace.uncorrelated-denial/v0',
+                     'decision.id': decision_id, 'potter.environment': environment,
+                     'time': timestamp}, sort_keys=True, separators=(',', ':')) + '\n')
 
 
 def emit_policy_event(event, *, task_id, trace_id, environment, timestamp, sink):

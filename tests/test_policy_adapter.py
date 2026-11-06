@@ -1,6 +1,6 @@
 import json
 import unittest
-from tracing.policy_adapter import emit_policy_event
+from tracing.policy_adapter import emit_policy_event, emit_uncorrelated_denial
 
 TASK = '12345678-1234-4234-8234-123456789abc'
 TRACE = 'abcdefab-cdef-4def-8def-abcdefabcdef'
@@ -38,6 +38,23 @@ class AdapterTest(unittest.TestCase):
             raise OSError('unavailable')
         with self.assertRaises(OSError):
             self.emit({'decision_id': ID, 'outcome': 'allow'}, fail)
+
+    def test_missing_correlation_audit_never_invents_task(self):
+        out = []
+        event = {'decision_id': ID, 'outcome': 'deny', 'task_id': None,
+                 'correlation': 'missing', 'reason': 'private'}
+        emit_uncorrelated_denial(event, environment='synthetic', timestamp='2026-11-06T15:00:00Z', sink=out.append)
+        record = json.loads(out[0])
+        self.assertEqual(record['decision.id'], ID)
+        self.assertNotIn('task.id', record)
+        self.assertNotIn('private', out[0])
+        for changes in ({'outcome': 'allow'}, {'task_id': TASK}, {'decision_id': 'private'}):
+            with self.assertRaises(ValueError):
+                emit_uncorrelated_denial(event | changes, environment='synthetic', timestamp='2026-11-06T15:00:00Z', sink=out.append)
+        def fail(_):
+            raise OSError('unavailable')
+        with self.assertRaises(OSError):
+            emit_uncorrelated_denial(event, environment='synthetic', timestamp='2026-11-06T15:00:00Z', sink=fail)
 
 
 if __name__ == '__main__':
