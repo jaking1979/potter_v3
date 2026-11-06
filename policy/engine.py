@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import enum
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -49,6 +50,7 @@ from ._contracts import approval as c0
 from .registry import Capability, CapabilityRegistry, RiskClass, UnknownCapability
 
 ALLOW, DENY, RECONCILE = "allow", "deny", "reconcile"
+_DECISION_ID = re.compile(r"dec-[0-9a-f]{32}")
 
 TRUSTED_SOURCES = frozenset({"principal_direct", "system_policy"})
 HOP_KINDS = frozenset({"subagent", "cron", "retry"})
@@ -217,7 +219,8 @@ class PolicyEngine:
     def decide(self, request: PolicyRequest) -> Decision:
         try:
             decision_id = self._new_id("dec")
-            if not isinstance(decision_id, str) or not decision_id:
+            # C6 joins traces on this exact format; anything else falls back.
+            if not isinstance(decision_id, str) or not _DECISION_ID.fullmatch(decision_id):
                 raise TypeError
         except Exception:
             decision_id = _default_id("dec")

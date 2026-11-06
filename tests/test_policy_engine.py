@@ -625,3 +625,21 @@ class Registry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecisionIdFormat(unittest.TestCase):
+    """C6 joins traces on `dec-` + 32 lowercase hex; custom generators cannot break it."""
+
+    def test_custom_ids_outside_format_fall_back(self):
+        import re as _re
+        from policy import engine as eng
+        for bad in ("", "dec-XYZ", "dec-" + "A" * 32, "decision-1", "dec-" + "0" * 31, 7):
+            e = eng.PolicyEngine(registry=eng.CapabilityRegistry([]), grants={},
+                                 ledger=None, authenticator=None, clock=lambda: 0,
+                                 new_id=lambda p, b=bad: b)
+            d = e.decide(object())
+            self.assertRegex(d.decision_id, r"^dec-[0-9a-f]{32}$")
+        e = eng.PolicyEngine(registry=eng.CapabilityRegistry([]), grants={}, ledger=None,
+                             authenticator=None, clock=lambda: 0,
+                             new_id=lambda p: "dec-" + "a" * 32)
+        self.assertEqual(e.decide(object()).decision_id, "dec-" + "a" * 32)
