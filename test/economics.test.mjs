@@ -162,3 +162,16 @@ test("equivalent timestamp offsets are canonical before replay comparison",()=>{
  const midnight=validateCall({...make(),occurred_at:"2026-11-05T24:00:00Z"});
  assert.equal(midnight.occurred_at,"2026-11-06T00:00:00.000Z");
 });
+
+
+test("sub-resolution positive costs remain unknown rather than free",()=>{
+ const call=make("tiny","parent",{usage:{input_tokens:1,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0}});
+ const priced=priceCall(call,{...rate,input_per_million:0.0001});
+ assert.equal(priced.computed_cost_usd,null);
+ assert.equal(priced.unpriced_reason,"precision_limit");
+ assert.equal(priceCall(call,{...rate,input_per_million:Number.MIN_VALUE}).unpriced_reason,"precision_limit");
+ const total=rollupTasks([{task_id:"parent",parent_task_id:null}],[priced]).parent;
+ assert.equal(total.total_cost_usd,null);
+ assert.equal(total.unpriced_calls,1);
+ assert.equal(priceCall(call,{...rate,input_per_million:0}).computed_cost_usd,0);
+});
