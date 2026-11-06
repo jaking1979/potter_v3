@@ -18,6 +18,7 @@ queued ──claim──▶ running ──complete──▶ done
    │                │  ├─3rd failure──────▶ escalated  (escalate callback, once)
    │                │  └─lease expired────▶ reclaimed by the next claim (counts as a failure)
    │                └─wait_for_approval─▶ waiting_approval ─approved─┘ / ─denied─▶ failed
+                                       (a denied or expired approval counts toward job escalation)
 ```
 
 Each worker mutation checks, inside its write transaction, that the worker still holds a live lease. If it doesn't, the call raises `LeaseLost`.
@@ -28,7 +29,11 @@ Each worker mutation checks, inside its write transaction, that the worker still
 2. `execute(key, perform, reconcile, owner=…)` works as follows:
    - `succeeded`: returns without calling `perform`.
    - `pending` / `failed`: sets the status to `unknown` and commits, then calls `perform` once.
-   - `unknown`: calls `reconcile(effect)` first. If the result is `succeeded`, the effect is resolved without re-executing. If it is `failed`, the effect is dispatched exactly once, with the same key. If it is `still_unknown`, unrecognised, or an error, the retry is refused (`EffectOutcomeUnknown`).
+   - `unknown`: calls `reconcile(effect)` first.
+     - `succeeded`: the effect is resolved without re-executing.
+     - `failed`: the effect is dispatched exactly once, with the same key, **but only if a late landing of the earlier dispatch is ruled out**. Either the `fence` seam confirms the earlier dispatcher is fenced off (C4 fills this seam; with no fence, or if it errors, the answer is refuse), or the connector declares `enforces_idempotency_key = True`. Without one of these, "not applied yet" is not trusted: the effect stays `unknown` in `unresolved()`, and the call raises `EffectOutcomeUnknown`. A stalled worker or a timed-out request might still land later.
+     - `still_unknown`, an unrecognised verdict, or an error: the retry is refused (`EffectOutcomeUnknown`).
+   - An expired in-flight claim is never permission to re-dispatch on its own.
    - When `perform` raises `EffectFailed`, the effect becomes `failed`. Any other exception leaves it `unknown`.
    - While a live dispatcher holds the effect (`in_flight_until`), other callers get `EffectInFlight`.
 3. `perform` must run `effect.action()`, the hash-checked journaled snapshot, and pass `effect.idempotency_key` to the external system.
@@ -36,7 +41,7 @@ Each worker mutation checks, inside its write transaction, that the worker still
 ## Not in this package
 
 - **C3:** the outbox and durable delivery of escalation notifications. The callback is at-most-once after commit.
-- **C4:** fencing tokens against a dispatcher that is stalled but still alive past its lease or in-flight window. C2 checks leases in the DB only.
+- **C4:** the fencing implementation. C2 provides the `fence` seam and refuses unfenced re-dispatch. Leases are checked in the DB only.
 - Real connectors, schedulers, and the worker loop.
 - `contracts/v0` is loaded as top-level module `approval` (see `_contract.py`), so EffectIntent identity matches the C0 tests.
 
