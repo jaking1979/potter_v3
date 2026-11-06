@@ -6,6 +6,7 @@ from .db import Database, JournalUnavailable
 from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_UNKNOWN,
                       SUCCEEDED, UNKNOWN, Effect, ConnectorContract, EffectConflict, EffectError, EffectFailed,
                       EffectInFlight, EffectJournal, EffectOutcomeUnknown, TrustedIdempotentRegistry,
+                      adapter_name,
                       idempotency_key)
 from .tasks import (DONE, ESCALATE_AFTER, ESCALATED, FAILED, QUEUED, RUNNING, STATES,
                     TRANSITIONS, WAITING_APPROVAL, Escalation, InvalidTransition, Job,

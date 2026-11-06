@@ -15,7 +15,16 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = "c2.v1"
+SCHEMA_VERSION = "c2.v2"
+
+# In-place upgrades of an existing journal, keyed by the stored version.
+# Upgraded rows carry no contract digest, so they are never trusted for a
+# re-dispatch after an ambiguous outcome (they need a fence or reconciliation).
+MIGRATIONS = {
+    "c2.v0": ("ALTER TABLE effects ADD COLUMN connector TEXT",
+              "ALTER TABLE effects ADD COLUMN connector_digest TEXT"),
+    "c2.v1": ("ALTER TABLE effects ADD COLUMN connector_digest TEXT",),
+}
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS meta (
@@ -61,6 +70,7 @@ SCHEMA = (
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         connector TEXT,
+        connector_digest TEXT,
         UNIQUE (task_id, effect_id))""",
     "CREATE INDEX IF NOT EXISTS effects_status ON effects (status)",
     """CREATE TABLE IF NOT EXISTS approval_nonces (
@@ -92,6 +102,11 @@ class Database:
                 c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', ?)",
                           (SCHEMA_VERSION,))
                 got = c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0]
+                if got in MIGRATIONS:
+                    for stmt in MIGRATIONS[got]:
+                        c.execute(stmt)
+                    c.execute("UPDATE meta SET value=? WHERE key='schema'", (SCHEMA_VERSION,))
+                    got = SCHEMA_VERSION
                 if got != SCHEMA_VERSION:
                     raise JournalUnavailable(f"schema {got!r}, expected {SCHEMA_VERSION!r}")
         except sqlite3.Error as exc:
