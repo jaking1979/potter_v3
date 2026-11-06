@@ -6,6 +6,7 @@ import re
 from uuid import UUID
 
 _HASH = re.compile(r'^[0-9a-f]{64}$')
+_DECISION_ID = re.compile(r'^dec-[0-9a-f]{32}$')
 _COMPONENTS = frozenset({'policy', 'task', 'effect'})
 _OUTCOMES = frozenset({'allow', 'deny', 'reconcile', 'accepted', 'blocked', 'completed', 'failed', 'unknown'})
 _ENVIRONMENTS = frozenset({'synthetic', 'replay', 'staging', 'production'})
@@ -19,6 +20,7 @@ class DecisionTrace:
     decision_digest: str
     environment: str
     timestamp: str
+    subject_id: str | None = None
 
     def __post_init__(self):
         for value in (self.task_id, self.trace_id):
@@ -31,6 +33,18 @@ class DecisionTrace:
             raise ValueError('unsupported component or outcome')
         if self.environment not in _ENVIRONMENTS or not isinstance(self.decision_digest, str) or not _HASH.fullmatch(self.decision_digest):
             raise ValueError('invalid environment or digest')
+        if self.subject_id is not None:
+            if not isinstance(self.subject_id, str):
+                raise ValueError('invalid subject ID')
+            if self.component == 'policy':
+                if not _DECISION_ID.fullmatch(self.subject_id):
+                    raise ValueError('invalid policy decision ID')
+            else:
+                try:
+                    if str(UUID(self.subject_id)) != self.subject_id:
+                        raise ValueError()
+                except (ValueError, AttributeError) as exc:
+                    raise ValueError('subject ID must be a canonical UUID') from exc
         try:
             dt = datetime.fromisoformat(self.timestamp.replace('Z', '+00:00'))
             if dt.tzinfo is None or dt.utcoffset() != timezone.utc.utcoffset(dt):
@@ -39,8 +53,10 @@ class DecisionTrace:
             raise ValueError('timestamp must be UTC ISO 8601') from exc
 
     def jsonl(self):
-        return json.dumps({'schema': 'potter.trace.decision/v0', 'task.id': self.task_id,
+        data = {'schema': 'potter.trace.decision/v0', 'task.id': self.task_id,
           'trace.id': self.trace_id, 'potter.component': self.component,
           'potter.outcome': self.outcome, 'potter.decision.digest': self.decision_digest,
-          'potter.environment': self.environment, 'time': self.timestamp},
-          sort_keys=True, separators=(',', ':')) + '\n'
+          'potter.environment': self.environment, 'time': self.timestamp}
+        if self.subject_id is not None:
+            data['potter.subject.id'] = self.subject_id
+        return json.dumps(data, sort_keys=True, separators=(',', ':')) + '\n'
