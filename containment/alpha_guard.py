@@ -61,18 +61,24 @@ class UnknownOutcome(RuntimeError):
     """
 
 
-# Acknowledgment contract ASSUMED until verified against the real broker
-# response schema at host integration (Dolores review on 03cc996). Anything
-# else, including error-shaped or empty responses, is an unknown outcome.
+# Acknowledgment contract: an ALLOWLIST, assumed until verified against the
+# real broker response schema at host integration (Dolores reviews on 03cc996
+# and 9e05736). A response is a success acknowledgment only if its key set is
+# exactly one of ACK_SHAPES, its order_id is well formed, and any echoed ref_id
+# equals the one submitted. Every other response, including one with an order
+# ID next to any other field (a status, an error, anything unrecognized), is
+# an unknown outcome. Replace ACK_SHAPES only from verified broker behavior.
+ACK_SHAPES = (frozenset({"order_id"}), frozenset({"order_id", "ref_id"}))
 _ACK_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-_ERROR_KEYS = ("error", "errors", "detail", "reject_reason", "message")
 
 
-def acknowledged_order_id(result: object) -> str | None:
-    """Order ID iff `result` is an unambiguous success acknowledgment."""
-    if type(result) is not dict or any(k in result for k in _ERROR_KEYS):
+def acknowledged_order_id(result: object, ref_id: str) -> str | None:
+    """Order ID iff `result` is exactly a recognized success acknowledgment."""
+    if type(result) is not dict or frozenset(result) not in ACK_SHAPES:
         return None
-    oid = result.get("order_id")
+    if "ref_id" in result and result["ref_id"] != ref_id:
+        return None
+    oid = result["order_id"]
     if type(oid) is not str or not 1 <= len(oid) <= 64 or not set(oid) <= _ACK_ID_CHARS:
         return None
     return oid
@@ -189,7 +195,7 @@ class AlphaGuard:
             except BaseException:
                 self._mark(entry, "unknown", None, "broker call raised; outcome unknown")
                 raise
-            order_id = acknowledged_order_id(result)
+            order_id = acknowledged_order_id(result, entry.ref_id)
             if order_id is None:
                 self._mark(entry, "unknown", None,
                            "broker returned an unrecognized response; outcome unknown")

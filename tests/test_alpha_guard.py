@@ -190,7 +190,9 @@ class Guard(Harness):
         did = decision_id("2026-11-04", "AAA", "buy", "s1")
         bad = [{"error": "indeterminate"}, None, {}, {"order_id": None},
                {"order_id": ""}, {"order_id": 7}, {"order_id": "x" * 65},
-               {"order_id": "o 1"}, {"order_id": "o1", "error": "rejected"}, "ok"]
+               {"order_id": "o 1"}, {"order_id": "o1", "error": "rejected"}, "ok",
+               {"order_id": "o1", "status": "rejected"}, {"order_id": "o1", "status": "filled"},
+               {"order_id": "o1", "ref_id": "someone-else"}, {"order_id": "o1", "extra": None}]
         real = self.broker.invoke
         for i, response in enumerate(bad):
             with self.subTest(response=response):
@@ -209,6 +211,11 @@ class Guard(Harness):
         self.buy()
         e = self.journal.get(decision_id("2026-11-04", "AAA", "buy", "s1"))
         self.assertEqual((e.status, e.order_id), ("placed", "o1"))
+
+    def test_ack_with_matching_ref_echo_is_recognized(self):
+        from containment.alpha_guard import acknowledged_order_id
+        self.assertEqual(acknowledged_order_id({"order_id": "o9", "ref_id": "r"}, "r"), "o9")
+        self.assertIsNone(acknowledged_order_id({"order_id": "o9", "ref_id": "x"}, "r"))
 
     def test_journal_write_failure_after_call_alerts_and_stays_unresolved(self):
         def broken(*a, **k):
