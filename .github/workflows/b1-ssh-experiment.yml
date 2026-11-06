@@ -1,0 +1,26 @@
+name: B1 SSH experiment
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/b1_ssh/**'
+      - '.github/workflows/b1-ssh-experiment.yml'
+  push:
+    branches:
+      - 'dolores/b1-governance-scaffolding'
+    paths:
+      - 'experiments/b1_ssh/**'
+      - '.github/workflows/b1-ssh-experiment.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  b1-ssh-experiment:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require OpenSSH
+        run: command -v ssh-keygen
+      - name: Run experiment tests
+        run: python3 -m unittest discover -s experiments/b1_ssh -p 'test_*.py' -v
