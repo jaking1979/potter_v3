@@ -6,6 +6,7 @@ from .db import Database, JournalUnavailable
 from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_UNKNOWN,
                       SUCCEEDED, UNKNOWN, Effect, ConnectorContract, EffectConflict, EffectError, EffectFailed,
                       EffectInFlight, EffectJournal, EffectOutcomeUnknown, TrustedIdempotentRegistry,
+                      adapter_name,
                       idempotency_key)
 from .outbox import (ABANDONED_UNKNOWN, ACKED, OUTBOX_NAMESPACE, ROUTINE, SENT, SUPPRESSED,
                      URGENT, Outbox, OutboxConflict, OutboxError, OutboxMessage, QueuedMessage,
