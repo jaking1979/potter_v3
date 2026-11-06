@@ -17,14 +17,17 @@ Statuses:
 
 Never blind retry: an ``unknown`` effect is only re-dispatched after the
 injected ``reconcile(effect)`` reads the external state and returns
-``"failed"``. ``"succeeded"`` resolves it without re-execution;
-``"still_unknown"`` (or anything unrecognised) refuses the retry.
+``"failed"`` AND a late landing of the earlier dispatch is excluded - by a
+``fence`` (C4 seam; default refuses) or a connector that declares
+``enforces_idempotency_key = True``. ``"succeeded"`` resolves it without
+re-execution; ``"still_unknown"`` (or anything unrecognised, or an unfenced
+``"failed"``) refuses the retry and leaves it unresolved.
 
 Executors run only ``effect.action()``: the persisted canonical action,
 integrity-checked against its hash (C0 "one snapshot" rule).
 
-Not here: fencing tokens against a stalled-but-alive dispatcher (C4); the
-outbox (C3); real connectors.
+Not here: the fencing implementation itself (C4 fills the ``fence`` seam);
+the outbox (C3); real connectors.
 """
 from __future__ import annotations
 
@@ -46,6 +49,18 @@ PENDING, UNKNOWN, SUCCEEDED, FAILED = "pending", "unknown", "succeeded", "failed
 STILL_UNKNOWN = "still_unknown"
 RECONCILE_VERDICTS = (SUCCEEDED, FAILED, STILL_UNKNOWN)
 DEFAULT_DISPATCH_TIMEOUT_S = 300.0
+NOT_APPLIED_UNFENCED = ("reconcile reports not applied, but the earlier dispatch may still land;"
+                        " re-dispatch needs a fence (C4) or an idempotency-enforcing connector")
+
+
+def enforces_idempotency_key(connector: Any) -> bool:
+    """True only if the connector (a perform callable, or the object it is
+    bound to) explicitly declares ``enforces_idempotency_key = True``: the
+    external system applies a given idempotency key at most once."""
+    for obj in (connector, getattr(connector, "__self__", None)):
+        if obj is not None and getattr(obj, "enforces_idempotency_key", False) is True:
+            return True
+    return False
 
 
 def idempotency_key(task_id: str, effect_id: str, action_hash: str) -> str:
@@ -127,8 +142,10 @@ def insert_intent(c: sqlite3.Connection, intent: EffectIntent, key: str, now: fl
 
 class EffectJournal:
     def __init__(self, db: Database | str | Path, *, clock: Callable[[], float] = time.time,
-                 dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S):
+                 dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
+                 fence: Callable[[Effect], bool] | None = None):
         self.db = as_database(db)
+        self._fence = fence   # C4 seam; None = no fencing = refuse unfenced re-dispatch
         self._clock = clock
         self._dispatch_timeout = dispatch_timeout_s
 
@@ -178,14 +195,24 @@ class EffectJournal:
 
     # -- reconciliation ----------------------------------------------------
     def reconcile(self, key: str, reconcile: Callable[[Effect], str], *,
-                  now: float | None = None) -> Effect:
+                  enforces_idempotency_key: bool = False, now: float | None = None) -> Effect:
         """Resolve an ``unknown`` effect from external state, without dispatching.
-        Returns the effect (status may still be ``unknown``)."""
+        Returns the effect, whose status may still be ``unknown``.
+
+        ``succeeded`` is always accepted. ``failed`` is accepted only when a late
+        landing of the earlier dispatch is excluded (see ``execute``); otherwise
+        the effect stays ``unknown`` for authoritative reconciliation."""
         now = self._now(now)
         eff = self._require(key)
         if eff.status != UNKNOWN:
             return eff
         self._refuse_if_in_flight(eff, now)
+        allow_failed = enforces_idempotency_key is True or self._fenced(eff)
+        return self._reconcile(eff, reconcile, allow_failed, now)
+
+    def _reconcile(self, eff: Effect, reconcile: Callable[[Effect], str], allow_failed: bool,
+                   now: float) -> Effect:
+        key = eff.idempotency_key
         try:
             verdict = reconcile(eff)
         except Exception as exc:  # a failed read is not evidence of anything
@@ -194,6 +221,12 @@ class EffectJournal:
             err = None
         if verdict not in RECONCILE_VERDICTS:
             verdict, err = STILL_UNKNOWN, f"unrecognised reconcile verdict {verdict!r}"
+        if verdict == FAILED and not allow_failed:
+            # "Not applied yet" is not "will never apply": the earlier dispatch
+            # (a stalled worker, or a timed-out request still on the wire) may
+            # land later. Without a fence or an idempotency-enforcing connector,
+            # keep the effect unresolved and leave any in-flight claim in place.
+            verdict, err = STILL_UNKNOWN, NOT_APPLIED_UNFENCED
         if verdict == STILL_UNKNOWN:
             if err:
                 with self.db.tx() as c:
@@ -211,6 +244,16 @@ class EffectJournal:
                 raise EffectInFlight(f"effect {key} changed during reconciliation")
             return load_effect(c, key)
 
+    def _fenced(self, eff: Effect) -> bool:
+        """C4 seam: True only if the earlier dispatcher is authoritatively fenced
+        off. Default (no fence configured), or any error: refuse."""
+        if self._fence is None:
+            return False
+        try:
+            return self._fence(eff) is True
+        except Exception:
+            return False
+
     # -- execution ---------------------------------------------------------
     def execute(self, key: str, perform: Callable[[Effect], Any],
                 reconcile: Callable[[Effect], str], *, owner: str,
@@ -218,9 +261,16 @@ class EffectJournal:
         """Run the journaled effect at most as often as the external state allows:
 
         * ``succeeded`` -> returned as is, ``perform`` is not called.
-        * ``unknown``   -> ``reconcile`` first; only a ``failed`` verdict lets it
-          proceed to ONE dispatch; ``still_unknown`` raises EffectOutcomeUnknown.
         * ``pending`` / ``failed`` -> dispatched once with the same key.
+        * ``unknown``   -> ``reconcile`` first. ``succeeded`` resolves it without
+          re-execution. ``failed`` permits ONE re-dispatch with the same key, and
+          only if a late landing of the earlier dispatch is excluded: the
+          configured ``fence`` (C4 seam) confirms the earlier dispatcher is fenced
+          off, or the connector declares ``enforces_idempotency_key = True`` (the
+          external system dedupes on ``effect.idempotency_key``). Otherwise, and
+          for ``still_unknown``, EffectOutcomeUnknown is raised and the effect
+          stays in ``unresolved()`` for authoritative reconciliation. An expired
+          in-flight claim is never by itself permission to re-dispatch.
 
         ``perform(effect)`` must use ``effect.action()`` and pass
         ``effect.idempotency_key`` to the external system.
@@ -232,12 +282,14 @@ class EffectJournal:
         if eff.status == SUCCEEDED:
             return eff
         if eff.status == UNKNOWN:
-            eff = self.reconcile(key, reconcile, now=now)
+            self._refuse_if_in_flight(eff, now)
+            allow_failed = enforces_idempotency_key(perform) or self._fenced(eff)
+            eff = self._reconcile(eff, reconcile, allow_failed, now)
             if eff.status == SUCCEEDED:
                 return eff
             if eff.status == UNKNOWN:
                 raise EffectOutcomeUnknown(
-                    f"effect {key} outcome unknown; retry refused until reconciled")
+                    f"effect {key} outcome unknown; re-dispatch refused ({eff.last_error or 'unreconciled'})")
         eff.action()  # integrity check BEFORE anything is dispatched
         with self.db.tx() as c:
             cur = c.execute("UPDATE effects SET status=?, dispatches=dispatches+1,"
