@@ -11,6 +11,7 @@ class AdapterTest(unittest.TestCase):
     def emit(self, event, sink, **changes):
         ctx = dict(task_id=TASK, trace_id=TRACE, environment='synthetic',
                    timestamp='2026-11-06T15:00:00Z', sink=sink)
+        event = {'task_id': TASK, 'correlation': 'request'} | event
         emit_policy_event(event, **(ctx | changes))
 
     def test_event_is_joined_without_copying_untrusted_fields(self):
@@ -24,6 +25,8 @@ class AdapterTest(unittest.TestCase):
         for event, ctx in [({'decision_id': 'private', 'outcome': 'allow'}, {}),
                            ({'outcome': 'allow'}, {}),
                            ({'decision_id': ID, 'outcome': 'private'}, {}),
+                           ({'decision_id': ID, 'outcome': 'allow', 'correlation': 'missing'}, {}),
+                           ({'decision_id': ID, 'outcome': 'allow', 'task_id': TRACE}, {}),
                            ({'decision_id': ID, 'outcome': 'allow'}, {'task_id': 'private'})]:
             out = []
             with self.subTest(event=event, ctx=ctx), self.assertRaises(ValueError):

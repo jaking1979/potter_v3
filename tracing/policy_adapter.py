@@ -16,6 +16,8 @@ def emit_policy_event(event, *, task_id, trace_id, environment, timestamp, sink)
     """
     if not isinstance(event, Mapping):
         raise ValueError('expected policy event mapping')
+    if event.get('correlation') != 'request' or event.get('task_id') != task_id:
+        raise ValueError('missing or mismatched task correlation')
     decision_id = event.get('decision_id')
     outcome = event.get('outcome')
     if outcome not in ('allow', 'deny', 'reconcile'):
