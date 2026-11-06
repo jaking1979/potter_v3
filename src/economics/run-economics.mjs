@@ -167,12 +167,19 @@ export function priceCall(raw, rawRate = null) {
            (u.cache_write_tokens > 0 && rate.cache_write_per_million == null)) {
     reason = "missing_rate_component";
   } else {
-    computed = rounded((
+    const rawCost = (
       uncached * (rate.input_per_million ?? 0) +
       u.output_tokens * (rate.output_per_million ?? 0) +
       u.cache_read_tokens * (rate.cache_read_per_million ?? 0) +
       u.cache_write_tokens * (rate.cache_write_per_million ?? 0)
-    ) / 1_000_000);
+    ) / 1_000_000;
+    const roundedCost = rounded(rawCost);
+    // Tiny positive charges cannot be represented at the prototype's precision.
+    if (roundedCost === 0 && ((uncached > 0 && rate.input_per_million > 0) ||
+        (u.output_tokens > 0 && rate.output_per_million > 0) ||
+        (u.cache_read_tokens > 0 && rate.cache_read_per_million > 0) ||
+        (u.cache_write_tokens > 0 && rate.cache_write_per_million > 0))) reason = "precision_limit";
+    else computed = roundedCost;
   }
   const priced = Object.freeze({
     ...call,
