@@ -15,4 +15,4 @@ jobs:
         with:
           python-version: "3.12"
       - name: T39 nonce store + consumer gate tests (stdlib only, no network)
-        run: python3 -m unittest -v tests.test_t39_store_gate
+        run: python3 -m unittest -v tests.test_t39_store_gate tests.test_t39_main_detector
