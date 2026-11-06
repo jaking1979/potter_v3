@@ -18,7 +18,7 @@
 4. **Forbidden:** always denied. A genuine approval cannot unlock a forbidden capability.
 4b. **Node state (C4, optional `node_state` seam):** a write from a node that isn't `active` is denied (`node_fenced` / `node_paused` / `node_not_active`) before any approval is touched. A seam error is denied. Without the seam, nothing changes.
 5. **Delegation:** root grants come from engine configuration and are never taken from the request. Each hop (`subagent` / `cron` / `retry`) can only narrow them, so the effective grants are the intersection. The maximum depth is 8.
-6. **Live state (stateful capabilities):** preconditions must be non-empty, every declared key must be present, and the values must equal the live state the caller just observed.
+6. **Live state (stateful capabilities):** preconditions must be non-empty, every declared key must be present, and the values must equal the live state the caller just observed. This gate applies to fresh execution only. A retry that carries a consumed intent skips it, because the original effect may already have changed that state. Such a retry can still only end in `reconcile` or `deny`.
 7. **Provenance:** the engine decides trust from the source *kind*. Only `principal_direct` and `system_policy` are trusted. Unknown, missing or mixed sources taint the request. A tainted request for any write needs an approval.
 8. **Approval:** C0 `verify` first runs against a probe ledger that refuses consumption. If the nonce turns out to be consumed already, only `reconcile` is possible. Otherwise a real `verify` consumes it. If an approval is presented but not required, it must still verify.
 

@@ -77,6 +77,28 @@ class External:
         return "succeeded" if self.count(effect.idempotency_key) else "failed"
 
 
+class DedupingExternal(External):
+    """A connector whose external system enforces the idempotency key: a key is
+    applied at most once however often it is sent. Attempts are counted
+    separately so a late duplicate is visible but harmless."""
+    enforces_idempotency_key = True
+
+    def __init__(self, path):
+        super().__init__(path)
+        with _sql(self.path) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS attempts (key TEXT PRIMARY KEY, n INTEGER NOT NULL)")
+
+    def apply(self, key):
+        with _sql(self.path) as c:
+            c.execute("INSERT INTO attempts VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET n = n + 1", (key,))
+            c.execute("INSERT OR IGNORE INTO applied VALUES (?, 1)", (key,))
+
+    def attempts(self, key):
+        with _sql(self.path) as c:
+            row = c.execute("SELECT n FROM attempts WHERE key=?", (key,)).fetchone()
+            return row[0] if row else 0
+
+
 # -- spawned workers (module level so `spawn` can import them) ---------------
 def _worker_dies_after_effect(db, ext, ready):
     store, journal, x = TaskStore(db), EffectJournal(db), External(ext)
@@ -101,6 +123,24 @@ def _worker_dies_mid_dispatch(db, ext, ready, applied_before_death):
         time.sleep(600)                      # ...and the worker dies before recording it
 
     journal.execute(eff.idempotency_key, perform, x.reconcile, owner="w1", now=T)
+
+
+def _late_dispatcher(db, ext_path, dedupe, key, started, go, q):
+    """Dispatcher A: claims the effect at T, then stalls past its dispatch
+    timeout before its external call lands."""
+    x = DedupingExternal(ext_path) if dedupe else External(ext_path)
+    journal = EffectJournal(db, dispatch_timeout_s=20)
+
+    def perform(effect):
+        started.set()
+        if not go.wait(60):
+            raise RuntimeError("never released")
+        return x.perform(effect)             # the late landing
+    perform.enforces_idempotency_key = dedupe
+    try:
+        q.put(journal.execute(key, perform, x.reconcile, owner="A", now=T).status)
+    except Exception as exc:                 # pragma: no cover - reported to the parent
+        q.put(repr(exc))
 
 
 def _submit_worker(db, barrier, q):
@@ -176,16 +216,33 @@ class KillMidTask(_TmpDB):
         self.assertEqual((out.status, calls), ("succeeded", []))
         self.assertEqual(self.ext.count(eff.idempotency_key), 1)
 
-    def test_killed_mid_dispatch_before_write_retries_once_same_key(self):
+    def test_killed_mid_dispatch_before_write_stays_unresolved_by_default(self):
         task = self._run_and_kill(_worker_dies_mid_dispatch, False)
         eff = self.journal.for_step(task.id, "send")
         self.assertEqual((eff.status, self.ext.count()), ("unknown", 0))
         self.store.claim("w2", LEASE, now=T + LEASE + 1)
-        out = self.journal.execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
-                                   owner="w2", now=T + LEASE + 1)
-        self.assertEqual((out.status, out.dispatches), ("succeeded", 2))
-        self.assertEqual(out.idempotency_key, eff.idempotency_key)
-        self.assertEqual(self.ext.count(eff.idempotency_key), 1)
+        # The expired claim is not permission: "not applied yet" may still land.
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "fence"):
+            self.journal.execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
+                                 owner="w2", now=T + LEASE + 1)
+        self.assertEqual(self.ext.count(), 0)
+        self.assertEqual([e.idempotency_key for e in self.journal.unresolved()], [eff.idempotency_key])
+
+    def test_killed_mid_dispatch_before_write_retries_once_same_key_when_guaranteed(self):
+        task = self._run_and_kill(_worker_dies_mid_dispatch, False)
+        eff = self.journal.for_step(task.id, "send")
+        dedupe = DedupingExternal(os.path.join(self.tmp.name, "dedupe.sqlite"))
+        fenced = EffectJournal(self.db, fence=lambda e: e.in_flight_owner == "w1")
+        for journal, ext in ((self.journal, dedupe), (fenced, self.ext)):
+            with self.subTest(guarantee="idempotent connector" if ext is dedupe else "fence"):
+                with _sql(self.db) as c:   # rewind to the post-kill state for each mode
+                    c.execute("UPDATE effects SET status='unknown', dispatches=1, in_flight_owner='w1',"
+                              " in_flight_until=? WHERE idempotency_key=?", (T + 20, eff.idempotency_key))
+                out = journal.execute(eff.idempotency_key, ext.perform, ext.reconcile,
+                                      owner="w2", now=T + LEASE + 1)
+                self.assertEqual((out.status, out.dispatches), ("succeeded", 2))
+                self.assertEqual(out.idempotency_key, eff.idempotency_key)
+                self.assertEqual(ext.count(eff.idempotency_key), 1)
 
     def test_dead_dispatcher_in_flight_window_refuses_reconcile(self):
         self._run_and_kill(_worker_dies_mid_dispatch, True)
@@ -194,6 +251,50 @@ class KillMidTask(_TmpDB):
             self.journal.execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
                                  owner="w2", now=T + 5)
         self.assertEqual(self.ext.count(), 1)
+
+
+# -- late dispatcher (stalled past its claim, still alive) ---------------------
+class LateDispatcher(_TmpDB):
+    """Dolores review of af4960f: A claims the effect, stalls past
+    dispatch_timeout_s, then its call lands. B must not double-apply."""
+
+    def _race(self, dedupe):
+        task, _ = self.store.submit("tg:msg:late", "reply", now=T)
+        key = self.journal.record_intent(task.id, "send", action(task.id), now=T).idempotency_key
+        ext = (DedupingExternal if dedupe else External)(os.path.join(self.tmp.name, f"late-{dedupe}.sqlite"))
+        started, go, q = SPAWN.Event(), SPAWN.Event(), SPAWN.Queue()
+        a = SPAWN.Process(target=_late_dispatcher, args=(self.db, ext.path, dedupe, key, started, go, q))
+        a.start()
+        self.addCleanup(lambda: (go.set(), a.join(30)))
+        self.assertTrue(started.wait(60))
+        b = EffectJournal(self.db, dispatch_timeout_s=20)
+        self.assertEqual(b.get(key).in_flight_owner, "A")
+        return key, ext, b, go, a, q
+
+    def test_default_refuses_redispatch_and_late_a_applies_once(self):
+        key, ext, b, go, a, q = self._race(dedupe=False)
+        calls = []
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "fence"):   # claim expired at T+20
+            b.execute(key, lambda e: calls.append(e), ext.reconcile, owner="B", now=T + 21)
+        self.assertEqual(calls, [])
+        eff = b.get(key)
+        self.assertEqual((eff.status, eff.in_flight_owner), ("unknown", "A"))   # left unresolved
+        self.assertIn(key, [e.idempotency_key for e in b.unresolved()])
+        go.set()                                   # A's late call lands
+        a.join(30)
+        self.assertEqual(q.get(timeout=5), "succeeded")
+        self.assertEqual(ext.count(key), 1)
+        self.assertEqual((b.get(key).status, b.get(key).dispatches), ("succeeded", 1))
+
+    def test_idempotency_enforcing_connector_dedupes_late_a(self):
+        key, ext, b, go, a, q = self._race(dedupe=True)
+        out = b.execute(key, ext.perform, ext.reconcile, owner="B", now=T + 21)
+        self.assertEqual((out.status, out.dispatches), ("succeeded", 2))
+        go.set()                                   # A's late duplicate reaches the external system
+        a.join(30)
+        self.assertEqual(q.get(timeout=5), "succeeded")
+        self.assertEqual((ext.count(key), ext.attempts(key)), (1, 2))   # sent twice, applied once
+        self.assertEqual(b.get(key).dispatches, 2)
 
 
 # -- duplicate triggers ------------------------------------------------------
@@ -227,6 +328,7 @@ class UnknownOutcome(_TmpDB):
         self.task, _ = self.store.submit("tg:msg:2", "reply", now=T)
         self.eff = self.journal.record_intent(self.task.id, "send", action(self.task.id), now=T)
         self.key = self.eff.idempotency_key
+        self.never_calls = []
 
     def _make_unknown(self, applied):
         def timeout(e):
@@ -238,7 +340,12 @@ class UnknownOutcome(_TmpDB):
         self.assertEqual(self.journal.get(self.key).status, "unknown")
 
     def _never(self, e):
-        self.fail("perform must not be called before reconciliation")
+        # Record rather than raise: an exception inside perform is itself an
+        # "unknown outcome" and would mask an illegal dispatch.
+        self.never_calls.append(e.idempotency_key)
+
+    def tearDown(self):
+        self.assertEqual(self.never_calls, [], "perform was called when it must not be")
 
     def test_intent_recorded_before_execution_with_deterministic_key(self):
         self.assertEqual(self.eff.status, "pending")
@@ -270,6 +377,27 @@ class UnknownOutcome(_TmpDB):
         self.assertEqual((out.status, out.dispatches), ("succeeded", 1))
         self.assertEqual(self.ext.count(self.key), 1)
 
+    def test_reconcile_failed_without_guarantee_stays_unresolved(self):
+        self._make_unknown(applied=False)    # a timed-out request may still land later
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "fence"):
+            self.journal.execute(self.key, self._never, self.ext.reconcile, owner="w1", now=T + 1)
+        self.assertEqual(self.journal.reconcile(self.key, self.ext.reconcile, now=T + 1).status, "unknown")
+        self.ext.apply(self.key)             # ...and it does: authoritative reconcile resolves it
+        self.assertEqual(self.journal.reconcile(self.key, self.ext.reconcile, now=T + 2).status,
+                         "succeeded")
+        self.assertEqual(self.ext.count(), 1)
+
+    def test_fence_seam_errors_and_non_true_refuse(self):
+        self._make_unknown(applied=False)
+        calls = []   # not self._never: an exception inside perform would mask a dispatch
+        for fence in (lambda e: 1, lambda e: "yes", lambda e: None, lambda e: 1 / 0):
+            with self.subTest(fence=fence), self.assertRaisesRegex(EffectOutcomeUnknown, "fence"):
+                EffectJournal(self.db, fence=fence).execute(
+                    self.key, calls.append, self.ext.reconcile, owner="w1", now=T + 1)
+        self.assertEqual(calls, [])
+        self.assertEqual((self.journal.get(self.key).status, self.journal.get(self.key).dispatches),
+                         ("unknown", 1))
+
     def test_reconcile_failed_allows_exactly_one_retry_with_same_key(self):
         self._make_unknown(applied=False)
         keys = []
@@ -277,6 +405,7 @@ class UnknownOutcome(_TmpDB):
         def perform(e):
             keys.append(e.idempotency_key)
             return self.ext.perform(e)
+        perform.enforces_idempotency_key = True   # explicit connector capability
         out = self.journal.execute(self.key, perform, self.ext.reconcile, owner="w1", now=T + 1)
         self.assertEqual(keys, [self.key])
         self.assertEqual((out.status, out.dispatches), ("succeeded", 2))
@@ -365,6 +494,20 @@ class EscalationTests(_TmpDB):
         self.store.complete(task.id, "w", now=T + 10)
         j = self.store.job("digest")
         self.assertEqual((j.consecutive_failures, j.escalated_at, j.last_success_at), (0, None, T + 10))
+
+    def test_job_escalates_after_three_denied_approvals(self):
+        """Codex P2 on af4960f: approval-ended runs count toward job escalation."""
+        self.store.register_job("digest", 3600, now=T)
+        for run in range(3):
+            task, _ = self.store.submit(f"job:digest:appr:{run}", "digest", job="digest", now=T + run)
+            self.store.claim("w", LEASE, now=T + run)
+            self.store.wait_for_approval(task.id, "w", now=T + run)
+            out = self.store.approval_resolved(task.id, False, error="approval expired", now=T + run)
+            self.assertEqual(out.state, FAILED)  # a human decision fails the task; it isn't escalated
+            self.assertEqual(len(self.escalations), 0 if run < 2 else 1)
+        e = self.escalations[0]
+        self.assertEqual((e.subject, e.id, e.failures, e.last_error), ("job", "digest", 3, "approval expired"))
+        self.assertEqual(self.store.job("digest").consecutive_failures, 3)
 
     def test_default_escalate_is_noop(self):
         store = TaskStore(self.db)

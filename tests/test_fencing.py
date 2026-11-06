@@ -12,6 +12,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_policy_engine as tpe  # noqa: E402  (C1 fixtures: registry, approvals)
-from runtime import (ACTIVE, FENCED, PAUSED, Database, EffectFailed, EffectJournal,  # noqa: E402
+from runtime import (ACTIVE, FENCED, PAUSED, Database, EffectFailed, EffectJournal,
+                     EffectOutcomeUnknown,  # noqa: E402
                      EpochAuthority, FencedEffects, FileCopyReplicator, FencingToken, Node,
                      NodeNotActive, PromotionConflict, StaleEpoch, StaleEpochRefused,
                      StubConnector, UnresolvedEffects, owner_epoch)
@@ -245,7 +247,7 @@ class JournalSideFence(_Tmp):
 
         with self.assertRaises(StaleEpoch):
             a.journal.execute(eff.idempotency_key, lambda e: performed.append(e),
-                              self.ext.reconcile, owner=token.owner, fence=fence)
+                              self.ext.reconcile, owner=token.owner, guard=fence)
         self.assertEqual(len(calls), 2)
         self.assertEqual(performed, [])
         after = a.journal.get(eff.idempotency_key)
@@ -268,7 +270,7 @@ class JournalSideFence(_Tmp):
         self.assertTrue(issubclass(StaleEpochRefused, EffectFailed))
         self.assertEqual(self.ext.count(), 1)
 
-    def test_release_in_flight_requires_matching_owner_and_keeps_unknown(self):
+    def test_expire_in_flight_requires_matching_owner_and_keeps_owner(self):
         j = EffectJournal(self.p.a)
         eff = j.record_intent(TASK, "send", action())
 
@@ -276,12 +278,128 @@ class JournalSideFence(_Tmp):
             raise RuntimeError("timeout")
         with self.assertRaises(Exception):
             j.execute(eff.idempotency_key, ambiguous, self.ext.reconcile, owner="x@epoch:1")
-        with j.db.tx() as c:   # simulate the window still being live
-            c.execute("UPDATE effects SET in_flight_owner='x@epoch:1', in_flight_until=9e18")
-        self.assertFalse(j.release_in_flight(eff.idempotency_key, "y@epoch:1"))
-        self.assertTrue(j.release_in_flight(eff.idempotency_key, "x@epoch:1"))
+        # an ambiguous outcome keeps the dispatcher's identity (window expired)
         after = j.get(eff.idempotency_key)
-        self.assertEqual((after.status, after.in_flight_owner), ("unknown", None))
+        self.assertEqual((after.status, after.in_flight_owner), ("unknown", "x@epoch:1"))
+        with j.db.tx() as c:   # simulate the window still being live
+            c.execute("UPDATE effects SET in_flight_until=9e18")
+        self.assertFalse(j.expire_in_flight(eff.idempotency_key, "y@epoch:1"))
+        self.assertTrue(j.expire_in_flight(eff.idempotency_key, "x@epoch:1"))
+        self.assertFalse(j.expire_in_flight(eff.idempotency_key, "x@epoch:1"))  # already ended
+        after = j.get(eff.idempotency_key)
+        self.assertEqual((after.status, after.in_flight_owner), ("unknown", "x@epoch:1"))
+        self.assertLess(after.in_flight_until, 9e18)
+
+
+# -- 1b. C2 fence seam filled by the epoch authority ---------------------------
+def _stall_past_timeout(p, stalled, resume, q):
+    """Dispatcher A at epoch 1 on the SHARED journal; stalls inside perform."""
+    try:
+        auth = EpochAuthority(p.auth)
+        ext = StubConnector(p.ext, auth)
+        node = Node("node-a", auth, p.a, dispatch_timeout_s=0.2)
+        node.promote()
+        node.unpause(ext.reconcile)
+        eff = node.journal.record_intent(TASK, "send", action())
+
+        def perform(effect, token):
+            stalled.set()
+            resume.wait(WAIT)                          # stalls far past the 0.2 s window
+            return ext.perform(effect, token)
+        try:
+            FencedEffects(node).execute(eff.idempotency_key, perform, ext.reconcile)
+            q.put({"late": "applied"})
+        except StaleEpoch as e:
+            q.put({"late": type(e).__name__, "state": node.state})
+    except BaseException as e:
+        q.put({"error": repr(e)})
+        raise
+
+
+class C2FenceSeam(_Tmp):
+    def test_stalled_past_timeout_fence_lets_new_epoch_redispatch_once(self):
+        stalled, resume, q = SPAWN.Event(), SPAWN.Event(), SPAWN.Queue()
+        a = SPAWN.Process(target=_stall_past_timeout, args=(self.p, stalled, resume, q))
+        a.start()
+        try:
+            self.assertTrue(stalled.wait(WAIT), "dispatcher A never stalled")
+            time.sleep(0.5)                            # A's in-flight window has expired
+            key = EffectJournal(self.p.a).for_step(TASK, "send").idempotency_key
+            row = EffectJournal(self.p.a).get(key)
+            self.assertEqual((row.status, row.in_flight_owner), ("unknown", "node-a@epoch:1"))
+            self.assertLess(row.in_flight_until, time.time())
+
+            # C2 alone: an expired claim is not permission; "not applied yet" is refused
+            with self.assertRaises(EffectOutcomeUnknown):
+                EffectJournal(self.p.a).execute(key, self.ext.perform_unfenced,
+                                                self.ext.reconcile, owner="plain-c2")
+            self.assertEqual(EffectJournal(self.p.a).get(key).status, "unknown")
+
+            # B, same journal: promoted to epoch 2, reconciles "failed", fence says True
+            b = Node("node-b", self.auth, self.p.a)
+            self.assertEqual(b.promote(), 2)
+            self.assertFalse(b.c2_fence(row))          # PAUSED and not reconciling
+            report = b.unpause(self.ext.reconcile)
+            self.assertEqual(report["resolved"], [key])
+            self.assertIn((key, "node-a@epoch:1", True), b.fence_log)
+            self.assertEqual(b.journal.get(key).status, "failed")
+            done = FencedEffects(b).execute(key, self.ext.perform, self.ext.reconcile)
+            self.assertEqual((done.status, done.dispatches), ("succeeded", 2))
+
+            resume.set()                               # A's late call reaches the boundary
+            out = self.get(q)
+            a.join(WAIT)
+        finally:
+            resume.set()
+            if a.is_alive():
+                a.kill()
+        self.assertEqual(out["late"], "StaleEpochRefused")
+        self.assertEqual(out["state"], FENCED)
+        self.assertEqual(self.ext.count(), 1)          # exactly one application
+        self.assertEqual(self.ext.applied(), [(key, "node-b", 2)])
+        self.assertEqual([(k, n, e) for k, n, e, _ in self.ext.refusals()],
+                         [(key, "node-a", 1)])
+        self.assertEqual(EffectJournal(self.p.a).get(key).status, "succeeded")  # A's settle no-op
+
+    def test_ambiguous_dispatch_of_older_epoch_resolved_at_unpause_then_dispatched(self):
+        j = EffectJournal(self.p.a)
+        eff = j.record_intent(TASK, "send", action())
+        with self.assertRaises(Exception):
+            j.execute(eff.idempotency_key, lambda e: 1 / 0, self.ext.reconcile,
+                      owner="node-a@epoch:0")
+        b = self.active_node("node-b", self.p.a)     # unpause reconciles it: fence says yes
+        self.assertEqual(b.journal.get(eff.idempotency_key).status, "failed")
+        self.assertEqual(FencedEffects(b).execute(eff.idempotency_key, self.ext.perform,
+                                                  self.ext.reconcile).status, "succeeded")
+        self.assertEqual(self.ext.count(), 1)
+
+    def test_fence_refuses_unless_epoch_authority_rules_out_late_landing(self):
+        b = self.active_node("node-b", self.p.b)      # epoch 1
+        mk = lambda owner: SimpleNamespace(idempotency_key="k", in_flight_owner=owner)
+        self.assertTrue(b.c2_fence(mk("node-a@epoch:0")))
+        self.assertTrue(b.c2_fence(mk("legacy-worker")))        # pre-C4 owner = epoch 0
+        self.assertFalse(b.c2_fence(mk(None)))                  # unknown dispatcher
+        self.assertFalse(b.c2_fence(mk("node-b@epoch:1")))      # our own epoch
+        self.assertFalse(b.c2_fence(mk("node-c@epoch:5")))      # newer than us
+        b.pause()
+        self.assertFalse(b.c2_fence(mk("node-a@epoch:0")))      # paused, not reconciling
+        b.unpause(self.ext.reconcile)
+        Node("node-c", self.auth, os.path.join(self.tmp.name, "c.sqlite")).promote()
+        self.assertFalse(b.c2_fence(mk("node-a@epoch:0")))      # superseded
+        self.assertEqual(b.state, FENCED)
+        self.assertFalse(b.c2_fence(mk("node-a@epoch:0")))      # fenced
+
+    def test_unpause_stays_paused_when_dispatcher_epoch_unknown(self):
+        j = EffectJournal(self.p.a)
+        eff = j.record_intent(TASK, "send", action())
+        with j.db.tx() as c:   # an unknown effect with no dispatcher evidence
+            c.execute("UPDATE effects SET status='unknown', dispatches=1")
+        b = Node("node-b", self.auth, self.p.a)
+        b.promote()
+        with self.assertRaises(UnresolvedEffects):
+            b.unpause(self.ext.reconcile)              # reconcile says "failed", fence says no
+        self.assertEqual(b.state, PAUSED)
+        self.assertEqual(j.get(eff.idempotency_key).status, "unknown")
 
 
 # -- 2. node lifecycle ---------------------------------------------------------

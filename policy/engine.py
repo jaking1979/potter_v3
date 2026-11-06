@@ -26,7 +26,9 @@ Gates, in order (first failure denies):
     only narrow them. Effective grants = intersection of all of them.
  6. Live-state revalidation for stateful capabilities (C0 README: "a C1 gate"):
     non-empty preconditions, required keys present, and equal to the live state
-    the caller just observed.
+    the caller just observed. Applies to fresh execution only: a retry carrying
+    a consumed intent skips it and can only reach `reconcile` or `deny`
+    (the effect may already have changed that state).
  7. Context provenance: trust is decided by the engine from source *kinds*;
     any unknown or untrusted source taints the request. An untrusted request
     for any write needs a verified approval.
@@ -274,9 +276,16 @@ class PolicyEngine:
         code = self._check_delegation(req.caller, cap.name)
         if code:
             return deny(code)
-        code = self._check_live_state(cap, req)
-        if code:
-            return deny(code)
+        # A retry carrying a consumed intent is routed to reconciliation before
+        # the live-state gate: the original effect may already have succeeded
+        # and changed the very state its preconditions bound, so requiring the
+        # old preconditions here would strand the intent. This path can only
+        # yield `reconcile` (exact recorded intent, authentic approval,
+        # consumed nonce) or `deny`, never `allow`.
+        if req.retry_intent is None:
+            code = self._check_live_state(cap, req)
+            if code:
+                return deny(code)
 
         untrusted = self._untrusted(req.provenance)
         needs_approval = cap.approval_required or (untrusted and cap.risk is not RiskClass.READ)

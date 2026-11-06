@@ -54,8 +54,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
 
 from .db import Database, as_database
-from .effects import (UNKNOWN, Effect, EffectError, EffectFailed, EffectInFlight,
-                      EffectJournal)
+from .effects import (DEFAULT_DISPATCH_TIMEOUT_S, UNKNOWN, Effect, EffectError,
+                      EffectFailed, EffectInFlight, EffectJournal)
 
 FENCED, PAUSED, ACTIVE = "fenced", "paused", "active"
 NODE_STATES = (FENCED, PAUSED, ACTIVE)
@@ -249,14 +249,19 @@ class Node:
     DB carries the marker that keeps it fenced."""
 
     def __init__(self, node_id: str, authority: EpochAuthority, db: Database | str | Path,
-                 *, clock: Callable[[], float] = time.time):
+                 *, clock: Callable[[], float] = time.time,
+                 dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S):
         if not node_id or not isinstance(node_id, str) or "@" in node_id:
             raise ValueError("node_id required (no '@')")
         self.node_id = node_id
         self.authority = authority
         self.db = as_database(db)
-        self.journal = EffectJournal(self.db, clock=clock)
+        self.journal = EffectJournal(self.db, clock=clock, dispatch_timeout_s=dispatch_timeout_s,
+                                     fence=self.c2_fence)
         self._clock = clock
+        self._reconciling = False
+        # (idempotency_key, owner judged, decision) for every C2 fence call: audit trail
+        self.fence_log: list[tuple[str, str | None, bool]] = []
         held_node = _meta_get(self.db, _META_NODE)
         held = _meta_get(self.db, _META_EPOCH)
         self._epoch: int | None = int(held) if held is not None and held_node == node_id else None
@@ -343,10 +348,11 @@ class Node:
                 now: float | None = None) -> dict[str, Any]:
         """Reconcile every ``unknown`` effect, then go ACTIVE.
 
-        In-flight windows owned by a LOWER epoch are released first: the
-        promotion is committed, so the boundary already refuses that dispatcher
-        and the external state read by ``reconcile`` is final for it. Windows of
-        our own epoch are respected. If anything is still unknown, the node
+        Live in-flight windows owned by a LOWER epoch are ended first (the owner
+        stays on the row): the promotion is committed, so the boundary already
+        refuses that dispatcher. C2 then accepts a ``failed`` verdict only
+        because :meth:`c2_fence` confirms the earlier dispatcher's epoch is
+        older than ours. Windows of our own epoch are respected. If anything is still unknown, the node
         stays PAUSED and :class:`UnresolvedEffects` is raised. ``pending``
         effects (never dispatched) need no reconciliation."""
         if self._state != PAUSED:
@@ -356,19 +362,23 @@ class Node:
             self._fence("superseded before unpause")
             raise NodeNotActive(FENCED, "authority moved past this node's epoch")
         released, resolved, blocked = [], [], []
-        for eff in self.journal.unresolved():
-            if eff.status != UNKNOWN:
-                continue
-            if eff.in_flight_owner and owner_epoch(eff.in_flight_owner) < token.epoch:
-                if self.journal.release_in_flight(eff.idempotency_key, eff.in_flight_owner,
-                                                  now=now):
-                    released.append(eff.idempotency_key)
-            try:
-                after = self.journal.reconcile(eff.idempotency_key, reconcile, now=now)
-            except EffectInFlight:
-                blocked.append(eff.idempotency_key)
-                continue
-            (blocked if after.status == UNKNOWN else resolved).append(eff.idempotency_key)
+        self._reconciling = True
+        try:
+            for eff in self.journal.unresolved():
+                if eff.status != UNKNOWN:
+                    continue
+                if eff.in_flight_owner and owner_epoch(eff.in_flight_owner) < token.epoch:
+                    if self.journal.expire_in_flight(eff.idempotency_key, eff.in_flight_owner,
+                                                     now=now):
+                        released.append(eff.idempotency_key)
+                try:
+                    after = self.journal.reconcile(eff.idempotency_key, reconcile, now=now)
+                except EffectInFlight:
+                    blocked.append(eff.idempotency_key)
+                    continue
+                (blocked if after.status == UNKNOWN else resolved).append(eff.idempotency_key)
+        finally:
+            self._reconciling = False
         if blocked:
             raise UnresolvedEffects(blocked)
         if not self.is_current(token):
@@ -395,6 +405,35 @@ class Node:
         if not self.is_current(token):
             self._fence(f"epoch {token.epoch} is stale")
             raise StaleEpoch(f"epoch {token.epoch} of {token.node_id} is no longer current")
+
+    def c2_fence(self, effect: Effect) -> bool:
+        """C2 ``EffectJournal(fence=...)`` seam. True only if a late landing of
+        the earlier dispatch of ``effect`` is ruled out by the epoch authority:
+
+        * this node is not FENCED, and is ACTIVE (or PAUSED but inside
+          :meth:`unpause`, which reconciles and never dispatches);
+        * the authority's current epoch is this node's epoch; and
+        * the row names the earlier dispatcher (``node@epoch:N``, or a pre-C4
+          untagged owner, read as epoch 0), and that epoch is older than ours.
+          The boundary refuses any token below the current epoch, so that
+          dispatcher can no longer land the effect.
+
+        Anything else, including an unknown dispatcher (no owner on the row) or
+        a dispatcher at our own epoch (e.g. a timed-out call of ours still on
+        the wire), returns False, and C2 keeps the effect unresolved."""
+        owner = getattr(effect, "in_flight_owner", None)
+        decision = False
+        try:
+            if (self._state == ACTIVE or (self._state == PAUSED and self._reconciling)) \
+                    and self._epoch is not None and owner \
+                    and owner_epoch(owner) < self._epoch:
+                decision = self.is_current()
+                if not decision:
+                    self._fence("superseded (seen by fence)")
+        except Exception:
+            decision = False
+        self.fence_log.append((getattr(effect, "idempotency_key", "?"), owner, decision))
+        return decision
 
     def policy_state(self) -> str:
         """C1 seam (``PolicyEngine(node_state=...)``): the live node state,
@@ -436,7 +475,7 @@ class FencedEffects:
                 raise
 
         eff = self.journal.execute(key, fenced_perform, reconcile, owner=token.owner,
-                                   now=now, fence=fence)
+                                   now=now, guard=fence)
         if refused:   # the journal settled it FAILED (not applied); surface the refusal
             self.node._fence(f"dispatch refused: {refused[0]}")
             raise refused[0]
@@ -515,6 +554,10 @@ class StubConnector:
     def perform(self, effect: Effect, token: FencingToken) -> dict[str, Any]:
         effect.action()                    # executors run only the journaled action
         return self.apply(effect.idempotency_key, token)
+
+    def perform_unfenced(self, effect: Effect) -> dict[str, Any]:
+        """A C2-shaped ``perform(effect)`` with no token: always refused here."""
+        return self.apply(effect.idempotency_key, None)  # type: ignore[arg-type]
 
     def reconcile(self, effect: Effect) -> str:
         return "succeeded" if self.count(effect.idempotency_key) else "failed"
