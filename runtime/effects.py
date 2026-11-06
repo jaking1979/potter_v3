@@ -18,10 +18,12 @@ Statuses:
 Never blind retry: an ``unknown`` effect is only re-dispatched after the
 injected ``reconcile(effect)`` reads the external state and returns
 ``"failed"`` AND a late landing of the earlier dispatch is excluded - by a
-``fence`` (C4 seam; default refuses) or because the effect was dispatched
-through a connector identity in the ``trusted_idempotent`` registry fixed at
-construction (default: none). No caller-supplied flag or attribute can grant
-this. ``"succeeded"`` resolves it without
+``fence`` (C4 seam; default refuses) or because the effect was first
+dispatched under a trusted ``ConnectorContract`` whose identity AND
+``contract_digest`` (persisted on the effect) still match an entry in the
+``trusted_idempotent`` registry fixed at construction (default: none). A
+contract rotated across a restart, or a row with no digest, is not trusted.
+No caller-supplied flag or attribute can grant this. ``"succeeded"`` resolves it without
 re-execution; ``"still_unknown"`` (or anything unrecognised, or an unfenced
 ``"failed"``) refuses the retry and leaves it unresolved.
 
@@ -33,11 +35,13 @@ the outbox (C3); real connectors.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Iterator, Mapping
@@ -57,22 +61,53 @@ NOT_APPLIED_UNFENCED = ("reconcile reports not applied, but the earlier dispatch
                         " idempotent registry")
 
 
+DEFAULT_IDEMPOTENCY_SEMANTICS = "provider applies each idempotency key at most once"
+
+
+def adapter_name(adapter: Any) -> str:
+    """Stable qualified name of an adapter: the bound object's class (if any)
+    plus the function's module-qualified name."""
+    owner = getattr(adapter, "__self__", None)
+    func = getattr(adapter, "__func__", adapter)
+    if not hasattr(func, "__qualname__"):            # callable instance
+        func = type(func).__call__
+    name = f"{func.__module__}.{func.__qualname__}"
+    if owner is not None:
+        cls = owner if isinstance(owner, type) else type(owner)
+        name = f"{cls.__module__}.{cls.__qualname__}#{name}"
+    return name
+
+
 @dataclass(frozen=True)
 class ConnectorContract:
     """A reviewed connector whose provider applies an idempotency key at most
     once. ``adapter`` is the exact perform callable that was reviewed against
-    that contract; ``contract_ref`` points at the verification evidence."""
+    that contract; ``contract_ref`` points at the verification evidence;
+    ``idempotency_semantics`` states the verified guarantee.
+
+    ``contract_digest`` (computed, immutable) is sha256 over the canonical JSON
+    of (identity, contract_ref, adapter qualified name, semantics). It is
+    persisted on an effect at first dispatch, so a registry rebuilt after a
+    restart must present the SAME contract before its trust applies."""
     identity: str
     adapter: Callable[["Effect"], Any]
     contract_ref: str
+    idempotency_semantics: str = DEFAULT_IDEMPOTENCY_SEMANTICS
+    contract_digest: str = field(init=False)
 
     def __post_init__(self):
         if not (isinstance(self.identity, str) and self.identity):
             raise ValueError("identity required")
         if not (isinstance(self.contract_ref, str) and self.contract_ref):
             raise ValueError("contract_ref required")
+        if not (isinstance(self.idempotency_semantics, str) and self.idempotency_semantics):
+            raise ValueError("idempotency_semantics required")
         if not callable(self.adapter):
             raise TypeError("adapter must be callable")
+        canon = json.dumps([self.identity, self.contract_ref, adapter_name(self.adapter),
+                            self.idempotency_semantics],
+                           separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        object.__setattr__(self, "contract_digest", hashlib.sha256(canon).hexdigest())
 
 
 class TrustedIdempotentRegistry(Mapping):
@@ -148,6 +183,7 @@ class Effect:
     result: Any
     last_error: str | None
     connector: str | None = None   # identity the effect was (first) dispatched through
+    connector_digest: str | None = None   # trusted contract digest at that dispatch, if any
 
     def intent(self) -> EffectIntent:
         return EffectIntent(self.effect_id, self.task_id, self.action_hash,
@@ -159,7 +195,8 @@ class Effect:
 
 
 _COLS = ("idempotency_key, task_id, effect_id, action_hash, action_canonical, approval_id,"
-         " status, dispatches, in_flight_owner, in_flight_until, result, last_error, connector")
+         " status, dispatches, in_flight_owner, in_flight_until, result, last_error, connector,"
+         " connector_digest")
 
 
 def _effect(row: tuple) -> Effect:
@@ -293,9 +330,15 @@ class EffectJournal:
             return load_effect(c, key)
 
     def _late_landing_excluded(self, eff: Effect) -> bool:
-        """Only configuration-time trust counts: the C4 fence, or the connector
-        identity RECORDED on the effect being in the trusted registry."""
-        return self._fenced(eff) or (eff.connector is not None and eff.connector in self._trusted)
+        """Only configuration-time trust counts: the C4 fence, or the contract
+        RECORDED on the effect at first dispatch (identity AND digest) being
+        present, unchanged, in this journal's trusted registry. A rotated or
+        re-mapped contract, or a row with no digest, is not trusted."""
+        if self._fenced(eff):
+            return True
+        contract = self._trusted.get(eff.connector) if eff.connector is not None else None
+        return (contract is not None and eff.connector_digest is not None
+                and hmac.compare_digest(contract.contract_digest, eff.connector_digest))
 
     def _fenced(self, eff: Effect) -> bool:
         """C4 seam: True only if the earlier dispatcher is authoritatively fenced
@@ -326,9 +369,10 @@ class EffectJournal:
           in-flight claim is never by itself permission to re-dispatch.
 
         ``connector`` names the identity ``perform`` dispatches through; it is
-        recorded on the first dispatch and every later dispatch must match it.
-        If it is a trusted identity, ``perform`` must be that contract's
-        registered adapter. Naming an identity grants nothing unless the
+        recorded on the first dispatch, together with the trusted contract's
+        digest if the identity is trusted, and every later dispatch must match
+        the identity. If it is a trusted identity, ``perform`` must be that
+        contract's registered adapter. Naming an identity grants nothing unless the
         journal was configured to trust it.
 
         ``perform(effect)`` must use ``effect.action()`` and pass
@@ -347,6 +391,8 @@ class EffectJournal:
                                  f" not {connector!r}")
         if connector in self._trusted and perform != self._trusted[connector].adapter:
             raise EffectConflict(f"perform is not the registered adapter for {connector!r}")
+        contract = self._trusted.get(connector)
+        digest = contract.contract_digest if contract is not None else None
         if eff.status == UNKNOWN:
             self._refuse_if_in_flight(eff, now)
             eff = self._reconcile(eff, reconcile, self._late_landing_excluded(eff), now)
@@ -359,10 +405,12 @@ class EffectJournal:
         with self.db.tx() as c:
             cur = c.execute("UPDATE effects SET status=?, dispatches=dispatches+1,"
                             " in_flight_owner=?, in_flight_until=?, updated_at=?,"
+                            " connector_digest=CASE WHEN connector IS NULL THEN ?"
+                            " ELSE connector_digest END,"
                             " connector=COALESCE(connector, ?)"
                             " WHERE idempotency_key=? AND status IN (?,?) AND dispatches=?"
                             " AND (connector IS NULL OR connector=?)",
-                            (UNKNOWN, owner, now + self._dispatch_timeout, now, connector,
+                            (UNKNOWN, owner, now + self._dispatch_timeout, now, digest, connector,
                              key, PENDING, FAILED, eff.dispatches, connector))
             if cur.rowcount != 1:
                 raise EffectInFlight(f"effect {key} was claimed by another dispatcher")
