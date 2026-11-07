@@ -42,3 +42,9 @@ A worker stalled after part of either header or body cannot hold the parent in a
 blocking receive. Deadline and caller cancellation still reap that worker;
 truncated/oversized frames fail closed. This remains a closed synthetic protocol,
 not an IPC security boundary for arbitrary code or a portable sandbox claim.
+
+The spawn boundary requires the exact plain synthetic configuration type and
+revalidates its fields into a new record before multiprocessing serializes it.
+Caller subclasses/custom reduction hooks and altered invalid records are refused.
+This guards the simulator interface; trusted module/process code and runtime
+remain assumptions, and it does not create a security sandbox.

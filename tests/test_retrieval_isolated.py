@@ -4,7 +4,7 @@ import time
 import unittest
 
 from retrieval.core import benchmark, retrieve_turn
-from retrieval.isolated import SyntheticProcessBackend, _decode
+from retrieval.isolated import SyntheticProcessBackend, _decode, bounded_search
 
 
 class IsolatedRetrievalContract(unittest.IsolatedAsyncioTestCase):
@@ -94,6 +94,22 @@ class IsolatedRetrievalContract(unittest.IsolatedAsyncioTestCase):
                                      'q', consequential=True)
         self.assertEqual((result.status, result.items, result.blocked),
                          ('unavailable', (), True))
+
+    async def test_spawn_revalidates_plain_synthetic_config(self):
+        class Custom(SyntheticProcessBackend):
+            def __reduce__(self):
+                raise AssertionError('must not pickle caller subclass')
+        with self.assertRaises(ValueError):
+            await bounded_search(Custom(), 'q', 1)
+        class CustomMode(str):
+            def __reduce__(self):
+                raise AssertionError('must not pickle caller field subclass')
+        with self.assertRaises(ValueError):
+            SyntheticProcessBackend(mode=CustomMode('normal'))
+        altered = SyntheticProcessBackend()
+        object.__setattr__(altered, 'items', (('x', 'y' * 2049),))
+        with self.assertRaises(ValueError):
+            await bounded_search(altered, 'q', 1)
 
     async def test_benchmark_has_separate_deadline_and_returns_only_ids(self):
         backend = SyntheticProcessBackend((('a', 'never returned by benchmark'),), .15)

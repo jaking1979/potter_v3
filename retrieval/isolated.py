@@ -35,7 +35,8 @@ class SyntheticProcessBackend:
     mode: str = 'normal'
 
     def __post_init__(self):
-        if (self.mode not in {'normal', 'blocking', 'ignore_termination',
+        if (type(self.mode) is not str
+                or self.mode not in {'normal', 'blocking', 'ignore_termination',
                               'exception', 'malformed', 'oversized',
                               'partial_header', 'partial_body', 'short_frame'}
                 or type(self.delay_s) not in (int, float)
@@ -46,6 +47,14 @@ class SyntheticProcessBackend:
                        or type(p[1]) is not str or len(p[1]) > MAX_TEXT_CHARS
                        for p in self.items)):
             raise ValueError('invalid synthetic process configuration')
+
+
+def _validated_config(config):
+    # A subclass/custom reduce hook is not a closed synthetic scenario. Rebuild
+    # the plain frozen record before spawn; do not pickle arbitrary caller state.
+    if type(config) is not SyntheticProcessBackend:
+        raise ValueError('expected closed synthetic process configuration')
+    return SyntheticProcessBackend(config.items, config.delay_s, config.mode)
 
 
 def _worker(sender, receiver, config):
@@ -126,6 +135,7 @@ async def _search(config, query, timeout):
             or type(timeout) not in (int, float)
             or not math.isfinite(timeout) or not 0 < timeout <= 30):
         raise ValueError('invalid isolated request')
+    config = _validated_config(config)
     start = time.monotonic()
     receiver, sender = socket.socketpair()
     receiver.setblocking(False)
