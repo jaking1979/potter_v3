@@ -42,7 +42,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
 from notifier import JobHandle, JobSpec, NotifierError, Stopped
-from notifier.issuer import ApprovalIssuer
+from notifier.issuer import ApprovalIssuer, ApprovalRefusal
 from notifier.kill import KillFlag
 from policy import ALLOW, RECONCILE, Caller, DelegationHop, PolicyEngine, PolicyRequest
 from runtime import (EFFECT_FAILED, SUCCEEDED, UNKNOWN, Database, Effect, EffectConflict,
@@ -224,6 +224,9 @@ class ResponsibilityRunner:
                 return RunResult(task.id, None, OUT_LEASE_LOST)
             return RunResult(task.id, None, OUT_FAILED, "unknown_responsibility")
         cp = dict(task.checkpoint or {})
+        # step id -> hash of the action an approval was requested for. E1 now
+        # issues only for a task already waiting_approval, after this worker's
+        # lease is gone, so the approval id itself is looked up by (task, hash).
         approvals: dict[str, str] = dict(cp.get("approvals", {}))
         index = int(cp.get("next", 0))
         try:
@@ -304,18 +307,18 @@ class ResponsibilityRunner:
         return False, None
 
     def _effect_of(self, task: Task, step: Step, approvals: Mapping[str, str]) -> Effect | None:
-        aid = approvals.get(step.id)
-        if aid is None:
+        h = approvals.get(step.id)
+        if h is None:
             return self.journal.for_step(task.id, step.id)
-        record = self._approval_record(aid)[1]
+        record = self._approval_for(task.id, h)[2]
         return self._ledger.effect(record["nonce"]) if record else None
 
     def _step(self, d: Responsibility, task: Task, step: Step, ctx: StepContext,
               approvals: dict[str, str], index: int, provenance: tuple[str, ...]) -> Any:
         action = self._build(step, ctx, task.id)
         conn = self._connectors[step.connector]
-        aid = approvals.get(step.id)
-        if aid is None:
+        h = approvals.get(step.id)
+        if h is None:
             eff = self.journal.for_step(task.id, step.id)
             dec = self._decide(d, step, action, ctx, provenance)
             if dec.outcome == ALLOW:
@@ -329,7 +332,9 @@ class ResponsibilityRunner:
             if dec.reason_code in APPROVAL_CODES and eff is None:
                 self._request_approval(task, step, action, approvals, index)
             raise _Fatal(f"policy denied {step.id}: {dec.reason_code}")
-        status, record = self._approval_record(aid)
+        if action.hash() != h:
+            raise _Fatal(f"step {step.id} no longer binds the approved action")
+        _, status, record = self._approval_for(task.id, h)
         if record is None:
             raise _Fatal(f"approval for {step.id} is {status or 'missing'}")
         eff = self._ledger.effect(record["nonce"])
@@ -397,43 +402,73 @@ class ResponsibilityRunner:
                 raise _Blocked(f"effect {eff.effect_id} outcome unknown")
 
     # ---------------------------------------------------------------- approvals
-    def _approval_record(self, approval_id: str) -> tuple[str | None, dict | None]:
-        """(status, signed record if approved). Read-only over E1's table: E1
-        has no API that returns the issued record (see README gaps)."""
+    def _approval_for(self, task_id: str, action_hash: str
+                      ) -> tuple[str | None, str | None, dict | None]:
+        """(approval id, status, signed record if approved) of the latest E1
+        request for this task and action. Read-only over E1's table: E1 has no
+        API that returns the issued record (see README gaps)."""
         with self.db.read() as c:
-            row = c.execute("SELECT status, record FROM approval_requests WHERE approval_id=?",
-                            (approval_id,)).fetchone()
+            row = c.execute("SELECT approval_id, status, record FROM approval_requests"
+                            " WHERE task_id=? AND action_hash=?"
+                            " ORDER BY requested_at DESC, rowid DESC LIMIT 1",
+                            (task_id, action_hash)).fetchone()
         if row is None:
-            return None, None
-        status, raw = row
-        return status, (json.loads(raw) if status == "approved" and raw else None)
+            return None, None, None
+        aid, status, raw = row
+        return aid, status, (json.loads(raw) if status == "approved" and raw else None)
 
     def _request_approval(self, task: Task, step: Step, action, approvals: dict[str, str],
                           index: int) -> None:
-        with self.db.read() as c:
-            row = c.execute("SELECT approval_id FROM approval_requests WHERE task_id=? AND"
-                            " action_hash=? AND status IN ('pending','approved')"
-                            " ORDER BY requested_at DESC LIMIT 1",
-                            (task.id, action.hash())).fetchone()
-        if row is not None:
-            aid = row[0]          # issued before a crash; never prompt twice
-        else:
-            try:
-                with self.db.tx() as c:
-                    aid = self._issuer.request(c, action, summary=step.approval_summary,
-                                               now=self._now())
-            except Stopped:
-                raise _Interrupt()
-        approvals[step.id] = aid
+        """Checkpoint, park the task in waiting_approval, then ask E1 (which
+        issues only for a waiting task). A crash or kill between parking and
+        issuing leaves a waiting task with no request; ``poll_approvals``
+        issues it. The task is never prompted twice for the same action."""
+        approvals[step.id] = action.hash()
         self.tasks.checkpoint(task.id, self._worker,
                               {"next": index, "approvals": approvals, "waiting": step.id})
         self.tasks.wait_for_approval(task.id, self._worker)
         self._report(self._defs[task.kind], task.id, WAITING_APPROVAL)
-        raise _Waiting(aid)
+        raise _Waiting(self._issue(task.id, step, action) or "")
+
+    def _issue(self, task_id: str, step: Step, action) -> str | None:
+        """The pending/approved request for this exact action, or a new one.
+        None if E1 refuses (kill flag set, task no longer waiting)."""
+        aid, status, _ = self._approval_for(task_id, action.hash())
+        if aid is not None and status in ("pending", "approved"):
+            return aid
+        try:
+            with self.db.tx() as c:
+                return self._issuer.request(c, action, summary=step.approval_summary,
+                                            now=self._now())
+        except (Stopped, ApprovalRefusal):
+            return None
+
+    def _waiting_step(self, task: Task) -> tuple[Responsibility, Step, Any] | None:
+        """(definition, waiting step, its action rebuilt now) for a waiting task."""
+        d = self._defs.get(task.kind)
+        if d is None or task.state != WAITING_APPROVAL:
+            return None
+        cp = task.checkpoint or {}
+        approvals = cp.get("approvals", {})
+        results: dict[str, Any] = {}
+        for step in d.steps:
+            ctx = StepContext(task.payload, MappingProxyType(dict(results)))
+            if step.id == cp.get("waiting"):
+                try:
+                    return d, step, step.build(ctx, task.id)
+                except Exception:
+                    return None
+            eff = self._effect_of(task, step, approvals)
+            if eff is None or eff.status != SUCCEEDED:
+                return None
+            results[step.id] = eff.result
+        return None
 
     def poll_approvals(self) -> list[RunResult]:
         """Move every waiting task on: approved -> queued (it resumes on the
-        next claim); denied / expired / voided / cancelled -> failed."""
+        next claim); denied / expired / voided / cancelled -> failed. A waiting
+        task with no request yet (crash or kill between parking and issuing)
+        gets its request now, unless the kill flag is set."""
         now = self._now()
         out = []
         with self.db.read() as c:
@@ -445,7 +480,14 @@ class ResponsibilityRunner:
             if d is None:
                 continue
             cp = task.checkpoint or {}
-            aid = cp.get("approvals", {}).get(cp.get("waiting", ""))
+            h = cp.get("approvals", {}).get(cp.get("waiting", ""))
+            aid, status, _ = self._approval_for(tid, h) if h else (None, None, None)
+            if aid is None:
+                ws = self._waiting_step(task)
+                if ws is not None and ws[2].hash() == h:
+                    if self.kill.is_set() or self._issue(tid, ws[1], ws[2]) is not None:
+                        continue                 # issued now, or after the flag clears
+                # The waiting action can no longer be rebuilt as approved.
             pa = self._issuer.get(aid) if aid else None
             if pa is not None and pa.status == "pending" and now < pa.expires_at:
                 continue
@@ -466,21 +508,11 @@ class ResponsibilityRunner:
         step would bind *now*, rebuilt from the definition and earlier results,
         so E1 voids the approval if anything it was issued for has changed."""
         task = self.tasks.get(task_id)
-        d = self._defs.get(task.kind) if task else None
-        if d is None or task.state != WAITING_APPROVAL:
+        pa = self._issuer.get(approval_id)
+        if task is None or pa is None or pa.task_id != task_id:
             return None
-        cp = task.checkpoint or {}
-        approvals = cp.get("approvals", {})
-        results: dict[str, Any] = {}
-        for step in d.steps:
-            ctx = StepContext(task.payload, MappingProxyType(dict(results)))
-            if step.id == cp.get("waiting"):
-                return step.build(ctx, task.id) if approvals.get(step.id) == approval_id else None
-            eff = self._effect_of(task, step, approvals)
-            if eff is None or eff.status != SUCCEEDED:
-                return None
-            results[step.id] = eff.result
-        return None
+        ws = self._waiting_step(task)
+        return ws[2] if ws is not None else None
 
     # ---------------------------------------------------------------- endings
     def _finish(self, d: Responsibility, task: Task, results: Mapping[str, Any]) -> RunResult:

@@ -284,6 +284,17 @@ class InterruptMidBatch(Base):
         self.assertEqual(w.ext.calls(), 1)
 
 
+def _set_kill_later(w):
+    """Set the kill flag just before the runner asks E1 for an approval."""
+    real = w.runner._issue
+
+    def issue(*a, **k):                      # one shot, then the real method
+        w.runner._issue = real
+        _set_kill(w)
+        return real(*a, **k)
+    w.runner._issue = issue
+
+
 def _set_kill(w):
     with w.db.tx() as c:
         w.notifier.kill.set(c, by="test", at=w.now)
@@ -312,8 +323,64 @@ class ApprovalFlow(Base):
         self.assertEqual(w.ext.applied(), [("log", 1), ("pay", 1)])
         self.assertEqual(w.ext.calls(), 2)
         self.assertEqual(w.runner.tasks.get(r.task_id).state, DONE)
-        self.assertEqual(w.ledger.effect(w.runner._approval_record(aid)[1]["nonce"]).status,
-                         "succeeded")
+        record = w.runner._approval_for(r.task_id, w.issuer.get(aid).action_hash)[2]
+        self.assertEqual(w.ledger.effect(record["nonce"]).status, "succeeded")
+
+    def approval_count(self, w):
+        with w.db.read() as c:
+            return c.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+
+    def test_request_is_issued_only_once_the_task_is_waiting(self):
+        # E1 c8c8422 refuses requests for a task not in waiting_approval.
+        w = self.world()
+        w.runner.on_event("bill.due", {"id": "bill-6", "amount": 10})
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "waiting_approval")
+        self.assertEqual(w.issuer.get(r.detail).task_id, r.task_id)
+        self.assertEqual(w.runner.tasks.get(r.task_id).state, WAITING_APPROVAL)
+
+    def test_crash_between_parking_and_request_is_recovered_by_poll(self):
+        w = self.world()
+        w.runner.on_event("bill.due", {"id": "bill-7", "amount": 10})
+
+        class Crash(BaseException):
+            pass
+
+        def boom(*a, **k):
+            raise Crash()
+
+        real = w.runner._issue
+        w.runner._issue = boom                       # dies after wait_for_approval
+        with self.assertRaises(Crash):
+            w.runner.run_once()
+        w.runner._issue = real
+        task = w.runner.on_event("bill.due", {"id": "bill-7", "amount": 10})[0][0]
+        self.assertEqual(task.state, WAITING_APPROVAL)
+        self.assertEqual(self.approval_count(w), 0)
+        self.assertEqual(w.runner.poll_approvals(), [])     # issues the request, keeps waiting
+        self.assertEqual(w.runner.poll_approvals(), [])     # never a second prompt
+        self.assertEqual(self.approval_count(w), 1)
+        with w.db.read() as c:
+            aid = c.execute("SELECT approval_id FROM approval_requests").fetchone()[0]
+        self.assertEqual(w.say(f"/approve {aid}").outcome, "approved")
+        w.runner.poll_approvals()
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(w.ext.calls("pay"), 1)
+
+    def test_kill_at_request_time_leaves_the_task_waiting_for_a_later_request(self):
+        w = self.world()
+        w.runner.on_event("bill.due", {"id": "bill-8", "amount": 10})
+        w.ext.hooks["log"] = ("after", lambda eff: _set_kill_later(w))
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "waiting_approval")
+        self.assertEqual(self.approval_count(w), 0)          # E1 refused while stopped
+        self.assertEqual(w.runner.tasks.get(r.task_id).state, WAITING_APPROVAL)
+        self.assertEqual(w.runner.poll_approvals(), [])      # still stopped: nothing issued
+        self.assertEqual(self.approval_count(w), 0)
+        w.notifier.kill.clear()
+        w.runner.poll_approvals()
+        self.assertEqual(self.approval_count(w), 1)
+        self.assertEqual(w.ext.calls("pay"), 0)
 
     def test_crash_after_consumption_resumes_through_c1_reconcile(self):
         w = self.world()
