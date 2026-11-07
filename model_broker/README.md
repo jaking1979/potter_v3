@@ -1,0 +1,7 @@
+# D1 ModelBroker offline prototype
+
+An isolated synthetic implementation of candidate filtering, deterministic cost-based selection and SQLite reservations. T13/T28 requires approved candidates validated for the task and privacy class, lowest expected eligible cost, and hard per-request, per-task, day and month ceilings. The prototype uses caller-supplied integer microdollar estimates and limits, with no real prices, models, provider SDKs, prompts, credentials or live effects. It records a reservation before dispatch, does not release unknown charges after a restart, refuses blind redispatch, and blocks later reservations on a detected cost overrun.
+
+Run `python3 -m unittest tests.test_model_broker` or `python3 -m unittest discover -s tests -p 'test_model_broker.py'`.
+
+This is **not a production budget gate**: no trusted task/candidate identity, authoritative period/timezone, hard model output bounds, real price evidence, provider charge guarantees, authenticated settlement, policy/trace integration, multi-host fencing, backup/restore rollback defense, monthly approval path or settlement reconciliation exists. A provider may charge above the estimate; this scaffold detects that only after settlement and cannot prevent the charge. Availability is an input from a synthetic source. A higher-cost escalation requires a separate policy design. T22, T39, A5 and independent review remain gates. Budgets shown in tests are synthetic, not settings.
