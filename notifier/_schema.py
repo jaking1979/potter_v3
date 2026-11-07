@@ -8,6 +8,8 @@
                           exact canonical BoundAction it was raised for.
 * ``notifier_sending``  - sends past the kill gate and not yet returned
                           (the /stop in-flight boundary, see service.py).
+* ``inbound_seen``      - (channel, update_id) of every accepted adapter
+                          update: transport replay protection.
 * ``inbound_log``       - commands that were ignored (non-allowlisted or
                           unauthenticated senders). Sender reference and
                           reason only; message text is never stored.
@@ -55,6 +57,12 @@ SCHEMA = (
         message_id TEXT PRIMARY KEY,
         owner TEXT NOT NULL,
         since REAL NOT NULL)""",
+    # Transport replay protection: each adapter update is accepted once.
+    """CREATE TABLE IF NOT EXISTS inbound_seen (
+        channel TEXT NOT NULL,
+        update_id TEXT NOT NULL,
+        at REAL NOT NULL,
+        PRIMARY KEY (channel, update_id))""",
     """CREATE TABLE IF NOT EXISTS inbound_log (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         at REAL NOT NULL,
