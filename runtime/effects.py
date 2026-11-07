@@ -20,7 +20,8 @@ injected ``reconcile(effect)`` reads the external state and returns
 ``"failed"`` AND a late landing of the earlier dispatch is excluded - by a
 ``fence`` (C4 seam; default refuses) or because the effect was first
 dispatched under a trusted ``ConnectorContract`` whose identity AND
-``contract_digest`` (persisted on the effect) still match an entry in the
+``contract_digest`` (persisted on the effect; it covers the verified adapter
+source artifact) still match an entry in the
 ``trusted_idempotent`` registry fixed at construction (default: none). A
 contract rotated across a restart, or a row with no digest, is not trusted.
 No caller-supplied flag or attribute can grant this. ``"succeeded"`` resolves it without
@@ -37,9 +38,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
+import os
 import sqlite3
 import time
+import types
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,20 +82,151 @@ def adapter_name(adapter: Any) -> str:
     return name
 
 
+class AdapterVerificationError(ValueError):
+    """A registry entry's adapter implementation cannot be verified against
+    its declared artifact digest; the registry is not built."""
+
+
+_HEX64 = frozenset("0123456789abcdef")
+
+
+def adapter_artifact_digest(adapter: Any) -> str:
+    """sha256 of the adapter's implementation: the bytes of the source file
+    that defines its function, plus (if different) the file defining the class
+    it is bound to. Raises AdapterVerificationError if any source file cannot
+    be located and read (builtins, C extensions, REPL/exec-defined code), or if
+    the loaded function's bytecode is not what that file compiles to."""
+    owner = getattr(adapter, "__self__", None)
+    func = getattr(adapter, "__func__", adapter)
+    objs = [func if hasattr(func, "__code__") else type(func)]
+    if owner is not None:
+        objs.append(owner if isinstance(owner, type) else type(owner))
+    files: list[str] = []
+    for obj in objs:
+        try:
+            path = inspect.getsourcefile(obj)
+        except (TypeError, OSError):
+            path = None
+        if not path or not os.path.isfile(path):
+            raise AdapterVerificationError(f"no readable source for adapter {adapter_name(adapter)!r}")
+        path = os.path.realpath(path)
+        if path not in files:
+            files.append(path)
+    parts, sources = [], {}
+    for path in files:
+        try:
+            with open(path, "rb") as f:
+                sources[path] = f.read()
+        except OSError as exc:
+            raise AdapterVerificationError(f"cannot read adapter source {path}: {exc}") from exc
+        parts.append(hashlib.sha256(sources[path]).hexdigest())
+    code = getattr(objs[0], "__code__", None)
+    if code is not None:
+        _require_loaded_matches_source(code, sources[files[0]], adapter)
+    return parts[0] if len(parts) == 1 else hashlib.sha256(":".join(parts).encode()).hexdigest()
+
+
+def _require_loaded_matches_source(code: Any, source: bytes, adapter: Any) -> None:
+    """The file on disk is only evidence for the code actually running if the
+    loaded function compiles identically from it; a file rewritten after
+    import (or code patched in memory) is refused."""
+    try:
+        module_code = compile(source, code.co_filename, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError) as exc:
+        raise AdapterVerificationError(f"adapter source does not compile: {exc}") from exc
+    # Structural equality, not marshal bytes: marshal output depends on
+    # reference counts and string interning (FLAG_REF), so equal code can
+    # serialize differently across interpreters and runs. CPython's code
+    # equality covers bytecode, constants (recursively, incl. nested code),
+    # names, locals, flags, first line, line table and exception table.
+    stack = [module_code]
+    while stack:
+        c = stack.pop()
+        if c.co_qualname == code.co_qualname and c.co_filename == code.co_filename \
+                and c.co_firstlineno == code.co_firstlineno and c == code:
+            return
+        stack.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
+    raise AdapterVerificationError(
+        f"loaded adapter {adapter_name(adapter)!r} differs from its source file")
+
+
+@dataclass(frozen=True)
+class IdempotencyScope:
+    """The provider-side namespace in which an idempotency key is deduplicated.
+    Non-secret by contract: identifiers and a hash of the relevant config,
+    never credentials. Two dispatches with the same key dedupe only if their
+    scopes are equal."""
+    provider: str            # e.g. "gmail"
+    account: str             # account / tenant id the adapter is bound to
+    endpoint: str            # API base the adapter calls
+    dedupe_scope: str        # what the provider dedupes over, e.g. "per-account"
+    dedupe_version: str      # provider's dedupe contract version
+    retention_window_s: int  # how long the provider remembers a key
+    config_hash: str         # sha256 of the adapter's dedupe-relevant config
+
+    def __post_init__(self):
+        for name in ("provider", "account", "endpoint", "dedupe_scope", "dedupe_version"):
+            v = getattr(self, name)
+            if not (isinstance(v, str) and v):
+                raise ValueError(f"idempotency scope {name} required")
+        r = self.retention_window_s
+        if not (isinstance(r, int) and not isinstance(r, bool) and r > 0):
+            raise ValueError("retention_window_s must be a positive int")
+        h = self.config_hash
+        if not (isinstance(h, str) and len(h) == 64 and set(h) <= _HEX64):
+            raise ValueError("config_hash must be 64 lowercase hex characters")
+
+    def canonical(self) -> list:
+        return [self.provider, self.account, self.endpoint, self.dedupe_scope,
+                self.dedupe_version, self.retention_window_s, self.config_hash]
+
+
+def current_idempotency_scope(adapter: Any) -> IdempotencyScope:
+    """Ask the adapter for the scope it is bound to RIGHT NOW: the
+    ``idempotency_scope()`` method of the object a bound adapter belongs to,
+    or a module-level ``idempotency_scope()`` beside a plain function. Raises
+    AdapterVerificationError if it is missing, fails, or returns anything but
+    an IdempotencyScope."""
+    owner = getattr(adapter, "__self__", None)
+    if owner is not None:
+        report = getattr(owner, "idempotency_scope", None)
+    else:
+        report = getattr(adapter, "__globals__", {}).get("idempotency_scope")
+    if not callable(report):
+        raise AdapterVerificationError(f"adapter {adapter_name(adapter)!r} cannot report its idempotency scope")
+    try:
+        scope = report()
+    except Exception as exc:
+        raise AdapterVerificationError(f"adapter {adapter_name(adapter)!r} failed to report its"
+                                       f" idempotency scope: {exc!r}") from exc
+    if not isinstance(scope, IdempotencyScope):
+        raise AdapterVerificationError(f"adapter {adapter_name(adapter)!r} reported a non-IdempotencyScope")
+    return scope
+
+
 @dataclass(frozen=True)
 class ConnectorContract:
     """A reviewed connector whose provider applies an idempotency key at most
     once. ``adapter`` is the exact perform callable that was reviewed against
     that contract; ``contract_ref`` points at the verification evidence;
-    ``idempotency_semantics`` states the verified guarantee.
+    ``adapter_artifact_digest`` is the sha256 of the reviewed adapter artifact,
+    supplied by trusted configuration (see ``adapter_artifact_digest()``);
+    ``idempotency_scope`` is the provider namespace (provider, account,
+    endpoint, dedupe scope/version, retention, config hash) the guarantee
+    holds in; ``idempotency_semantics`` states the verified guarantee.
 
     ``contract_digest`` (computed, immutable) is sha256 over the canonical JSON
-    of (identity, contract_ref, adapter qualified name, semantics). It is
-    persisted on an effect at first dispatch, so a registry rebuilt after a
-    restart must present the SAME contract before its trust applies."""
+    of (identity, contract_ref, adapter qualified name, adapter artifact
+    digest, idempotency scope, semantics). It is persisted on an effect at first dispatch, so a
+    registry rebuilt after a restart must present the SAME contract, including
+    the same adapter implementation, before its trust applies.
+    TrustedIdempotentRegistry verifies the declared artifact digest against the
+    adapter's actual source when it is built."""
     identity: str
     adapter: Callable[["Effect"], Any]
     contract_ref: str
+    adapter_artifact_digest: str
+    idempotency_scope: IdempotencyScope
     idempotency_semantics: str = DEFAULT_IDEMPOTENCY_SEMANTICS
     contract_digest: str = field(init=False)
 
@@ -104,7 +239,13 @@ class ConnectorContract:
             raise ValueError("idempotency_semantics required")
         if not callable(self.adapter):
             raise TypeError("adapter must be callable")
+        d = self.adapter_artifact_digest
+        if not (isinstance(d, str) and len(d) == 64 and set(d) <= _HEX64):
+            raise ValueError("adapter_artifact_digest must be 64 lowercase hex characters")
+        if not isinstance(self.idempotency_scope, IdempotencyScope):
+            raise TypeError("idempotency_scope must be an IdempotencyScope")
         canon = json.dumps([self.identity, self.contract_ref, adapter_name(self.adapter),
+                            self.adapter_artifact_digest, self.idempotency_scope.canonical(),
                             self.idempotency_semantics],
                            separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         object.__setattr__(self, "contract_digest", hashlib.sha256(canon).hexdigest())
@@ -112,7 +253,11 @@ class ConnectorContract:
 
 class TrustedIdempotentRegistry(Mapping):
     """Frozen identity -> ConnectorContract mapping, injected by configuration
-    when an EffectJournal is constructed. It cannot be changed afterwards."""
+    when an EffectJournal is constructed. It cannot be changed afterwards.
+
+    Each entry's declared ``adapter_artifact_digest`` must equal the digest of
+    the adapter's actual source; otherwise (or if the source is unreadable)
+    construction raises AdapterVerificationError."""
 
     def __init__(self, contracts: Iterable[ConnectorContract] = ()):
         entries: dict[str, ConnectorContract] = {}
@@ -121,6 +266,13 @@ class TrustedIdempotentRegistry(Mapping):
                 raise TypeError("registry entries must be ConnectorContract")
             if k.identity in entries:
                 raise ValueError(f"duplicate connector identity {k.identity!r}")
+            actual = adapter_artifact_digest(k.adapter)
+            if not hmac.compare_digest(actual, k.adapter_artifact_digest):
+                raise AdapterVerificationError(
+                    f"adapter for {k.identity!r} does not match its declared artifact digest")
+            if current_idempotency_scope(k.adapter) != k.idempotency_scope:
+                raise AdapterVerificationError(
+                    f"adapter for {k.identity!r} is bound to a different idempotency scope")
             entries[k.identity] = k
         self._entries = MappingProxyType(entries)
 
@@ -337,8 +489,20 @@ class EffectJournal:
         if self._fenced(eff):
             return True
         contract = self._trusted.get(eff.connector) if eff.connector is not None else None
-        return (contract is not None and eff.connector_digest is not None
-                and hmac.compare_digest(contract.contract_digest, eff.connector_digest))
+        if not (contract is not None and eff.connector_digest is not None
+                and hmac.compare_digest(contract.contract_digest, eff.connector_digest)):
+            return False
+        return self._scope_unchanged(contract)
+
+    @staticmethod
+    def _scope_unchanged(contract: ConnectorContract) -> bool:
+        """The adapter must still report exactly the scope its contract (and so
+        the recorded digest) declares; config changed at runtime, or an adapter
+        that cannot report, is not trusted."""
+        try:
+            return current_idempotency_scope(contract.adapter) == contract.idempotency_scope
+        except AdapterVerificationError:
+            return False
 
     def _fenced(self, eff: Effect) -> bool:
         """C4 seam: True only if the earlier dispatcher is authoritatively fenced
@@ -393,6 +557,11 @@ class EffectJournal:
             raise EffectConflict(f"perform is not the registered adapter for {connector!r}")
         contract = self._trusted.get(connector)
         digest = contract.contract_digest if contract is not None else None
+        if contract is not None and not self._scope_unchanged(contract):
+            # Dispatching now would land in a namespace the recorded contract
+            # does not describe; refuse before anything is claimed.
+            raise EffectConflict(f"adapter for {connector!r} no longer reports its contract's"
+                                 " idempotency scope")
         if eff.status == UNKNOWN:
             self._refuse_if_in_flight(eff, now)
             eff = self._reconcile(eff, reconcile, self._late_landing_excluded(eff), now)
