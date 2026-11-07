@@ -61,6 +61,9 @@ STILL_UNKNOWN = "still_unknown"
 RECONCILE_VERDICTS = (SUCCEEDED, FAILED, STILL_UNKNOWN)
 DEFAULT_DISPATCH_TIMEOUT_S = 300.0
 DEFAULT_RETENTION_MARGIN_S = 60.0
+BASIS_DEFINITE, BASIS_FENCE, BASIS_WINDOW = "definite", "fence", "window"
+WINDOW_LAPSED = ("trusted idempotency window no longer covers a re-dispatch;"
+                 " the earlier dispatch may still land: back to unknown")
 NOT_APPLIED_UNFENCED = ("reconcile reports not applied, but the earlier dispatch may still land;"
                         " re-dispatch needs a fence (C4) or a connector in the trusted"
                         " idempotent registry")
@@ -360,6 +363,11 @@ class Effect:
     connector: str | None = None   # identity the effect was (first) dispatched through
     connector_digest: str | None = None   # trusted contract digest at that dispatch, if any
     first_dispatched_at: float | None = None   # journal time of the first dispatch
+    # Why a FAILED status may be re-dispatched: "definite" (the provider
+    # rejected it), "fence" (C4 fenced the earlier dispatcher) or "window"
+    # (trusted idempotency window, which expires, so it is re-checked at every
+    # dispatch claim). NULL on a FAILED row is treated like "window".
+    failed_basis: str | None = None
 
     def intent(self) -> EffectIntent:
         return EffectIntent(self.effect_id, self.task_id, self.action_hash,
@@ -372,7 +380,7 @@ class Effect:
 
 _COLS = ("idempotency_key, task_id, effect_id, action_hash, action_canonical, approval_id,"
          " status, dispatches, in_flight_owner, in_flight_until, result, last_error, connector,"
-         " connector_digest, first_dispatched_at")
+         " connector_digest, first_dispatched_at, failed_basis")
 
 
 def _effect(row: tuple) -> Effect:
@@ -473,10 +481,14 @@ class EffectJournal:
         if eff.status != UNKNOWN:
             return eff
         self._refuse_if_in_flight(eff, now)
-        return self._reconcile(eff, reconcile, self._late_landing_excluded(eff, now), now)
+        return self._reconcile(eff, reconcile, self._exclusion_basis(eff, now), now)
 
-    def _reconcile(self, eff: Effect, reconcile: Callable[[Effect], str], allow_failed: bool,
+    def _reconcile(self, eff: Effect, reconcile: Callable[[Effect], str], basis: str | None,
                    now: float) -> Effect:
+        """``basis`` is why a late landing is excluded right now ("fence" or
+        "window"), or None. A FAILED verdict is accepted only with a basis,
+        and the basis is persisted so a dispatch claim can re-prove it."""
+        allow_failed = basis is not None
         key = eff.idempotency_key
         try:
             verdict = reconcile(eff)
@@ -500,16 +512,20 @@ class EffectJournal:
             return self._require(key)
         with self.db.tx() as c:
             cur = c.execute("UPDATE effects SET status=?, updated_at=?, last_error=?,"
-                            " in_flight_owner=NULL, in_flight_until=NULL"
+                            " in_flight_owner=NULL, in_flight_until=NULL, failed_basis=?"
                             " WHERE idempotency_key=? AND status=? AND dispatches=?"
                             " AND (in_flight_owner IS NULL OR in_flight_until <= ?)",
                             (verdict, now, "reconciled: not applied" if verdict == FAILED else None,
+                             basis if verdict == FAILED else None,
                              key, UNKNOWN, eff.dispatches, now))
             if cur.rowcount != 1:
                 raise EffectInFlight(f"effect {key} changed during reconciliation")
             return load_effect(c, key)
 
     def _late_landing_excluded(self, eff: Effect, now: float) -> bool:
+        return self._exclusion_basis(eff, now) is not None
+
+    def _exclusion_basis(self, eff: Effect, now: float) -> str | None:
         """Only configuration-time trust counts: the C4 fence, or the contract
         RECORDED on the effect at first dispatch (identity AND digest) being
         present, unchanged, in this journal's trusted registry, with the
@@ -519,14 +535,16 @@ class EffectJournal:
         with no digest or first-dispatch time, or an expired window is not
         trusted."""
         if self._fenced(eff):
-            return True
+            return BASIS_FENCE
         contract = self._trusted.get(eff.connector) if eff.connector is not None else None
         if not (contract is not None and eff.connector_digest is not None
                 and hmac.compare_digest(contract.contract_digest, eff.connector_digest)):
-            return False
+            return None
         if not self._scope_unchanged(contract):
-            return False
-        return contract.idempotency_scope.covers_retry(eff.first_dispatched_at, now, self._margin)
+            return None
+        if contract.idempotency_scope.covers_retry(eff.first_dispatched_at, now, self._margin):
+            return BASIS_WINDOW
+        return None
 
     @staticmethod
     def _scope_unchanged(contract: ConnectorContract) -> bool:
@@ -580,6 +598,7 @@ class EffectJournal:
             raise ValueError("owner required")
         if not (isinstance(connector, str) and connector):
             raise ValueError("connector identity required")
+        explicit_now = now
         now = self._now(now)
         eff = self._require(key)
         if eff.status == SUCCEEDED:
@@ -598,24 +617,39 @@ class EffectJournal:
                                  " idempotency scope")
         if eff.status == UNKNOWN:
             self._refuse_if_in_flight(eff, now)
-            eff = self._reconcile(eff, reconcile, self._late_landing_excluded(eff, now), now)
+            eff = self._reconcile(eff, reconcile, self._exclusion_basis(eff, now), now)
             if eff.status == SUCCEEDED:
                 return eff
             if eff.status == UNKNOWN:
                 raise EffectOutcomeUnknown(
                     f"effect {key} outcome unknown; re-dispatch refused ({eff.last_error or 'unreconciled'})")
         eff.action()  # integrity check BEFORE anything is dispatched
+        lapsed = False
+        with self.db.tx() as c:
+            # Time of the claim itself, not of entry or of a (possibly slow)
+            # reconcile: a window-based FAILED is only as good as right now.
+            now = self._now(explicit_now)
+            eff = load_effect(c, key)
+            if eff.status == FAILED and eff.failed_basis not in (BASIS_DEFINITE, BASIS_FENCE) \
+                    and self._exclusion_basis(eff, now) is None:
+                c.execute("UPDATE effects SET status=?, failed_basis=NULL, last_error=?, updated_at=?"
+                          " WHERE idempotency_key=? AND status=? AND dispatches=?",
+                          (UNKNOWN, WINDOW_LAPSED, now, key, FAILED, eff.dispatches))
+                lapsed = True
+        if lapsed:
+            raise EffectOutcomeUnknown(f"effect {key}: {WINDOW_LAPSED}")
         with self.db.tx() as c:
             cur = c.execute("UPDATE effects SET status=?, dispatches=dispatches+1,"
-                            " in_flight_owner=?, in_flight_until=?, updated_at=?,"
+                            " in_flight_owner=?, in_flight_until=?, updated_at=?, failed_basis=NULL,"
                             " first_dispatched_at=COALESCE(first_dispatched_at, ?),"
                             " connector_digest=CASE WHEN connector IS NULL THEN ?"
                             " ELSE connector_digest END,"
                             " connector=COALESCE(connector, ?)"
                             " WHERE idempotency_key=? AND status IN (?,?) AND dispatches=?"
-                            " AND (connector IS NULL OR connector=?)",
+                            " AND (connector IS NULL OR connector=?)"
+                            " AND failed_basis IS ?",
                             (UNKNOWN, owner, now + self._dispatch_timeout, now, now, digest, connector,
-                             key, PENDING, FAILED, eff.dispatches, connector))
+                             key, PENDING, FAILED, eff.dispatches, connector, eff.failed_basis))
             if cur.rowcount != 1:
                 raise EffectInFlight(f"effect {key} was claimed by another dispatcher")
             eff = load_effect(c, key)
@@ -623,20 +657,20 @@ class EffectJournal:
         try:
             result = perform(eff)
         except EffectFailed as exc:
-            return self._settle(eff, FAILED, None, repr(exc), now)
+            return self._settle(eff, FAILED, None, repr(exc), now, basis=BASIS_DEFINITE)
         except Exception as exc:
             self._settle(eff, UNKNOWN, None, f"ambiguous: {exc!r}", now)
             raise EffectOutcomeUnknown(f"effect {key} outcome unknown after {exc!r}") from exc
         return self._settle(eff, SUCCEEDED, result, None, now)
 
     def _settle(self, eff: Effect, status: str, result: Any, error: str | None,
-                now: float) -> Effect:
+                now: float, basis: str | None = None) -> Effect:
         blob = json.dumps(result, sort_keys=True) if result is not None else None
         with self.db.tx() as c:
             c.execute("UPDATE effects SET status=?, result=?, last_error=?, in_flight_owner=NULL,"
-                      " in_flight_until=NULL, updated_at=?"
+                      " in_flight_until=NULL, updated_at=?, failed_basis=?"
                       " WHERE idempotency_key=? AND dispatches=? AND in_flight_owner=?",
-                      (status, blob, error, now, eff.idempotency_key,
+                      (status, blob, error, now, basis, eff.idempotency_key,
                        eff.dispatches, eff.in_flight_owner))
             return load_effect(c, eff.idempotency_key)
 

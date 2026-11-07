@@ -32,6 +32,8 @@ from runtime import (DONE, ESCALATED, FAILED, QUEUED, RUNNING, WAITING_APPROVAL,
 from runtime import (AdapterVerificationError, IdempotencyScope, adapter_artifact_digest,  # noqa: E402
                      current_idempotency_scope)
 from runtime._contract import ApprovalRefused, BoundAction  # noqa: E402
+from runtime.db import SCHEMA_VERSION  # noqa: E402
+import runtime.effects as runtime_effects  # noqa: E402
 
 T = 1_800_000_000.0
 CONN = "fake.external"      # plain connector: no idempotency guarantee
@@ -709,7 +711,7 @@ class ContractRotation(_EffectFixture):
         b.calls = 1
         journal = self._journal(b.perform)            # opening it migrates to c2.v2
         with _sql(self.db) as c:
-            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v3")
+            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], SCHEMA_VERSION)
         eff = journal.get(self.key)
         self.assertEqual((eff.status, eff.connector, eff.connector_digest), ("unknown", DEDUPE, None))
         self._restart_refused(journal, b)
@@ -1179,10 +1181,130 @@ class RetentionWindow(_EffectFixture):
             c.execute("UPDATE meta SET value='c2.v2' WHERE key='schema'")
         Database(self.db)
         with _sql(self.db) as c:
-            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v3")
+            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], SCHEMA_VERSION)
             cols = [r[1] for r in c.execute("PRAGMA table_info(effects)")]
         self.assertIn("first_dispatched_at", cols)
         self.assertIsNone(self.journal.get(self.key).first_dispatched_at)
+
+
+# -- persisted FAILED verdicts must be re-proven (Dolores review of b55df07) -
+class FailedVerdictReproof(_EffectFixture):
+    """A FAILED verdict accepted on the trusted-window basis is not timeless:
+    every dispatch claim re-runs the full check at the claim's own time."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = WindowedProvider(os.path.join(self.tmp.name, "fv.sqlite"), 100, 5)
+        self.scope = IdempotencyScope("fake-windowed", "acct-1", "e", "per-key", "1", 100, "d" * 64,
+                                      enforced_request_lifetime_s=5)
+        self.clock = [1000.0]
+
+    def _journal(self, fence=None, clock=None):
+        a = WindowedAdapter(self.provider, self.clock, self.scope)
+        kw = {"fence": fence} if fence else {}
+        if clock:
+            kw["clock"] = clock
+        return a, EffectJournal(self.db, retention_margin_s=0, trusted_idempotent=TrustedIdempotentRegistry(
+            [ConnectorContract(DEDUPE, a.perform, "c", adapter_artifact_digest(a.perform), self.scope)]), **kw)
+
+    def _ambiguous_then_reconciled(self, journal=None):
+        a, j = journal or self._journal()
+        a.stall = True                                     # original leaves at t1000, times out
+        with self.assertRaises(EffectOutcomeUnknown):
+            j.execute(self.key, a.perform, self.provider.reconcile, owner="A", connector=DEDUPE, now=1000.0)
+        eff = j.reconcile(self.key, self.provider.reconcile, now=1001.0)   # inside the window
+        self.assertEqual((eff.status, eff.failed_basis), ("failed", "window"))
+        return a, j
+
+    def _retry(self, j, a, at):
+        self.clock[0] = at
+        return j.execute(self.key, a.perform, self.provider.reconcile, owner="B", connector=DEDUPE, now=at)
+
+    def test_dolores_repro_late_original_then_outside_window_refused(self):
+        a, j = self._ambiguous_then_reconciled()
+        self.assertEqual(self.provider.deliver(self.key, 1000.0, 1004.0), "applied")   # original lands
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "window"):
+            self._retry(j, a, 1200.0)
+        eff = j.get(self.key)
+        self.assertEqual((eff.status, eff.failed_basis, eff.dispatches), ("unknown", None, 1))
+        self.assertEqual(self.provider.applications(self.key), [1004.0])            # once, not twice
+
+    def test_restart_after_reconcile_outside_window_refused(self):
+        self._ambiguous_then_reconciled()
+        b, j2 = self._journal()                                                      # process restart
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "window"):
+            self._retry(j2, b, 1200.0)
+        self.assertEqual(j2.get(self.key).status, "unknown")
+        self.assertEqual(self.provider.applications(self.key), [])
+
+    def test_in_window_positive_control(self):
+        a, j = self._ambiguous_then_reconciled()
+        self.provider.deliver(self.key, 1000.0, 1004.0)                              # original lands
+        out = self._retry(j, a, 1050.0)                    # 100 >= 5 + 50: still provable
+        self.assertEqual((out.status, out.dispatches), ("succeeded", 2))
+        self.assertEqual(self.provider.applications(self.key), [1004.0])            # retry deduped
+
+    def test_claim_time_not_entry_time_is_checked(self):
+        t = [1001.0]
+        a, j = self._ambiguous_then_reconciled(self._journal(clock=lambda: t[0]))
+
+        def slow_reconcile(effect):                        # not consulted: the row is already FAILED
+            return "failed"
+        # Entry reads the clock at t1001; the claim happens at t1200 (a slow caller in between).
+        orig_load = runtime_effects.load_effect
+
+        def late_load(c, key):
+            t[0] = 1200.0
+            return orig_load(c, key)
+        runtime_effects.load_effect = late_load
+        try:
+            with self.assertRaisesRegex(EffectOutcomeUnknown, "window"):
+                j.execute(self.key, a.perform, slow_reconcile, owner="B", connector=DEDUPE)
+        finally:
+            runtime_effects.load_effect = orig_load
+        self.assertEqual(self.provider.applications(self.key), [])
+
+    def test_slow_reconcile_in_unknown_path_checked_at_claim(self):
+        t = [1000.0]
+        a, j = self._journal(clock=lambda: t[0])
+        a.stall = True
+        with self.assertRaises(EffectOutcomeUnknown):
+            j.execute(self.key, a.perform, self.provider.reconcile, owner="A", connector=DEDUPE)
+        t[0] = 1001.0                                      # inside the window at entry...
+
+        def slow_reconcile(effect):
+            t[0] = 1200.0                                  # ...but the read takes until t1200
+            return "failed"
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "window"):
+            j.execute(self.key, a.perform, slow_reconcile, owner="B", connector=DEDUPE)
+        self.assertEqual((j.get(self.key).status, self.provider.applications(self.key)), ("unknown", []))
+
+    def test_fence_based_failed_keeps_current_behaviour(self):
+        a, j = self._journal(fence=lambda e: True)
+        a.stall = True
+        with self.assertRaises(EffectOutcomeUnknown):
+            j.execute(self.key, a.perform, self.provider.reconcile, owner="A", connector=DEDUPE, now=1000.0)
+        self.assertEqual(j.reconcile(self.key, self.provider.reconcile, now=1001.0).failed_basis, "fence")
+        out = self._retry(j, a, 1200.0)                    # fenced: no window re-check
+        self.assertEqual(out.status, "succeeded")
+
+    def test_definite_failure_needs_no_window(self):
+        def reject(effect):
+            raise EffectFailed("422 invalid recipient")   # provider rejected: never applies
+        out = self.journal.execute(self.key, reject, self.provider.reconcile, owner="A", connector=CONN, now=1000.0)
+        self.assertEqual((out.status, out.failed_basis), ("failed", "definite"))
+        out = self.journal.execute(self.key, self.ext.perform, self.ext.reconcile, owner="A",
+                                   connector=CONN, now=99_999.0)
+        self.assertEqual(out.status, "succeeded")
+
+    def test_migrated_failed_row_without_basis_is_reproven(self):
+        self._ambiguous_then_reconciled()
+        with _sql(self.db) as c:                           # as for a FAILED row migrated from c2.v3
+            c.execute("UPDATE effects SET failed_basis=NULL")
+        b, j2 = self._journal()
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "window"):
+            self._retry(j2, b, 1200.0)
+        self.assertEqual(self.provider.applications(self.key), [])
 
 
 # -- escalation ---------------------------------------------------------------

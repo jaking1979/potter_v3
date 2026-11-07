@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = "c2.v3"
+SCHEMA_VERSION = "c2.v4"
 
 # In-place upgrades of an existing journal, keyed by the stored version.
 # Upgraded rows carry no contract digest and no first-dispatch time, so they
@@ -26,10 +26,12 @@ SCHEMA_VERSION = "c2.v3"
 _CONNECTOR = ("effects", "connector", "TEXT")
 _DIGEST = ("effects", "connector_digest", "TEXT")
 _FIRST = ("effects", "first_dispatched_at", "REAL")
+_BASIS = ("effects", "failed_basis", "TEXT")   # NULL on a migrated FAILED row => re-checked
 MIGRATIONS = {
-    "c2.v0": (_CONNECTOR, _DIGEST, _FIRST),
-    "c2.v1": (_DIGEST, _FIRST),
-    "c2.v2": (_FIRST,),
+    "c2.v0": (_CONNECTOR, _DIGEST, _FIRST, _BASIS),
+    "c2.v1": (_DIGEST, _FIRST, _BASIS),
+    "c2.v2": (_FIRST, _BASIS),
+    "c2.v3": (_BASIS,),
 }
 
 SCHEMA = (
@@ -78,6 +80,7 @@ SCHEMA = (
         connector TEXT,
         connector_digest TEXT,
         first_dispatched_at REAL,
+        failed_basis TEXT,
         UNIQUE (task_id, effect_id))""",
     "CREATE INDEX IF NOT EXISTS effects_status ON effects (status)",
     """CREATE TABLE IF NOT EXISTS approval_nonces (
