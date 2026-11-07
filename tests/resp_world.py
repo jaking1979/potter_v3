@@ -7,6 +7,7 @@ import sqlite3
 import sys
 from contextlib import closing, contextmanager
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,7 +16,7 @@ if str(ROOT) not in sys.path:
 
 from identity.seed import JOSH  # noqa: E402
 from notifier import (ApprovalIssuer, ChannelAuth, CommandRouter, FakeChannel,  # noqa: E402
-                      HmacIssuerKey, InboundMessage, Notifier)
+                      HmacIssuerKey, Notifier, TransportSigner)
 from policy import Capability, CapabilityRegistry, PolicyEngine, RiskClass  # noqa: E402
 from policy._contracts import approval as c0  # noqa: E402
 from responsibilities import (Connector, Event, Responsibility, ResponsibilityRunner,  # noqa: E402
@@ -25,6 +26,9 @@ from runtime import Database, EffectFailed, EffectJournal, JournalApprovalLedger
 T0 = 1_800_000_000.0
 TEST_KEY = b"test-only-e2-issuer-key"          # test constant, not a secret
 TG_JOSH = "tg-1001"
+# Test-only adapter keys (E1 transport auth); not secrets.
+TRANSPORT_KEYS = {"telegram": b"test-only-e2-telegram-adapter",
+                  "email": b"test-only-e2-email-adapter-key"}
 R = RiskClass
 CAPS = (Capability("notes.append", R.REVERSIBLE_WRITE, False, False),
         Capability("bills.lookup", R.READ, False, False),
@@ -145,7 +149,9 @@ class World:
         self.db = Database(tmp / "potter.db")
         self.ext = FakeExternal(tmp / "external.db")
         self.tg, self.email = FakeChannel("telegram"), FakeChannel("email")
-        self.auth = ChannelAuth(inbound_bindings={"telegram": {TG_JOSH: JOSH}},
+        self.signer = TransportSigner("telegram", TRANSPORT_KEYS["telegram"])
+        self.auth = ChannelAuth(db=self.db, transport_keys=TRANSPORT_KEYS, clock=self.clock,
+                                inbound_bindings={"telegram": {TG_JOSH: JOSH}},
                                 outbound_addresses={JOSH: {"telegram": "chat-1001",
                                                            "email": "josh@example.test"}})
         self.notifier = Notifier(self.db, channels={"telegram": self.tg, "email": self.email},
@@ -169,7 +175,11 @@ class World:
                                     live_action=self.runner.live_action, clock=self.clock)
 
     def say(self, text: str):
-        return self.router.handle(InboundMessage("telegram", TG_JOSH, text), self.clock())
+        # A trusted Telegram adapter's signed envelope; update ids are unique
+        # across World instances sharing one database (restart tests).
+        msg = self.signer.envelope(TG_JOSH, text, update_id=f"u-{uuid.uuid4().hex}",
+                                   sent_at=self.clock())
+        return self.router.handle(msg, self.clock())
 
     def outbox_ids(self) -> list[str]:
         with self.db.read() as c:
