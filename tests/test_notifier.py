@@ -737,6 +737,158 @@ class StopAckFallback(Base):
         self.assertEqual(self.w.tg.delivered, [])
 
 
+# ============================================================ review regressions (Dolores, #28)
+
+class HandleIsolation(Base):
+    """A job holding a handle cannot reach a channel (Dolores finding 1)."""
+    DOLORES = "handle._n._channels['telegram'].send(msg)"
+
+    def _queued_msg(self):
+        self.w.job_notify("digest", "d1", "x")
+        return self.w.notifier.outbox.get("job:digest:d1:telegram")
+
+    def test_dolores_snippet_is_impossible_and_flagged(self):
+        handle = self.w.notifier.handle_for(JobSpec("digest", "josh"))
+        msg = self._queued_msg()
+        with self.assertRaises(AttributeError):
+            exec(self.DOLORES, {"handle": handle, "msg": msg})
+        work = handle.long_work("w1", T)
+        with self.assertRaises(AttributeError):
+            exec(self.DOLORES.replace("handle", "work"), {"work": work, "msg": msg})
+        self.assertEqual(self.w.tg.calls, 0)
+        rules = [f.rule for f in lint.scan_source(self.DOLORES, "jobs/x.py", exempt=False)]
+        self.assertIn("direct send: .send()", rules)
+        self.assertIn("private reach-through: ._n", rules)
+        self.assertIn("private reach-through: ._channels", rules)
+
+    def test_no_notifier_or_channel_reachable_from_handle_data(self):
+        import gc
+        import types
+        from notifier import ChannelAuth as CA, Notifier as N
+        from runtime import Outbox
+        handle = self.w.notifier.handle_for(JobSpec("digest", "josh"))
+        forbidden = (N, FakeChannel, CA, Outbox)
+        skip = (type, types.FunctionType, types.ModuleType, types.BuiltinFunctionType)
+        for root in (handle, handle.long_work("w1", T)):
+            seen, frontier = set(), [root]
+            for _ in range(5):                 # instance data, 5 hops deep
+                nxt = []
+                for obj in frontier:
+                    for ref in gc.get_referents(obj):
+                        if id(ref) in seen or isinstance(ref, skip):
+                            continue
+                        seen.add(id(ref))
+                        self.assertNotIsInstance(ref, forbidden, f"{type(root).__name__} leaks")
+                        nxt.append(ref)
+                frontier = nxt
+        self.assertFalse(hasattr(handle, "_n"))
+        with self.assertRaises(TypeError):
+            import pickle
+            pickle.dumps(handle)
+
+    def test_lint_flags_other_reach_through_paths(self):
+        cases = {
+            "getattr(handle, '_n')": "dynamic getattr()",
+            "getattr(handle, name)": "dynamic getattr()",
+            "vars(handle)": "vars()",
+            "type(handle).notify.__globals__['_HANDLES']": ".__globals__",
+            "import gc\ngc.get_referents(handle)": "introspection import: gc",
+            "from inspect import getclosurevars": "introspection import: inspect",
+            "handle.notify.__func__.__closure__": ".__closure__",
+            "from notifier.service import _resolve": "direct channel path",
+        }
+        for src, needle in cases.items():
+            with self.subTest(src=src):
+                rules = [f.rule for f in lint.scan_source(src, "jobs/x.py", exempt=False)]
+                self.assertTrue(any(needle in r for r in rules), rules)
+        ok = "handle.notify(tx, 'k', kind='alert', text='t')\nself._auth = 1"
+        self.assertEqual(lint.scan_source(ok, "jobs/x.py", exempt=False), [])
+
+
+class StopSendRace(Base):
+    """Dolores finding 2: no send may start after stop() has returned."""
+
+    def setUp(self):
+        super().setUp()
+        import threading
+        self.threading = threading
+        self.paused, self.resume = threading.Event(), threading.Event()
+
+    def _pause_once(self, msg):
+        if msg.notification_id == "job:digest:d1" and not self.paused.is_set():
+            self.paused.set()
+            self.assertTrue(self.resume.wait(10))
+
+    def _run_in_thread(self):
+        errors = []
+
+        def target():
+            try:
+                self.w.notifier.run()
+            except BaseException as e:      # surfaced by the test
+                errors.append(e)
+        t = self.threading.Thread(target=target)
+        t.start()
+        self.assertTrue(self.paused.wait(10))
+        return t, errors
+
+    def test_paused_after_check_then_stop_returns_then_resume_no_send(self):
+        # Pause where the old code had already passed its kill check.
+        self.w.notifier._hook_before_gate = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        worker, errors = self._run_in_thread()
+        res = self.w.router.handle(self.w.tg_msg("/stop"))      # returns while paused
+        self.assertEqual(res.outcome, "stopped")
+        self.assertEqual(res.detail.unconfirmed_in_flight, ())
+        self.resume.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertNotIn("job:digest:d1", self.w.tg.delivered_notifications())
+        self.assertEqual([m.body["kind"] for m in self.w.tg.delivered], ["stop_ack"])
+
+    def test_send_past_the_gate_completes_before_stop_returns(self):
+        self.w.notifier._hook_after_gate = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        self.w.job_notify("digest", "d2", "y")
+        worker, errors = self._run_in_thread()
+        order, stop_result = [], []
+        self.w.tg.on_send = lambda m: order.append(("send", m.notification_id))
+
+        def do_stop():
+            stop_result.append(self.w.router.handle(self.w.tg_msg("/stop")))
+            order.append(("stop_returned", None))
+        stopper = self.threading.Thread(target=do_stop)
+        stopper.start()
+        stopper.join(0.3)
+        self.assertTrue(stopper.is_alive(), "stop() must wait for the send past the gate")
+        self.resume.set()
+        stopper.join(10)
+        worker.join(10)
+        self.assertEqual(errors, [])
+        # The /stop confirmation is the one permitted send and may land at any
+        # point after the flag is set; ignore it when checking the boundary.
+        events = [e for e in order if not (e[0] == "send" and e[1].startswith("stop:"))]
+        self.assertEqual(events, [("send", "job:digest:d1"), ("stop_returned", None)])
+        self.assertIn("stop_ack", [m.body["kind"] for m in self.w.tg.delivered])
+        self.assertNotIn("job:digest:d2", self.w.tg.delivered_notifications())
+        with self.w.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM notifier_sending").fetchone()[0], 0)
+
+    def test_dead_sender_row_does_not_block_stop_forever(self):
+        with self.w.db.tx() as c:
+            c.execute("INSERT INTO notifier_sending VALUES ('ghost:telegram', 'dead', ?)",
+                      (self.w.now - 10,))
+        quick = self.w.make_notifier(stop_wait_s=0.05)
+        sender = self.w.auth.authenticate(self.w.tg_msg("/stop")).sender
+        report = quick.stop(sender)
+        self.assertEqual(report.unconfirmed_in_flight, ("ghost:telegram",))
+        with self.w.db.tx() as c:
+            c.execute("UPDATE notifier_sending SET since=?", (self.w.now - 3600,))
+        self.assertEqual(quick.stop(self.w.auth.authenticate(
+            self.w.tg_msg("/stop")).sender).unconfirmed_in_flight, ())   # aged out
+
+
 # ============================================================ long work (item 5)
 
 class LongWorkUpdates(Base):

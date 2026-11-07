@@ -8,6 +8,14 @@ Python code may not:
   ``runtime.outbox``) or call ``.relay(`` - that is the send path;
 * import the ``Notifier`` service itself (jobs get a ``JobHandle``; only the
   future C8 wiring module, passed in ``allow``, may build one);
+* reach through a handle into notifier internals: attribute access to
+  ``_n``, ``_hid``, ``_channels``, ``_outbox``, ``_auth``, ``_HANDLES``,
+  ``_resolve``, ``__dict__``, ``__closure__``, ``__globals__``, ``__self__``,
+  ``__func__``, ``__code__``, ``cell_contents``, ``f_globals``/``f_locals``,
+  ``get_referents``/``get_referrers``/``get_objects`` (except on ``self`` /
+  ``cls``); any ``.send(`` call;
+  ``vars()``; ``getattr``/``setattr``/``delattr`` with a dynamic name or a
+  ``_``-prefixed literal; importing ``gc``, ``inspect`` or ``ctypes``;
 * import a network or mail client (``smtplib``, ``urllib.request``,
   ``http.client``, ``requests``, ``httpx``, ``aiohttp``, ``telegram``,
   ``telebot``, ``socket``). These are refused everywhere, ``notifier/``
@@ -28,6 +36,11 @@ OUTBOX_NAMES = frozenset({"Outbox", "OutboxMessage", "SendFailed"})
 NETWORK = frozenset({"smtplib", "urllib.request", "http.client", "requests", "httpx", "aiohttp",
                      "telegram", "telebot", "socket"})
 EXEMPT_DIRS = ("notifier", "runtime", "tests", ".git")
+REACH_ATTRS = frozenset({"_n", "_hid", "_channels", "_outbox", "_auth", "_HANDLES", "_resolve",
+                         "__dict__", "__closure__", "__globals__", "__self__", "__func__",
+                         "__code__", "cell_contents", "f_globals", "f_locals",
+                         "get_referents", "get_referrers", "get_objects"})
+INTROSPECTION = frozenset({"gc", "inspect", "ctypes"})
 
 
 @dataclass(frozen=True)
@@ -52,6 +65,8 @@ def scan_source(src: str, path: str, *, exempt: bool) -> list[Finding]:
                 elif not exempt and a.name in ("notifier.channels", "runtime.outbox",
                                                "notifier.service"):
                     out.append(Finding(path, node.lineno, f"direct channel path: {a.name}"))
+                elif not exempt and a.name.split(".")[0] in INTROSPECTION:
+                    out.append(Finding(path, node.lineno, f"introspection import: {a.name}"))
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             names = {a.name for a in node.names}
@@ -59,15 +74,32 @@ def scan_source(src: str, path: str, *, exempt: bool) -> list[Finding]:
                 out.append(Finding(path, node.lineno, f"network client import: {mod}"))
             if exempt:
                 continue
+            if mod.split(".")[0] in INTROSPECTION:
+                out.append(Finding(path, node.lineno, f"introspection import: {mod}"))
             if mod in ("notifier.channels", "runtime.outbox", "notifier.service") or (
                     mod == "notifier" and names & ({"channels", "service", "Notifier"}
                                                    | CHANNEL_NAMES)) or (
                     mod == "runtime" and names & (OUTBOX_NAMES | {"outbox"})):
                 out.append(Finding(path, node.lineno, f"direct channel path: from {mod}"))
-        elif not exempt and isinstance(node, ast.Call):
+        elif (not exempt and isinstance(node, ast.Attribute) and node.attr in REACH_ATTRS
+              and not (isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"))):
+            # A class using its own private attributes is fine; reaching into
+            # another object's (a handle, a notifier) is not.
+            out.append(Finding(path, node.lineno, f"private reach-through: .{node.attr}"))
+        if not exempt and isinstance(node, ast.Call):
             f = node.func
             if isinstance(f, ast.Attribute) and f.attr == "relay":
                 out.append(Finding(path, node.lineno, "direct send: .relay()"))
+            if isinstance(f, ast.Attribute) and f.attr == "send":
+                out.append(Finding(path, node.lineno, "direct send: .send()"))
+            if isinstance(f, ast.Name) and f.id == "vars":
+                out.append(Finding(path, node.lineno, "private reach-through: vars()"))
+            if isinstance(f, ast.Name) and f.id in ("getattr", "setattr", "delattr"):
+                name = node.args[1] if len(node.args) > 1 else None
+                literal = isinstance(name, ast.Constant) and isinstance(name.value, str)
+                if not literal or name.value.startswith("_"):
+                    out.append(Finding(path, node.lineno,
+                                       f"private reach-through: dynamic {f.id}()"))
             if isinstance(f, ast.Name) and f.id in OUTBOX_NAMES | {"FakeChannel", "Notifier"}:
                 out.append(Finding(path, node.lineno, f"direct channel path: {f.id}()"))
     return out

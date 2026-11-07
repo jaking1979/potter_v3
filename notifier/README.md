@@ -10,13 +10,16 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
 | `router.py` | `CommandRouter`: handles `/stop`, `/ack`, `/approve`, `/deny`. Senders who aren't authenticated or allowlisted are ignored and logged to `inbound_log`; the log never stores message text. |
 | `kill.py` | `KillFlag`: a durable global flag in the shared SQLite file. Only an explicit `clear()` resets it. |
 | `channels.py` | The `Channel` interface (`send`, `reconcile`, `probe`), `InboundMessage` and `FakeChannel`. |
-| `lint.py` | Structural check: no direct channel use outside `notifier/`. Run it with `python3 -m notifier.lint .`. |
+| `lint.py` | Structural check: no direct channel use and no reach-through into notifier internals outside `notifier/`. Run it with `python3 -m notifier.lint .`. |
 | `traces.py` | Emits C6 `DecisionTrace` records for issue, decide and send. The records are redaction-safe. |
 | `_schema.py` | The `notifier_state`, `approval_requests` and `inbound_log` tables, pinned by `meta.notifier_schema=e1.v0`. |
 
 ## T19 PASS 2 mapping
 
-1. **One notifier.** Jobs get a `JobHandle`, which can only enqueue and has no send or channel API. Every job declares `JobSpec(name, delivery="josh"|"silent")`. `lint.py` fails on any import of a channel, the outbox or a network client, and on any `.relay()` call, outside `notifier/` and `runtime/`. Network clients are refused everywhere.
+1. **One notifier.** Every job declares `JobSpec(name, delivery="josh"|"silent")` and gets a `JobHandle`, which can only enqueue.
+   - The handle, and any `LongWork` it returns, holds only an opaque handle ID, the job name and the silent flag. The notifier, outbox and channels are resolved from a private registry on each call, so no attribute chain on the handle's data leads to a channel. A test walks the handle's references to prove this, and Dolores's `handle._n._channels['telegram'].send(msg)` now raises `AttributeError`.
+   - `lint.py` fails, outside `notifier/` and `runtime/`, on: imports of a channel, the outbox, the notifier service or a network client; `.relay()` and `.send()` calls; reach-through attributes (`_n`, `_hid`, `_channels`, `__dict__`, `__closure__`, `__globals__`, `cell_contents`, `get_referents` and similar, except on `self`/`cls`); `vars()`; `getattr`/`setattr`/`delattr` with a dynamic or `_`-prefixed name; and imports of `gc`, `inspect` or `ctypes`. Network clients are refused everywhere.
+   - **Honest boundary:** in-process Python cannot be a hard isolation boundary. Code in the same interpreter can always reach the private registry or the channels through some route a lint doesn't anticipate. The handle design and the lint are defence in depth. Hard enforcement is the runtime/process boundary in C8: jobs run where the notifier's channels and credentials don't exist. So the T19 release test "a job sending directly fails" holds for jobs written against the handle API and checked by the lint; it is not a claim about hostile code inside the notifier's process.
 2. **Identity.** The allowlist is `human:josh`. `human:christie` is listed but disabled in the C5 seed, so she is ignored. Everyone else is ignored and logged.
 3. **Delivery IDs, unknown outcomes and acks.**
    - The outbox row (`<notification_id>:<channel>`) is committed before any send.
@@ -29,7 +32,9 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
    - A reply counts only if its channel authenticates Josh. See the note on email below.
 5. **Long work.** One acknowledgement once work runs past 30 s, an update only when the state changes, and a final message with the receipt link. Progress is read back from the outbox on every tick, so update numbering and the last-told state survive a restart.
 6. **`/stop`.** One transaction sets the kill flag, marks every `pending`/`unknown` outbox row `suppressed`, cancels pending approvals, and enqueues a reply that lists what was cancelled.
-   - A send already in flight completes. C3 records its delivery, but the row stays suppressed, so nothing follows it.
+   - **Boundary:** every send passes a gate that checks the kill flag and records the send in `notifier_sending`, in one `BEGIN IMMEDIATE` transaction. `stop()` sets the flag under the same write lock and then waits until every recorded send has returned. So a send already past the gate may complete, and does so before `stop()` returns. No send that has not passed the gate can start after `stop()` returns; the only exception is the `/stop` confirmation itself. C3 records the completed delivery, but the row stays suppressed, so nothing follows it.
+   - A row older than the dispatch timeout (from a dead process) isn't waited for. It is reported in `StopReport.unconfirmed_in_flight`, and `stop_wait_s` (default 30 s) caps the wait.
+   - The gate is shared through the SQLite file, so it holds across threads and processes. Tests pause a worker deterministically before the gate (stop returns, the worker resumes, nothing is sent) and after the gate (stop blocks until the send returns).
    - New enqueues, approval requests and decisions all raise or refuse.
 7. **Outage.**
    - Three consecutive primary failures, whether definite or ambiguous, mark Telegram down.

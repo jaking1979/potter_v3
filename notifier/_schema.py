@@ -6,6 +6,8 @@
                           issuance in C2's database so each request is
                           answered at most once (single use), and stores the
                           exact canonical BoundAction it was raised for.
+* ``notifier_sending``  - sends past the kill gate and not yet returned
+                          (the /stop in-flight boundary, see service.py).
 * ``inbound_log``       - commands that were ignored (non-allowlisted or
                           unauthenticated senders). Sender reference and
                           reason only; message text is never stored.
@@ -45,6 +47,14 @@ SCHEMA = (
         status_reason TEXT,
         record TEXT)""",
     "CREATE INDEX IF NOT EXISTS approval_requests_task ON approval_requests (task_id, status)",
+    # One row per send that has passed the kill gate and not yet returned.
+    # Inserted in the same BEGIN IMMEDIATE transaction as the kill check, so
+    # stop() (which sets the flag under the same write lock) sees every send
+    # that got past the gate and waits for it before returning.
+    """CREATE TABLE IF NOT EXISTS notifier_sending (
+        message_id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        since REAL NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS inbound_log (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         at REAL NOT NULL,
