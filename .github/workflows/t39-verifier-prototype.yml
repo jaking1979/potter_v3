@@ -1,0 +1,17 @@
+name: T39 verifier offline prototype
+on:
+  pull_request:
+    paths:
+      - 'experiments/t39_verifier/**'
+      - 't39/**'
+      - '.github/workflows/t39-verifier-prototype.yml'
+permissions:
+  contents: read
+jobs:
+  synthetic-signatures:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test with ephemeral Ed25519 keys
+        working-directory: experiments/t39_verifier
+        run: PYTHONPATH=../.. python3 -m unittest -v test_verify_pair
