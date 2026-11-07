@@ -7,6 +7,7 @@ revalidation, before relying on retrieved context for consequential work.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from typing import Protocol, Sequence
@@ -65,6 +66,15 @@ async def _bounded(backend: Backend, query: str, timeout: float):
         raise
 
 
+def _positive_finite_duration(value):
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and value > 0
+    except OverflowError:
+        return False
+
+
 async def retrieve_turn(backend: Backend, query: str, *, consequential: bool,
                         timeout: float = 2.0) -> TurnResult:
     """Advisory timeouts expose no late results; consequential misses block.
@@ -72,7 +82,7 @@ async def retrieve_turn(backend: Backend, query: str, *, consequential: bool,
     Consequential work remains blocked even after a successful simulated search:
     canonical revalidation and policy integration are not implemented here.
     """
-    if not isinstance(consequential, bool) or timeout <= 0:
+    if not isinstance(consequential, bool) or not _positive_finite_duration(timeout):
         raise ValueError('invalid mode or timeout')
     from retrieval.isolated import SyntheticProcessBackend
     if isinstance(backend, SyntheticProcessBackend) and timeout > 2.0:
@@ -96,7 +106,7 @@ async def benchmark(backend: Backend, query: str, expected_ids: Sequence[str], *
     expected = tuple(expected_ids)
     if (not 1 <= len(expected) <= 3 or len(set(expected)) != len(expected)
             or any(not isinstance(i, str) or not i for i in expected)
-            or production_deadline <= 0 or timeout <= 0):
+            or not _positive_finite_duration(production_deadline) or not _positive_finite_duration(timeout)):
         raise ValueError('invalid evidence set or deadline')
     status, items, elapsed = await _bounded(backend, query, timeout)
     ids = tuple(i.item_id for i in items)

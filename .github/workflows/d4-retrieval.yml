@@ -1,0 +1,25 @@
+name: d4-retrieval
+on:
+  pull_request:
+    paths:
+      - 'retrieval/**'
+      - 'tests/test_retrieval*.py'
+      - '.github/workflows/d4-retrieval.yml'
+permissions:
+  contents: read
+jobs:
+  synthetic-retrieval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        python: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Synthetic retrieval contract and process tests
+        run: python3 -m unittest discover -s tests -p 'test_retrieval*.py' -v
