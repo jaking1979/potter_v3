@@ -6,7 +6,7 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
 | --- | --- |
 | `service.py` | `Notifier`: `enqueue(tx, …)` writes to the C3 outbox in the caller's transaction. `run()` relays one claim at a time, re-checking the kill flag and primary health between messages. Also: outage fallback, `ack`, `stop`, `watchdog`, `JobSpec`/`JobHandle`, `LongWork`. |
 | `issuer.py` | `ApprovalIssuer`: `request(tx, BoundAction, …)` stores the action ID with the exact canonical action and a 24 h deadline, then enqueues the prompt. `decide(…)` signs a C0 `ApprovalRecord` with the injected issuer key, or refuses. |
-| `auth.py` | `ChannelAuth`: maps inbound senders to principals, enforces the allowlist, and applies each channel's own authentication: a Telegram user ID binding, email DKIM through an injected verifier, a Potter Home session through an injected verifier. |
+| `auth.py` | `ChannelAuth`: maps inbound senders to principals, enforces the allowlist, and applies each channel's own authentication: a Telegram user ID binding, email DKIM through an injected verifier, a Potter Home session through an injected verifier. Vouchers carry an unguessable token; `vouches()` accepts only the exact minted object with unchanged claims, and `consume()` retires one so it drives at most one approval decision. |
 | `router.py` | `CommandRouter`: handles `/stop`, `/ack`, `/approve`, `/deny`. Senders who aren't authenticated or allowlisted are ignored and logged to `inbound_log`; the log never stores message text. |
 | `kill.py` | `KillFlag`: a durable global flag in the shared SQLite file. Only an explicit `clear()` resets it. |
 | `channels.py` | The `Channel` interface (`send`, `reconcile`, `probe`), `InboundMessage` and `FakeChannel`. |
@@ -27,7 +27,7 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
    - An approval is refused 24 h after the request. The signed `expires_at` is that deadline, so the C1 window never extends past it.
    - An approval is voided when the live action's hash differs (a parameter or precondition changed), when the C2 task has left `waiting_approval`, or on `state_changed(task_id)`.
    - A reply counts only if its channel authenticates Josh. See the note on email below.
-5. **Long work.** One acknowledgement once work runs past 30 s, an update only when the state changes, and a final message with the receipt link. Message IDs are deterministic.
+5. **Long work.** One acknowledgement once work runs past 30 s, an update only when the state changes, and a final message with the receipt link. Progress is read back from the outbox on every tick, so update numbering and the last-told state survive a restart.
 6. **`/stop`.** One transaction sets the kill flag, marks every `pending`/`unknown` outbox row `suppressed`, cancels pending approvals, and enqueues a reply that lists what was cancelled.
    - A send already in flight completes. C3 records its delivery, but the row stays suppressed, so nothing follows it.
    - New enqueues, approval requests and decisions all raise or refuse.
@@ -35,7 +35,8 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
    - Three consecutive primary failures, whether definite or ambiguous, mark Telegram down.
    - While it is down, urgent notifications are copied to email. Routine ones are deferred: they make no attempts and burn no retries.
    - A `probe()` every `probe_interval_s` (60 s) ends the outage.
-   - `watchdog()` reports C3 `stale_backlog` older than 30 min and raises one urgent alert per 30-minute bucket.
+   - `watchdog()` reports C3 `stale_backlog` older than 30 min and raises one urgent alert per 30-minute bucket; a later change in the same bucket keeps the first alert.
+   - While stopped, outage handling still runs for the `/stop` confirmation only, so it falls back to email if Telegram is down.
 
 ## Known gaps / decisions for review
 

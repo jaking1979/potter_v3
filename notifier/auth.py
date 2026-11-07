@@ -11,13 +11,20 @@
     configured -> never authenticated.
   - ``potter_home``: the injected session verifier must confirm the session
     (passkey-backed). No verifier -> never authenticated.
-* ``AuthenticatedSender`` tokens are minted only here, and ``vouches`` lets
-  the issuer check a token came from this instance (a caller cannot construct
-  one to bypass authentication).
+* ``AuthenticatedSender`` vouchers are minted only here. Each carries an
+  unguessable token; this instance keeps the exact minted object and its
+  claims. ``vouches`` accepts only that same object with unchanged claims, so
+  a constructed lookalike, a ``dataclasses.replace`` copy (e.g. an email
+  voucher relabelled as Telegram) or a mutated voucher is refused.
+  ``consume`` additionally retires the voucher: an approval decision uses it
+  exactly once.
 """
 from __future__ import annotations
 
+import hmac
 import itertools
+import secrets
+import threading
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
@@ -36,6 +43,7 @@ class AuthenticatedSender:
     principal: str
     channel: str
     _serial: int = field(repr=False, compare=False, default=0)
+    _token: str = field(repr=False, compare=False, default="")
 
 
 @dataclass(frozen=True)
@@ -64,7 +72,9 @@ class ChannelAuth:
         self._dir = directory or seed_directory()
         self._allow = frozenset(allowlist)
         self._serials = itertools.count(1)
-        self._minted: set[int] = set()
+        # token -> (the exact minted object, its claims at mint time)
+        self._minted: dict[str, tuple[AuthenticatedSender, tuple[str, str, str]]] = {}
+        self._lock = threading.Lock()
 
     def authenticate(self, msg: InboundMessage) -> AuthResult:
         if not isinstance(msg, InboundMessage) or not msg.sender_ref:
@@ -88,8 +98,11 @@ class ChannelAuth:
         else:
             return AuthResult(None, "unknown_channel")
         serial = next(self._serials)
-        self._minted.add(serial)
-        return AuthResult(AuthenticatedSender(principal, msg.channel, serial), "ok")
+        token = secrets.token_hex(32)
+        sender = AuthenticatedSender(principal, msg.channel, serial, token)
+        with self._lock:
+            self._minted[token] = (sender, (principal, msg.channel, str(serial)))
+        return AuthResult(sender, "ok")
 
     @staticmethod
     def _verified(verifier: Verifier | None, msg: InboundMessage) -> bool:
@@ -100,8 +113,41 @@ class ChannelAuth:
         except Exception:
             return False
 
+    def _check(self, sender: object) -> str | None:
+        """Return the voucher's token if ``sender`` is exactly what was minted."""
+        if type(sender) is not AuthenticatedSender:
+            return None
+        token = sender._token
+        if not isinstance(token, str) or not token:
+            return None
+        entry = self._minted.get(token)
+        if entry is None:
+            return None
+        minted, (principal, channel, serial) = entry
+        if minted is not sender:
+            return None
+        claims = (sender.principal, sender.channel, str(sender._serial))
+        ok = True
+        for got, want in zip(claims, (principal, channel, serial)):
+            if not isinstance(got, str) or not hmac.compare_digest(got.encode(), want.encode()):
+                ok = False
+        if not hmac.compare_digest(token.encode(), sender._token.encode()):
+            ok = False
+        return token if ok else None
+
     def vouches(self, sender: object) -> bool:
-        return isinstance(sender, AuthenticatedSender) and sender._serial in self._minted
+        """True only for the exact voucher this instance minted, unmodified."""
+        with self._lock:
+            return self._check(sender) is not None
+
+    def consume(self, sender: object) -> bool:
+        """Like ``vouches``, then retire the voucher (single use for approvals)."""
+        with self._lock:
+            token = self._check(sender)
+            if token is None:
+                return False
+            del self._minted[token]
+            return True
 
     def address(self, principal: str, channel: str) -> str | None:
         return self._out.get(principal, {}).get(channel)
