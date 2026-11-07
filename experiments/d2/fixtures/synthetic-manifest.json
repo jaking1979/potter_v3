@@ -1,0 +1,1 @@
+{"capabilities":[{"class":"read","enabled":true,"name":"notes.read"},{"class":"voice","enabled":false,"name":"voice.call"},{"class":"host-write","enabled":false,"name":"host.write"}],"classes":[{"deferred":false,"name":"read"},{"deferred":true,"name":"voice"},{"deferred":true,"name":"host-write"}],"schema":"potter.d2.synthetic-manifest.v1","version":"fixture-1"}
