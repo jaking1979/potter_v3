@@ -40,6 +40,9 @@ def _drain(task: asyncio.Task) -> None:
 
 
 async def _bounded(backend: Backend, query: str, timeout: float):
+    from retrieval.isolated import SyntheticProcessBackend, bounded_search
+    if isinstance(backend, SyntheticProcessBackend):
+        return await bounded_search(backend, query, timeout)
     start = time.monotonic()
     task = asyncio.create_task(backend.search(query))
     try:
@@ -71,6 +74,9 @@ async def retrieve_turn(backend: Backend, query: str, *, consequential: bool,
     """
     if not isinstance(consequential, bool) or timeout <= 0:
         raise ValueError('invalid mode or timeout')
+    from retrieval.isolated import SyntheticProcessBackend
+    if isinstance(backend, SyntheticProcessBackend) and timeout > 2.0:
+        raise ValueError('isolated production deadline exceeds two seconds')
     status, items, elapsed = await _bounded(backend, query, timeout)
     return TurnResult(items, status, elapsed, consequential)
 
@@ -110,3 +116,4 @@ class FakeBackend:
         if self.error:
             raise RuntimeError('simulated outage')
         return self.items
+
