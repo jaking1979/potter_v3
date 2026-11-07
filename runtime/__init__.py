@@ -6,7 +6,8 @@ from .db import Database, JournalUnavailable
 from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_UNKNOWN,
                       SUCCEEDED, UNKNOWN, Effect, ConnectorContract, EffectConflict, EffectError, EffectFailed,
                       EffectInFlight, EffectJournal, EffectOutcomeUnknown, TrustedIdempotentRegistry,
-                      AdapterVerificationError, adapter_artifact_digest, adapter_name,
+                      AdapterVerificationError, IdempotencyScope, adapter_artifact_digest,
+                      adapter_name, current_idempotency_scope,
                       idempotency_key)
 from .tasks import (DONE, ESCALATE_AFTER, ESCALATED, FAILED, QUEUED, RUNNING, STATES,
                     TRANSITIONS, WAITING_APPROVAL, Escalation, InvalidTransition, Job,

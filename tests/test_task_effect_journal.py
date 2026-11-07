@@ -7,6 +7,7 @@ Offline only: the "external system" is a local SQLite file standing in for a
 connector that deduplicates on the idempotency key and counts applications.
 """
 import contextlib
+import hashlib
 import importlib.util
 import itertools
 import multiprocessing
@@ -28,7 +29,8 @@ from runtime import (DONE, ESCALATED, FAILED, QUEUED, RUNNING, WAITING_APPROVAL,
                      ConnectorContract, Database, EffectConflict, JournalUnavailable, TrustedIdempotentRegistry, EffectFailed, EffectInFlight, EffectJournal,
                      EffectOutcomeUnknown, InvalidTransition, JournalApprovalLedger, LeaseLost,
                      TaskStore, idempotency_key, task_id_for)
-from runtime import AdapterVerificationError, adapter_artifact_digest  # noqa: E402
+from runtime import (AdapterVerificationError, IdempotencyScope, adapter_artifact_digest,  # noqa: E402
+                     current_idempotency_scope)
 from runtime._contract import ApprovalRefused, BoundAction  # noqa: E402
 
 T = 1_800_000_000.0
@@ -43,6 +45,14 @@ def action(task_id, n=1):
 
 
 # -- fake external system ---------------------------------------------------
+def scope_for(account, endpoint):
+    cfg = hashlib.sha256(f"{account}|{endpoint}".encode()).hexdigest()
+    return IdempotencyScope("fake-provider", account, endpoint, "per-account-key", "1", 86_400, cfg)
+
+
+SCOPE = scope_for("acct-1", "sqlite://fixed")
+
+
 @contextlib.contextmanager
 def _sql(path):
     c = sqlite3.connect(path, timeout=30)
@@ -57,11 +67,16 @@ class External:
     """Counts how many times each idempotency key was applied (no dedupe on
     purpose, so any double execution is visible)."""
 
-    def __init__(self, path, stall=None, stall_after_apply=False):
+    def __init__(self, path, stall=None, stall_after_apply=False, account="acct-1"):
         self.path = str(path)
+        self.account = account
         self.stall, self.stall_after_apply = stall, stall_after_apply   # (started, go) events
         with _sql(self.path) as c:
             c.execute("CREATE TABLE IF NOT EXISTS applied (key TEXT PRIMARY KEY, n INTEGER NOT NULL)")
+
+    def idempotency_scope(self):
+        """Read-only report of the namespace this adapter dedupes in now."""
+        return scope_for(self.account, "sqlite://" + os.path.basename(self.path))
 
     def _stall(self):
         started, go = self.stall
@@ -133,7 +148,8 @@ class FlakyDedupe(DedupingExternal):
 def contract(identity, adapter, ref, *args, **kw):
     """A contract whose artifact digest is declared from the adapter's current
     source, as trusted configuration would after review."""
-    return ConnectorContract(identity, adapter, ref, adapter_artifact_digest(adapter), *args, **kw)
+    return ConnectorContract(identity, adapter, ref, adapter_artifact_digest(adapter),
+                             current_idempotency_scope(adapter), *args, **kw)
 
 
 def trusted(ext, identity=DEDUPE):
@@ -450,13 +466,18 @@ class UnknownOutcome(_EffectFixture):
                          ("unknown", 1))
 
     def test_reconcile_failed_allows_exactly_one_retry_with_same_key(self):
-        keys, flaky = [], [True]
+        keys, flaky, ext = [], [True], self.ext
 
-        def adapter(e):                      # the reviewed adapter for DEDUPE
-            keys.append(e.idempotency_key)
-            if flaky.pop() if flaky else False:
-                raise TimeoutError("connector timed out")   # first call: ambiguous, not applied
-            return self.ext.perform(e)
+        class Adapter:                       # the reviewed adapter for DEDUPE
+            def idempotency_scope(self):
+                return ext.idempotency_scope()
+
+            def perform(self, e):
+                keys.append(e.idempotency_key)
+                if flaky.pop() if flaky else False:
+                    raise TimeoutError("connector timed out")   # first call: ambiguous, not applied
+                return ext.perform(e)
+        adapter = Adapter().perform
         journal = EffectJournal(self.db, trusted_idempotent=TrustedIdempotentRegistry(
             [contract(DEDUPE, adapter, "test: provider dedupes on key")]))
         with self.assertRaises(EffectOutcomeUnknown):
@@ -639,17 +660,18 @@ class ContractRotation(_EffectFixture):
         variants = [contract("fake.other", a.perform, "contract:v1"),
                     contract(DEDUPE, a.perform, "contract:v2"),
                     contract(DEDUPE, DedupingExternal(self.ext_path).perform, "contract:v1"),
-                    ConnectorContract(DEDUPE, a.perform, "contract:v1", "1" * 64),
+                    ConnectorContract(DEDUPE, a.perform, "contract:v1", "1" * 64, a.idempotency_scope()),
+                    contract(DEDUPE, FlakyDedupe(self.ext_path, account="acct-2").perform, "contract:v1"),
                     contract(DEDUPE, a.perform, "contract:v1",
                                       idempotency_semantics="dedupes within 24 h")]
-        self.assertEqual(len({v.contract_digest for v in variants} | {base.contract_digest}), 6)
+        self.assertEqual(len({v.contract_digest for v in variants} | {base.contract_digest}), 7)
         # Same inherited function, different adapter class: different contract.
         self.assertNotEqual(contract(DEDUPE, External(self.ext_path).perform, "c").contract_digest,
                             contract(DEDUPE, DedupingExternal(self.ext_path).perform, "c").contract_digest)
         with self.assertRaises(Exception):
             base.contract_digest = "0" * 64                       # immutable
         with self.assertRaises(TypeError):
-            ConnectorContract(DEDUPE, a.perform, "contract:v1", "0" * 64, contract_digest="0" * 64)
+            ConnectorContract(DEDUPE, a.perform, "contract:v1", "0" * 64, SCOPE, contract_digest="0" * 64)
 
     def test_restart_with_rotated_contract_ref_refused(self):
         self._ambiguous_under_v1()
@@ -712,7 +734,14 @@ ADAPTER_SRC = """\
 import os
 import sqlite3
 
+from runtime import IdempotencyScope
+
 PATH = {path!r}
+
+
+def idempotency_scope():
+    return IdempotencyScope("fake-mail", "acct-1", "sqlite://provider", "per-account-key", "1",
+                            86400, "{cfg}")
 
 
 def perform(effect):
@@ -744,7 +773,7 @@ class SameNameAdapterSwap(_EffectFixture):
 
     def _write(self, sql):
         with open(self.mod_path, "w") as f:
-            f.write(ADAPTER_SRC.format(path=self.provider.path, sql=sql))
+            f.write(ADAPTER_SRC.format(path=self.provider.path, sql=sql, cfg="c" * 64))
 
     def _load(self):
         """A fresh import of the module file, as after a process restart."""
@@ -756,7 +785,7 @@ class SameNameAdapterSwap(_EffectFixture):
     def _journal(self, adapter, declared=None):
         declared = declared or adapter_artifact_digest(adapter)
         return EffectJournal(self.db, trusted_idempotent=TrustedIdempotentRegistry(
-            [ConnectorContract(DEDUPE, adapter, "contract:mail-v1", declared)]))
+            [ConnectorContract(DEDUPE, adapter, "contract:mail-v1", declared, current_idempotency_scope(adapter))]))
 
     def _ambiguous_v1(self):
         self._write(DEDUPING_SQL)
@@ -818,9 +847,153 @@ class SameNameAdapterSwap(_EffectFixture):
                 with self.assertRaises(AdapterVerificationError):
                     adapter_artifact_digest(adapter)
                 with self.assertRaises(AdapterVerificationError):
-                    TrustedIdempotentRegistry([ConnectorContract(DEDUPE, adapter, "c", "0" * 64)])
+                    TrustedIdempotentRegistry([ConnectorContract(DEDUPE, adapter, "c", "0" * 64, SCOPE)])
         with self.assertRaises(ValueError):
-            ConnectorContract(DEDUPE, self.provider.perform, "c", "not-a-digest")
+            ConnectorContract(DEDUPE, self.provider.perform, "c", "not-a-digest", SCOPE)
+
+
+# -- provider idempotency namespace (Dolores review of d8ea587) ---------------
+class NamespacedProvider:
+    """A provider that dedupes per (account, key): the same key sent to two
+    accounts is applied twice."""
+
+    def __init__(self, path):
+        self.path = str(path)
+        with _sql(self.path) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS applied (account TEXT, key TEXT,"
+                      " PRIMARY KEY (account, key))")
+
+    def apply(self, account, key):
+        with _sql(self.path) as c:
+            c.execute("INSERT OR IGNORE INTO applied VALUES (?, ?)", (account, key))
+
+    def count(self, key):
+        with _sql(self.path) as c:
+            return c.execute("SELECT COUNT(*) FROM applied WHERE key=?", (key,)).fetchone()[0]
+
+    def reconcile_for(self, account):
+        def reconcile(effect):
+            with _sql(self.path) as c:
+                hit = c.execute("SELECT 1 FROM applied WHERE account=? AND key=?",
+                                (account, effect.idempotency_key)).fetchone()
+            return "succeeded" if hit else "failed"
+        return reconcile
+
+
+class NamespacedAdapter:
+    def __init__(self, provider, account, endpoint="https://api.example.invalid/v1"):
+        self.provider, self.account, self.endpoint = provider, account, endpoint
+        self.timeout_next = False
+        self.broken_report = False
+
+    def idempotency_scope(self):
+        if self.broken_report:
+            raise RuntimeError("config unavailable")
+        return scope_for(self.account, self.endpoint)
+
+    def perform(self, effect):
+        effect.action()
+        if self.timeout_next:
+            self.timeout_next = False
+            raise TimeoutError("connector timed out")   # ambiguous; nothing applied yet
+        self.provider.apply(self.account, effect.idempotency_key)
+        return {"account": self.account}
+
+
+class IdempotencyScopeBinding(_EffectFixture):
+    """The trusted contract binds the provider namespace; a retry may not land
+    in a different one."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = NamespacedProvider(os.path.join(self.tmp.name, "ns-provider.sqlite"))
+
+    def _journal(self, adapter, scope=None):
+        return EffectJournal(self.db, trusted_idempotent=TrustedIdempotentRegistry([
+            ConnectorContract(DEDUPE, adapter.perform, "contract:ns-v1",
+                              adapter_artifact_digest(adapter.perform),
+                              scope or adapter.idempotency_scope())]))
+
+    def _ambiguous_in(self, account):
+        a = NamespacedAdapter(self.provider, account)
+        a.timeout_next = True
+        j = self._journal(a)
+        with self.assertRaises(EffectOutcomeUnknown):
+            j.execute(self.key, a.perform, self.provider.reconcile_for(account), owner="A",
+                      connector=DEDUPE, now=T)
+        return a, j
+
+    def test_retry_into_new_namespace_refused_while_old_call_lands(self):
+        self._ambiguous_in("acct-1")
+        b = NamespacedAdapter(self.provider, "acct-2")      # restarted, pointed at another tenant
+        j2 = self._journal(b)                              # registry rebuilt with the new scope
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "trusted"):
+            j2.execute(self.key, b.perform, self.provider.reconcile_for("acct-2"), owner="B",
+                       connector=DEDUPE, now=T + 1)
+        self.provider.apply("acct-1", self.key)            # A's original call lands, late
+        self.assertEqual(self.provider.count(self.key), 1)  # one application, not one per namespace
+        # A registry still declaring the old scope cannot even be built for B.
+        with self.assertRaisesRegex(AdapterVerificationError, "idempotency scope"):
+            self._journal(b, scope=scope_for("acct-1", b.endpoint))
+
+    def test_config_mutated_while_running_refused(self):
+        a = NamespacedAdapter(self.provider, "acct-1")
+        j = self._journal(a)
+        a.account = "acct-2"                               # config changed after registration
+        with self.assertRaisesRegex(EffectConflict, "idempotency scope"):
+            j.execute(self.key, a.perform, self.provider.reconcile_for("acct-2"), owner="A",
+                      connector=DEDUPE, now=T)
+        self.assertEqual((j.get(self.key).status, self.provider.count(self.key)), ("pending", 0))
+
+    def test_config_mutated_after_ambiguous_dispatch_refused(self):
+        a, j = self._ambiguous_in("acct-1")
+        a.account = "acct-2"
+        with self.assertRaisesRegex(EffectConflict, "idempotency scope"):
+            j.execute(self.key, a.perform, self.provider.reconcile_for("acct-2"), owner="A",
+                      connector=DEDUPE, now=T + 1)
+        # Even a "not applied" read cannot clear it while the scope differs.
+        self.assertEqual(j.reconcile(self.key, self.provider.reconcile_for("acct-1"), now=T + 1).status,
+                         "unknown")
+        self.assertEqual((j.get(self.key).dispatches, self.provider.count(self.key)), (1, 0))
+
+    def test_adapter_that_cannot_report_scope_refused(self):
+        a = NamespacedAdapter(self.provider, "acct-1")
+        a.broken_report = True
+        with self.assertRaisesRegex(AdapterVerificationError, "idempotency scope"):
+            self._journal(a, scope=scope_for("acct-1", a.endpoint))
+        a.broken_report = False
+        a2, j = self._ambiguous_in("acct-1")
+        a2.broken_report = True                            # starts failing after registration
+        with self.assertRaisesRegex(EffectConflict, "idempotency scope"):
+            j.execute(self.key, a2.perform, self.provider.reconcile_for("acct-1"), owner="A",
+                      connector=DEDUPE, now=T + 1)
+
+        class NoReport:
+            def perform(self, e):
+                return None
+        with self.assertRaisesRegex(AdapterVerificationError, "cannot report"):
+            current_idempotency_scope(NoReport().perform)
+
+    def test_same_scope_after_restart_allowed(self):
+        self._ambiguous_in("acct-1")
+        b = NamespacedAdapter(self.provider, "acct-1")      # restarted, same namespace
+        out = self._journal(b).execute(self.key, b.perform, self.provider.reconcile_for("acct-1"),
+                                       owner="B", connector=DEDUPE, now=T + 1)
+        self.assertEqual((out.status, out.dispatches), ("succeeded", 2))
+        self.provider.apply("acct-1", self.key)            # late duplicate of A: deduped
+        self.assertEqual(self.provider.count(self.key), 1)
+
+    def test_scope_validation(self):
+        for bad in ({"retention_window_s": 0}, {"retention_window_s": True},
+                    {"config_hash": "x"}, {"account": ""}):
+            fields = dict(provider="p", account="a", endpoint="e", dedupe_scope="s",
+                          dedupe_version="1", retention_window_s=60, config_hash="0" * 64)
+            fields.update(bad)
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                IdempotencyScope(**fields)
+        with self.assertRaises(TypeError):
+            ConnectorContract(DEDUPE, NamespacedAdapter(self.provider, "a").perform, "c",
+                              "0" * 64, {"account": "a"})
 
 
 # -- escalation ---------------------------------------------------------------
