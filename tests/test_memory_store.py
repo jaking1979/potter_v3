@@ -85,6 +85,18 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(Invalid):
             self.store.retrieve('preference', consequential=None)
 
+    def test_forget_clears_local_history_and_staging(self):
+        first = self.promote(self.stage(value='private-old'))
+        next_item = self.promote(self.stage(value='private-new', request_id='next'))
+        staged = self.stage(value='private-staged', request_id='stage')
+        self.store.forget(next_item.id, next_item.version, ('test', 'forget'))
+        self.assertEqual(self.store.retrieve('preference', consequential=False).active, ())
+        self.assertEqual(self.store.retrieve('preference', consequential=False).provisional, ())
+        for item in (first, next_item, staged):
+            self.assertEqual(self.store._get(item.id).value, '')
+        for row in self.store._db.execute('SELECT payload FROM request'):
+            self.assertNotIn('private-', row[0])
+
 
 if __name__ == '__main__':
     unittest.main()
