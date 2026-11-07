@@ -48,11 +48,13 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
 import sqlite3
 import time
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -240,28 +242,149 @@ class EpochAuthority:
         return [Epoch(int(e), h) for e, h in rows]
 
 
+def authority_scope_id(authority: "EpochAuthority") -> str:
+    """Stable, non-secret identifier of an epoch authority for a FencingScope."""
+    return "sqlite:" + os.path.realpath(authority.path)
+
+
 # --------------------------------------------------------------------------- boundary registry
 
 DEFAULT_FENCING_SEMANTICS = (
     "refuses any token below the epoch authority's committed epoch; the check and"
     " the external apply are one transaction linearized with promotion")
+_HEX64 = frozenset("0123456789abcdef")
+
+
+class BoundaryVerificationError(ValueError):
+    """A fenced boundary's adapter or bound scope cannot be verified against its
+    declared contract. Mirrors C2's ``AdapterVerificationError``."""
+
+
+# Artifact verification mirrors C2's ``adapter_artifact_digest`` /
+# ``_require_loaded_matches_source`` (claude/c2-task-effect-journal@fdd3137),
+# which is not yet on claude/c-integration. Same algorithm and semantics; when
+# that C2 change is integrated, these two helpers become imports from effects.
+def boundary_artifact_digest(adapter: Any) -> str:
+    """sha256 of the adapter's implementation: the bytes of the source file
+    defining its function, plus (if different) the file defining the class it
+    is bound to. Raises BoundaryVerificationError if a source file cannot be
+    read (builtins, C extensions, REPL/exec code), or if the LOADED function is
+    not structurally what that file compiles to (rewritten after import, or
+    patched in memory)."""
+    owner = getattr(adapter, "__self__", None)
+    func = getattr(adapter, "__func__", adapter)
+    objs = [func if hasattr(func, "__code__") else type(func)]
+    if owner is not None:
+        objs.append(owner if isinstance(owner, type) else type(owner))
+    files: list[str] = []
+    for obj in objs:
+        try:
+            path = inspect.getsourcefile(obj)
+        except (TypeError, OSError):
+            path = None
+        if not path or not os.path.isfile(path):
+            raise BoundaryVerificationError(f"no readable source for adapter {adapter_name(adapter)!r}")
+        path = os.path.realpath(path)
+        if path not in files:
+            files.append(path)
+    parts, sources = [], {}
+    for path in files:
+        try:
+            with open(path, "rb") as f:
+                sources[path] = f.read()
+        except OSError as exc:
+            raise BoundaryVerificationError(f"cannot read adapter source {path}: {exc}") from exc
+        parts.append(hashlib.sha256(sources[path]).hexdigest())
+    code = getattr(objs[0], "__code__", None)
+    if code is not None:
+        _require_loaded_matches_source(code, sources[files[0]], adapter)
+    return parts[0] if len(parts) == 1 else hashlib.sha256(":".join(parts).encode()).hexdigest()
+
+
+def _require_loaded_matches_source(code: Any, source: bytes, adapter: Any) -> None:
+    try:
+        module_code = compile(source, code.co_filename, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError) as exc:
+        raise BoundaryVerificationError(f"adapter source does not compile: {exc}") from exc
+    # Structural code equality (bytecode, consts incl. nested code, names,
+    # flags, first line, line and exception tables), as in C2.
+    stack = [module_code]
+    while stack:
+        c = stack.pop()
+        if c.co_qualname == code.co_qualname and c.co_filename == code.co_filename \
+                and c.co_firstlineno == code.co_firstlineno and c == code:
+            return
+        stack.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
+    raise BoundaryVerificationError(
+        f"loaded adapter {adapter_name(adapter)!r} differs from its source file")
+
+
+@dataclass(frozen=True)
+class FencingScope:
+    """What a fenced boundary is bound to, mirroring C2's ``IdempotencyScope``.
+    Non-secret identifiers and a config hash, never credentials. The fence
+    guarantee holds only within this scope: the boundary must enforce tokens
+    from THIS authority, in THIS store, under THIS check version and config."""
+    boundary: str          # boundary kind, e.g. "potter.stub-epoch-gateway"
+    authority: str         # the epoch authority whose committed epoch it checks
+    store: str             # where the check + apply are made atomic
+    check_version: str     # version of the token-check contract
+    config_hash: str       # sha256 of the boundary's fencing-relevant config
+
+    def __post_init__(self):
+        for name in ("boundary", "authority", "store", "check_version"):
+            v = getattr(self, name)
+            if not (isinstance(v, str) and v):
+                raise ValueError(f"fencing scope {name} required")
+        h = self.config_hash
+        if not (isinstance(h, str) and len(h) == 64 and set(h) <= _HEX64):
+            raise ValueError("config_hash must be 64 lowercase hex characters")
+
+    def canonical(self) -> list:
+        return [self.boundary, self.authority, self.store, self.check_version, self.config_hash]
+
+
+def current_fencing_scope(adapter: Any) -> FencingScope:
+    """Ask the adapter what it is bound to RIGHT NOW: ``fencing_scope()`` on the
+    object a bound adapter belongs to, or a module-level ``fencing_scope()``
+    beside a plain function. Raises BoundaryVerificationError otherwise."""
+    owner = getattr(adapter, "__self__", None)
+    report = (getattr(owner, "fencing_scope", None) if owner is not None
+              else getattr(adapter, "__globals__", {}).get("fencing_scope"))
+    if not callable(report):
+        raise BoundaryVerificationError(f"adapter {adapter_name(adapter)!r} cannot report its fencing scope")
+    try:
+        scope = report()
+    except Exception as exc:
+        raise BoundaryVerificationError(f"adapter {adapter_name(adapter)!r} failed to report its"
+                                        f" fencing scope: {exc!r}") from exc
+    if not isinstance(scope, FencingScope):
+        raise BoundaryVerificationError(f"adapter {adapter_name(adapter)!r} reported a non-FencingScope")
+    return scope
 
 
 @dataclass(frozen=True)
 class FencedBoundaryContract:
     """A reviewed connector boundary that PROVABLY refuses stale fencing tokens.
 
-    Mirrors C2's ``ConnectorContract``: ``adapter`` is the exact
-    ``perform(effect, token)`` callable reviewed against the guarantee,
-    ``contract_ref`` points at the evidence, ``fencing_semantics`` states the
-    guarantee. ``contract_digest`` is sha256 over the canonical JSON of
-    (kind, identity, contract_ref, adapter qualified name, semantics). It is
-    recorded on each effect when it is dispatched through
-    :class:`FencedEffects`, so a rotated or re-mapped contract stops vouching
-    for effects dispatched under the old one."""
+    Mirrors C2's ``ConnectorContract``:
+    * ``adapter``: the exact ``perform(effect, token)`` callable reviewed;
+    * ``contract_ref``: where the evidence is;
+    * ``adapter_artifact_digest``: sha256 of the reviewed implementation,
+      supplied by trusted configuration (see :func:`boundary_artifact_digest`);
+    * ``fencing_scope``: the authority / store / config it is bound to;
+    * ``fencing_semantics``: the stated guarantee.
+
+    ``contract_digest`` is sha256 over the canonical JSON of all of them plus
+    the adapter's qualified name. It is recorded on each effect when dispatched
+    through :class:`FencedEffects`. A changed body under the same name, a
+    memory patch, or a re-pointed scope is a different (or unverifiable)
+    contract and stops vouching."""
     identity: str
     adapter: Callable[[Effect, "FencingToken"], Any]
     contract_ref: str
+    adapter_artifact_digest: str
+    fencing_scope: FencingScope
     fencing_semantics: str = DEFAULT_FENCING_SEMANTICS
     contract_digest: str = field(init=False)
 
@@ -274,16 +397,38 @@ class FencedBoundaryContract:
             raise ValueError("fencing_semantics required")
         if not callable(self.adapter):
             raise TypeError("adapter must be callable")
-        canon = json.dumps(["potter.c4.fenced_boundary/v0", self.identity, self.contract_ref,
-                            adapter_name(self.adapter), self.fencing_semantics],
+        d = self.adapter_artifact_digest
+        if not (isinstance(d, str) and len(d) == 64 and set(d) <= _HEX64):
+            raise ValueError("adapter_artifact_digest must be 64 lowercase hex characters")
+        if not isinstance(self.fencing_scope, FencingScope):
+            raise TypeError("fencing_scope must be a FencingScope")
+        canon = json.dumps(["potter.c4.fenced_boundary/v1", self.identity, self.contract_ref,
+                            adapter_name(self.adapter), self.adapter_artifact_digest,
+                            self.fencing_scope.canonical(), self.fencing_semantics],
                            separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         object.__setattr__(self, "contract_digest", hashlib.sha256(canon).hexdigest())
+
+    def verify_live(self) -> None:
+        """Re-check the RUNNING adapter against this contract: its implementation
+        artifact and its current scope. Raises BoundaryVerificationError."""
+        actual = boundary_artifact_digest(self.adapter)
+        if not hmac.compare_digest(actual, self.adapter_artifact_digest):
+            raise BoundaryVerificationError(
+                f"adapter for {self.identity!r} does not match its declared artifact digest")
+        if current_fencing_scope(self.adapter) != self.fencing_scope:
+            raise BoundaryVerificationError(
+                f"adapter for {self.identity!r} is bound to a different fencing scope")
 
 
 class FencedBoundaryRegistry(Mapping):
     """Frozen identity -> FencedBoundaryContract mapping, given to a
     :class:`Node` at construction. Empty by default: then no effect is ever
-    cleared by the fence, and C2 keeps ambiguous effects unresolved."""
+    cleared by the fence, and C2 keeps ambiguous effects unresolved.
+
+    Every entry is verified when the registry is built (artifact digest against
+    the adapter's actual source, scope against the adapter's live report);
+    otherwise construction raises BoundaryVerificationError. Nodes verify again
+    before every dispatch and before vouching for a retry."""
 
     def __init__(self, contracts: Iterable[FencedBoundaryContract] = ()):
         entries: dict[str, FencedBoundaryContract] = {}
@@ -292,6 +437,7 @@ class FencedBoundaryRegistry(Mapping):
                 raise TypeError("registry entries must be FencedBoundaryContract")
             if k.identity in entries:
                 raise ValueError(f"duplicate boundary identity {k.identity!r}")
+            k.verify_live()
             entries[k.identity] = k
         self._entries = MappingProxyType(entries)
 
@@ -524,13 +670,18 @@ class Node:
         """Record which boundary dispatches ``key``, before any dispatch.
 
         A registered identity requires ``perform`` to be that contract's
-        reviewed adapter, and records its digest. An unregistered identity is
+        reviewed adapter, re-verified live (implementation artifact and bound
+        scope, which must name this node's authority), and records its digest. An unregistered identity is
         recorded with no digest: it may dispatch, but the fence will never
         clear a re-dispatch for it. A different binding for the same key is
         refused (``EffectConflict``)."""
         contract = self.boundaries.get(connector)
-        if contract is not None and perform != contract.adapter:
-            raise EffectConflict(f"perform is not the registered fenced adapter for {connector!r}")
+        if contract is not None:
+            if perform != contract.adapter:
+                raise EffectConflict(f"perform is not the registered fenced adapter for {connector!r}")
+            problem = self._contract_problem(contract)
+            if problem:
+                raise EffectConflict(f"fenced boundary {connector!r} failed live verification: {problem}")
         digest = contract.contract_digest if contract is not None else None
         with self.db.tx() as c:
             row = c.execute("SELECT connector, boundary_digest FROM fenced_bindings"
@@ -544,15 +695,30 @@ class Node:
                                      f" (digest {row[1]!r}); refusing {connector!r}")
         return digest
 
+    def _contract_problem(self, contract: FencedBoundaryContract) -> str | None:
+        """Why ``contract`` cannot vouch right now (None if it can): the running
+        adapter must still match its reviewed artifact, report the same scope,
+        and that scope must name THIS node's epoch authority."""
+        try:
+            contract.verify_live()
+        except BoundaryVerificationError as exc:
+            return str(exc)
+        if contract.fencing_scope.authority != authority_scope_id(self.authority):
+            return "scope names a different epoch authority"
+        return None
+
     def _boundary_proven(self, effect: Effect) -> bool:
         """The effect's recorded connector is a registered fenced boundary whose
-        contract digest matches the one recorded when it was dispatched."""
+        contract digest matches the one recorded when it was dispatched, and
+        whose adapter and scope still verify live."""
         recorded = getattr(effect, "connector", None)
         bound = self.binding(effect.idempotency_key)
         if recorded is None or bound is None or bound[0] != recorded or bound[1] is None:
             return False
         contract = self.boundaries.get(recorded)
-        return contract is not None and hmac.compare_digest(contract.contract_digest, bound[1])
+        return (contract is not None
+                and hmac.compare_digest(contract.contract_digest, bound[1])
+                and self._contract_problem(contract) is None)
 
     def c2_fence(self, effect: Effect) -> bool:
         """C2 ``EffectJournal(fence=...)`` seam. True only if a late landing of
@@ -725,13 +891,30 @@ class StubConnector:
             raise StaleEpochRefused(f"connector refused: {reason}")
         return {"applied": key, "epoch": token.epoch}
 
-    def contract(self) -> FencedBoundaryContract:
+    CHECK_VERSION = "c4.boundary.v1"
+
+    def fencing_scope(self) -> FencingScope:
+        """What this boundary is bound to, reported live (read-only): the
+        authority whose committed epoch it checks, the store where check and
+        apply are atomic (the same SQLite DB), and its fencing config."""
+        auth = authority_scope_id(self.authority)
+        config = json.dumps({"identity": self.identity, "tables": ["ext_fence", "ext_applied",
+                             "ext_refused"], "lock": "BEGIN IMMEDIATE on authority DB",
+                             "refuse": ["epoch < max_seen", "epoch != committed",
+                                        "node != holder"]}, sort_keys=True)
+        return FencingScope("potter.stub-epoch-gateway", auth, auth, self.CHECK_VERSION,
+                            hashlib.sha256(config.encode("utf-8")).hexdigest())
+
+    def contract(self, adapter_artifact_digest: str) -> FencedBoundaryContract:
         """This boundary's reviewed fencing contract, for a node's
-        :class:`FencedBoundaryRegistry`. The adapter is ``self.perform``; the
-        evidence is the linearization tests in ``tests/test_fencing.py``."""
+        :class:`FencedBoundaryRegistry`. ``adapter_artifact_digest`` must come
+        from trusted configuration (the digest of the REVIEWED implementation);
+        the registry checks it against the running code, so the stub cannot
+        vouch for itself. Evidence: tests/test_fencing.py BoundaryLinearization."""
         return FencedBoundaryContract(
             self.identity, self.perform,
-            "runtime/fencing.py:StubConnector + tests/test_fencing.py:BoundaryLinearization")
+            "runtime/fencing.py:StubConnector + tests/test_fencing.py:BoundaryLinearization",
+            adapter_artifact_digest, self.fencing_scope())
 
     # C2 / FencedEffects-compatible callables
     def perform(self, effect: Effect, token: FencingToken) -> dict[str, Any]:
