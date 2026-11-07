@@ -36,6 +36,7 @@ from policy import (ALLOW, DENY, TRUSTED_SOURCES, Caller, Capability,  # noqa: E
 from policy._contracts import approval as c0  # noqa: E402
 
 T = 1_800_000_000
+TASK_ID = "00000000-0000-4000-8000-000000000001"  # canonical UUID (C1 8c6bf28)
 TG_JOSH, TG_CHRISTIE, TG_STRANGER = 1001, 3003, 2002
 JOSH_MAIL = "josh@potter.test"
 EVIL = "mallory@attacker.test"
@@ -136,7 +137,7 @@ class Fixture(unittest.TestCase):
                             clock=lambda: T)
 
     def request(self, event, capability="notes.append"):
-        action = c0.BoundAction(task_id="task-1", capability=capability, operation="do",
+        action = c0.BoundAction(task_id=TASK_ID, capability=capability, operation="do",
                                 target="test/notes/1", parameters={"x": 1})
         return PolicyRequest(caller=Caller(JOSH), capability=capability, action=action,
                              provenance=event.provenance)
