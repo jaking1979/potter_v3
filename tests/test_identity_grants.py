@@ -23,6 +23,7 @@ EHR_HYPHEN = "2fba667c-6316-80c5-a852-c40b076e3c46"
 R = RiskClass
 NOW = 1_800_000_000
 TRUSTED = ("principal_direct",)
+TASK_ID = "00000000-0000-4000-8000-000000000001"   # canonical UUID (C1 invalid_task_id gate)
 
 CAPS = (
     Capability("josh.mail.read", R.READ, False, False),
@@ -68,7 +69,7 @@ def engine(res=None, **kw):
 
 def request(cap, principal, chain=(), target="target:1"):
     return PolicyRequest(caller=Caller(principal, tuple(chain)), capability=cap,
-                         action=c0.BoundAction("task-1", cap, "read", target, {"k": "v"}),
+                         action=c0.BoundAction(TASK_ID, cap, "read", target, {"k": "v"}),
                          provenance=TRUSTED)
 
 
