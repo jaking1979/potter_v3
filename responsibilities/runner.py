@@ -230,17 +230,21 @@ class ResponsibilityRunner:
             self._report(d, task.id, RUNNING)
             self._reconcile_gate(task)
             results: dict[str, Any] = {}
+            sources: set[str] = set()       # provenance of every earlier result
             for i, step in enumerate(d.steps):
                 index = i
                 ctx = StepContext(task.payload, MappingProxyType(dict(results)))
                 done, result = self._already_done(task, step, approvals)
+                if not done:
+                    if self.kill.is_set():
+                        raise _Interrupt()
+                    self.tasks.heartbeat(task.id, self._worker, self._lease)
+                    result = self._step(d, task, step, ctx, approvals, i,
+                                        self._provenance(d, step, sources))
+                results[step.id] = result
+                sources |= step.result_sources(result)
                 if done:
-                    results[step.id] = result
                     continue
-                if self.kill.is_set():
-                    raise _Interrupt()
-                self.tasks.heartbeat(task.id, self._worker, self._lease)
-                results[step.id] = self._step(d, task, step, ctx, approvals, i)
                 self.tasks.checkpoint(task.id, self._worker,
                                       {"next": i + 1, "approvals": approvals})
                 self._report(d, task.id, RUNNING)
@@ -263,7 +267,17 @@ class ResponsibilityRunner:
         return Caller(d.principal, (DelegationHop(f"responsibility:{d.id}", "cron",
                                                   d.capabilities()),))
 
-    def _decide(self, d: Responsibility, step: Step, action, ctx: StepContext, *,
+    @staticmethod
+    def _provenance(d: Responsibility, step: Step, sources: set[str]) -> tuple[str, ...]:
+        """The trigger's provenance, plus every earlier result's provenance if
+        this step's action may be derived from those results."""
+        out = set(d.provenance)
+        if step.derives_from_results:
+            out |= sources
+        return tuple(sorted(out))
+
+    def _decide(self, d: Responsibility, step: Step, action, ctx: StepContext,
+                provenance: tuple[str, ...], *,
                 approval: Mapping[str, Any] | None = None, retry_intent=None):
         live = None
         if step.observe is not None and retry_intent is None:
@@ -273,7 +287,7 @@ class ResponsibilityRunner:
                 raise _Retry(f"live state unreadable for {step.id}: {type(exc).__name__}")
         return self._policy.decide(PolicyRequest(self._caller(d), step.capability, action,
                                                  approval=approval, live_state=live,
-                                                 provenance=tuple(d.provenance),
+                                                 provenance=provenance,
                                                  retry_intent=retry_intent))
 
     def _build(self, step: Step, ctx: StepContext, task_id: str):
@@ -296,13 +310,13 @@ class ResponsibilityRunner:
         return self._ledger.effect(record["nonce"]) if record else None
 
     def _step(self, d: Responsibility, task: Task, step: Step, ctx: StepContext,
-              approvals: dict[str, str], index: int) -> Any:
+              approvals: dict[str, str], index: int, provenance: tuple[str, ...]) -> Any:
         action = self._build(step, ctx, task.id)
         conn = self._connectors[step.connector]
         aid = approvals.get(step.id)
         if aid is None:
             eff = self.journal.for_step(task.id, step.id)
-            dec = self._decide(d, step, action, ctx)
+            dec = self._decide(d, step, action, ctx, provenance)
             if dec.outcome == ALLOW:
                 if self.kill.is_set():
                     raise _Interrupt()
@@ -319,14 +333,15 @@ class ResponsibilityRunner:
             raise _Fatal(f"approval for {step.id} is {status or 'missing'}")
         eff = self._ledger.effect(record["nonce"])
         if eff is None:
-            dec = self._decide(d, step, action, ctx, approval=record)
+            dec = self._decide(d, step, action, ctx, provenance, approval=record)
             if dec.outcome != ALLOW:
                 raise _Fatal(f"policy denied approved {step.id}: {dec.reason_code}")
             eff = self._ledger.effect(record["nonce"])
         else:
             # Nonce already consumed (we crashed after C1 allowed it): C1 may
             # only route the recorded intent to reconciliation; C2 then decides.
-            dec = self._decide(d, step, action, ctx, approval=record, retry_intent=eff.intent())
+            dec = self._decide(d, step, action, ctx, provenance, approval=record,
+                               retry_intent=eff.intent())
             if dec.outcome != RECONCILE:
                 raise _Fatal(f"policy denied resumed {step.id}: {dec.reason_code}")
         if eff is None or eff.task_id != task.id:

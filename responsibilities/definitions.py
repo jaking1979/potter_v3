@@ -14,6 +14,7 @@ different action.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
@@ -26,6 +27,8 @@ TRUSTED_SCHEDULE_PROVENANCE = ("system_policy",)
 # An event carries data from outside Potter. C1 treats this kind as untrusted,
 # so any write it triggers needs an approval.
 DEFAULT_EVENT_PROVENANCE = ("external_event",)
+# A step result whose source the definition does not declare. Untrusted at C1.
+UNVERIFIED_RESULT = "unverified_result"
 
 
 class DefinitionError(ValueError):
@@ -62,13 +65,20 @@ class Event:
             raise DefinitionError("event trigger needs a topic and key field names")
 
     def dedupe_key(self, event: Mapping[str, Any]) -> str:
-        parts = []
+        """Typed canonical encoding: the JSON array of ``[field, value]`` pairs.
+        Values must be non-empty strings or integers, so no two distinct
+        subjects can encode alike (separators are escaped by JSON, and ``1``
+        and ``"1"`` stay different)."""
+        if not isinstance(event, Mapping):
+            raise DefinitionError("event must be a mapping")
+        pairs = []
         for k in self.key:
-            v = event.get(k) if isinstance(event, Mapping) else None
-            if v is None or v == "":
-                raise DefinitionError(f"event lacks dedupe field {k!r}")
-            parts.append(str(v).replace("|", "||"))
-        return "|".join(parts)
+            v = event.get(k)
+            if isinstance(v, bool) or not isinstance(v, (str, int)) or v == "":
+                raise DefinitionError(f"event dedupe field {k!r} must be a non-empty"
+                                      " string or an integer")
+            pairs.append([k, v])
+        return json.dumps(pairs, separators=(",", ":"), ensure_ascii=False)
 
 
 @dataclass(frozen=True)
@@ -86,7 +96,16 @@ class Step:
     C2 effect id (``record_intent(task, id, action)``) for steps that need no
     approval. ``parameters`` / ``preconditions`` are mappings or deterministic
     builders over ``StepContext``. ``observe`` reads live state for stateful C1
-    capabilities; its value is passed as ``live_state`` and never persisted."""
+    capabilities; its value is passed as ``live_state`` and never persisted.
+
+    ``result_provenance`` declares the source kinds of what this step returns
+    (e.g. ``("external_sender",)`` for a mail read). ``None`` means unknown,
+    which is recorded as ``unverified_result`` (untrusted). A result mapping's
+    own ``"provenance"`` list is added to it, and can only add sources, never
+    remove them. Any later step whose action is built by a callable (so it may
+    use earlier results) carries the union of all earlier results' provenance
+    to C1, so a write derived from external data needs an approval even when
+    the trigger was a trusted schedule."""
     id: str
     capability: str
     operation: str
@@ -96,13 +115,35 @@ class Step:
     preconditions: Mapping[str, Any] | Builder = field(default_factory=dict)
     observe: Callable[[StepContext], Mapping[str, Any]] | None = None
     approval_summary: str = "Approve this step?"
+    result_provenance: tuple[str, ...] | None = None
 
     def __post_init__(self):
         if not _ID.match(self.id or ""):
             raise DefinitionError("step id must be dotted lowercase")
+        if self.result_provenance is not None:
+            object.__setattr__(self, "result_provenance", tuple(self.result_provenance))
+            if not self.result_provenance or not all(
+                    isinstance(k, str) and k for k in self.result_provenance):
+                raise DefinitionError(f"step {self.id}: result_provenance must name sources")
         for name in ("capability", "operation", "target", "connector"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise DefinitionError(f"step {self.id}: {name} required")
+
+    @property
+    def derives_from_results(self) -> bool:
+        """Conservative: a builder callable may read earlier results."""
+        return callable(self.parameters) or callable(self.preconditions)
+
+    def result_sources(self, result: Any) -> frozenset[str]:
+        out = set(self.result_provenance or (UNVERIFIED_RESULT,))
+        if isinstance(result, Mapping) and "provenance" in result:
+            extra = result["provenance"]
+            if isinstance(extra, (list, tuple)) and extra and all(
+                    isinstance(k, str) and k for k in extra):
+                out.update(extra)
+            else:
+                out.add(UNVERIFIED_RESULT)
+        return frozenset(out)
 
     def build(self, ctx: StepContext, task_id: str):
         from policy._contracts import approval as c0

@@ -28,6 +28,7 @@ TG_JOSH = "tg-1001"
 R = RiskClass
 CAPS = (Capability("notes.append", R.REVERSIBLE_WRITE, False, False),
         Capability("bills.lookup", R.READ, False, False),
+        Capability("mail.read", R.READ, False, False),
         Capability("bills.pay", R.CONSEQUENTIAL, True, False))
 CONNECTOR = "fake.notes"
 
@@ -51,6 +52,7 @@ class FakeExternal:
             c.execute("CREATE TABLE IF NOT EXISTS calls (seq INTEGER PRIMARY KEY"
                       " AUTOINCREMENT, key TEXT, step TEXT)")
         self.hooks: dict[str, tuple[str, object]] = {}
+        self.results: dict[str, object] = {}       # canned provider results per step
 
     def _step(self, eff) -> str:
         return eff.action().parameters.get("step", eff.effect_id)
@@ -69,7 +71,7 @@ class FakeExternal:
                       (eff.idempotency_key, step, action.task_id))
         if when == "after":
             fn(eff)
-        return {"step": step, "ok": True}
+        return self.results.get(step, {"step": step, "ok": True})
 
     def reconcile(self, eff) -> str:
         with _conn(self.path) as c:
@@ -108,6 +110,24 @@ def batch(rid="notes.batch", delivery="josh", n=3, every=3600.0) -> Responsibili
     return Responsibility(rid, Schedule(every), delivery,
                           tuple(note_step(f"s{i}") for i in range(1, n + 1)),
                           report=lambda ctx: f"Appended {len(ctx.results)} notes.")
+
+
+def mail_read_step(sid: str = "read", sources=None) -> Step:
+    return Step(sid, "mail.read", "list", "mail/inbox", CONNECTOR,
+                parameters={"step": sid}, result_provenance=sources)
+
+
+def derived_note_step(sid: str, src: str = "read") -> Step:
+    """A write whose text comes from an earlier step's result."""
+    return Step(sid, "notes.append", "append", "notes/daily", CONNECTOR,
+                parameters=lambda ctx: {"step": sid,
+                                        "line": (ctx.results.get(src) or {}).get("text", "")})
+
+
+def mail_digest(sources=None, extra=()) -> Responsibility:
+    """Scheduled (trusted trigger) read of external mail, then derived writes."""
+    return Responsibility("mail.digest", Schedule(3600.0), "josh",
+                          (mail_read_step("read", sources),) + tuple(extra))
 
 
 def bill_watch() -> Responsibility:

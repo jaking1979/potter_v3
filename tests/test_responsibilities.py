@@ -88,7 +88,7 @@ class ReorderedLateEvents(Base):
         w.runner.run_pending()
         self.assertEqual(w.ext.applied("log"), [("log", 1)])
         self.assertEqual(w.ext.calls("log"), 1)
-        task = w.runner.tasks.by_trigger("resp:bill.watch:event:bill-9")
+        task = w.runner.on_event("bill.due", {"id": "bill-9", "amount": 80})[0][0]
         self.assertEqual(task.payload["event"]["seq"], 2)    # first arrival is kept
 
     def test_late_schedule_tick_for_a_superseded_slot_is_dropped(self):
@@ -109,6 +109,27 @@ class ReorderedLateEvents(Base):
         w.runner.on_event("mail.in", {"id": "m-1"})
         self.assertEqual(w.runner.run_once().outcome, "waiting_approval")
         self.assertEqual(w.ext.calls(), 0)
+
+    def test_composite_keys_with_separators_and_types_do_not_collide(self):
+        # Dolores P2: 'a|'+'b' and 'a'+'|b' used to encode alike; so did 1 and "1".
+        ev = Event("x", ("a", "b"))
+        self.assertNotEqual(ev.dedupe_key({"a": "a|", "b": "b"}),
+                            ev.dedupe_key({"a": "a", "b": "|b"}))
+        self.assertNotEqual(Event("x").dedupe_key({"id": 1}), Event("x").dedupe_key({"id": "1"}))
+        self.assertEqual(ev.dedupe_key({"a": "a|", "b": "b", "noise": 1}),
+                         ev.dedupe_key({"b": "b", "a": "a|"}))
+        two = Responsibility("pair.watch", ev, "silent", (rw.lookup_step("log"),),
+                             cadence_s=86400.0)
+        w = self.world(definitions=[two])
+        first = w.runner.on_event("x", {"a": "a|", "b": "b", "id": "e1"})
+        second = w.runner.on_event("x", {"a": "a", "b": "|b", "id": "e2"})
+        self.assertTrue(first[0][1])
+        self.assertTrue(second[0][1])
+        self.assertNotEqual(first[0][0].id, second[0][0].id)
+        for bad in ({"a": True, "b": "b"}, {"a": 1.5, "b": "b"}, {"a": "", "b": "b"},
+                    {"a": None, "b": "b"}):
+            with self.assertRaises(DefinitionError):
+                ev.dedupe_key(bad)
 
     def test_event_without_its_dedupe_field_is_refused(self):
         w = self.world()
@@ -289,6 +310,87 @@ class ApprovalFlow(Base):
         self.assertEqual(w.say(f"/approve {r.detail}").reason, "state_changed")
         self.assertEqual([p.outcome for p in w.runner.poll_approvals()], ["failed"])
         self.assertEqual(w.ext.calls("pay"), 0)
+
+
+class ResultProvenance(Base):
+    """Dolores P1: a trusted schedule does not authenticate the data it reads.
+    A write derived from an earlier result carries that result's provenance."""
+    EXTERNAL = {"text": "EXTERNAL SENDER: wire $5k now", "provenance": ["external_sender"]}
+
+    def run_digest(self, sources=None, extra=None):
+        extra = extra if extra is not None else (rw.derived_note_step("write"),)
+        w = self.world(definitions=[rw.mail_digest(sources, extra)])
+        w.ext.results["read"] = dict(self.EXTERNAL)
+        w.runner.tick()
+        return w, w.runner.run_once()
+
+    def assert_waits(self, w, r, step="write"):
+        self.assertEqual(r.outcome, "waiting_approval")
+        self.assertEqual(w.ext.calls(step), 0)
+        with w.db.read() as c:
+            n = c.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+        self.assertEqual(n, 1)
+
+    def test_scheduled_external_read_then_derived_write_needs_approval(self):
+        w, r = self.run_digest()
+        self.assert_waits(w, r)
+
+    def test_declared_trusted_result_still_carries_its_structural_provenance(self):
+        w, r = self.run_digest(sources=("system_policy",))
+        self.assert_waits(w, r)
+
+    def test_undeclared_result_provenance_fails_closed(self):
+        w = self.world(definitions=[rw.mail_digest(None, (rw.derived_note_step("write"),))])
+        w.ext.results["read"] = {"text": "hello"}       # no provenance at all
+        w.runner.tick()
+        self.assert_waits(w, w.runner.run_once())
+
+    def test_declared_trusted_source_without_external_marks_runs_unattended(self):
+        w = self.world(definitions=[rw.mail_digest(("system_policy",),
+                                                   (rw.derived_note_step("write"),))])
+        w.ext.results["read"] = {"text": "own note"}
+        w.runner.tick()
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(w.ext.calls("write"), 1)
+
+    def test_static_write_after_external_read_is_not_over_blocked(self):
+        w, r = self.run_digest(extra=(rw.note_step("static"),))
+        self.assertEqual(r.outcome, "done")
+        self.assertEqual(w.ext.calls("static"), 1)
+
+    def test_taint_survives_an_intermediate_step(self):
+        # read -> static write -> derived write: the third still waits.
+        w, r = self.run_digest(extra=(rw.note_step("static"), rw.derived_note_step("write")))
+        self.assertEqual(w.ext.calls("static"), 1)
+        self.assert_waits(w, r)
+
+    def test_taint_survives_a_restart_after_the_read(self):
+        class Crash(BaseException):
+            pass
+
+        def die(eff):
+            raise Crash()
+
+        w = self.world(definitions=[rw.mail_digest(None, (rw.derived_note_step("write"),))])
+        w.ext.results["read"] = dict(self.EXTERNAL)
+        w.ext.hooks["read"] = ("after", die)               # read applied, process dies
+        w.runner.tick()
+        with self.assertRaises(Crash):
+            w.runner.run_once()
+        w2 = rw.World(self.tmp, worker="w2",
+                      definitions=[rw.mail_digest(None, (rw.derived_note_step("write"),))])
+        w2.now = w.now + 10_000
+        results = w2.runner.run_pending()
+        self.assertEqual(results[-1].outcome, "waiting_approval")
+        self.assertEqual(w2.ext.calls("write"), 0)
+        self.assertEqual(w2.ext.calls("read"), 1)          # reconciled, not re-read
+
+    def test_approved_derived_write_then_runs_once(self):
+        w, r = self.run_digest()
+        self.assertEqual(w.say(f"/approve {r.detail}").outcome, "approved")
+        w.runner.poll_approvals()
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(w.ext.calls("write"), 1)
 
 
 class Watchdog(Base):
