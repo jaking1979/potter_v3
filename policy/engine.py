@@ -13,7 +13,8 @@
 
 Gates, in order (first failure denies):
 
- 1. Request shape (types, non-empty ids, capability name == action.capability).
+ 1. Request shape (types, non-empty ids, canonical task UUID, capability
+    name == action.capability).
  2. Clock read.
  3. Capability registry lookup (unknown -> deny).
  4. Forbidden risk class -> deny (an approval cannot unlock it).
@@ -38,6 +39,7 @@ caller-chosen names is ever placed in ``reason`` or in ``trace_record()``.
 """
 from __future__ import annotations
 
+import dataclasses
 import enum
 import json
 import re
@@ -62,6 +64,7 @@ REASONS: Mapping[str, str] = MappingProxyType({
     "ok_approved": "all policy gates passed; approval verified and consumed",
     "reconcile_pending_intent": "approval already consumed; route the recorded intent to reconciliation",
     "malformed_request": "request is malformed",
+    "invalid_task_id": "action task ID is not a canonical task UUID",
     "capability_mismatch": "requested capability does not match the bound action",
     "unknown_capability": "capability is not registered",
     "forbidden_capability": "capability is forbidden",
@@ -158,6 +161,9 @@ class Decision:
     capability: str | None = None                   # registered name only, else None
     risk: str | None = None
     action_hash: str | None = None
+    # Canonical task UUID from request.action.task_id (C2 task_id_for format),
+    # or None when no valid one could be established.
+    task_id: str | None = None
     # Holds action parameters: never logged, never in repr, never traced.
     intent: c0.EffectIntent | None = field(default=None, repr=False, compare=False)
 
@@ -166,8 +172,12 @@ class Decision:
         return self.outcome == ALLOW
 
     def trace_record(self) -> dict[str, Any]:
-        """Redaction-safe record for C6 tracing."""
+        """Redaction-safe record for C6 tracing. `correlation` is "request" when
+        `task_id` is a validated canonical UUID from the request's BoundAction,
+        and "missing" (task_id None) otherwise: never guessed, never omitted."""
         return {"decision_id": self.decision_id, "outcome": self.outcome,
+                "task_id": self.task_id,
+                "correlation": "request" if self.task_id is not None else "missing",
                 "reason_code": self.reason_code, "capability": self.capability,
                 "risk": self.risk, "action_hash": self.action_hash,
                 "effect_id": self.intent.effect_id if self.intent else None}
@@ -186,6 +196,25 @@ class _ProbeLedger:
 
     def pending(self, nonce: str):
         return None
+
+
+def _canonical_task_id(value: Any) -> str | None:
+    """The canonical UUID string, or None. Same rule as C6 DecisionTrace:
+    str(UUID(v)) == v (lowercase, hyphenated); C2 task_id_for emits this form."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return value if str(uuid.UUID(value)) == value else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _request_task_id(request: Any) -> str | None:
+    """Correlation from the request itself (frozen PolicyRequest -> frozen
+    BoundAction), never from caller closures or other shared state."""
+    if isinstance(request, PolicyRequest) and isinstance(request.action, c0.BoundAction):
+        return _canonical_task_id(request.action.task_id)
+    return None
 
 
 def _default_id(prefix: str) -> str:
@@ -225,11 +254,16 @@ class PolicyEngine:
         except Exception:
             decision_id = _default_id("dec")
         try:
+            task_id = _request_task_id(request)
+        except Exception:
+            task_id = None
+        try:
             decision = self._decide(decision_id, request)
         except _Deny as d:
             decision = self._make(decision_id, DENY, d.code)
         except Exception:
             decision = self._make(decision_id, DENY, "engine_error")
+        decision = dataclasses.replace(decision, task_id=task_id)
         try:
             self._trace(decision.trace_record())
         except Exception:
@@ -237,7 +271,7 @@ class PolicyEngine:
             # so C2 recovery reconciles it (T10): nothing is stranded or replayed.
             decision = self._make(decision_id, DENY, "trace_error",
                                   capability=decision.capability, risk=decision.risk,
-                                  action_hash=decision.action_hash)
+                                  action_hash=decision.action_hash, task_id=task_id)
         return decision
 
     # ---- core ------------------------------------------------------------------
@@ -307,6 +341,8 @@ class PolicyEngine:
             raise _Deny("malformed_request")
         if not isinstance(req.action, c0.BoundAction) or not req.action.task_id:
             raise _Deny("malformed_request")
+        if _canonical_task_id(req.action.task_id) is None:
+            raise _Deny("invalid_task_id")
         if req.action.capability != req.capability:
             raise _Deny("capability_mismatch")
         if not isinstance(req.provenance, tuple) or not all(

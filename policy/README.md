@@ -33,7 +33,13 @@
 
 ## Redaction and tracing
 
-Reasons are fixed strings from the closed `REASONS` table. C0 refusal messages are mapped to codes and never echoed. `Decision.intent` holds the action parameters and is excluded from `repr` and from `trace_record()`. `trace_hook(record)` is the seam for C6 and is a no-op by default. If the trace hook raises, the decision becomes a deny. Any nonce already consumed stays recorded as a pending intent, so C2/T10 recovery reconciles it.
+Reasons are fixed strings from the closed `REASONS` table. C0 refusal messages are mapped to codes and never echoed. `Decision.intent` holds the action parameters and is excluded from `repr` and from `trace_record()`. `trace_hook(record)` is the seam for C6 and is a no-op by default.
+
+Every trace record carries `task_id` and `correlation`:
+
+- `task_id` is taken from the request's frozen `BoundAction.task_id`, never from caller closures. It is used only if it is a canonical UUID: `str(UUID(v)) == v`, which is the form C2 `task_id_for` emits and C6 `DecisionTrace` requires.
+- A non-UUID task ID is denied with `invalid_task_id`.
+- When no valid ID can be established (a malformed request or an invalid ID), the record carries `task_id: None` and `correlation: "missing"`. The decision still denies and is still traced. Otherwise `correlation` is `"request"`. If the trace hook raises, the decision becomes a deny. Any nonce already consumed stays recorded as a pending intent, so C2/T10 recovery reconciles it.
 
 ## Not in this package
 
