@@ -25,7 +25,7 @@ class BrokerTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "broker.sqlite"
         self.caps = Caps(50, 20, 30, 60)
-        self.b = Broker(self.path, self.caps)
+        self.b = Broker.bootstrap(self.path, self.caps)
 
     def test_selects_cheapest_validated_approved_private_available(self):
         selected = self.b.reserve(req(), [candidate("badprivacy", 1, 2, privacy={"public"}),
@@ -204,6 +204,90 @@ os._exit(0)
         with sqlite3.connect(path) as db:
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertEqual(tables, {'broker_calls'})
+
+    def test_missing_store_is_not_created_by_open_or_existing_instance(self):
+        missing = Path(self.tmp.name) / 'missing.sqlite'
+        with self.assertRaisesRegex(LedgerUnavailable, 'store_unavailable'):
+            Broker(missing, self.caps)
+        self.assertFalse(missing.exists())
+        self.b.reserve(req(), [candidate()])
+        self.path.unlink()
+        with self.assertRaisesRegex(LedgerUnavailable, 'store_unavailable'):
+            self.b.reserve(req('c2'), [candidate()])
+        self.assertFalse(self.path.exists())
+
+    def test_empty_store_refused_and_bootstrap_never_replaces_existing(self):
+        empty = Path(self.tmp.name) / 'empty.sqlite'
+        empty.touch()
+        with self.assertRaisesRegex(LedgerUnavailable, 'empty_store'):
+            Broker(empty, self.caps)
+        with self.assertRaisesRegex(LedgerUnavailable, 'bootstrap_refused'):
+            Broker.bootstrap(empty, self.caps)
+        self.b.reserve(req(), [candidate()])
+        with self.assertRaisesRegex(LedgerUnavailable, 'bootstrap_refused'):
+            Broker.bootstrap(self.path, self.caps)
+        self.assertEqual(self.b.status('c1')[-1], 'reserved')
+
+    def test_bootstrap_concurrent_processes_have_only_one_winner(self):
+        fresh = Path(self.tmp.name) / 'fresh.sqlite'
+        code = '''import sys
+from model_broker.broker import Broker,Caps,LedgerUnavailable
+try:
+    Broker.bootstrap(sys.argv[1], Caps(50,20,30,60))
+except LedgerUnavailable:
+    print('refused')
+else:
+    print('created')
+'''
+        children = [subprocess.Popen([sys.executable, '-c', code, str(fresh)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    for _ in range(4)]
+        results = [p.communicate(timeout=10) for p in children]
+        self.assertTrue(all(p.returncode == 0 for p in children), results)
+        self.assertCountEqual([out.strip() for out, err in results],
+                              ['created', 'refused', 'refused', 'refused'])
+        Broker(fresh, self.caps).reserve(req(), [candidate()])
+
+    def test_overrun_blocks_already_reserved_dispatch_after_restart(self):
+        self.b.reserve(req(), [candidate()])
+        self.b.reserve(req('c2'), [candidate()])
+        self.b.dispatch_once('c1')
+        with self.assertRaisesRegex(Refused, 'cost_variance'):
+            self.b.settle('c1', 11)
+        reopened = Broker(self.path, self.caps)
+        with self.assertRaisesRegex(Refused, 'unresolved_cost_variance'):
+            reopened.dispatch_once('c2')
+        self.assertEqual(reopened.status('c2')[-1], 'reserved')
+        self.assertEqual(reopened.entries('c2'), (('reservation', 10, 'operation'),))
+
+    def test_tightened_caps_refuse_dispatch_without_releasing_reservation(self):
+        self.b.reserve(req(), [candidate()])
+        for cap in (Caps(9,99,99,99), Caps(99,9,99,99),
+                    Caps(99,99,9,99), Caps(99,99,99,9)):
+            reopened = Broker(self.path, cap)
+            with self.assertRaisesRegex(Refused, 'budget_ceiling'):
+                reopened.dispatch_once('c1')
+            self.assertEqual(reopened.status('c1')[-1], 'reserved')
+        self.b.dispatch_once('c1')
+
+    def test_dispatch_once_process_race_has_single_winner(self):
+        self.b.reserve(req(), [candidate()])
+        code = '''import sys
+from model_broker.broker import Broker,Caps,Refused
+try:
+    Broker(sys.argv[1], Caps(50,20,30,60)).dispatch_once('c1')
+except Refused:
+    print('refused')
+else:
+    print('dispatched')
+'''
+        children = [subprocess.Popen([sys.executable, '-c', code, str(self.path)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    for _ in range(4)]
+        results = [p.communicate(timeout=10) for p in children]
+        self.assertTrue(all(p.returncode == 0 for p in children), results)
+        self.assertCountEqual([out.strip() for out, err in results],
+                              ['dispatched', 'refused', 'refused', 'refused'])
 
 
 if __name__ == "__main__": unittest.main()

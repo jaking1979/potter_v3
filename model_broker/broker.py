@@ -7,6 +7,7 @@ This prototype does not establish their provenance or enforce provider costs.
 from __future__ import annotations
 
 import sqlite3
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,15 +62,40 @@ class Broker:
     deliberate tampering or restoration of an older whole database.
     """
 
-    def __init__(self, path: str | Path, caps: Caps):
-        if any(type(x) is not int or x < 0 for x in vars(caps).values()):
+    @classmethod
+    def bootstrap(cls, path: str | Path, caps: Caps):
+        """Create one new synthetic ledger exclusively; never reset a store."""
+        cls._validate_caps(caps)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as exc:
+            raise LedgerUnavailable('bootstrap_refused') from exc
+        os.close(fd)
+        # Leave failed initialization for explicit inspection, never guess that
+        # an existing empty store is safe to initialize on a later open.
+        instance = cls.__new__(cls)
+        instance._open(path, caps, initialize=True)
+        return instance
+
+    @staticmethod
+    def _validate_caps(caps):
+        if type(caps) is not Caps or any(type(x) is not int or x < 0 for x in vars(caps).values()):
             raise ValueError("caps must be nonnegative integer microdollars")
+
+    def __init__(self, path: str | Path, caps: Caps):
+        """Open existing state; missing or empty files are never bootstrapped."""
+        self._open(path, caps, initialize=False)
+
+    def _open(self, path, caps, *, initialize):
+        self._validate_caps(caps)
         self.path, self.caps = str(path), caps
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             tables = {r[0] for r in db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if not tables:
+                if not initialize:
+                    raise LedgerUnavailable('empty_store')
                 db.execute("""CREATE TABLE broker_calls (
                 call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
                 task_class TEXT NOT NULL, privacy_class TEXT NOT NULL,
@@ -112,7 +138,13 @@ class Broker:
 
     @contextmanager
     def _db(self):
-        db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        # mode=rw is important on every operation, not only at construction:
+        # losing the file must not produce a fresh budget on an old instance.
+        try:
+            db = sqlite3.connect(Path(self.path).absolute().as_uri() + '?mode=rw',
+                                 uri=True, timeout=10, isolation_level=None)
+        except sqlite3.OperationalError as exc:
+            raise LedgerUnavailable('store_unavailable') from exc
         try:
             db.execute('PRAGMA foreign_keys=ON')
             db.execute('PRAGMA synchronous=FULL')
@@ -223,6 +255,23 @@ class Broker:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             self._validate_ledger(db)
+            if db.execute("SELECT 1 FROM broker_calls WHERE state='overrun' LIMIT 1").fetchone():
+                raise Refused('unresolved_cost_variance')
+            row = db.execute('SELECT task_id,day,month,worst,state FROM broker_calls WHERE call_id=?',
+                             (call_id,)).fetchone()
+            if row is None or row[4] != 'reserved':
+                raise Refused('not_reserved')
+            # A reservation is not irrevocable dispatch permission. Another
+            # call can overrun or configured caps can tighten before dispatch.
+            for column, value, cap in zip(('task_id', 'day', 'month'), row[:3],
+                                          (self.caps.task, self.caps.day, self.caps.month)):
+                used = db.execute('SELECT COALESCE(SUM(e.amount),0) FROM broker_entries e '
+                                  'JOIN broker_calls c USING(call_id) WHERE c.' + column + '=?',
+                                  (value,)).fetchone()[0]
+                if used > cap:
+                    raise Refused('budget_ceiling')
+            if row[3] > self.caps.request:
+                raise Refused('budget_ceiling')
             changed = db.execute("UPDATE broker_calls SET state='dispatched' WHERE call_id=? AND state='reserved'", (call_id,)).rowcount
             if changed != 1:
                 raise Refused("not_reserved")
