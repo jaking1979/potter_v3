@@ -540,6 +540,45 @@ class EndToEndPolicy(Fixture):
                          (DENY, "untrusted_context_requires_approval"))
 
 
+class HandBuiltVoucherRefused(Fixture):
+    """E1 binds vouchers to minted tokens (4078f97). If anything on the ingress
+    path yields a hand-constructed AuthenticatedSender, it is not principal_direct."""
+
+    def forging_auth(self):
+        from notifier import AuthenticatedSender, AuthResult
+        real = self.auth
+
+        class ForgingAuth(ChannelAuth):
+            def authenticate(self, msg):
+                return AuthResult(AuthenticatedSender(JOSH, msg.channel, 1, "f" * 64), "ok")
+
+            def vouches(self, sender):
+                return real.vouches(sender)
+        return ForgingAuth(inbound_bindings={}, outbound_addresses={})
+
+    def test_45_forged_voucher_telegram_rejected(self):
+        res = self.gateway(channel_auth=self.forging_auth()).ingest_telegram(self.tg())
+        self.assertEqual((res.accepted, res.reason), (False, "sender_not_allowlisted"))
+
+    def test_46_forged_voucher_email_untrusted(self):
+        self.pass_dkim("<m1@potter.test>")
+        res = self.gateway(channel_auth=self.forging_auth()).ingest_email(make_email())
+        self.assertEqual(res.trust_reason, "unvouched_sender")
+        self.assertEqual(res.event.provenance, (EXTERNAL_SENDER,))
+        self.assertIsNone(res.event.principal)
+
+    def test_47_voucher_relabelled_to_other_channel_refused(self):
+        from notifier import InboundMessage
+        self.pass_dkim("<m1@potter.test>")
+        minted = self.auth.authenticate(InboundMessage("email", JOSH_MAIL, "",
+                                                       raw_ref="<m1@potter.test>"))
+        self.assertTrue(minted.ok)
+        relabelled = dataclasses.replace(minted.sender, channel="telegram")
+        self.assertFalse(self.auth.vouches(relabelled))
+        self.assertIsNone(self.gw._vouched_principal(minted, "telegram"))
+        self.assertEqual(self.gw._vouched_principal(minted, "email"), JOSH)
+
+
 class Structure(unittest.TestCase):
     def test_43_ingress_passes_notifier_lint(self):
         self.assertEqual([f for f in lint.scan(ROOT) if f.path.startswith("ingress")], [])

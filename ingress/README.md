@@ -40,6 +40,8 @@ A mixed event (Josh's command plus a forward or an attachment) keeps `principal=
   Any failure, including a missing verifier or one that raises, makes the text `external_sender` with a fixed `trust_reason` (`dkim_failed`, `display_name_spoof`, `reply_to_mismatch`, …). Email from other people is accepted as untrusted (inbox triage), not rejected.
 - **Webhooks.** Each source needs a signature verifier. Unknown sources and unsigned deliveries are rejected and not recorded.
 
+**Vouchers.** For both Telegram and email, a principal counts only if `ChannelAuth.vouches(sender)` confirms that this `ChannelAuth` minted that exact `AuthenticatedSender` for this channel (E1 binds tokens to vouchers). A hand-built, copied or relabelled voucher yields no principal: the Telegram message is rejected, and the email is `external_sender` with `unvouched_sender`.
+
 ## Content handling
 
 - Provenance is computed from authentication results only. No text is parsed for provenance, approval or policy fields. `InboundEvent` has no approval field, and ingress exposes no policy API.

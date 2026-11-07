@@ -60,7 +60,7 @@ REASONS = frozenset({
     "ok", "multiple_from", "header_defect", "display_name_spoof", "reply_to_mismatch",
     "sender_mismatch", "dkim_missing", "dkim_failed", "dkim_unaligned", "spf_failed",
     "verifier_error", "unknown_sender", "not_allowlisted", "principal_disabled",
-    "dkim_unverified", "non_private_chat", "via_bot", "unauthenticated_channel",
+    "dkim_unverified", "unvouched_sender", "non_private_chat", "via_bot", "unauthenticated_channel",
 })
 
 
@@ -212,7 +212,7 @@ class IngressGateway:
             raise _Reject("bot_sender", record=True).with_draft(draft)
         auth = self._auth.authenticate(InboundMessage(TELEGRAM, str(u.from_user_id), "",
                                                       raw_ref=u.delivery_ref))
-        if not auth.ok:
+        if self._vouched_principal(auth, TELEGRAM) is None:
             # A stranger DMing the bot does not drive the runner (E1: ignored + logged).
             raise _Reject("sender_not_allowlisted", record=True).with_draft(draft)
         if u.via_bot:
@@ -227,7 +227,8 @@ class IngressGateway:
         else:
             segs = (Segment(own, u.text),) if u.text else ()
         draft.segments = segs
-        draft.principal = auth.sender.principal if own == PRINCIPAL_DIRECT else None
+        draft.principal = (self._vouched_principal(auth, TELEGRAM)
+                           if own == PRINCIPAL_DIRECT else None)
         draft.trust_reason = trust
         return draft
 
@@ -306,9 +307,26 @@ class IngressGateway:
         if v.spf in ("fail", "softfail"):
             return "spf_failed", addr, None
         auth = self._auth.authenticate(InboundMessage(EMAIL, addr, "", raw_ref=mid))
-        if not auth.ok:
-            return (auth.reason if auth.reason in REASONS else "unknown_sender"), addr, None
-        return "ok", addr, auth.sender.principal
+        principal = self._vouched_principal(auth, EMAIL)
+        if principal is None:
+            reason = getattr(auth, "reason", None)
+            return (reason if reason in REASONS and reason != "ok" else "unvouched_sender"), \
+                addr, None
+        return "ok", addr, principal
+
+    def _vouched_principal(self, auth: object, channel: str) -> str | None:
+        """The principal only if E1 ``ChannelAuth`` itself minted this exact
+        voucher for this channel (``vouches``). A hand-constructed or copied
+        ``AuthenticatedSender`` never yields ``principal_direct``."""
+        try:
+            sender = getattr(auth, "sender", None)
+            if sender is None or not self._auth.vouches(sender):
+                return None
+            if sender.channel != channel or not isinstance(sender.principal, str):
+                return None
+            return sender.principal or None
+        except Exception:
+            return None
 
     @staticmethod
     def _email_parts(msg) -> tuple[str, list[RawAttachment]]:
