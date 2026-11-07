@@ -1,12 +1,14 @@
 """Offline-only T15/T27 memory staging prototype.
 
 The injectable verifier is a *test seam*, not evidence of authentication.
-No network, filesystem persistence, Notion writes, effect journal or policy
-integration is implemented. Never use this prototype for production memory.
+No network, Notion writes, effect journal or policy integration is implemented.
+Explicit local synthetic stores support offline restart/concurrency experiments. Never use this prototype for production memory.
 """
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
+from pathlib import Path
 import json
 import sqlite3
 import threading
@@ -49,32 +51,128 @@ class Retrieval:
     excluded_ids: tuple[str, ...]
 
 
+_ACTIVE_INDEX = "CREATE UNIQUE INDEX one_active_key ON item(key) WHERE status='active'"
+_COLUMNS = {
+    'item': ('id','key','value','origin','status','sensitivity','confidence','source_ref','version','supersedes','contradicts'),
+    'request': ('request_id','payload','item_id'),
+    'audit': ('seq','op','item_id','version'),
+    'metadata': ('schema','environment'),
+}
+_SCHEMA = """
+BEGIN IMMEDIATE;
+CREATE TABLE item (id TEXT PRIMARY KEY, key TEXT NOT NULL,
+ value TEXT NOT NULL, origin TEXT NOT NULL, status TEXT NOT NULL,
+ sensitivity TEXT NOT NULL, confidence TEXT NOT NULL,
+ source_ref TEXT NOT NULL, version INTEGER NOT NULL,
+ supersedes TEXT, contradicts TEXT);
+CREATE UNIQUE INDEX one_active_key ON item(key) WHERE status='active';
+CREATE TABLE request (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL, item_id TEXT NOT NULL);
+CREATE TABLE audit (seq INTEGER PRIMARY KEY, op TEXT NOT NULL, item_id TEXT NOT NULL, version INTEGER NOT NULL);
+CREATE TABLE metadata (schema TEXT NOT NULL, environment TEXT NOT NULL);
+INSERT INTO metadata VALUES ('potter.memory.offline/v1','synthetic');
+PRAGMA user_version=1;
+COMMIT;
+"""
+
+
 class MemoryStore:
-    """A serialized in-memory model of staged and promoted items.
+    """An offline model of staged and promoted items; memory-only by default.
 
     `verify` must authenticate an operation and its *exact* payload in the
     future real integration. This prototype accepts only a test callback.
     SQLite changes, compare-and-set checks and audit share a transaction.
     """
     def __init__(self, verify: Callable[[str, object, dict], bool]):
+        self._initialize(verify, ":memory:", create=True)
+
+    @classmethod
+    def bootstrap_offline(cls, path, verify, *, environment):
+        """Explicit new synthetic store; never overwrite or enable production."""
+        if environment != 'synthetic':
+            raise Invalid('synthetic environment required')
+        path = Path(path).absolute()
+        with path.open('xb'):
+            pass
+        result = cls.__new__(cls)
+        result._initialize(verify, path.as_uri() + '?mode=rw', create=True, uri=True)
+        return result
+
+    @classmethod
+    def open_offline(cls, path, verify, *, environment):
+        """Missing/unknown stores fail closed; never create a replacement."""
+        if environment != 'synthetic':
+            raise Invalid('synthetic environment required')
+        path = Path(path).absolute()
+        if not path.is_file() or path.is_symlink():
+            raise Invalid('existing regular store required')
+        result = cls.__new__(cls)
+        result._initialize(verify, path.as_uri() + '?mode=rw', create=False, uri=True)
+        return result
+
+    def _initialize(self, verify, database, *, create, uri=False):
         if not callable(verify):
             raise Invalid("verifier required")
         self._verify = verify
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(":memory:", check_same_thread=False)
+        self._closed = False
+        self._db = sqlite3.connect(database, uri=uri, timeout=10,
+                                   check_same_thread=False, isolation_level=None)
         self._db.row_factory = sqlite3.Row
-        self._db.executescript('''
-          CREATE TABLE item (id TEXT PRIMARY KEY, key TEXT NOT NULL,
-            value TEXT NOT NULL, origin TEXT NOT NULL, status TEXT NOT NULL,
-            sensitivity TEXT NOT NULL, confidence TEXT NOT NULL,
-            source_ref TEXT NOT NULL, version INTEGER NOT NULL,
-            supersedes TEXT, contradicts TEXT);
-          CREATE UNIQUE INDEX one_active_key ON item(key) WHERE status='active';
-          CREATE TABLE request (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
-                                item_id TEXT NOT NULL);
-          CREATE TABLE audit (seq INTEGER PRIMARY KEY, op TEXT NOT NULL,
-                              item_id TEXT NOT NULL, version INTEGER NOT NULL);
-        ''')
+        try:
+            self._db.execute('PRAGMA synchronous=FULL')
+            self._db.execute('PRAGMA trusted_schema=OFF')
+            self._db.execute('PRAGMA secure_delete=ON')
+            if create:
+                # Exclusive bootstrap owns an empty file, never a migration.
+                self._db.executescript(_SCHEMA)
+            with self._transaction(write=False):
+                if self._db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                    raise Invalid('store integrity')
+        except Exception:
+            self._db.close()
+            self._closed = True
+            raise
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self._db.close()
+                self._closed = True
+
+    def _check_schema(self):
+        if self._db.execute('PRAGMA user_version').fetchone()[0] != 1:
+            raise Invalid('unknown store version')
+        tables = {r[0] for r in self._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if tables != {'item', 'request', 'audit', 'metadata'}:
+            raise Invalid('unknown store tables')
+        meta = self._db.execute('SELECT schema,environment FROM metadata').fetchall()
+        if [tuple(r) for r in meta] != [('potter.memory.offline/v1', 'synthetic')]:
+            raise Invalid('unknown store metadata')
+        for table, columns in _COLUMNS.items():
+            actual = tuple(row[1] for row in self._db.execute('PRAGMA table_info(' + table + ')'))
+            if actual != columns:
+                raise Invalid('unknown store columns')
+        # The partial unique index is essential to the one-active-value invariant.
+        row = self._db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='one_active_key'").fetchone()
+        if not row or row[0] != _ACTIVE_INDEX:
+            raise Invalid('active-key invariant unavailable')
+
+    @contextmanager
+    def _transaction(self, *, write=True):
+        # BEGIN IMMEDIATE takes the cross-process write reservation before reads,
+        # so compare-and-set, request dedupe, mutation and audit share a snapshot.
+        with self._lock:
+            if self._closed:
+                raise Invalid('store closed')
+            self._db.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
+            try:
+                self._check_schema()
+                yield
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def _auth(self, operation: str, proof: object, payload: dict) -> None:
         try:
@@ -110,7 +208,7 @@ class MemoryStore:
             self._auth('direct_statement', direct_proof, payload)
         packed = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'),
                                            ensure_ascii=False).encode('utf-8')).hexdigest()
-        with self._lock, self._db:
+        with self._transaction():
             old = self._db.execute('SELECT * FROM request WHERE request_id=?', (request_id,)).fetchone()
             if old:
                 if old['payload'] != packed:
@@ -129,7 +227,7 @@ class MemoryStore:
     def promote(self, ident: str, expected_version: int, proof: object, *, batch: bool = False) -> Item:
         payload = dict(id=ident, expected_version=expected_version, batch=batch)
         self._auth('promote', proof, payload)
-        with self._lock, self._db:
+        with self._transaction():
             item = self._get(ident)
             if item.status != 'staged' or item.version != expected_version:
                 raise Conflict('stale or non-staged candidate')
@@ -150,7 +248,7 @@ class MemoryStore:
 
     def undo(self, ident: str, expected_version: int, proof: object) -> Item:
         self._auth('undo', proof, dict(id=ident, expected_version=expected_version))
-        with self._lock, self._db:
+        with self._transaction():
             item = self._get(ident)
             if item.status != 'active' or item.version != expected_version or not item.supersedes:
                 raise Conflict('cannot undo changed or root memory')
@@ -165,7 +263,7 @@ class MemoryStore:
 
     def forget(self, ident: str, expected_version: int, proof: object) -> None:
         self._auth('forget', proof, dict(id=ident, expected_version=expected_version))
-        with self._lock, self._db:
+        with self._transaction():
             item = self._get(ident)
             if item.version != expected_version or item.status == 'forgotten':
                 raise Conflict('stale item')
@@ -180,7 +278,7 @@ class MemoryStore:
     def retrieve(self, key: str, *, consequential: bool) -> Retrieval:
         if type(consequential) is not bool:
             raise Invalid('explicit task tier required')
-        with self._lock:
+        with self._transaction(write=False):
             rows = self._db.execute("SELECT * FROM item WHERE key=? AND status IN ('active','staged') ORDER BY rowid", (key,)).fetchall()
             items = [Item(**dict(x)) for x in rows]
             active = tuple(x for x in items if x.status == 'active')
