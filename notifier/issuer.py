@@ -2,7 +2,8 @@
 
 Lifecycle of one approval (one action ID):
 
-1. ``request(tx, action, ...)`` - in the caller's transaction: stores the exact
+1. ``request(tx, action, ...)`` - refused unless the C2 task ``action.task_id``
+   exists and is ``waiting_approval``. In the caller's transaction: stores the exact
    canonical BoundAction (and so its preconditions) under a fresh
    ``approval_id``, valid for 24 h from now, and enqueues the prompt through
    the notifier. Refused while the kill flag is set.
@@ -14,9 +15,12 @@ Lifecycle of one approval (one action ID):
      * the kill flag is clear and the request is still ``pending``
        (single use: the state flip is one ``BEGIN IMMEDIATE`` update);
      * it is less than 24 h since the request;
+     * the voucher was minted for this exact ``/approve <id>`` (or
+       ``/deny <id>``) message, by transport-authenticated delivery;
      * the action recomputed against live state hashes to the stored hash
-       (any precondition/parameter change -> ``voided``), and, if the C2 task
-       exists, it is still ``waiting_approval`` (any other state -> voided).
+       (any precondition/parameter change -> ``voided``), and the C2 task
+       with ``id == action.task_id`` exists and is still ``waiting_approval``
+       (missing -> ``task_not_waiting``; any other state -> ``state_changed``).
    On success the record is signed with the injected issuer key; its
    ``expires_at`` is the request's 24 h deadline, so the whole window never
    exceeds 24 h. C1 then verifies it and consumes the nonce exactly once.
@@ -56,6 +60,7 @@ APPROVE, DENY = "approve", "deny"
 REFUSALS = frozenset({
     "unauthenticated", "channel_not_approval_capable", "stopped", "unknown_approval",
     "already_decided", "expired", "state_changed", "bad_decision", "issuer_error",
+    "task_not_waiting", "command_mismatch",
 })
 
 
@@ -134,6 +139,10 @@ class ApprovalIssuer:
             raise ValueError("T38: browser/computer approvals need a screenshot_ref")
         if self.kill.is_set(tx):
             raise Stopped("kill flag set")
+        # Only an authoritative C2 task, waiting for this approval, can ask.
+        task = tx.execute("SELECT state FROM tasks WHERE id=?", (action.task_id,)).fetchone()
+        if task is None or task[0] != WAITING_APPROVAL:
+            raise ApprovalRefusal("task_not_waiting")
         now = self._now(now)
         approval_id = self._new_id()
         nid = f"approval:{approval_id}"
@@ -166,6 +175,11 @@ class ApprovalIssuer:
             raise ApprovalRefusal("unauthenticated")
         if sender.channel not in c0.CHANNELS:
             raise ApprovalRefusal("channel_not_approval_capable")
+        # The voucher must come from the very message that answered this prompt.
+        cmd, target = sender.command()
+        if cmd != ("/approve" if decision == APPROVE else "/deny") or target not in (
+                approval_id, f"approval:{approval_id}"):
+            raise ApprovalRefusal("command_mismatch")
         outcome: dict | ApprovalRefusal
         with self.db.tx() as c:
             outcome = self._decide_tx(c, approval_id, decision, sender, live_action, now)
@@ -197,7 +211,10 @@ class ApprovalIssuer:
             self._close(c, approval_id, "expired", "24h")
             return ApprovalRefusal("expired")
         task = c.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if task is not None and task[0] != WAITING_APPROVAL:
+        if task is None:
+            self._close(c, approval_id, "voided", "task_missing")
+            return ApprovalRefusal("task_not_waiting")
+        if task[0] != WAITING_APPROVAL:
             self._close(c, approval_id, "voided", "task_state_changed")
             return ApprovalRefusal("state_changed")
         if not isinstance(live_action, c0.BoundAction) or live_action.hash() != action_hash:

@@ -28,7 +28,8 @@ sys.path.insert(0, str(ROOT))
 
 from identity.seed import CHRISTIE, JOSH  # noqa: E402
 from notifier import (ApprovalIssuer, ChannelAuth, CommandRouter, FakeChannel,  # noqa: E402
-                      HmacIssuerKey, InboundMessage, JobSpec, Notifier, Stopped)
+                      HmacIssuerKey, InboundMessage, JobSpec, Notifier, Stopped,
+                      TransportSigner)
 from notifier import lint  # noqa: E402
 from policy import (ALLOW, DENY, Caller, Capability, CapabilityRegistry,  # noqa: E402
                     PolicyEngine, PolicyRequest, RiskClass)
@@ -39,6 +40,9 @@ from runtime import (ABANDONED_UNKNOWN, ACKED, SENT, SUPPRESSED, Database,  # no
 T = 1_800_000_000
 DAY = 24 * 3600
 TEST_KEY = b"test-only-e1-issuer-key"          # test constant, not a secret
+TRANSPORT_KEYS = {"telegram": b"test-only-telegram-adapter-key",   # test constants
+                  "email": b"test-only-email-adapter-key-0",
+                  "potter_home": b"test-only-home-adapter-key-00"}
 TG_JOSH, TG_CHRISTIE, TG_STRANGER = "tg-1001", "tg-2002", "tg-6666"
 MAIL_JOSH = "josh@example.test"
 R = RiskClass
@@ -59,7 +63,10 @@ class World:
         self.home = FakeChannel("potter_home")
         self.dkim_pass: set[str] = set()
         self.sessions: set[str] = set()
+        self.signers = {ch: TransportSigner(ch, k) for ch, k in TRANSPORT_KEYS.items()}
+        self._updates = 0
         self.auth = ChannelAuth(
+            db=self.db, transport_keys=TRANSPORT_KEYS, clock=lambda: self.now,
             inbound_bindings={"telegram": {TG_JOSH: JOSH, TG_CHRISTIE: CHRISTIE},
                               "email": {MAIL_JOSH: JOSH},
                               "potter_home": {"home:josh": JOSH}},
@@ -91,13 +98,23 @@ class World:
                         trace_sink=self.traces.append, **kw)
 
     # -- helpers --------------------------------------------------------------
+    def signed(self, channel, sender, text, reply_to=None, raw_ref=None):
+        """What the trusted (fake) adapter hands the router: a signed update."""
+        self._updates += 1
+        return self.signers[channel].envelope(sender, text, update_id=f"u{self._updates}",
+                                              sent_at=self.now, reply_to=reply_to,
+                                              raw_ref=raw_ref)
+
     def tg_msg(self, text, sender=TG_JOSH, reply_to=None):
-        return InboundMessage("telegram", sender, text, reply_to=reply_to)
+        return self.signed("telegram", sender, text, reply_to)
 
     def mail_msg(self, text, *, dkim: bool, reply_to=None, ref="mail-1"):
         if dkim:
             self.dkim_pass.add(ref)
-        return InboundMessage("email", MAIL_JOSH, text, reply_to=reply_to, raw_ref=ref)
+        return self.signed("email", MAIL_JOSH, text, reply_to, ref)
+
+    def home_msg(self, text, *, session: str):
+        return self.signed("potter_home", "home:josh", text, raw_ref=session)
 
     def job_notify(self, job, key, text, urgency="routine", kind="alert"):
         handle = self.notifier.handle_for(JobSpec(job, "josh"))
@@ -213,9 +230,9 @@ class NonAllowlistedIgnored(Base):
             (self.w.tg_msg("/stop", sender=TG_STRANGER), "unknown_sender"),
             (self.w.tg_msg("/stop", sender=TG_CHRISTIE), "principal_disabled"),
             (self.w.mail_msg("/stop", dkim=False), "dkim_unverified"),
-            (InboundMessage("potter_home", "home:josh", "/stop", raw_ref="no-session"),
-             "session_unverified"),
-            (InboundMessage("sms", "+15550000", "/stop"), "unknown_sender"),
+            (self.w.home_msg("/stop", session="no-session"), "session_unverified"),
+            (InboundMessage("sms", "+15550000", "/stop", update_id="x", sent_at=T),
+             "unknown_channel"),
         ]
         for msg, reason in cases:
             with self.subTest(reason=reason):
@@ -575,8 +592,7 @@ class ApprovalEndToEnd(Base):
         self.assertEqual((res.outcome, res.reason), ("refused", "channel_not_approval_capable"))
         # Potter Home with a verified session counts.
         self.w.sessions.add("sess-1")
-        res = self.w.router.handle(InboundMessage("potter_home", "home:josh", f"/approve {aid}",
-                                                  raw_ref="sess-1"))
+        res = self.w.router.handle(self.w.home_msg(f"/approve {aid}", session="sess-1"))
         self.assertEqual(res.outcome, "approved")
         self.assertEqual(res.detail["channel"], "potter_home")
         self.assertEqual(self.w.c1(mail_action(tid), res.detail).outcome, ALLOW)
@@ -651,7 +667,7 @@ class VoucherForgery(Base):
         from notifier import ApprovalRefusal
         t1, t2 = self.w.waiting_task("t1"), self.w.waiting_task("t2")
         a1, a2 = self.w.request(mail_action(t1)), self.w.request(mail_action(t2))
-        sender = self.w.auth.authenticate(self.w.tg_msg("/approve")).sender
+        sender = self.w.auth.authenticate(self.w.tg_msg(f"/approve {a1}")).sender
         self.w.issuer.decide(a1, "approve", sender, mail_action(t1))
         with self.assertRaises(ApprovalRefusal) as cm:
             self.w.issuer.decide(a2, "approve", sender, mail_action(t2))
@@ -661,7 +677,9 @@ class VoucherForgery(Base):
 
     def test_voucher_from_another_auth_instance_is_refused(self):
         from notifier import ChannelAuth as CA
-        stranger_auth = CA(inbound_bindings={"telegram": {TG_JOSH: JOSH}},
+        stranger_auth = CA(db=self.w.db, transport_keys=TRANSPORT_KEYS,
+                           clock=lambda: self.w.now,
+                           inbound_bindings={"telegram": {TG_JOSH: JOSH}},
                            outbound_addresses={JOSH: {"telegram": "chat-1001"}})
         foreign = stranger_auth.authenticate(self.w.tg_msg("/stop")).sender
         self.assertFalse(self.w.auth.vouches(foreign))
@@ -735,6 +753,379 @@ class StopAckFallback(Base):
         self.assertEqual(kinds, ["stop_ack"])              # only the confirmation, nothing else
         self.assertEqual(self.w.email.delivered[0].notification_id, res.detail.reply_notification_id)
         self.assertEqual(self.w.tg.delivered, [])
+
+
+# ============================================================ review regressions (Dolores, #28)
+
+class HandleIsolation(Base):
+    """A job holding a handle cannot reach a channel (Dolores finding 1)."""
+    DOLORES = "handle._n._channels['telegram'].send(msg)"
+
+    def _queued_msg(self):
+        self.w.job_notify("digest", "d1", "x")
+        return self.w.notifier.outbox.get("job:digest:d1:telegram")
+
+    def test_dolores_snippet_is_impossible_and_flagged(self):
+        handle = self.w.notifier.handle_for(JobSpec("digest", "josh"))
+        msg = self._queued_msg()
+        with self.assertRaises(AttributeError):
+            exec(self.DOLORES, {"handle": handle, "msg": msg})
+        work = handle.long_work("w1", T)
+        with self.assertRaises(AttributeError):
+            exec(self.DOLORES.replace("handle", "work"), {"work": work, "msg": msg})
+        self.assertEqual(self.w.tg.calls, 0)
+        rules = [f.rule for f in lint.scan_source(self.DOLORES, "jobs/x.py", exempt=False)]
+        self.assertIn("direct send: .send()", rules)
+        self.assertIn("private reach-through: ._n", rules)
+        self.assertIn("private reach-through: ._channels", rules)
+
+    def test_no_notifier_or_channel_reachable_from_handle_data(self):
+        import gc
+        import types
+        from notifier import ChannelAuth as CA, Notifier as N
+        from runtime import Outbox
+        handle = self.w.notifier.handle_for(JobSpec("digest", "josh"))
+        forbidden = (N, FakeChannel, CA, Outbox)
+        skip = (type, types.FunctionType, types.ModuleType, types.BuiltinFunctionType)
+        for root in (handle, handle.long_work("w1", T)):
+            seen, frontier = set(), [root]
+            for _ in range(5):                 # instance data, 5 hops deep
+                nxt = []
+                for obj in frontier:
+                    for ref in gc.get_referents(obj):
+                        if id(ref) in seen or isinstance(ref, skip):
+                            continue
+                        seen.add(id(ref))
+                        self.assertNotIsInstance(ref, forbidden, f"{type(root).__name__} leaks")
+                        nxt.append(ref)
+                frontier = nxt
+        self.assertFalse(hasattr(handle, "_n"))
+        with self.assertRaises(TypeError):
+            import pickle
+            pickle.dumps(handle)
+
+    def test_lint_flags_other_reach_through_paths(self):
+        cases = {
+            "getattr(handle, '_n')": "dynamic getattr()",
+            "getattr(handle, name)": "dynamic getattr()",
+            "vars(handle)": "vars()",
+            "type(handle).notify.__globals__['_HANDLES']": ".__globals__",
+            "import gc\ngc.get_referents(handle)": "introspection import: gc",
+            "from inspect import getclosurevars": "introspection import: inspect",
+            "handle.notify.__func__.__closure__": ".__closure__",
+            "from notifier.service import _resolve": "direct channel path",
+        }
+        for src, needle in cases.items():
+            with self.subTest(src=src):
+                rules = [f.rule for f in lint.scan_source(src, "jobs/x.py", exempt=False)]
+                self.assertTrue(any(needle in r for r in rules), rules)
+        ok = "handle.notify(tx, 'k', kind='alert', text='t')\nself._auth = 1"
+        self.assertEqual(lint.scan_source(ok, "jobs/x.py", exempt=False), [])
+
+
+class StopSendRace(Base):
+    """Dolores finding 2: no send may start after stop() has returned."""
+
+    def setUp(self):
+        super().setUp()
+        import threading
+        self.threading = threading
+        self.paused, self.resume = threading.Event(), threading.Event()
+
+    def _pause_once(self, msg):
+        if msg.notification_id == "job:digest:d1" and not self.paused.is_set():
+            self.paused.set()
+            self.assertTrue(self.resume.wait(10))
+
+    def _run_in_thread(self):
+        errors = []
+
+        def target():
+            try:
+                self.w.notifier.run()
+            except BaseException as e:      # surfaced by the test
+                errors.append(e)
+        t = self.threading.Thread(target=target)
+        t.start()
+        self.assertTrue(self.paused.wait(10))
+        return t, errors
+
+    def test_paused_after_check_then_stop_returns_then_resume_no_send(self):
+        # Pause where the old code had already passed its kill check.
+        self.w.notifier._hook_before_gate = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        worker, errors = self._run_in_thread()
+        res = self.w.router.handle(self.w.tg_msg("/stop"))      # returns while paused
+        self.assertEqual(res.outcome, "stopped")
+        self.assertEqual(res.detail.unconfirmed_in_flight, ())
+        self.resume.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertNotIn("job:digest:d1", self.w.tg.delivered_notifications())
+        self.assertEqual([m.body["kind"] for m in self.w.tg.delivered], ["stop_ack"])
+
+    def test_sender_past_gate_aborts_and_stop_waits_for_it(self):
+        # Past the gate but not yet inside channel.send: stop() must wait for the
+        # sender to resolve, and the sender's recheck sees the flag and aborts.
+        self.w.notifier._hook_after_gate = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        self.w.job_notify("digest", "d2", "y")
+        worker, errors = self._run_in_thread()
+        order = []
+        self.w.tg.on_send = lambda m: order.append(("send", m.notification_id))
+
+        def do_stop():
+            self.stop_res = self.w.router.handle(self.w.tg_msg("/stop"))
+            order.append(("stop_returned", None))
+        stopper = self.threading.Thread(target=do_stop)
+        stopper.start()
+        stopper.join(0.3)
+        self.assertTrue(stopper.is_alive(), "stop() must wait for the sender past the gate")
+        self.resume.set()
+        stopper.join(10)
+        worker.join(10)
+        self.assertEqual(errors, [])
+        self.assertTrue(self.stop_res.detail.all_clear)
+        events = [e for e in order if not (e[0] == "send" and e[1].startswith("stop:"))]
+        self.assertEqual(events, [("stop_returned", None)])     # d1 aborted, d2 never sent
+        self.assertIn("stop_ack", [m.body["kind"] for m in self.w.tg.delivered])
+        with self.w.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM notifier_sending").fetchone()[0], 0)
+
+    def test_send_inside_channel_completes_before_stop_returns(self):
+        # Already inside channel.send: it may complete, and does so before stop() returns.
+        entered, release = self.threading.Event(), self.threading.Event()
+
+        def inside(msg):
+            if msg.notification_id == "job:digest:d1":
+                entered.set()
+                self.assertTrue(release.wait(10))
+        self.w.tg.on_send = inside
+        self.w.job_notify("digest", "d1", "x")
+        worker = self.threading.Thread(target=self.w.notifier.run)
+        worker.start()
+        self.assertTrue(entered.wait(10))
+        done = []
+        stopper = self.threading.Thread(
+            target=lambda: done.append(self.w.router.handle(self.w.tg_msg("/stop"))))
+        stopper.start()
+        stopper.join(0.3)
+        self.assertTrue(stopper.is_alive())
+        release.set()
+        stopper.join(10)
+        worker.join(10)
+        self.assertIn("job:digest:d1", self.w.tg.delivered_notifications())
+        self.assertTrue(done[0].detail.all_clear)
+
+    def test_unreturned_row_is_always_reported_never_aged_out(self):
+        with self.w.db.tx() as c:
+            c.execute("INSERT INTO notifier_sending VALUES ('ghost:telegram', 'dead', ?)",
+                      (self.w.now - 10,))
+        quick = self.w.make_notifier(stop_wait_s=0.05)
+        # Bounded wait expires on a live-looking row: returned as unconfirmed, not all-clear.
+        report = quick.stop(self.w.auth.authenticate(self.w.tg_msg("/stop")).sender)
+        self.assertEqual(report.unconfirmed_in_flight, ("ghost:telegram",))
+        self.assertEqual(report.expired_in_flight, ())
+        self.assertFalse(report.all_clear)
+        # Aged far past the dispatch timeout: still reported (flagged expired), not dropped.
+        with self.w.db.tx() as c:
+            c.execute("UPDATE notifier_sending SET since=?", (self.w.now - 3600,))
+        report = quick.stop(self.w.auth.authenticate(self.w.tg_msg("/stop")).sender)
+        self.assertEqual(report.unconfirmed_in_flight, ("ghost:telegram",))
+        self.assertEqual(report.expired_in_flight, ("ghost:telegram",))
+        self.assertFalse(report.all_clear)
+
+    def test_dolores_aged_live_sender_cannot_deliver_after_stop(self):
+        # Pause after the gate, before the first channel.send; /stop at T+21 with
+        # dispatch_timeout 20; resume: the sender must abort, not deliver.
+        self.w.notifier._hook_after_gate = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        worker, errors = self._run_in_thread()
+        self.w.now = T + 21
+        res = self.w.router.handle(self.w.tg_msg("/stop"))
+        self.assertEqual(res.outcome, "stopped")
+        self.assertEqual(res.detail.unconfirmed_in_flight, ("job:digest:d1:telegram",))
+        self.assertEqual(res.detail.expired_in_flight, ("job:digest:d1:telegram",))
+        self.assertFalse(res.detail.all_clear)
+        self.resume.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertNotIn("job:digest:d1", self.w.tg.delivered_notifications())
+        with self.w.db.read() as c:   # the aborting sender cleared its own row
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM notifier_sending").fetchone()[0], 0)
+
+    def test_bounded_wait_expiry_returns_unconfirmed_and_late_sender_aborts(self):
+        self.w.notifier = quick = self.w.make_notifier(stop_wait_s=0.1)
+        self.w.router = CommandRouter(auth=self.w.auth, notifier=quick, issuer=self.w.issuer,
+                                      live_action=lambda aid, tid: None, clock=lambda: self.w.now)
+        quick._hook_after_gate = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        worker, errors = self._run_in_thread()
+        res = self.w.router.handle(self.w.tg_msg("/stop"))      # wait expires while paused
+        self.assertEqual(res.detail.unconfirmed_in_flight, ("job:digest:d1:telegram",))
+        self.assertEqual(res.detail.expired_in_flight, ())
+        self.assertFalse(res.detail.all_clear)
+        self.resume.set()
+        worker.join(10)
+        self.assertEqual(errors, [])
+        self.assertNotIn("job:digest:d1", self.w.tg.delivered_notifications())
+
+    def test_expired_gate_cannot_send_even_without_stop(self):
+        self.w.notifier._hook_after_gate = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        worker, errors = self._run_in_thread()
+        self.w.now = T + 25                                 # past dispatch timeout, no /stop
+        self.resume.set()
+        worker.join(10)
+        self.assertEqual(errors, [])
+        self.assertNotIn("job:digest:d1", self.w.tg.delivered_notifications())
+
+
+# ============================================================ transport auth + task authority (Dolores, #28)
+
+class TransportAuthentication(Base):
+    """Commands count only as signed, fresh, unreplayed adapter envelopes."""
+
+    def assertIgnored(self, msg, reason):
+        res = self.w.router.handle(msg)
+        self.assertEqual((res.outcome, res.reason), ("ignored", reason))
+
+    def test_fabricated_stop_is_ignored_and_logged(self):
+        self.assertIgnored(InboundMessage("telegram", TG_JOSH, "/stop"), "unauthenticated_transport")
+        self.assertIgnored(InboundMessage("telegram", TG_JOSH, "/stop", update_id="u-x",
+                                          sent_at=T, transport_mac="0" * 64),
+                           "unauthenticated_transport")
+        self.assertFalse(self.w.notifier.kill.is_set())
+        self.assertEqual([r[2] for r in self.w.router.ignored()],
+                         ["unauthenticated_transport"] * 2)
+
+    def test_fabricated_approve_is_ignored(self):
+        tid = self.w.waiting_task()
+        aid = self.w.request(mail_action(tid))
+        self.assertIgnored(InboundMessage("telegram", TG_JOSH, f"/approve {aid}"),
+                           "unauthenticated_transport")
+        self.assertIsNone(self.w.auth.authenticate(
+            InboundMessage("telegram", TG_JOSH, f"/approve {aid}")).sender)
+        self.assertEqual(self.w.issuer.get(aid).status, "pending")
+
+    def test_attacker_key_is_refused(self):
+        evil = TransportSigner("telegram", b"attacker-telegram-adapter-key")
+        msg = evil.envelope(TG_JOSH, "/stop", update_id="e1", sent_at=T)
+        self.assertIgnored(msg, "unauthenticated_transport")
+        self.assertFalse(self.w.notifier.kill.is_set())
+
+    def test_message_substitution_is_refused(self):
+        from dataclasses import replace
+        tid = self.w.waiting_task()
+        aid = self.w.request(mail_action(tid))
+        genuine = self.w.tg_msg("/ack job:digest:d1")
+        for field, value in (("text", "/stop"), ("text", f"/approve {aid}"),
+                             ("reply_to", f"approval:{aid}"), ("sender_ref", TG_CHRISTIE),
+                             ("channel", "potter_home"), ("update_id", "u-other")):
+            with self.subTest(field=field):
+                self.assertIgnored(replace(genuine, **{field: value}), "unauthenticated_transport")
+        self.assertFalse(self.w.notifier.kill.is_set())
+        self.assertEqual(self.w.issuer.get(aid).status, "pending")
+
+    def test_replayed_update_is_refused(self):
+        self.w.job_notify("digest", "d1", "x")
+        ack = self.w.tg_msg("/ack job:digest:d1")
+        self.assertEqual(self.w.router.handle(ack).outcome, "acked")
+        self.assertIgnored(ack, "replayed")
+        restarted_auth = ChannelAuth(db=self.w.db, transport_keys=TRANSPORT_KEYS,
+                                     clock=lambda: self.w.now,
+                                     inbound_bindings={"telegram": {TG_JOSH: JOSH}},
+                                     outbound_addresses={})
+        self.assertEqual(restarted_auth.authenticate(ack).reason, "replayed")   # durable
+
+    def test_stale_update_is_refused(self):
+        old = self.w.tg_msg("/stop")
+        self.w.now += 301
+        self.assertIgnored(old, "stale_transport")
+        self.assertFalse(self.w.notifier.kill.is_set())
+
+    def test_voucher_is_bound_to_its_command(self):
+        from notifier import ApprovalRefusal
+        t1, t2 = self.w.waiting_task("t1"), self.w.waiting_task("t2")
+        a1, a2 = self.w.request(mail_action(t1)), self.w.request(mail_action(t2))
+        ack_voucher = self.w.auth.authenticate(self.w.tg_msg("/ack job:digest:d1")).sender
+        with self.assertRaises(PermissionError):
+            self.w.notifier.stop(ack_voucher)
+        self.assertFalse(self.w.notifier.kill.is_set())
+        with self.assertRaises(ApprovalRefusal) as cm:
+            self.w.issuer.decide(a1, "approve", ack_voucher, mail_action(t1))
+        self.assertEqual(cm.exception.code, "command_mismatch")
+        v1 = self.w.auth.authenticate(self.w.tg_msg(f"/approve {a1}")).sender
+        with self.assertRaises(ApprovalRefusal) as cm:
+            self.w.issuer.decide(a2, "approve", v1, mail_action(t2))     # wrong approval id
+        self.assertEqual(cm.exception.code, "command_mismatch")
+        deny_voucher = self.w.auth.authenticate(self.w.tg_msg(f"/deny {a2}")).sender
+        with self.assertRaises(ApprovalRefusal) as cm:
+            self.w.issuer.decide(a2, "approve", deny_voucher, mail_action(t2))   # deny != approve
+        self.assertEqual(cm.exception.code, "command_mismatch")
+        self.assertEqual({self.w.issuer.get(a).status for a in (a1, a2)}, {"pending"})
+
+    def test_boundary_wiring_with_fake_telegram_adapter(self):
+        """Fake transport -> adapter (verifies webhook secret, signs) -> router."""
+        world = self.w
+
+        class FakeTelegramAdapter:
+            WEBHOOK_SECRET = "test-only-webhook-secret"
+
+            def __init__(self, signer):
+                self._signer, self._n = signer, 0
+
+            def on_webhook(self, headers, update):
+                if headers.get("X-Telegram-Bot-Api-Secret-Token") != self.WEBHOOK_SECRET:
+                    return None                         # never reaches the router
+                self._n += 1
+                msg = self._signer.envelope(str(update["from_id"]), update["text"],
+                                            update_id=f"tg-{update['update_id']}",
+                                            sent_at=world.now)
+                return world.router.handle(msg)
+
+        adapter = FakeTelegramAdapter(world.signers["telegram"])
+        good = {"X-Telegram-Bot-Api-Secret-Token": adapter.WEBHOOK_SECRET}
+        self.assertIsNone(adapter.on_webhook({}, {"update_id": 1, "from_id": TG_JOSH,
+                                                  "text": "/stop"}))
+        self.assertFalse(world.notifier.kill.is_set())
+        res = adapter.on_webhook(good, {"update_id": 2, "from_id": TG_STRANGER, "text": "/stop"})
+        self.assertEqual((res.outcome, res.reason), ("ignored", "unknown_sender"))
+        res = adapter.on_webhook(good, {"update_id": 3, "from_id": TG_JOSH, "text": "/stop"})
+        self.assertEqual(res.outcome, "stopped")
+        res = adapter.on_webhook(good, {"update_id": 3, "from_id": TG_JOSH, "text": "/stop"})
+        self.assertEqual((res.outcome, res.reason), ("ignored", "replayed"))
+
+
+class TaskAuthority(Base):
+    """Approvals exist only for an authoritative C2 task waiting for them."""
+
+    def test_request_for_missing_task_is_refused(self):
+        from notifier import ApprovalRefusal
+        with self.w.db.tx() as c, self.assertRaises(ApprovalRefusal) as cm:
+            self.w.issuer.request(c, mail_action("no-such-task"), summary="s")
+        self.assertEqual(cm.exception.code, "task_not_waiting")
+        with self.w.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0], 0)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    def test_request_for_task_not_waiting_is_refused(self):
+        from notifier import ApprovalRefusal
+        task, _ = self.w.tasks.submit("trigger:q", "send-mail")      # queued, not waiting
+        with self.w.db.tx() as c, self.assertRaises(ApprovalRefusal) as cm:
+            self.w.issuer.request(c, mail_action(task.id), summary="s")
+        self.assertEqual(cm.exception.code, "task_not_waiting")
+
+    def test_approve_after_task_vanishes_is_refused(self):
+        tid = self.w.waiting_task()
+        aid = self.w.request(mail_action(tid))
+        with self.w.db.tx() as c:
+            c.execute("DELETE FROM tasks WHERE id=?", (tid,))
+        res = self.w.router.handle(self.w.tg_msg(f"/approve {aid}"))
+        self.assertEqual((res.outcome, res.reason), ("refused", "task_not_waiting"))
+        self.assertEqual(self.w.issuer.get(aid).status, "voided")
 
 
 # ============================================================ long work (item 5)

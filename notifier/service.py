@@ -5,10 +5,15 @@ long-work progress, watchdog alert, /stop confirmation - is enqueued here, in
 the caller's transaction, through the C3 outbox. Nothing else holds a channel.
 
 * Jobs: each scheduled job declares ``JobSpec(name, delivery="josh"|"silent")``
-  and receives a ``JobHandle``. The handle can only enqueue (or, for silent
-  jobs, drop); it has no send or channel API. ``notifier.lint`` fails the
-  build if code outside ``notifier/`` imports a channel, the outbox or a
-  network client.
+  and receives a ``JobHandle``. The handle holds only an opaque handle id and
+  its job's name/target; the notifier, outbox and channels are looked up in a
+  private registry on each call, so nothing reachable from the handle (or from
+  a ``LongWork`` it returns) leads to a channel. ``notifier.lint`` fails the
+  build on channel/outbox/network imports outside ``notifier/`` and on
+  reach-through (``_n``, ``_channels``, ``__closure__``, ``.send(``, dynamic
+  ``getattr``, ``gc``/``inspect``). In-process Python is not a hard isolation
+  boundary: this is defence in depth, and hard enforcement is the C8 process
+  boundary (jobs run where the notifier's channels do not exist).
 * ID before send: the outbox row (stable ``message_id`` = ``<notification
   id>:<channel>``) is committed with the business change, before any send.
   Unknown outcomes reuse C3: routine not resent, urgent resent once.
@@ -22,8 +27,21 @@ the caller's transaction, through the C3 outbox. Nothing else holds a channel.
   raises one urgent alert per 30-min bucket.
 * /stop: ``stop()`` sets the durable kill flag, cancels (``suppressed``) every
   queued or unresolved send, cancels pending approvals, and enqueues one
-  confirmation listing what was cancelled. A send already in flight completes;
-  the relay checks the flag before every claim and every send.
+  confirmation listing what was cancelled. Boundary: every send passes a gate
+  that checks the flag and records the send in ``notifier_sending`` in ONE
+  ``BEGIN IMMEDIATE`` transaction; ``stop()`` sets the flag under the same
+  write lock and then waits until every recorded send has returned. So a
+  send already past the gate may complete (before ``stop()`` returns), and no
+  send that has not passed the gate can start afterwards.
+  Immediately before ``channel.send`` the sender re-checks, in its own
+  transaction, that its gate row still exists, that it is younger than the
+  dispatch timeout and that the kill flag is clear; otherwise it removes its
+  row and aborts. So a sender paused past the gate cannot deliver after a
+  /stop, and an expired gate cannot deliver at all. ``stop()`` never gives an
+  all-clear from age: it waits (up to ``stop_wait_s``) for unexpired rows,
+  and returns EVERY row still present in ``StopReport.unconfirmed_in_flight``
+  (expired ones also in ``expired_in_flight``: those senders must abort at
+  their recheck). An empty ``unconfirmed_in_flight`` is the only all-clear.
 * Long work: ``LongWork`` sends one acknowledgement after 30 s, an update only
   when the state changes, and a final message with the receipt link.
 
@@ -32,7 +50,10 @@ Staging-only (T22): channels are injected; only fakes exist in this package.
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
@@ -106,6 +127,12 @@ class StopReport:
     cancelled_approvals: tuple[str, ...]
     already_stopped: bool
     reply_notification_id: str
+    unconfirmed_in_flight: tuple[str, ...] = ()   # every unreturned send, never filtered by age
+    expired_in_flight: tuple[str, ...] = ()       # subset past dispatch timeout: must abort
+
+    @property
+    def all_clear(self) -> bool:
+        return not self.unconfirmed_in_flight
 
 
 class Notifier:
@@ -115,7 +142,8 @@ class Notifier:
                  max_attempts: int = 8, backoff_s: float = 30.0,
                  dispatch_timeout_s: float = 300.0, clock: Callable[[], float] = time.time,
                  trace_sink: Sink | None = None, environment: str = "synthetic",
-                 owner: str = "e1-notifier"):
+                 owner: str = "e1-notifier", stop_wait_s: float = 30.0,
+                 sleep: Callable[[float], None] = time.sleep):
         if failure_threshold < 1 or max_attempts <= failure_threshold:
             # Routine messages must outlive the outage detector: they wait, not fail.
             raise ValueError("need 1 <= failure_threshold < max_attempts")
@@ -137,6 +165,13 @@ class Notifier:
         self._owner = owner
         self._run_now: float | None = None
         self._claimed = False
+        self._dispatch_timeout = dispatch_timeout_s
+        self._stop_wait = stop_wait_s
+        self._sleep = sleep
+        self._local = threading.local()          # this thread's sends past the gate
+        # Test seams for the /stop race (deterministic pauses); None in production.
+        self._hook_before_gate: Callable[[QueuedMessage], None] | None = None
+        self._hook_after_gate: Callable[[QueuedMessage], None] | None = None
         for ch in (primary, fallback):
             if auth.address(recipient, ch) is None:
                 raise ValueError(f"no {ch} address for {recipient}")
@@ -202,23 +237,65 @@ class Notifier:
         self._trace_sends(report, self._now(now))
         return report
 
+    def _inflight(self) -> set[str]:
+        got = getattr(self._local, "ids", None)
+        if got is None:
+            got = self._local.ids = set()
+        return got
+
     def _send(self, msg: QueuedMessage) -> Any:
         self._claimed = True
-        if msg.body.get("kind") != "stop_ack" and self.kill.is_set():
-            raise SendFailed("stopped")          # never reached after a sweep; defence in depth
+        if self._hook_before_gate is not None:
+            self._hook_before_gate(msg)
         channel = self._channels.get(msg.channel)
         if channel is None:
             raise SendFailed("no such channel")
+        # The gate: kill check + in-flight record, atomically (see module doc).
+        with self.db.tx() as c:
+            if msg.body.get("kind") != "stop_ack" and self.kill.is_set(c):
+                raise SendFailed("stopped")      # row stays suppressed by the sweep
+            c.execute("INSERT OR REPLACE INTO notifier_sending (message_id, owner, since)"
+                      " VALUES (?,?,?)", (msg.message_id,
+                                          f"{self._owner}:{os.getpid()}:{threading.get_ident()}",
+                                          self._now()))
+        mine = self._inflight()
+        mine.add(msg.message_id)
         is_primary = msg.channel == self._primary
         try:
-            result = channel.send(msg)
-        except BaseException:
+            if self._hook_after_gate is not None:
+                self._hook_after_gate(msg)
+            self._recheck(msg)                   # last word before the channel call
+            try:
+                result = channel.send(msg)
+            except BaseException:
+                if is_primary:
+                    self._record_health(ok=False)
+                raise
             if is_primary:
-                self._record_health(ok=False)
-            raise
-        if is_primary:
-            self._record_health(ok=True)
-        return result
+                self._record_health(ok=True)
+            return result
+        finally:
+            mine.discard(msg.message_id)
+            try:
+                with self.db.tx() as c:
+                    c.execute("DELETE FROM notifier_sending WHERE message_id=?",
+                              (msg.message_id,))
+            except Exception:
+                pass   # a leftover row only delays stop() until it ages out
+
+    def _recheck(self, msg: QueuedMessage) -> None:
+        """Abort unless this send's gate row is still ours, unexpired, and the
+        kill flag is clear (stop_ack exempt from the flag). The finally-block
+        in ``_send`` removes the row on abort."""
+        with self.db.tx() as c:
+            row = c.execute("SELECT since FROM notifier_sending WHERE message_id=?",
+                            (msg.message_id,)).fetchone()
+            if row is None:
+                raise SendFailed("aborted: gate record missing")
+            if self._now() >= row[0] + self._dispatch_timeout:
+                raise SendFailed("aborted: gate expired")
+            if msg.body.get("kind") != "stop_ack" and self.kill.is_set(c):
+                raise SendFailed("aborted: stopped after gate")
 
     def _reconcile(self, msg: QueuedMessage) -> str:
         self._claimed = True
@@ -306,6 +383,9 @@ class Notifier:
         suppresses every undelivered sibling on every channel."""
         if not self._auth.vouches(sender) or sender.principal != self._recipient:
             return False
+        cmd, target = sender.command()
+        if cmd != "/ack" or target != notification_id:
+            return False                      # voucher was minted for another command
         candidates = [f"{notification_id}:{sender.channel}",
                       f"{notification_id}:{self._primary}", f"{notification_id}:{self._fallback}"]
         for mid in candidates:
@@ -319,6 +399,8 @@ class Notifier:
         and unresolved sends, cancel pending approvals, enqueue the reply."""
         if not self._auth.vouches(sender) or sender.principal != self._recipient:
             raise PermissionError("stop needs an authenticated allowlisted sender")
+        if sender.command()[0] != "/stop":
+            raise PermissionError("voucher was not minted for /stop")
         now = self._now(now)
         with self.db.tx() as c:
             first = self.kill.set(c, by=sender.principal, at=now)
@@ -337,7 +419,32 @@ class Notifier:
             self.enqueue(c, notification_id=reply, kind="stop_ack", text=text, urgency=URGENT,
                          channel=channel, now=now,
                          extra={"cancelled_notifications": nids, "cancelled_approvals": appr})
-        return StopReport(tuple(msgs), tuple(nids), tuple(appr), not first, reply)
+        unconfirmed, expired = self._await_in_flight()
+        return StopReport(tuple(msgs), tuple(nids), tuple(appr), not first, reply,
+                          tuple(unconfirmed), tuple(expired))
+
+    def _await_in_flight(self) -> tuple[list[str], list[str]]:
+        """Wait (bounded by ``stop_wait_s``) for unexpired sends past the gate
+        to return, then report EVERY row still present - age never removes an
+        entry from the report. Expired rows are not waited for: their senders
+        cannot pass the recheck. The caller's own in-flight send (``/stop``
+        handled from inside a send on this thread) is excluded.
+
+        Returns (unconfirmed, expired). When the wait expires the unconfirmed
+        set is returned as-is; it is never an all-clear."""
+        deadline = time.monotonic() + self._stop_wait
+        mine = self._inflight()
+        while True:
+            now = self._now()
+            with self.db.read() as c:
+                rows = c.execute("SELECT message_id, since FROM notifier_sending"
+                                 " ORDER BY message_id").fetchall()
+            rows = [(m, since) for m, since in rows if m not in mine]
+            expired = [m for m, since in rows if now >= since + self._dispatch_timeout]
+            waiting = [m for m, since in rows if now < since + self._dispatch_timeout]
+            if not waiting or time.monotonic() >= deadline:
+                return [m for m, _ in rows], expired
+            self._sleep(0.005)
 
     def _sweep(self, now: float) -> list[str]:
         with self.db.tx() as c:
@@ -386,24 +493,42 @@ class Notifier:
                            now=now, environment=self._env)
 
 
+# Private registry: handle id -> (notifier, spec). Handles never hold the
+# notifier; they hold an unguessable id that only this module can resolve.
+_HANDLES: dict[str, tuple[Notifier, JobSpec]] = {}
+_HANDLES_LOCK = threading.Lock()
+
+
+def _register_handle(notifier: Notifier, spec: JobSpec) -> str:
+    hid = secrets.token_hex(16)
+    with _HANDLES_LOCK:
+        _HANDLES[hid] = (notifier, spec)
+    return hid
+
+
+def _resolve(hid: str) -> tuple[Notifier, JobSpec]:
+    with _HANDLES_LOCK:
+        entry = _HANDLES.get(hid)
+    if entry is None:
+        raise NotifierError("unknown job handle")
+    return entry
+
+
 class JobHandle:
-    """What a scheduled job gets: enqueue-only, bound to its declared target."""
-    __slots__ = ("_n", "_spec")
+    """What a scheduled job gets: enqueue-only, bound to its declared target.
+    Holds only strings and a bool; no reference to the notifier or channels."""
+    __slots__ = ("_hid", "job", "silent")
 
     def __init__(self, notifier: Notifier, spec: JobSpec):
-        object.__setattr__(self, "_n", notifier)
-        object.__setattr__(self, "_spec", spec)
+        object.__setattr__(self, "_hid", _register_handle(notifier, spec))
+        object.__setattr__(self, "job", spec.name)
+        object.__setattr__(self, "silent", spec.delivery == "silent")
 
     def __setattr__(self, name, value):
         raise AttributeError("JobHandle is read-only")
 
-    @property
-    def job(self) -> str:
-        return self._spec.name
-
-    @property
-    def silent(self) -> bool:
-        return self._spec.delivery == "silent"
+    def __reduce__(self):
+        raise TypeError("JobHandle cannot be serialized")
 
     def notify(self, tx: sqlite3.Connection, key: str, *, kind: str, text: str,
                urgency: str = ROUTINE, now: float | None = None) -> str | None:
@@ -412,12 +537,12 @@ class JobHandle:
             raise ValueError(f"jobs may send {sorted(JOB_KINDS)}")
         if self.silent:
             return None
-        return self._n.enqueue(tx, notification_id=f"job:{self._spec.name}:{key}", kind=kind,
-                               text=text, urgency=urgency, now=now)
+        notifier, spec = _resolve(self._hid)
+        return notifier.enqueue(tx, notification_id=f"job:{spec.name}:{key}", kind=kind,
+                                text=text, urgency=urgency, now=now)
 
     def long_work(self, work_id: str, started_at: float) -> "LongWork":
-        return LongWork(self._n, f"{self._spec.name}:{work_id}", started_at,
-                        silent=self.silent)
+        return LongWork(self._hid, f"{self.job}:{work_id}", started_at, silent=self.silent)
 
 
 class LongWork:
@@ -431,9 +556,12 @@ class LongWork:
     continues the numbering and compares against the last state Josh was
     told, so a replayed tick sends nothing and no id is reused."""
 
-    def __init__(self, notifier: Notifier, work_id: str, started_at: float, *,
+    __slots__ = ("_hid", "_id", "_start", "_silent", "_state", "_done")
+
+    def __init__(self, handle_id: str, work_id: str, started_at: float, *,
                  silent: bool = False):
-        self._n, self._id, self._start, self._silent = notifier, work_id, started_at, silent
+        # Like JobHandle: a handle id, never the notifier itself.
+        self._hid, self._id, self._start, self._silent = handle_id, work_id, started_at, silent
         self._state: str | None = None      # in-memory only before the ack
         self._done = False
 
@@ -461,8 +589,8 @@ class LongWork:
         return ack_state, seq, last, done
 
     def _enqueue(self, c, suffix: str, kind: str, text: str, now: float, extra) -> None:
-        self._n.enqueue(c, notification_id=f"{self._prefix}{suffix}", kind=kind, text=text,
-                        now=now, extra=extra)
+        _resolve(self._hid)[0].enqueue(c, notification_id=f"{self._prefix}{suffix}",
+                                       kind=kind, text=text, now=now, extra=extra)
 
     def tick(self, state: str, now: float) -> None:
         if self._done:
@@ -470,7 +598,7 @@ class LongWork:
         if self._silent:
             self._state = state
             return
-        with self._n.db.tx() as c:
+        with _resolve(self._hid)[0].db.tx() as c:
             ack_state, seq, last, done = self._durable(c)
             if done:
                 self._done = True
@@ -494,6 +622,6 @@ class LongWork:
         self._done = True
         if self._silent:
             return
-        with self._n.db.tx() as c:
+        with _resolve(self._hid)[0].db.tx() as c:
             self._enqueue(c, "final", "work_final", f"Finished ({outcome}).", now,
                           {"receipt": receipt_link, "outcome": outcome})
