@@ -5,6 +5,21 @@ from retrieval.core import Evidence, FakeBackend, benchmark, retrieve_turn
 
 
 class RetrievalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_durations_rejected_before_backend_work(self):
+        class Never:
+            async def search(self, query):
+                raise AssertionError('invalid duration must not reach backend')
+        for value in (float('nan'), float('inf'), -float('inf'), 0, -1,
+                      True, '1', None, 10 ** 10000):
+            # Avoid formatting the huge integer in unittest's subtest label.
+            with self.subTest(type=type(value).__name__):
+                with self.assertRaises(ValueError):
+                    await retrieve_turn(Never(), 'q', consequential=False, timeout=value)
+                with self.assertRaises(ValueError):
+                    await benchmark(Never(), 'q', ['a'], timeout=value)
+                with self.assertRaises(ValueError):
+                    await benchmark(Never(), 'q', ['a'], production_deadline=value)
+
     async def test_successful_retrieval_does_not_grant_consequential_authority(self):
         r = await retrieve_turn(FakeBackend([Evidence('a', 'synthetic')]), 'q', consequential=True)
         self.assertEqual((r.status, r.blocked), ('complete', True))
@@ -58,3 +73,4 @@ class RetrievalContract(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
