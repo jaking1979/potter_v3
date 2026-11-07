@@ -19,10 +19,11 @@ SECTIONS=tuple(ENUMS)
 
 
 def timestamp(value):
-    if type(value) is not str or len(value)!=20 or not value.endswith('Z'):
+    if type(value) is not str or len(value) not in (20,27) or not value.endswith('Z'):
         raise ValueError('time')
-    dt=datetime.strptime(value,'%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-    if dt.strftime('%Y-%m-%dT%H:%M:%SZ')!=value: raise ValueError('time')
+    fmt='%Y-%m-%dT%H:%M:%SZ' if len(value)==20 else '%Y-%m-%dT%H:%M:%S.%fZ'
+    dt=datetime.strptime(value,fmt).replace(tzinfo=timezone.utc)
+    if dt.strftime(fmt)!=value: raise ValueError('time')
     return dt
 
 
@@ -50,7 +51,7 @@ def project(snapshot, *, now):
     """
     if not isinstance(now,datetime) or now.tzinfo is None or now.utcoffset().total_seconds()!=0:
         raise ValueError('aware UTC clock required')
-    result={'schema':'potter.e4a-view/v0','generated_at':now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+    result={'schema':'potter.e4a-view/v0','generated_at':now.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
             'mode':'offline_read_only','sections':{}}
     for name in SECTIONS:
         try:

@@ -55,6 +55,10 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):project(fixture(),now=NOW.replace(tzinfo=None))
         for s in (None,{}, {'schema':'wrong'}, {'schema':SCHEMA}):
             self.assertTrue(all(x['availability']=='unavailable' for x in project(s,now=NOW)['sections'].values()))
+    def test_fractional_staleness_survives_html_render(self):
+        v=project(fixture(300),now=NOW+timedelta(microseconds=1))
+        self.assertTrue(v['sections']['tasks']['stale'])
+        self.assertIn('Stale. Snapshot age: 300 seconds.',render(v))
     def test_forged_projection_revalidated(self):
         v=project(fixture(),now=NOW);v['sections']['tasks']['items'][0]['status']='<script>CANARY_SECRET</script>'
         self.assertNotIn('CANARY_SECRET',render(v))
