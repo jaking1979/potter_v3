@@ -6,6 +6,7 @@ integration is implemented. Never use this prototype for production memory.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -107,7 +108,8 @@ class MemoryStore:
         # must bind provenance to the content; all other sources remain staged.
         if origin == 'direct':
             self._auth('direct_statement', direct_proof, payload)
-        packed = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        packed = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                                           ensure_ascii=False).encode('utf-8')).hexdigest()
         with self._lock, self._db:
             old = self._db.execute('SELECT * FROM request WHERE request_id=?', (request_id,)).fetchone()
             if old:
@@ -167,8 +169,13 @@ class MemoryStore:
             item = self._get(ident)
             if item.version != expected_version or item.status == 'forgotten':
                 raise Conflict('stale item')
-            self._db.execute("UPDATE item SET status='forgotten', value='', version=version+1 WHERE id=?", (ident,))
-            self._audit('forget', ident, item.version + 1)
+            # Erase every local revision and staged claim under this fact key,
+            # not just the selected current row. External views and external
+            # backups remain outside this isolated experiment.
+            rows = self._db.execute("SELECT id,version FROM item WHERE key=? AND status!='forgotten'", (item.key,)).fetchall()
+            self._db.execute("UPDATE item SET status='forgotten', value='', version=version+1 WHERE key=? AND status!='forgotten'", (item.key,))
+            for row in rows:
+                self._audit('forget', row['id'], row['version'] + 1)
 
     def retrieve(self, key: str, *, consequential: bool) -> Retrieval:
         if type(consequential) is not bool:
