@@ -47,7 +47,8 @@ def action(task_id, n=1):
 # -- fake external system ---------------------------------------------------
 def scope_for(account, endpoint):
     cfg = hashlib.sha256(f"{account}|{endpoint}".encode()).hexdigest()
-    return IdempotencyScope("fake-provider", account, endpoint, "per-account-key", "1", 86_400, cfg)
+    return IdempotencyScope("fake-provider", account, endpoint, "per-account-key", "1", 86_400, cfg,
+                            enforced_request_lifetime_s=300)
 
 
 SCOPE = scope_for("acct-1", "sqlite://fixed")
@@ -708,7 +709,7 @@ class ContractRotation(_EffectFixture):
         b.calls = 1
         journal = self._journal(b.perform)            # opening it migrates to c2.v2
         with _sql(self.db) as c:
-            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v2")
+            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v3")
         eff = journal.get(self.key)
         self.assertEqual((eff.status, eff.connector, eff.connector_digest), ("unknown", DEDUPE, None))
         self._restart_refused(journal, b)
@@ -741,7 +742,7 @@ PATH = {path!r}
 
 def idempotency_scope():
     return IdempotencyScope("fake-mail", "acct-1", "sqlite://provider", "per-account-key", "1",
-                            86400, "{cfg}")
+                            86400, "{cfg}", enforced_request_lifetime_s=300)
 
 
 def perform(effect):
@@ -994,6 +995,194 @@ class IdempotencyScopeBinding(_EffectFixture):
         with self.assertRaises(TypeError):
             ConnectorContract(DEDUPE, NamespacedAdapter(self.provider, "a").perform, "c",
                               "0" * 64, {"account": "a"})
+
+
+# -- finite provider retention (Dolores review of fdd3137) --------------------
+class WindowedProvider:
+    """A synthetic provider with a finite dedupe memory and (optionally) an
+    enforced request lifetime: it rejects requests older than ``lifetime``
+    and remembers an applied key for ``retention`` seconds."""
+
+    def __init__(self, path, retention, lifetime=None):
+        self.path, self.retention, self.lifetime = str(path), retention, lifetime
+        with _sql(self.path) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS applied (key TEXT PRIMARY KEY, at REAL, n INTEGER)")
+            c.execute("CREATE TABLE IF NOT EXISTS log (key TEXT, at REAL, outcome TEXT)")
+
+    def deliver(self, key, sent_at, at):
+        """A request sent at ``sent_at`` reaches the provider at ``at``."""
+        with _sql(self.path) as c:
+            if self.lifetime is not None and at - sent_at > self.lifetime:
+                outcome = "rejected-expired"
+            else:
+                row = c.execute("SELECT at, n FROM applied WHERE key=?", (key,)).fetchone()
+                if row and at - row[0] <= self.retention:
+                    outcome = "deduped"
+                else:
+                    c.execute("INSERT INTO applied VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE"
+                              " SET at=excluded.at, n=n+1", (key, at))
+                    outcome = "applied"
+            c.execute("INSERT INTO log VALUES (?, ?, ?)", (key, at, outcome))
+        return outcome
+
+    def applications(self, key):
+        with _sql(self.path) as c:
+            return [r[0] for r in c.execute(
+                "SELECT at FROM log WHERE key=? AND outcome='applied' ORDER BY at", (key,))]
+
+    def reconcile(self, effect):
+        return "succeeded" if self.applications(effect.idempotency_key) else "failed"
+
+
+class WindowedAdapter:
+    """Sends at the simulated time in ``clock[0]``. With ``stall`` set, the
+    request leaves but the call times out (an ambiguous outcome); the test
+    then decides when, or whether, that original request lands."""
+
+    def __init__(self, provider, clock, scope):
+        self.provider, self.clock, self.scope = provider, clock, scope
+        self.stall = False
+
+    def idempotency_scope(self):
+        return self.scope
+
+    def perform(self, effect):
+        effect.action()
+        if self.stall:
+            self.stall = False
+            raise TimeoutError("connector timed out")
+        return {"outcome": self.provider.deliver(effect.idempotency_key, self.clock[0], self.clock[0])}
+
+
+class RetentionWindow(_EffectFixture):
+    """A finite dedupe window only excludes a duplicate if every attempt is
+    provably inside it: provider-enforced request lifetime L and retention
+    R >= L + (retry - first_dispatch) + margin, checked at retry time."""
+
+    def _run(self, retention, lifetime, retry_at, margin=0.0, first_at=1000.0):
+        provider = WindowedProvider(os.path.join(self.tmp.name, f"w-{retry_at}.sqlite"),
+                                    retention, lifetime)
+        scope = IdempotencyScope("fake-windowed", "acct-1", "https://api.example.invalid", "per-key",
+                                 "1", retention, "d" * 64, enforced_request_lifetime_s=lifetime)
+        clock = [first_at]
+
+        def journal():
+            a = WindowedAdapter(provider, clock, scope)
+            return a, EffectJournal(self.db, retention_margin_s=margin, trusted_idempotent=TrustedIdempotentRegistry(
+                [ConnectorContract(DEDUPE, a.perform, "contract:windowed-v1",
+                                   adapter_artifact_digest(a.perform), scope)]))
+        a, ja = journal()
+        a.stall = True                                     # A's request leaves at first_at, then stalls
+        with self.assertRaises(EffectOutcomeUnknown):
+            ja.execute(self.key, a.perform, provider.reconcile, owner="A", connector=DEDUPE, now=first_at)
+        self.assertEqual(ja.get(self.key).first_dispatched_at, first_at)
+        clock[0] = retry_at
+        b, jb = journal()                                  # restarted dispatcher B
+        try:
+            out = jb.execute(self.key, b.perform, provider.reconcile, owner="B", connector=DEDUPE,
+                             now=retry_at)
+        except EffectOutcomeUnknown:
+            out = None
+        return provider, jb, out
+
+    def test_dolores_scenario_no_enforced_lifetime_refused(self):
+        # retention 1 s, no enforced lifetime: B at t1002 must not retry.
+        provider, jb, out = self._run(retention=1, lifetime=None, retry_at=1002.0)
+        self.assertIsNone(out)
+        self.assertEqual(jb.get(self.key).status, "unknown")
+        self.assertEqual(provider.deliver(self.key, 1000.0, 1004.0), "applied")   # A lands at t1004
+        self.assertEqual(provider.applications(self.key), [1004.0])               # exactly once
+        # Sanity: had B applied at t1002, A at t1004 would have been a second application.
+        self.assertEqual(provider.deliver("probe", 1002.0, 1002.0), "applied")
+        self.assertEqual(provider.deliver("probe", 1000.0, 1004.0), "applied")
+        self.assertEqual(len(provider.applications("probe")), 2)
+
+    def test_enforced_lifetime_but_retention_too_short_refused(self):
+        provider, jb, out = self._run(retention=1, lifetime=5, retry_at=1002.0)
+        self.assertIsNone(out)
+        self.assertEqual(jb.reconcile(self.key, provider.reconcile, now=1002.0).status, "unknown")
+        self.assertEqual(provider.applications(self.key), [])
+
+    def test_window_boundary_inclusive(self):
+        # R=100, L=5, margin=10, first=1000: allowed iff retry <= 1085.
+        provider, jb, out = self._run(retention=100, lifetime=5, retry_at=1085.0, margin=10.0)
+        self.assertEqual((out.status, out.dispatches), ("succeeded", 2))
+        self.assertEqual(provider.deliver(self.key, 1000.0, 1090.0), "rejected-expired")  # late A
+        self.assertEqual(provider.applications(self.key), [1085.0])
+
+    def test_window_just_past_boundary_refused(self):
+        provider, jb, out = self._run(retention=100, lifetime=5, retry_at=1085.5, margin=10.0)
+        self.assertIsNone(out)
+        self.assertEqual(provider.applications(self.key), [])
+
+    def test_margin_is_applied(self):
+        provider, jb, out = self._run(retention=100, lifetime=5, retry_at=1085.0, margin=10.5)
+        self.assertIsNone(out)
+
+    def test_valid_window_positive_control_late_original_deduped(self):
+        # Long retention: B retries at t1002; A's original lands at t1004 (within L) and is deduped.
+        provider, jb, out = self._run(retention=3600, lifetime=60, retry_at=1002.0, margin=1.0)
+        self.assertEqual(out.status, "succeeded")
+        self.assertEqual(provider.deliver(self.key, 1000.0, 1004.0), "deduped")
+        self.assertEqual(provider.applications(self.key), [1002.0])
+
+    def test_window_anchored_to_first_dispatch_not_latest(self):
+        # R=100, L=5: A at t1000 and an allowed retry B at t1050 both time out.
+        # C at t1096 must be measured from t1000 (5+96 > 100), not from t1050.
+        provider = WindowedProvider(os.path.join(self.tmp.name, "anchor.sqlite"), 100, 5)
+        scope = IdempotencyScope("fake-windowed", "acct-1", "e", "per-key", "1", 100, "d" * 64,
+                                 enforced_request_lifetime_s=5)
+        clock = [1000.0]
+        a = WindowedAdapter(provider, clock, scope)
+        j = EffectJournal(self.db, retention_margin_s=0, trusted_idempotent=TrustedIdempotentRegistry(
+            [ConnectorContract(DEDUPE, a.perform, "c", adapter_artifact_digest(a.perform), scope)]))
+        for t in (1000.0, 1050.0):                         # two ambiguous dispatches
+            clock[0], a.stall = t, True
+            with self.assertRaises(EffectOutcomeUnknown):
+                j.execute(self.key, a.perform, provider.reconcile, owner="A", connector=DEDUPE, now=t)
+        self.assertEqual((j.get(self.key).dispatches, j.get(self.key).first_dispatched_at), (2, 1000.0))
+        clock[0] = 1096.0
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "trusted"):
+            j.execute(self.key, a.perform, provider.reconcile, owner="C", connector=DEDUPE, now=1096.0)
+        self.assertEqual(provider.applications(self.key), [])
+
+    def test_missing_first_dispatch_time_refused(self):
+        provider = WindowedProvider(os.path.join(self.tmp.name, "m.sqlite"), 3600, 60)
+        scope = IdempotencyScope("fake-windowed", "acct-1", "e", "per-key", "1", 3600, "d" * 64,
+                                 enforced_request_lifetime_s=60)
+        a = WindowedAdapter(provider, [1000.0], scope)
+        reg = TrustedIdempotentRegistry([ConnectorContract(DEDUPE, a.perform, "c",
+                                                           adapter_artifact_digest(a.perform), scope)])
+        j = EffectJournal(self.db, trusted_idempotent=reg, retention_margin_s=0)
+        a.stall = True
+        with self.assertRaises(EffectOutcomeUnknown):
+            j.execute(self.key, a.perform, provider.reconcile, owner="A", connector=DEDUPE, now=1000.0)
+        with _sql(self.db) as c:                           # as for a row migrated from c2.v2
+            c.execute("UPDATE effects SET first_dispatched_at=NULL")
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "trusted"):
+            j.execute(self.key, a.perform, provider.reconcile, owner="B", connector=DEDUPE, now=1001.0)
+        self.assertEqual(provider.applications(self.key), [])
+
+    def test_validation(self):
+        for bad in (0, -1, True, 1.5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                IdempotencyScope("p", "a", "e", "s", "1", 60, "0" * 64, enforced_request_lifetime_s=bad)
+        with self.assertRaises(ValueError):
+            EffectJournal(self.db, retention_margin_s=-1)
+        s1 = IdempotencyScope("p", "a", "e", "s", "1", 60, "0" * 64)
+        s2 = IdempotencyScope("p", "a", "e", "s", "1", 60, "0" * 64, enforced_request_lifetime_s=5)
+        self.assertNotEqual(s1.canonical(), s2.canonical())   # lifetime is part of the digest
+
+    def test_migration_from_c2_v2_adds_first_dispatch_column(self):
+        with _sql(self.db) as c:
+            c.execute("ALTER TABLE effects DROP COLUMN first_dispatched_at")
+            c.execute("UPDATE meta SET value='c2.v2' WHERE key='schema'")
+        Database(self.db)
+        with _sql(self.db) as c:
+            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v3")
+            cols = [r[1] for r in c.execute("PRAGMA table_info(effects)")]
+        self.assertIn("first_dispatched_at", cols)
+        self.assertIsNone(self.journal.get(self.key).first_dispatched_at)
 
 
 # -- escalation ---------------------------------------------------------------

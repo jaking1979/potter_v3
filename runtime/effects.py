@@ -65,6 +65,7 @@ PENDING, UNKNOWN, SUCCEEDED, FAILED = "pending", "unknown", "succeeded", "failed
 STILL_UNKNOWN = "still_unknown"
 RECONCILE_VERDICTS = (SUCCEEDED, FAILED, STILL_UNKNOWN)
 DEFAULT_DISPATCH_TIMEOUT_S = 300.0
+DEFAULT_RETENTION_MARGIN_S = 60.0
 NOT_APPLIED_UNFENCED = ("reconcile reports not applied, but the earlier dispatch may still land;"
                         " re-dispatch needs a fence (C4) or a connector in the trusted"
                         " idempotent registry")
@@ -168,6 +169,11 @@ class IdempotencyScope:
     dedupe_version: str      # provider's dedupe contract version
     retention_window_s: int  # how long the provider remembers a key
     config_hash: str         # sha256 of the adapter's dedupe-relevant config
+    # Max age of a request the provider will still ACCEPT, enforced by the
+    # provider itself (e.g. a signed request expiry), measured from dispatch.
+    # None = the provider enforces no such bound: a late request can land at
+    # any time, so a finite retention can never exclude a duplicate.
+    enforced_request_lifetime_s: int | None = None
 
     def __post_init__(self):
         for name in ("provider", "account", "endpoint", "dedupe_scope", "dedupe_version"):
@@ -180,10 +186,27 @@ class IdempotencyScope:
         h = self.config_hash
         if not (isinstance(h, str) and len(h) == 64 and set(h) <= _HEX64):
             raise ValueError("config_hash must be 64 lowercase hex characters")
+        L = self.enforced_request_lifetime_s
+        if L is not None and not (isinstance(L, int) and not isinstance(L, bool) and L > 0):
+            raise ValueError("enforced_request_lifetime_s must be a positive int or None")
 
     def canonical(self) -> list:
         return [self.provider, self.account, self.endpoint, self.dedupe_scope,
-                self.dedupe_version, self.retention_window_s, self.config_hash]
+                self.dedupe_version, self.retention_window_s, self.config_hash,
+                self.enforced_request_lifetime_s]
+
+    def covers_retry(self, first_dispatched_at: float | None, retry_at: float,
+                     margin_s: float) -> bool:
+        """True only if every attempt, the original included, is provably
+        inside one still-valid dedupe window. Any attempt is accepted at most
+        L after it was sent, and the earliest may already have been applied at
+        first_dispatched_at. So the provider must remember the key for
+        L + (retry_at - first_dispatched_at) + margin. No enforced lifetime, or
+        no journaled first dispatch, means it cannot be proven."""
+        L = self.enforced_request_lifetime_s
+        if L is None or first_dispatched_at is None:
+            return False
+        return self.retention_window_s >= L + (retry_at - first_dispatched_at) + margin_s
 
 
 def current_idempotency_scope(adapter: Any) -> IdempotencyScope:
@@ -341,6 +364,7 @@ class Effect:
     last_error: str | None
     connector: str | None = None   # identity the effect was (first) dispatched through
     connector_digest: str | None = None   # trusted contract digest at that dispatch, if any
+    first_dispatched_at: float | None = None   # journal time of the first dispatch
 
     def intent(self) -> EffectIntent:
         return EffectIntent(self.effect_id, self.task_id, self.action_hash,
@@ -353,7 +377,7 @@ class Effect:
 
 _COLS = ("idempotency_key, task_id, effect_id, action_hash, action_canonical, approval_id,"
          " status, dispatches, in_flight_owner, in_flight_until, result, last_error, connector,"
-         " connector_digest")
+         " connector_digest, first_dispatched_at")
 
 
 def _effect(row: tuple) -> Effect:
@@ -381,8 +405,12 @@ class EffectJournal:
     def __init__(self, db: Database | str | Path, *, clock: Callable[[], float] = time.time,
                  dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
                  fence: Callable[[Effect], bool] | None = None,
-                 trusted_idempotent: TrustedIdempotentRegistry | None = None):
+                 trusted_idempotent: TrustedIdempotentRegistry | None = None,
+                 retention_margin_s: float = DEFAULT_RETENTION_MARGIN_S):
         self.db = as_database(db)
+        if not (isinstance(retention_margin_s, (int, float)) and retention_margin_s >= 0):
+            raise ValueError("retention_margin_s must be >= 0")
+        self._margin = float(retention_margin_s)   # clock skew / processing slack
         self._fence = fence   # C4 seam; None = no fencing = refuse unfenced re-dispatch
         if trusted_idempotent is None:
             trusted_idempotent = TrustedIdempotentRegistry()
@@ -450,7 +478,7 @@ class EffectJournal:
         if eff.status != UNKNOWN:
             return eff
         self._refuse_if_in_flight(eff, now)
-        return self._reconcile(eff, reconcile, self._late_landing_excluded(eff), now)
+        return self._reconcile(eff, reconcile, self._late_landing_excluded(eff, now), now)
 
     def _reconcile(self, eff: Effect, reconcile: Callable[[Effect], str], allow_failed: bool,
                    now: float) -> Effect:
@@ -486,18 +514,24 @@ class EffectJournal:
                 raise EffectInFlight(f"effect {key} changed during reconciliation")
             return load_effect(c, key)
 
-    def _late_landing_excluded(self, eff: Effect) -> bool:
+    def _late_landing_excluded(self, eff: Effect, now: float) -> bool:
         """Only configuration-time trust counts: the C4 fence, or the contract
         RECORDED on the effect at first dispatch (identity AND digest) being
-        present, unchanged, in this journal's trusted registry. A rotated or
-        re-mapped contract, or a row with no digest, is not trusted."""
+        present, unchanged, in this journal's trusted registry, with the
+        adapter still in that scope AND the provider's enforced request
+        lifetime and retention window covering every attempt up to ``now``
+        (journaled first-dispatch time). A rotated or re-mapped contract, a row
+        with no digest or first-dispatch time, or an expired window is not
+        trusted."""
         if self._fenced(eff):
             return True
         contract = self._trusted.get(eff.connector) if eff.connector is not None else None
         if not (contract is not None and eff.connector_digest is not None
                 and hmac.compare_digest(contract.contract_digest, eff.connector_digest)):
             return False
-        return self._scope_unchanged(contract)
+        if not self._scope_unchanged(contract):
+            return False
+        return contract.idempotency_scope.covers_retry(eff.first_dispatched_at, now, self._margin)
 
     @staticmethod
     def _scope_unchanged(contract: ConnectorContract) -> bool:
@@ -577,7 +611,7 @@ class EffectJournal:
                                  " idempotency scope")
         if eff.status == UNKNOWN:
             self._refuse_if_in_flight(eff, now)
-            eff = self._reconcile(eff, reconcile, self._late_landing_excluded(eff), now)
+            eff = self._reconcile(eff, reconcile, self._late_landing_excluded(eff, now), now)
             if eff.status == SUCCEEDED:
                 return eff
             if eff.status == UNKNOWN:
@@ -589,12 +623,13 @@ class EffectJournal:
                 guard()  # under the journal write lock; raising rolls the claim back
             cur = c.execute("UPDATE effects SET status=?, dispatches=dispatches+1,"
                             " in_flight_owner=?, in_flight_until=?, updated_at=?,"
+                            " first_dispatched_at=COALESCE(first_dispatched_at, ?),"
                             " connector_digest=CASE WHEN connector IS NULL THEN ?"
                             " ELSE connector_digest END,"
                             " connector=COALESCE(connector, ?)"
                             " WHERE idempotency_key=? AND status IN (?,?) AND dispatches=?"
                             " AND (connector IS NULL OR connector=?)",
-                            (UNKNOWN, owner, now + self._dispatch_timeout, now, digest, connector,
+                            (UNKNOWN, owner, now + self._dispatch_timeout, now, now, digest, connector,
                              key, PENDING, FAILED, eff.dispatches, connector))
             if cur.rowcount != 1:
                 raise EffectInFlight(f"effect {key} was claimed by another dispatcher")
