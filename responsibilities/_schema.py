@@ -2,13 +2,11 @@
 
 * ``responsibility_state``    - key/value: the schedule watermark per
                                 responsibility (latest slot submitted).
-* ``responsibility_progress`` - per task: when it was first claimed and the
-                                ordered T16 state ticks given to E1's
-                                ``LongWork``. A tick is written *before* it is
-                                handed to E1, so a restart replays the same
-                                ticks and E1's deterministic message ids
-                                re-enqueue as no-ops (or recover a message the
-                                crash lost).
+* ``responsibility_progress`` - per task: when its first T16 state was
+                                reported (the long-work clock, so the 30 s ack
+                                survives a restart) and the ticks handed to
+                                E1's ``LongWork``. E1 keeps its own message
+                                progress in the outbox.
 
 ``meta.responsibilities_schema`` pins the layout; any other value fails closed.
 """

@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
-from notifier import JobHandle, JobSpec, Stopped
+from notifier import JobHandle, JobSpec, NotifierError, Stopped
 from notifier.issuer import ApprovalIssuer
 from notifier.kill import KillFlag
 from policy import ALLOW, RECONCILE, Caller, DelegationHop, PolicyEngine, PolicyRequest
@@ -518,15 +518,12 @@ class ResponsibilityRunner:
 
     # ---------------------------------------------------------------- long work (E1)
     def _long_work(self, d: Responsibility, task_id: str):
+        """A fresh E1 LongWork for the task. E1 reads its own progress (ack,
+        update numbering, last state told) back from the outbox on every tick,
+        so nothing is replayed here."""
         with self.db.read() as c:
             row = _schema.load_progress(c, task_id)
-        if row is None:
-            return None
-        started, history = row
-        lw = self._handles[d.id].long_work(task_id, started)
-        for state, at in history:
-            lw.tick(state, at)     # replay: deterministic ids re-enqueue as no-ops
-        return lw
+        return None if row is None else self._handles[d.id].long_work(task_id, row[0])
 
     def _acked(self, task_id: str) -> bool:
         with self.db.read() as c:
@@ -534,8 +531,9 @@ class ResponsibilityRunner:
         return bool(row) and any(at - row[0] >= LONG_WORK_ACK_S for _, at in row[1])
 
     def _report(self, d: Responsibility, task_id: str, state: str) -> None:
-        """Hand a T16 state to E1's LongWork, write-ahead: the tick is persisted
-        before E1 sees it, and replayed in order on every later report."""
+        """Hand a T16 state to E1's LongWork. The first report pins the run's
+        start time, and every tick is logged here, so the ack timing survives a
+        restart. E1 makes repeated ticks idempotent."""
         if self._handles[d.id].silent or self.kill.is_set():
             return
         now = self._now()
@@ -546,16 +544,12 @@ class ResponsibilityRunner:
             acked = any(at - started >= LONG_WORK_ACK_S for _, at in history)
             if state == last and (acked or now - started < LONG_WORK_ACK_S):
                 return
-            prior = list(history)
             history.append([state, now])
             _schema.save_progress(c, task_id, started, history)
         try:
-            lw = self._handles[d.id].long_work(task_id, started)
-            for s, at in prior:
-                lw.tick(s, at)
-            lw.tick(state, now)
-        except Stopped:
-            pass
+            self._handles[d.id].long_work(task_id, started).tick(state, now)
+        except NotifierError:
+            pass    # Stopped, or the work already has its final message
 
     # ================================================================ escalation / watchdog
     def _escalation_note(self, subject: str, ident: str) -> tuple[str, str] | None:
