@@ -7,7 +7,7 @@ does not complete D4, claim a production SLA or authorize consequential work.
 
 `SyntheticProcessBackend` is an explicit closed synthetic option to `retrieve_turn`
 and `benchmark`. A fresh spawned process sleeps or emits a synthetic bounded JSON
-result through a private pipe for each request. There are no real adapters,
+result through a private socket for each request. There are no real adapters,
 credentials, network calls, durable writes or configurable worker callables.
 Production turn default/max is two seconds for this option; benchmarks default to
 30 seconds and may score slower answers, returning IDs only. Existing async
@@ -26,7 +26,7 @@ cross-platform qualification and host resource quotas remain future work.
 
 IPC is capped at 16KiB, three items, 256 characters per ID and 2048 per text;
 only validated JSON evidence is accepted. No received pickle is deserialized.
-Each request owns its process/pipe, preventing a timed-out worker/result from
+Each request owns its process/socket, preventing a timed-out worker/result from
 being reused by a subsequent turn. Consequential results always remain blocked,
 including successful retrieval, pending canonical/policy integration.
 
@@ -35,3 +35,10 @@ SIGTERM resistance/kill, parent heartbeat, caller cancellation, worker exception
 malformed/oversized messages, result/request bounds, fresh-request independence,
 separate benchmark deadlines and unconditional consequential blocking. Synthetic
 short deadline tests do not establish production latency or benchmark quality.
+
+Partial IPC frames are read without blocking: a four-byte length prefix and
+payload are accumulated with nonblocking socket reads, with a 16KiB payload cap.
+A worker stalled after part of either header or body cannot hold the parent in a
+blocking receive. Deadline and caller cancellation still reap that worker;
+truncated/oversized frames fail closed. This remains a closed synthetic protocol,
+not an IPC security boundary for arbitrary code or a portable sandbox claim.

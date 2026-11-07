@@ -1,7 +1,7 @@
 """D4/T3 synthetic-only process deadline experiment (T22: no adapters/effects).
 
 This is lifecycle isolation, not an OS security sandbox. Each request spawns a
-fresh worker. Only bounded JSON crosses its private pipe; no pickle is received.
+fresh worker. Only bounded JSON crosses its private socket; no pickle is received.
 """
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import json
 import math
 import multiprocessing
 import signal
+import socket
+import struct
 import time
 from dataclasses import dataclass
 
@@ -34,8 +36,9 @@ class SyntheticProcessBackend:
 
     def __post_init__(self):
         if (self.mode not in {'normal', 'blocking', 'ignore_termination',
-                              'exception', 'malformed', 'oversized'}
-                or not isinstance(self.delay_s, (int, float))
+                              'exception', 'malformed', 'oversized',
+                              'partial_header', 'partial_body', 'short_frame'}
+                or type(self.delay_s) not in (int, float)
                 or not math.isfinite(self.delay_s) or self.delay_s < 0
                 or type(self.items) is not tuple or len(self.items) > MAX_ITEMS
                 or any(type(p) is not tuple or len(p) != 2
@@ -60,7 +63,17 @@ def _worker(sender, receiver, config):
             payload = b'x' * (MAX_WIRE_BYTES + 1)
         else:
             payload = json.dumps({'items': config.items}, ensure_ascii=True).encode()
-        sender.send_bytes(payload)
+        frame = struct.pack('!I', len(payload)) + payload
+        if config.mode == 'partial_header':
+            sender.sendall(frame[:2])
+            time.sleep(10)
+        elif config.mode == 'partial_body':
+            sender.sendall(frame[:6])
+            time.sleep(10)
+        elif config.mode == 'short_frame':
+            sender.sendall(frame[:2])
+        else:
+            sender.sendall(frame)
     except Exception:
         # Exception text can contain backend data; expose no details.
         pass
@@ -110,11 +123,14 @@ async def bounded_search(config, query, timeout):
 
 async def _search(config, query, timeout):
     if (type(query) is not str or len(query) > 4_096
-            or not isinstance(timeout, (int, float))
+            or type(timeout) not in (int, float)
             or not math.isfinite(timeout) or not 0 < timeout <= 30):
         raise ValueError('invalid isolated request')
     start = time.monotonic()
-    receiver, sender = multiprocessing.get_context('spawn').Pipe(duplex=False)
+    receiver, sender = socket.socketpair()
+    receiver.setblocking(False)
+    wire = bytearray()
+    payload_size = None
     process = multiprocessing.get_context('spawn').Process(
         target=_worker, args=(sender, receiver, config), daemon=True)
     started = False
@@ -126,17 +142,31 @@ async def _search(config, query, timeout):
             elapsed = time.monotonic() - start
             if elapsed >= timeout:
                 return 'deadline', (), elapsed
-            if receiver.poll():
-                try:
-                    payload = receiver.recv_bytes(MAX_WIRE_BYTES)
-                    items = _decode(payload)
-                    # Decode/startup are also charged to the request deadline.
-                    elapsed = time.monotonic() - start
-                    if elapsed >= timeout:
-                        return 'deadline', (), elapsed
-                    return 'complete', items, elapsed
-                except (EOFError, OSError, ValueError, TypeError, UnicodeError):
-                    return 'unavailable', (), time.monotonic() - start
+            try:
+                # recv never waits for a complete frame. A partial header/body
+                # must still yield to the event loop, deadline and cancellation.
+                chunk = receiver.recv(MAX_WIRE_BYTES + 5 - len(wire))
+            except BlockingIOError:
+                chunk = None
+            if chunk == b'':
+                return 'unavailable', (), time.monotonic() - start
+            if chunk:
+                wire.extend(chunk)
+                if len(wire) >= 4 and payload_size is None:
+                    payload_size = struct.unpack('!I', wire[:4])[0]
+                    if payload_size > MAX_WIRE_BYTES:
+                        return 'unavailable', (), time.monotonic() - start
+                if payload_size is not None and len(wire) >= payload_size + 4:
+                    try:
+                        if len(wire) != payload_size + 4:
+                            raise ValueError('trailing frame data')
+                        items = _decode(wire[4:])
+                        elapsed = time.monotonic() - start
+                        if elapsed >= timeout:
+                            return 'deadline', (), elapsed
+                        return 'complete', items, elapsed
+                    except (ValueError, TypeError, UnicodeError):
+                        return 'unavailable', (), time.monotonic() - start
             if not process.is_alive():
                 return 'unavailable', (), time.monotonic() - start
             await asyncio.sleep(min(.005, timeout - elapsed))

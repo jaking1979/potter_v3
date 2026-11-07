@@ -64,6 +64,37 @@ class IsolatedRetrievalContract(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
 
+    async def test_partial_wire_never_blocks_deadline_or_parent_loop(self):
+        for mode in ('partial_header', 'partial_body'):
+            ticks = []
+            async def heartbeat():
+                for _ in range(12):
+                    await asyncio.sleep(.01)
+                    ticks.append(time.monotonic())
+            beat = asyncio.create_task(heartbeat())
+            start = time.monotonic()
+            result = await retrieve_turn(SyntheticProcessBackend(mode=mode),
+                                        'q', consequential=True, timeout=.3)
+            await beat
+            self.assertLess(time.monotonic() - start, 1.5)
+            self.assertEqual((result.status, result.items, result.blocked),
+                             ('deadline', (), True))
+            self.assertGreater(len(ticks), 8)
+
+    async def test_partial_wire_cancellation_reaps_before_propagation(self):
+        task = asyncio.create_task(retrieve_turn(
+            SyntheticProcessBackend(mode='partial_body'), 'q', consequential=True))
+        await asyncio.sleep(.15)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_closed_truncated_frame_is_unavailable(self):
+        result = await retrieve_turn(SyntheticProcessBackend(mode='short_frame'),
+                                     'q', consequential=True)
+        self.assertEqual((result.status, result.items, result.blocked),
+                         ('unavailable', (), True))
+
     async def test_benchmark_has_separate_deadline_and_returns_only_ids(self):
         backend = SyntheticProcessBackend((('a', 'never returned by benchmark'),), .15)
         missed = await retrieve_turn(backend, 'q', consequential=True, timeout=.05)
