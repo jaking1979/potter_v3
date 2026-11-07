@@ -22,3 +22,30 @@ HTML includes landmarks, a skip link, headings, language, table captions and hea
 Run `python3 -m unittest discover -s tests -v`. Ten local synthetic tests passed: stopped harness data; five-minute staleness boundary and independent item age; malformed/future/missing/duplicate/oversize rejection; sensitive-payload canary exclusion; action/path refusal; response security headers; semantic HTML/no actions; invalid clocks/envelopes; forged view revalidation; fractional-second staleness preserved across HTML formatting. No network or host test ran. No CI or independent review is claimed.
 
 Before merge/integration: actual C7 contract and read-only durable-store adapter; authenticated identity and least-privilege source access; trusted filtering and ID provenance; E1/E2 current-state projection; state consistency/cursor bounds; actual harness-down S2 test; redaction/privacy adversarial tests; browser/accessibility evidence; opposite-agent review and T39 signed evidence. E4b adds the separate S1/S2/S11 exact-approval and passkey/stop/recovery requirements. Migration is additive offline files only; rollback deletes this prototype, with no mutable runtime state.
+
+## Bounded synthetic bytes adapter
+
+`transport.py` adds a pure `load_snapshot(bytes)` / `project_json(bytes, now=...)`
+/ `respond_json(method, path, bytes, now=...)` seam. It opens no socket and reads
+no files, credentials, harness or backend. It accepts only exact immutable
+`bytes`, up to 128 KiB, decoded as strict UTF-8. It preflights nesting before
+JSON parsing (maximum depth eight), rejects duplicate keys including escaped
+aliases, NaN/Infinity/overflow, numeric tokens over 64 characters, strings over
+4,096 characters, lone surrogates, trailing data and non-object roots. These are
+explicit synthetic prototype bounds, not an adopted C7 transport contract.
+
+Malformed transport input produces six unavailable sections without reflecting
+input, decoder messages or prior successful state. Valid transport with one
+malformed section preserves the other five. Every parse creates detached plain
+JSON values; no previous state is retained. Unknown input fields are discarded
+by the existing allowlisted projector. Write methods and unknown routes refuse
+before parsing or clock access. New transport tests cover all six sections,
+bounds, invalid encoding/duplicate keys, sensitive canaries, fresh parse state,
+partial-section failure and refusal ordering. The local E4 suite now has 19
+passing tests (10 existing, nine transport tests), no skips.
+
+The bytes seam neither authenticates its sender nor establishes source truth,
+clinical filtering, a C7 adapter, a service-down S2 test or actual browser and
+accessibility evidence. No actual server/authentication, action endpoint or
+E4b capability exists. C7/E1/E2 integration dependencies and independent Claude
+review remain open. Existing T22/T39/readiness requirements still apply.
