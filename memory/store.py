@@ -321,19 +321,44 @@ class MemoryStore:
             for row in rows:
                 self._audit('forget', row['id'], row['version'] + 1)
 
+    def _retrieve(self, key, consequential):
+        rows = self._db.execute("SELECT * FROM item WHERE key=? AND status IN ('active','staged') ORDER BY rowid", (key,)).fetchall()
+        items = [Item(**dict(x)) for x in rows]
+        active = tuple(x for x in items if x.status == 'active')
+        staged = tuple(x for x in items if x.status == 'staged')
+        excluded = tuple(x.id for x in staged if consequential and x.origin != 'direct')
+        provisional = tuple(x for x in staged if not consequential or x.origin == 'direct')
+        return Retrieval(active, provisional, excluded)
+
     def retrieve(self, key: str, *, consequential: bool) -> Retrieval:
+        self._text(key, 'key')
         if type(consequential) is not bool:
             raise Invalid('explicit task tier required')
         with self._transaction(write=False):
-            rows = self._db.execute("SELECT * FROM item WHERE key=? AND status IN ('active','staged') ORDER BY rowid", (key,)).fetchall()
-            items = [Item(**dict(x)) for x in rows]
-            active = tuple(x for x in items if x.status == 'active')
-            staged = tuple(x for x in items if x.status == 'staged')
-            # Never place contents of excluded staged claims in consequential
-            # context. IDs are provided so a separate review surface can show them.
-            excluded = tuple(x.id for x in staged if consequential and x.origin != 'direct')
-            provisional = tuple(x for x in staged if not consequential or x.origin == 'direct')
-            return Retrieval(active, provisional, excluded)
+            return self._retrieve(key, consequential)
+
+    def view_read(self, key, *, consequential):
+        """Tier-filtered result and advisory identity from one snapshot."""
+        self._text(key, 'key')
+        if type(consequential) is not bool:
+            raise Invalid('explicit task tier required')
+        with self._transaction(write=False):
+            return self._retrieve(key, consequential), self._retrieve(key, False)
+
+    def snapshot(self, keys):
+        """Bounded detached advisory rows in one local read transaction.
+
+        Contains content, never trace material or authoritative export.
+        """
+        if type(keys) not in (list, tuple) or len(keys) > 1000:
+            raise Invalid('bounded explicit keys required')
+        keys = tuple(keys)
+        for key in keys:
+            self._text(key, 'key')
+        if len(set(keys)) != len(keys):
+            raise Invalid('duplicate keys')
+        with self._transaction(write=False):
+            return {key: self._retrieve(key, False) for key in keys}
 
     def _get(self, ident: str) -> Item:
         row = self._db.execute('SELECT * FROM item WHERE id=?', (ident,)).fetchone()

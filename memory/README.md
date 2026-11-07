@@ -59,3 +59,25 @@ views; Notion staging, outbox and replay; C1/C2/C6 wiring; freshness-bounded
 canonical revalidation; generation rebuilds and retrieval indexes; atomic
 trace/audit; import/rollback; T21 change governance; full adversarial and
 opposite-agent review. None is claimed by this experiment.
+
+`memory.views.LocalView` is an additional synthetic ID-only view experiment.
+A rebuild reads all explicit keys in one local snapshot and publishes an entire
+immutable ID/version/status generation at once. A failed rebuild retains the
+last good generation and marks it stale; reads during rebuilding see the old
+complete generation. The view stores no fact values, source pointers or content
+digests. Every read obtains a fresh canonical local snapshot and applies the
+store's consequential-tier filter. A changed/missing indexed row uses canonical
+fallback, so forgotten/superseded values and staged injected claims are not
+returned from stale view content. Canonical outage fails closed. Index age over
+24 hours and clock regression flag staleness; synthetic clock inputs are finite.
+
+This is not an embedding/FTS index, shared durable generation store, Notion
+canonical backend, authenticated invalidation stream or production freshness
+claim. It performs direct reads every time instead of trusting a 15-minute
+cache. Read-time revalidation is not an action-time fence: C1/C2 still need
+canonical validation at consequential dispatch. Returned objects already held
+by a caller, previous review packets and external copies cannot be recalled;
+external forgetting, backup erasure, restore authority and runtime integration
+remain open. Generations contain canonical IDs and versions but do not yet
+implement T15's full provenance/validity fields. The bounded snapshot API has
+an explicit 1,000-key limit; this is a local test limit, not a product contract.
