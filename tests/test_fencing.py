@@ -10,6 +10,7 @@ directory of snapshot files written by FileCopyReplicator (no Litestream).
 import contextlib
 import importlib.util
 import multiprocessing
+import threading
 import os
 import sqlite3
 import sys
@@ -24,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_policy_engine as tpe  # noqa: E402  (C1 fixtures: registry, approvals)
+from runtime.fencing import _pass_gate  # noqa: E402  (test seam helper)
 from runtime import (ACTIVE, FENCED, PAUSED, AuthorityUnavailable, BoundaryVerificationError,
                      Database, EffectFailed, EffectJournal, FencedBoundaryContract,
                      FencedBoundaryRegistry, FencingScope, boundary_artifact_digest,
@@ -39,13 +41,44 @@ WAIT = 60
 
 
 @contextlib.contextmanager
-def before_apply(ext, fn):
-    """Install a stall / transport-error hook inside the stub's reviewed adapter."""
-    ext.before_apply = fn
+def failing(ext, message="timeout"):
+    """The stub's reviewed adapter raises ConnectionError before the boundary:
+    an ambiguous transport failure (a data seam, not injected code)."""
+    ext.fail_before_apply = message
     try:
         yield
     finally:
-        ext.before_apply = None
+        ext.fail_before_apply = None
+
+
+class Parked:
+    """Runs ``call`` in a thread that parks at the stub's Event gate, so the
+    test thread can act (as node B) while A is stalled. No sleeps."""
+
+    def __init__(self, ext, call, gate="gate_before_apply"):
+        self.ext, self.call, self.gate = ext, call, gate
+        self.reached, self.resume = threading.Event(), threading.Event()
+        self.result = self.error = None
+
+    def __enter__(self):
+        setattr(self.ext, self.gate, (self.reached, self.resume))
+
+        def run():
+            try:
+                self.result = self.call()
+            except BaseException as e:
+                self.error = e
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+        if not self.reached.wait(WAIT):
+            raise AssertionError("dispatch never reached the gate")
+        return self
+
+    def __exit__(self, *exc):
+        self.resume.set()
+        self.thread.join(WAIT)
+        setattr(self.ext, self.gate, None)
+        return False
 
 
 # "Trusted configuration": the reviewed stub implementation's artifact digest,
@@ -103,11 +136,7 @@ def _node_a(p, mode, stalled, resume, q):
             except StaleEpoch as e:
                 out["first"] = type(e).__name__
         else:
-            def stall(effect, token):              # inside the reviewed adapter
-                rep.replicate(p.a)                     # ships the "unknown" claim
-                stalled.set()
-                resume.wait(WAIT)                      # GC pause / VM freeze
-            ext.before_apply = stall
+            ext.gate_before_apply = (stalled, resume)   # GC pause / VM freeze, in the adapter
             try:
                 fx.execute(eff.idempotency_key, ext.perform, ext.reconcile, connector=ext.identity)
                 out["first"] = "dispatched"
@@ -194,6 +223,7 @@ class StalledLeaderTakeover(_Tmp):
         a.start()
         try:
             self.assertTrue(stalled.wait(WAIT), "node A never stalled")
+            FileCopyReplicator(self.p.replica).replicate(self.p.a)   # ships A's current journal
             b = SPAWN.Process(target=_node_b, args=(self.p, qb))
             b.start()
             out_b = self.get(qb)
@@ -337,11 +367,11 @@ class BoundaryLinearization(_Tmp):
         a = self.active_node()
         eff = a.journal.record_intent(TASK, "send", action())
 
-        def promote_b(effect, token):
+        with Parked(self.ext, lambda: FencedEffects(a).execute(
+                eff.idempotency_key, self.ext.perform, self.ext.reconcile,
+                connector=self.ext.identity)) as job:
             Node("node-b", self.auth, self.p.b, boundaries=fenced(self.ext)).promote()
-        with before_apply(self.ext, promote_b), self.assertRaises(StaleEpochRefused):
-            FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
-                                     connector=self.ext.identity)
+        self.assertIsInstance(job.error, StaleEpochRefused)
         self.assertEqual(self.ext.count(), 0)
         self.assertEqual(a.journal.get(eff.idempotency_key).status, "failed")
         self.assertEqual(a.state, FENCED)
@@ -352,17 +382,16 @@ class BoundaryLinearization(_Tmp):
         token = a.token()
         contender = EpochAuthority(self.p.auth, busy_timeout_s=0)   # never waits for the lock
         seen = {}
-
-        def after_check(conn, tok):        # inside A's apply transaction, token already passed
+        with Parked(self.ext, lambda: self.ext.apply(eff.idempotency_key, token),
+                    gate="gate_in_check") as job:    # parked INSIDE the apply transaction
             seen["epoch_visible"] = contender.current().epoch
             try:
                 contender.promote("node-b", 1)
                 seen["promoted"] = True
             except AuthorityUnavailable:
                 seen["promoted"] = False   # the write lock is held by the apply
-        self.ext.after_check = after_check
-        self.assertEqual(self.ext.apply(eff.idempotency_key, token)["epoch"], 1)
-        self.ext.after_check = None
+        self.assertIsNone(job.error)
+        self.assertEqual(job.result["epoch"], 1)
         self.assertEqual(seen, {"epoch_visible": 1, "promoted": False})
         self.assertEqual(self.auth.current().epoch, 1)   # no promotion slipped in mid-apply
 
@@ -397,10 +426,7 @@ def _stall_past_timeout(p, stalled, resume, q):
         node.unpause(ext.reconcile)
         eff = node.journal.record_intent(TASK, "send", action())
 
-        def stall(effect, token):                      # inside the reviewed adapter
-            stalled.set()
-            resume.wait(WAIT)                          # stalls far past the 0.2 s window
-        ext.before_apply = stall
+        ext.gate_before_apply = (stalled, resume)      # stalls far past the 0.2 s window
         try:
             FencedEffects(node).execute(eff.idempotency_key, ext.perform, ext.reconcile,
                                         connector=ext.identity)
@@ -468,9 +494,7 @@ class C2FenceSeam(_Tmp):
         a = self.active_node()                        # epoch 1, registered stub boundary
         eff = a.journal.record_intent(TASK, "send", action())
 
-        def ambiguous(e, token):
-            raise RuntimeError("timeout")
-        with before_apply(self.ext, ambiguous), self.assertRaises(EffectOutcomeUnknown):
+        with failing(self.ext), self.assertRaises(EffectOutcomeUnknown):
             FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
                                      connector=self.ext.identity)
         b = self.active_node("node-b", self.p.a)     # unpause reconciles it: fence says yes
@@ -499,9 +523,7 @@ class C2FenceSeam(_Tmp):
         a = self.active_node()
         eff = a.journal.record_intent(TASK, "send", action())
 
-        def ambiguous(e, token):
-            raise RuntimeError("timeout")
-        with before_apply(self.ext, ambiguous), self.assertRaises(EffectOutcomeUnknown):
+        with failing(self.ext), self.assertRaises(EffectOutcomeUnknown):
             FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
                                      connector=self.ext.identity)
         with self.assertRaises(EffectConflict):   # C2: later dispatches must match
@@ -622,9 +644,7 @@ class UnprovenBoundary(_Tmp):
         a = self.active_node()
         eff = a.journal.record_intent(TASK, "send", action())
 
-        def ambiguous(e, token):
-            raise RuntimeError("timeout")
-        with before_apply(self.ext, ambiguous), self.assertRaises(EffectOutcomeUnknown):
+        with failing(self.ext), self.assertRaises(EffectOutcomeUnknown):
             FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
                                      connector=self.ext.identity)
         rotated = FencedBoundaryRegistry([FencedBoundaryContract(
@@ -643,9 +663,7 @@ class UnprovenBoundary(_Tmp):
         a = self.active_node()
         eff = a.journal.record_intent(TASK, "send", action())
 
-        def ambiguous(e, token):
-            raise RuntimeError("timeout")
-        with before_apply(self.ext, ambiguous), self.assertRaises(EffectOutcomeUnknown):
+        with failing(self.ext), self.assertRaises(EffectOutcomeUnknown):
             FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
                                      connector=self.ext.identity)
         b = Node("node-b", self.auth, self.p.a)    # no boundaries configured
@@ -683,12 +701,34 @@ class UnprovenBoundary(_Tmp):
 # -- 1e. contract binds the verified implementation and its scope (review fix) --
 def _token_ignoring_perform(self, effect, token):
     """Synthetic replacement body: same signature, writes WITHOUT any check."""
-    if self.before_apply is not None:
-        self.before_apply(effect, token)
+    if self.gate_before_apply is not None:
+        _pass_gate(self.gate_before_apply)
     with self.authority.boundary() as (c, _):
         c.execute("INSERT INTO ext_applied (key, node_id, epoch) VALUES (?,?,?)",
                   (effect.idempotency_key, token.node_id, token.epoch))
     return {"applied": effect.idempotency_key, "epoch": token.epoch}
+
+
+def _token_ignoring_apply(self, key, token):
+    """Synthetic replacement for apply: records the write WITHOUT the check."""
+    with self.authority.boundary() as (c, _):
+        c.execute("INSERT INTO ext_applied (key, node_id, epoch) VALUES (?,?,?)",
+                  (key, token.node_id, token.epoch))
+    return {"applied": key, "epoch": token.epoch}
+
+
+@contextlib.contextmanager
+def mutated_code(func, replacement):
+    """Swap ``func.__code__`` for ``replacement``'s body, keeping the name,
+    qualified name, file and first line (Dolores's in-memory probes)."""
+    original = func.__code__
+    func.__code__ = replacement.__code__.replace(
+        co_name=original.co_name, co_qualname=original.co_qualname,
+        co_filename=original.co_filename, co_firstlineno=original.co_firstlineno)
+    try:
+        yield
+    finally:
+        func.__code__ = original
 
 
 @contextlib.contextmanager
@@ -729,9 +769,7 @@ class ContractBindsImplementationAndScope(_Tmp):
     def _dispatch_ambiguously(self, a):
         eff = a.journal.record_intent(TASK, "send", action())
 
-        def ambiguous(e, token):
-            raise RuntimeError("timeout")
-        with before_apply(self.ext, ambiguous), self.assertRaises(EffectOutcomeUnknown):
+        with failing(self.ext), self.assertRaises(EffectOutcomeUnknown):
             FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
                                      connector=self.ext.identity)
         return eff.idempotency_key
@@ -746,51 +784,123 @@ class ContractBindsImplementationAndScope(_Tmp):
                          "succeeded")
         self.assertEqual(self.ext.applied(), [(key, "node-b", 2)])
 
-    def test_same_name_memory_mutation_after_registry_build_loses_trust(self):
-        """Dolores's reproduction, deterministic. The registry is built and the
-        effect bound under the reviewed code; then perform's code is replaced
-        under the same name by a token-ignoring body. Epoch-1's stalled call
-        runs that body; epoch 2 must NOT be vouched for; exactly one write."""
+    def _late_stale_write_scenario(self, mutation, stale_write_lands=True):
+        """Registry built and the effect bound under the reviewed code; then
+        ``mutation`` replaces boundary code in memory under the same names.
+        Epoch-1's stalled call runs the mutated code; epoch 2 must NOT be
+        vouched for; the stale write lands; exactly one application."""
         a = self.active_node()
         eff = a.journal.record_intent(TASK, "send", action())
         key, token = eff.idempotency_key, a.token()
         a.bind(key, self.ext.identity, self.ext.perform)          # bound while genuine
-        seen = {}
-
-        def takeover(effect, tok):                                # A stalled, mutated
-            b = seen["b"]          # built (and its registry verified) BEFORE the mutation
-            self.assertEqual(b.promote(), 2)
-            row = b.journal.get(key)
-            with self.assertRaises(UnresolvedEffects):            # past A's window
-                b.unpause(self.ext.reconcile, now=row.in_flight_until + 1)
-            self.assertEqual(b.fence_log, [(key, "node-a@epoch:1", False)])
-            self.assertEqual(b.state, PAUSED)
-        seen["b"] = Node("node-b", self.auth, self.p.a, boundaries=fenced(self.ext))
-        with mutated_stub_perform():
-            from runtime.effects import adapter_name
-            self.assertEqual(adapter_name(self.ext.perform),
-                             "runtime.fencing.StubConnector#runtime.fencing.StubConnector.perform")
+        b = Node("node-b", self.auth, self.p.a, boundaries=fenced(self.ext))  # built pre-mutation
+        with mutation():
             with self.assertRaises(BoundaryVerificationError):
                 fenced(self.ext)                                  # registry build refuses
-            # A new dispatch through FencedEffects is refused by live verification
             other = a.journal.record_intent(TASK, "other", action(n=2))
-            with self.assertRaises(EffectConflict):
+            with self.assertRaises(EffectConflict):               # live verification at bind
                 FencedEffects(a).execute(other.idempotency_key, self.ext.perform,
                                          self.ext.reconcile, connector=self.ext.identity)
             self.assertIsNone(a.binding(other.idempotency_key))
-            # The already-bound effect: epoch-1's mutated call stalls, B takes over
-            with before_apply(self.ext, takeover):
-                done = a.journal.execute(key, lambda e: self.ext.perform(e, token),
-                                         self.ext.reconcile, owner=token.owner,
-                                         connector=self.ext.identity)
-        self.assertEqual(done.status, "succeeded")             # the late stale write
-        self.assertEqual(self.ext.applied(), [(key, "node-a", 1)])   # exactly one, no (b,2)
-        b = seen["b"]
-        b.unpause(self.ext.reconcile)                           # reconcile: succeeded
+            with Parked(self.ext, lambda: a.journal.execute(
+                    key, lambda e: self.ext.perform(e, token), self.ext.reconcile,
+                    owner=token.owner, connector=self.ext.identity)) as job:
+                self.assertEqual(b.promote(), 2)
+                row = b.journal.get(key)
+                with self.assertRaises(UnresolvedEffects):        # past A's window
+                    b.unpause(self.ext.reconcile, now=row.in_flight_until + 1)
+                self.assertEqual(b.fence_log, [(key, "node-a@epoch:1", False)])
+                self.assertEqual(b.state, PAUSED)
+        self.assertIsNone(job.error)
+        if stale_write_lands:     # the mutated code ignores the token: the stale write lands
+            self.assertEqual(job.result.status, "succeeded")
+            expected = [(key, "node-a", 1)]
+        else:                     # apply still checks: the stale call is refused, not landed
+            self.assertEqual(job.result.status, "failed")
+            expected = [(key, "node-b", 2)]
+        if stale_write_lands:
+            self.assertEqual(self.ext.applied(), expected)          # no (b,2) re-dispatch
+        b.unpause(self.ext.reconcile)
         self.assertEqual(FencedEffects(b).execute(key, self.ext.perform, self.ext.reconcile,
                                                   connector=self.ext.identity).status,
                          "succeeded")
-        self.assertEqual(self.ext.applied(), [(key, "node-a", 1)])
+        self.assertEqual(self.ext.applied(), expected)              # exactly one application
+
+    def test_same_name_memory_mutation_after_registry_build_loses_trust(self):
+        from runtime.effects import adapter_name
+        self.assertEqual(adapter_name(self.ext.perform),
+                         "runtime.fencing.StubConnector#runtime.fencing.StubConnector.perform")
+        self._late_stale_write_scenario(mutated_stub_perform)
+
+    def test_apply_helper_mutation_loses_trust(self):
+        """Dolores's probe at 7c0a944: perform and the file unchanged, only
+        StubConnector.apply's code replaced by a token-ignoring version."""
+        self._late_stale_write_scenario(
+            lambda: mutated_code(StubConnector.apply, _token_ignoring_apply))
+
+    def test_module_helper_mutation_loses_trust(self):
+        """A module-level helper on the boundary path (the authority's scope id)."""
+        import runtime.fencing as fencing_mod
+
+        def evil(authority):
+            return "sqlite:" + os.path.realpath(authority.path)
+        self._late_stale_write_scenario(
+            lambda: mutated_code(fencing_mod.authority_scope_id, evil), stale_write_lands=False)
+
+    def test_instance_attribute_shadowing_a_method_loses_trust(self):
+        import types as _t
+        self.ext.apply = _t.MethodType(_token_ignoring_apply, self.ext)   # shadows apply
+        try:
+            with self.assertRaises(BoundaryVerificationError):
+                fenced(self.ext)
+        finally:
+            del self.ext.apply
+        reg = fenced(self.ext)                                    # ...built while genuine
+        a = Node("node-a", self.auth, self.p.a, boundaries=reg)
+        a.promote()
+        a.unpause(self.ext.reconcile)
+        eff = a.journal.record_intent(TASK, "send", action())
+        self.ext.apply = _t.MethodType(_token_ignoring_apply, self.ext)
+        try:
+            with self.assertRaises(EffectConflict):              # refused at bind, live
+                FencedEffects(a).execute(eff.idempotency_key, self.ext.perform,
+                                         self.ext.reconcile, connector=self.ext.identity)
+            self.assertFalse(a._boundary_proven(SimpleNamespace(
+                idempotency_key=eff.idempotency_key, connector=self.ext.identity)))
+        finally:
+            del self.ext.apply
+        self.assertEqual(self.ext.count(), 0)
+
+    def test_instance_callables_and_collaborator_tampering_lose_trust(self):
+        cases = []
+
+        def extra_callable():
+            self.ext.helper = lambda: None                      # a callable, no shadowing
+            return lambda: delattr(self.ext, "helper")
+
+        def authority_method_shadow():
+            self.ext.authority.boundary = lambda: None          # collaborator shadowed
+            return lambda: delattr(self.ext.authority, "boundary")
+
+        def authority_subclass():
+            real = self.ext.authority
+
+            class Lenient(EpochAuthority):
+                pass
+            fake = Lenient.__new__(Lenient)
+            fake.__dict__.update(real.__dict__)
+            self.ext.authority = fake                           # same path, other class
+            return lambda: setattr(self.ext, "authority", real)
+        for tamper in (extra_callable, authority_method_shadow, authority_subclass):
+            undo = tamper()
+            try:
+                with self.assertRaises(BoundaryVerificationError, msg=tamper.__name__):
+                    fenced(self.ext)
+            finally:
+                undo()
+            cases.append(tamper.__name__)
+        fenced(self.ext)                                         # genuine again
+        self.assertEqual(len(cases), 3)
 
     def test_same_name_implementation_from_another_file_loses_trust(self):
         from runtime.effects import adapter_name
@@ -808,12 +918,12 @@ class ContractBindsImplementationAndScope(_Tmp):
         self.assertNotEqual(boundary_artifact_digest(fake.perform), STUB_ARTIFACT)
         with self.assertRaises(BoundaryVerificationError):      # pinned digest: refused
             FencedBoundaryRegistry([fake.contract(STUB_ARTIFACT)])
-        # Even declaring the impostor's own (honest) digest yields a DIFFERENT
-        # contract, which does not vouch for effects bound under the reviewed one.
-        honest = FencedBoundaryRegistry([fake.contract(boundary_artifact_digest(fake.perform))])
-        self.assertNotEqual(honest[fake.identity].contract_digest,
-                            self.ext.contract(STUB_ARTIFACT).contract_digest)
-        b = Node("node-b", self.auth, self.p.a, boundaries=honest)
+        # Even with the impostor's own (honest) digest, the impostor class is not
+        # the reviewed module's class at that name: refused.
+        with self.assertRaises(BoundaryVerificationError):
+            FencedBoundaryRegistry([fake.contract(boundary_artifact_digest(fake.perform))])
+        # and the effect bound under the reviewed contract is never vouched by it
+        b = Node("node-b", self.auth, self.p.a)
         b.promote()
         with self.assertRaises(UnresolvedEffects):
             b.unpause(fake.reconcile)
@@ -911,9 +1021,7 @@ class NodeLifecycle(_Tmp):
         a = self.active_node()
         eff = a.journal.record_intent(TASK, "send", action())
 
-        def ambiguous(e, token):
-            raise RuntimeError("connection reset")        # outcome unknown
-        with before_apply(self.ext, ambiguous), self.assertRaises(Exception):
+        with failing(self.ext), self.assertRaises(Exception):
             FencedEffects(a).execute(eff.idempotency_key, self.ext.perform, self.ext.reconcile,
                                      connector=self.ext.identity)
         self.assertEqual(a.journal.get(eff.idempotency_key).status, "unknown")
@@ -1010,9 +1118,7 @@ class ReplicatorSeam(_Tmp):
         a.journal.record_intent(TASK, "s2", action(n=2))   # stays pending
         unk = a.journal.record_intent(TASK, "s3", action(n=3))
 
-        def ambiguous(e, token):
-            raise RuntimeError("timeout")
-        with before_apply(self.ext, ambiguous), self.assertRaises(Exception):
+        with failing(self.ext), self.assertRaises(Exception):
             fx.execute(unk.idempotency_key, self.ext.perform, self.ext.reconcile,
                        connector=self.ext.identity)
         return a

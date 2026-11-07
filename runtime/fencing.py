@@ -46,15 +46,21 @@ for that window. Staging-only (T22); nothing here performs a real effect.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import multiprocessing.synchronize
+import threading
 import hashlib
 import hmac
 import inspect
 import json
 import os
 import re
+import reprlib
 import sqlite3
+import sys
 import time
 import types
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -319,6 +325,168 @@ def _require_loaded_matches_source(code: Any, source: bytes, adapter: Any) -> No
         f"loaded adapter {adapter_name(adapter)!r} differs from its source file")
 
 
+_DATACLASS_GENERATED = frozenset({
+    "__init__", "__repr__", "__eq__", "__hash__", "__setattr__", "__delattr__", "__lt__",
+    "__le__", "__gt__", "__ge__", "__replace__", "__getstate__", "__setstate__"})
+_PROTOCOL_GENERATED = frozenset({"__init__", "__subclasshook__"})
+_CONTEXTMANAGER_HELPER = contextlib.contextmanager(lambda: iter(())).__code__
+_DATACLASS_ORIGINS = frozenset(os.path.realpath(m.__file__) for m in (dataclasses, reprlib))
+
+
+def _foreign_ok(cls: type, name: str, code: types.CodeType) -> bool:
+    """Methods the class machinery generates (there is no source to compare):
+    dataclass-generated dunders on dataclasses, Protocol's __init__ /
+    __subclasshook__ from typing. Residual, documented: these are checked by
+    origin and name, not by content."""
+    origin = code.co_filename
+    if dataclasses.is_dataclass(cls) and name in _DATACLASS_GENERATED:
+        return origin == "<string>" or os.path.realpath(origin) in _DATACLASS_ORIGINS
+    if getattr(cls, "_is_protocol", False) and name in _PROTOCOL_GENERATED:
+        return os.path.realpath(origin) == os.path.realpath(typing.__file__)
+    return False
+
+
+def verify_boundary_implementation(adapter: Any) -> None:
+    """Every loaded callable that can supply the boundary must still be what
+    the reviewed artifact compiles to, not just ``perform``.
+
+    For each module defining the adapter's function or its bound class, the
+    module source is compiled and compared, structurally (as in C2), with:
+    every module-level function and class the source defines (same object at
+    the same name, nothing removed); every method of those classes (plain,
+    static, class, property parts; ``contextmanager``-wrapped functions are
+    unwrapped and the wrapper must be contextlib's own helper); and no
+    function or method the source does not define. For a bound adapter, the
+    instance's class must be the module's own class at that name, and no
+    instance attribute may shadow a class attribute or hold a callable (an
+    instance-level callable injects behavior). Raises
+    BoundaryVerificationError. Imported modules are NOT covered here."""
+    owner = getattr(adapter, "__self__", None)
+    func = getattr(adapter, "__func__", adapter)
+    modnames = {getattr(func, "__module__", None)}
+    cls_of_owner = None
+    if owner is not None:
+        cls_of_owner = owner if isinstance(owner, type) else type(owner)
+        modnames.add(cls_of_owner.__module__)
+    for modname in modnames:
+        _verify_module(modname, adapter)
+    if cls_of_owner is not None:
+        home = sys.modules.get(cls_of_owner.__module__)
+        if home is None or getattr(home, cls_of_owner.__qualname__, None) is not cls_of_owner:
+            raise BoundaryVerificationError(
+                f"adapter class {cls_of_owner.__qualname__!r} is not its module's reviewed class")
+        if not isinstance(owner, type):
+            for k, v in vars(owner).items():
+                if any(k in vars(c) for c in cls_of_owner.__mro__):
+                    raise BoundaryVerificationError(f"instance attribute {k!r} shadows a class attribute")
+                if callable(v):
+                    raise BoundaryVerificationError(f"instance attribute {k!r} holds a callable")
+                _verify_collaborator(k, v, modnames)
+
+
+def _verify_collaborator(name: str, obj: Any, modnames: set) -> None:
+    """An instance attribute whose class comes from a verified module (e.g. the
+    stub's EpochAuthority) must be exactly that module's class, with no
+    instance attribute shadowing its methods. (Its own injected callables,
+    like a clock, are allowed: they are not on the check-and-apply path.)"""
+    cls = type(obj)
+    if not any(c.__module__ in modnames for c in cls.__mro__):
+        return                              # not a boundary collaborator class
+    home = sys.modules.get(cls.__module__)
+    if cls.__module__ not in modnames:
+        raise BoundaryVerificationError(f"collaborator {name!r} is a subclass from an unverified module")
+    if home is None or getattr(home, cls.__qualname__, None) is not cls:
+        raise BoundaryVerificationError(f"collaborator {name!r} is not its module's reviewed class")
+    for k in getattr(obj, "__dict__", {}):
+        if any(k in vars(c) for c in cls.__mro__):
+            raise BoundaryVerificationError(f"collaborator {name!r}: attribute {k!r} shadows a class attribute")
+
+
+def _verify_module(modname: str | None, adapter: Any) -> None:
+    mod = sys.modules.get(modname) if modname else None
+    path = getattr(mod, "__file__", None) if mod is not None else None
+    if not path or not os.path.isfile(path):
+        raise BoundaryVerificationError(f"no readable module source for adapter {adapter_name(adapter)!r}")
+    modfile = os.path.realpath(path)
+    try:
+        with open(modfile, "rb") as f:
+            source = f.read()
+        tree = compile(source, modfile, "exec", dont_inherit=True)
+    except (OSError, SyntaxError, ValueError) as exc:
+        raise BoundaryVerificationError(f"cannot compile adapter module source: {exc}") from exc
+    funcs: dict[str, list[types.CodeType]] = {}
+    classes: set[str] = set()
+    stack = list(k for k in tree.co_consts if isinstance(k, types.CodeType))
+    while stack:
+        c = stack.pop()
+        stack.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
+        if "<" in c.co_qualname:
+            continue                        # lambdas, comprehensions, locals
+        if c.co_flags & inspect.CO_NEWLOCALS:
+            funcs.setdefault(c.co_qualname, []).append(c)
+        else:
+            classes.add(c.co_qualname)      # class body
+
+    def same(code: types.CodeType, qualname: str) -> bool:
+        return (os.path.realpath(code.co_filename) == modfile
+                and any(code == e and code.co_firstlineno == e.co_firstlineno
+                        for e in funcs.get(qualname, ())))
+
+    def check_func(f: Any, qualname: str, cls: type | None, name: str) -> None:
+        outer = getattr(f, "__code__", None)
+        if cls is not None and qualname not in funcs and outer is not None \
+                and _foreign_ok(cls, name, outer):
+            return                          # generated by the class machinery
+        inner = getattr(f, "__wrapped__", None)
+        if inner is not None:
+            if getattr(f, "__code__", None) != _CONTEXTMANAGER_HELPER:
+                raise BoundaryVerificationError(f"{qualname} is wrapped by an unreviewed decorator")
+            f = inner
+        code = getattr(f, "__code__", None)
+        if code is None:
+            raise BoundaryVerificationError(f"{qualname} has no code to verify")
+        if same(code, qualname):
+            return
+        raise BoundaryVerificationError(f"loaded {qualname} differs from the reviewed source")
+
+    def check_class(cls: Any, qualname: str) -> None:
+        if not (isinstance(cls, type) and cls.__qualname__ == qualname and cls.__module__ == modname):
+            raise BoundaryVerificationError(f"class {qualname} is not the reviewed class")
+        present = set()
+        for name, v in vars(cls).items():
+            parts: list[Any] = []
+            if isinstance(v, types.FunctionType):
+                parts = [v]
+            elif isinstance(v, (staticmethod, classmethod)):
+                parts = [v.__func__]
+            elif isinstance(v, property):
+                parts = [x for x in (v.fget, v.fset, v.fdel) if x is not None]
+            elif isinstance(v, type) and v.__qualname__ == f"{qualname}.{name}":
+                check_class(v, v.__qualname__)
+                continue
+            for part in parts:
+                check_func(part, f"{qualname}.{name}", cls, name)
+                present.add(name)
+        for q in funcs:
+            if q.startswith(qualname + ".") and "." not in q[len(qualname) + 1:]:
+                if q[len(qualname) + 1:] not in present:
+                    raise BoundaryVerificationError(f"reviewed method {q} is missing")
+
+    for q in funcs:
+        if "." not in q:
+            f = vars(mod).get(q)
+            if not isinstance(f, types.FunctionType):
+                raise BoundaryVerificationError(f"reviewed function {q} is missing or replaced")
+            check_func(f, q, None, q)
+    for q in classes:
+        if "." not in q:
+            check_class(vars(mod).get(q), q)
+    for name, v in vars(mod).items():
+        if isinstance(v, types.FunctionType) and v.__module__ == modname \
+                and "<" not in v.__qualname__ and name not in funcs:
+            raise BoundaryVerificationError(f"unreviewed function {name} added to the module")
+
+
 @dataclass(frozen=True)
 class FencingScope:
     """What a fenced boundary is bound to, mirroring C2's ``IdempotencyScope``.
@@ -410,11 +578,14 @@ class FencedBoundaryContract:
 
     def verify_live(self) -> None:
         """Re-check the RUNNING adapter against this contract: its implementation
-        artifact and its current scope. Raises BoundaryVerificationError."""
+        artifact, ALL loaded callables of its module(s) (see
+        :func:`verify_boundary_implementation`), and its current scope.
+        Raises BoundaryVerificationError."""
         actual = boundary_artifact_digest(self.adapter)
         if not hmac.compare_digest(actual, self.adapter_artifact_digest):
             raise BoundaryVerificationError(
                 f"adapter for {self.identity!r} does not match its declared artifact digest")
+        verify_boundary_implementation(self.adapter)
         if current_fencing_scope(self.adapter) != self.fencing_scope:
             raise BoundaryVerificationError(
                 f"adapter for {self.identity!r} is bound to a different fencing scope")
@@ -820,6 +991,21 @@ class FencedEffects:
 
 # --------------------------------------------------------------------------- boundary
 
+_GATE_TYPES = (threading.Event, multiprocessing.synchronize.Event)
+GATE_TIMEOUT_S = 60.0
+
+
+def _pass_gate(gate: Any) -> None:
+    """Test seam: signal ``reached`` and park until ``resume`` (Events only)."""
+    if not (isinstance(gate, tuple) and len(gate) == 2
+            and all(type(e) in _GATE_TYPES for e in gate)):
+        raise TypeError("a gate is a (reached, resume) pair of Events")
+    reached, resume = gate
+    reached.set()
+    if not resume.wait(GATE_TIMEOUT_S):
+        raise ConnectionError("gate never resumed")
+
+
 class StubConnector:
     """Staging stand-in for the external system behind an epoch-checking egress
     boundary. It does NOT deduplicate on the idempotency key, so any double
@@ -836,10 +1022,14 @@ class StubConnector:
     older token lands, and an apply in progress delays the promotion until it
     has committed. ``reconcile`` reads under the same lock.
 
-    Test seams: ``before_apply(effect, token)`` runs in :meth:`perform` before
-    the boundary transaction (a stall or transport error on the way in; it
-    holds no lock). ``after_check(conn, token)`` runs inside the transaction
-    after the token passed, before the apply is recorded."""
+    Test seams are DATA, not code (a callable seam in the boundary path would be
+    a token bypass, and verification refuses any instance-level callable):
+    ``gate_before_apply`` / ``gate_in_check`` are ``(reached, resume)`` Event
+    pairs (exactly ``threading.Event`` or a multiprocessing Event) that park the
+    caller before the boundary transaction (holding no lock) or inside it after
+    the token passed; ``fail_before_apply`` is a message that makes
+    :meth:`perform` raise ``ConnectionError`` before the boundary (an
+    ambiguous transport failure)."""
 
     IDENTITY = "stub.epoch-gateway"
 
@@ -850,10 +1040,9 @@ class StubConnector:
             raise ValueError("identity required")
         self.identity = identity   # C2 connector identity; NOT trusted-idempotent
         self.authority = authority
-        self.after_check: Callable[[sqlite3.Connection, FencingToken], None] | None = None
-        # test seam: runs in the reviewed adapter BEFORE the boundary transaction
-        # (network latency / a stalled caller / a transport error on the way in)
-        self.before_apply: Callable[[Effect, FencingToken], None] | None = None
+        self.gate_before_apply: tuple[Any, Any] | None = None
+        self.gate_in_check: tuple[Any, Any] | None = None
+        self.fail_before_apply: str | None = None
         with authority.boundary() as (c, _):
             c.execute("CREATE TABLE IF NOT EXISTS ext_applied ("
                       " seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL,"
@@ -880,8 +1069,8 @@ class StubConnector:
                     c.execute("INSERT INTO ext_refused (key, node_id, epoch, reason)"
                               " VALUES (?,?,?,?)", (key, token.node_id, token.epoch, reason))
                 else:
-                    if self.after_check is not None:
-                        self.after_check(c, token)
+                    if self.gate_in_check is not None:
+                        _pass_gate(self.gate_in_check)
                     c.execute("UPDATE ext_fence SET max_epoch = ? WHERE id = 1", (token.epoch,))
                     c.execute("INSERT INTO ext_applied (key, node_id, epoch) VALUES (?,?,?)",
                               (key, token.node_id, token.epoch))
@@ -919,8 +1108,10 @@ class StubConnector:
     # C2 / FencedEffects-compatible callables
     def perform(self, effect: Effect, token: FencingToken) -> dict[str, Any]:
         effect.action()                    # executors run only the journaled action
-        if self.before_apply is not None:
-            self.before_apply(effect, token)
+        if self.fail_before_apply is not None:
+            raise ConnectionError(self.fail_before_apply)
+        if self.gate_before_apply is not None:
+            _pass_gate(self.gate_before_apply)
         return self.apply(effect.idempotency_key, token)
 
     def perform_unfenced(self, effect: Effect) -> dict[str, Any]:
