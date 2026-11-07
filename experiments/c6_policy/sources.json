@@ -1,0 +1,45 @@
+{
+  "files": {
+    "contracts/v0/approval.py": {
+      "observed_commit": "085308ba030eb0f0cdbb8277fee8a7fe347d18c5",
+      "sha256": "602f62aac044b3ee5bfe4072f6f7e07b310cd7fc78ea156673924bccf153d5c7"
+    },
+    "policy/__init__.py": {
+      "observed_commit": "8c6bf2811aa7f0f1fce89148aa4596116e64d733",
+      "sha256": "b6616f12ef4ad98435e5148d675a2388eed5a4bafe997c7f24b5d8f9580a28c4"
+    },
+    "policy/_contracts.py": {
+      "observed_commit": "8c6bf2811aa7f0f1fce89148aa4596116e64d733",
+      "sha256": "213856b75c21daffb5847b1b8487bfa23178fa8c83a9cafa3cb7a0d5989feeb8"
+    },
+    "policy/engine.py": {
+      "observed_commit": "8c6bf2811aa7f0f1fce89148aa4596116e64d733",
+      "sha256": "3a8d3083aab2638c71fe1b2a06b791fc30acf1a60ad29d51f48b640df843a5aa"
+    },
+    "policy/registry.py": {
+      "observed_commit": "8c6bf2811aa7f0f1fce89148aa4596116e64d733",
+      "sha256": "5b518a03e33ea8641831af9c649a0e2899d28b3f932b98f3077c2da81c733fee"
+    },
+    "tracing/emitter.py": {
+      "observed_commit": "abdde433c1163d311645ed25110c6b2852bcbc69",
+      "sha256": "41eaeeeb66736065de2e5b0d9926409178c8c72501e7f805d752d82e3feb03b8"
+    },
+    "tracing/policy_adapter.py": {
+      "observed_commit": "abdde433c1163d311645ed25110c6b2852bcbc69",
+      "sha256": "60e458443a2895f12e9169302525e28eb52eeac10a4acc2eab95257430427e22"
+    },
+    "tracing/policy_binding.py": {
+      "sha256": "deeddb366c77c06204012b0ca33a7ab6815299dc2c23765b4d36b7670dc95fe1",
+      "source": "this candidate"
+    },
+    "tracing/sqlite_sink.py": {
+      "observed_commit": "abdde433c1163d311645ed25110c6b2852bcbc69",
+      "sha256": "9e001397e4cf773102ca8c878cb39e54c1aeadffcc8a532077f2eed864f13ab5"
+    },
+    "tracing/trace.py": {
+      "observed_commit": "abdde433c1163d311645ed25110c6b2852bcbc69",
+      "sha256": "352ca135b1e8b139397630e810d7d1277297e1ede846710bb4ad1658f4b5b695"
+    }
+  },
+  "schema": "potter.c6-policy.synthetic-sources/v0"
+}
