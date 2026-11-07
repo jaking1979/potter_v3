@@ -32,9 +32,16 @@ the caller's transaction, through the C3 outbox. Nothing else holds a channel.
   ``BEGIN IMMEDIATE`` transaction; ``stop()`` sets the flag under the same
   write lock and then waits until every recorded send has returned. So a
   send already past the gate may complete (before ``stop()`` returns), and no
-  send that has not passed the gate can start afterwards. Rows older than the
-  dispatch timeout (a dead process) are not waited for; they are reported in
-  ``StopReport.unconfirmed_in_flight`` instead.
+  send that has not passed the gate can start afterwards.
+  Immediately before ``channel.send`` the sender re-checks, in its own
+  transaction, that its gate row still exists, that it is younger than the
+  dispatch timeout and that the kill flag is clear; otherwise it removes its
+  row and aborts. So a sender paused past the gate cannot deliver after a
+  /stop, and an expired gate cannot deliver at all. ``stop()`` never gives an
+  all-clear from age: it waits (up to ``stop_wait_s``) for unexpired rows,
+  and returns EVERY row still present in ``StopReport.unconfirmed_in_flight``
+  (expired ones also in ``expired_in_flight``: those senders must abort at
+  their recheck). An empty ``unconfirmed_in_flight`` is the only all-clear.
 * Long work: ``LongWork`` sends one acknowledgement after 30 s, an update only
   when the state changes, and a final message with the receipt link.
 
@@ -120,7 +127,12 @@ class StopReport:
     cancelled_approvals: tuple[str, ...]
     already_stopped: bool
     reply_notification_id: str
-    unconfirmed_in_flight: tuple[str, ...] = ()
+    unconfirmed_in_flight: tuple[str, ...] = ()   # every unreturned send, never filtered by age
+    expired_in_flight: tuple[str, ...] = ()       # subset past dispatch timeout: must abort
+
+    @property
+    def all_clear(self) -> bool:
+        return not self.unconfirmed_in_flight
 
 
 class Notifier:
@@ -252,6 +264,7 @@ class Notifier:
         try:
             if self._hook_after_gate is not None:
                 self._hook_after_gate(msg)
+            self._recheck(msg)                   # last word before the channel call
             try:
                 result = channel.send(msg)
             except BaseException:
@@ -269,6 +282,20 @@ class Notifier:
                               (msg.message_id,))
             except Exception:
                 pass   # a leftover row only delays stop() until it ages out
+
+    def _recheck(self, msg: QueuedMessage) -> None:
+        """Abort unless this send's gate row is still ours, unexpired, and the
+        kill flag is clear (stop_ack exempt from the flag). The finally-block
+        in ``_send`` removes the row on abort."""
+        with self.db.tx() as c:
+            row = c.execute("SELECT since FROM notifier_sending WHERE message_id=?",
+                            (msg.message_id,)).fetchone()
+            if row is None:
+                raise SendFailed("aborted: gate record missing")
+            if self._now() >= row[0] + self._dispatch_timeout:
+                raise SendFailed("aborted: gate expired")
+            if msg.body.get("kind") != "stop_ack" and self.kill.is_set(c):
+                raise SendFailed("aborted: stopped after gate")
 
     def _reconcile(self, msg: QueuedMessage) -> str:
         self._claimed = True
@@ -356,6 +383,9 @@ class Notifier:
         suppresses every undelivered sibling on every channel."""
         if not self._auth.vouches(sender) or sender.principal != self._recipient:
             return False
+        cmd, target = sender.command()
+        if cmd != "/ack" or target != notification_id:
+            return False                      # voucher was minted for another command
         candidates = [f"{notification_id}:{sender.channel}",
                       f"{notification_id}:{self._primary}", f"{notification_id}:{self._fallback}"]
         for mid in candidates:
@@ -369,6 +399,8 @@ class Notifier:
         and unresolved sends, cancel pending approvals, enqueue the reply."""
         if not self._auth.vouches(sender) or sender.principal != self._recipient:
             raise PermissionError("stop needs an authenticated allowlisted sender")
+        if sender.command()[0] != "/stop":
+            raise PermissionError("voucher was not minted for /stop")
         now = self._now(now)
         with self.db.tx() as c:
             first = self.kill.set(c, by=sender.principal, at=now)
@@ -387,23 +419,31 @@ class Notifier:
             self.enqueue(c, notification_id=reply, kind="stop_ack", text=text, urgency=URGENT,
                          channel=channel, now=now,
                          extra={"cancelled_notifications": nids, "cancelled_approvals": appr})
-        unconfirmed = self._await_in_flight(now)
+        unconfirmed, expired = self._await_in_flight()
         return StopReport(tuple(msgs), tuple(nids), tuple(appr), not first, reply,
-                          tuple(unconfirmed))
+                          tuple(unconfirmed), tuple(expired))
 
-    def _await_in_flight(self, now: float) -> list[str]:
-        """Block until every send that passed the gate before the flag was set
-        has returned. The caller's own in-flight send (``/stop`` handled from
-        inside a send on this thread) is excluded: it completes after we return."""
+    def _await_in_flight(self) -> tuple[list[str], list[str]]:
+        """Wait (bounded by ``stop_wait_s``) for unexpired sends past the gate
+        to return, then report EVERY row still present - age never removes an
+        entry from the report. Expired rows are not waited for: their senders
+        cannot pass the recheck. The caller's own in-flight send (``/stop``
+        handled from inside a send on this thread) is excluded.
+
+        Returns (unconfirmed, expired). When the wait expires the unconfirmed
+        set is returned as-is; it is never an all-clear."""
         deadline = time.monotonic() + self._stop_wait
         mine = self._inflight()
         while True:
+            now = self._now()
             with self.db.read() as c:
-                rows = c.execute("SELECT message_id, since FROM notifier_sending").fetchall()
-            live = sorted(m for m, since in rows
-                          if m not in mine and since > now - self._dispatch_timeout)
-            if not live or time.monotonic() >= deadline:
-                return live
+                rows = c.execute("SELECT message_id, since FROM notifier_sending"
+                                 " ORDER BY message_id").fetchall()
+            rows = [(m, since) for m, since in rows if m not in mine]
+            expired = [m for m, since in rows if now >= since + self._dispatch_timeout]
+            waiting = [m for m, since in rows if now < since + self._dispatch_timeout]
+            if not waiting or time.monotonic() >= deadline:
+                return [m for m, _ in rows], expired
             self._sleep(0.005)
 
     def _sweep(self, now: float) -> list[str]:

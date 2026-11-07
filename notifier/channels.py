@@ -40,14 +40,18 @@ class Channel(Protocol):
 class InboundMessage:
     """A message arriving from a channel. ``sender_ref`` is the channel's own
     sender identity (Telegram user id, email From address, home session
-    principal). Authentication signals (DKIM, session) are NOT fields here:
-    they come from verifiers injected into ``ChannelAuth``, so a caller cannot
-    simply claim them."""
+    principal). Anyone can construct one; it counts only if it carries a valid
+    ``transport_mac`` from the trusted adapter (``auth.TransportSigner``),
+    which binds every field. DKIM / session signals are not fields: they come
+    from verifiers injected into ``ChannelAuth``."""
     channel: str
     sender_ref: str
     text: str
     reply_to: str | None = None        # notification id being answered, if any
     raw_ref: str | None = None         # opaque handle the verifiers look up
+    update_id: str = ""                # adapter's unique id for this update (replay)
+    sent_at: float = 0.0               # adapter's receive time (freshness)
+    transport_mac: str = ""            # adapter MAC over all fields above (auth.py)
 
 
 @dataclass
