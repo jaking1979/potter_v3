@@ -609,6 +609,134 @@ class ApprovalEndToEnd(Base):
         self.assertIsNone(self.w.notifier.outbox.get("approval:x:telegram"))
 
 
+# ============================================================ review regressions (Codex, #28)
+
+class VoucherForgery(Base):
+    """P1: a constructed or relabelled voucher must never pass."""
+
+    def test_codex_repro_dkim_email_then_constructed_telegram_voucher_is_refused(self):
+        from dataclasses import replace
+        from notifier import AuthenticatedSender, ApprovalRefusal
+        tid = self.w.waiting_task()
+        action = mail_action(tid)
+        aid = self.w.request(action)
+        # Authenticate one DKIM email so the instance has minted a voucher (serial 1).
+        email_sender = self.w.auth.authenticate(self.w.mail_msg("hi", dkim=True)).sender
+        self.assertEqual(email_sender.channel, "email")
+        lookalikes = [
+            AuthenticatedSender(JOSH, "telegram", 1),
+            AuthenticatedSender(JOSH, "telegram", 1, email_sender._token),
+            replace(email_sender, channel="telegram"),
+        ]
+        for forged in lookalikes:
+            with self.subTest(forged=forged):
+                self.assertFalse(self.w.auth.vouches(forged))
+                with self.assertRaises(ApprovalRefusal) as cm:
+                    self.w.issuer.decide(aid, "approve", forged, action)
+                self.assertEqual(cm.exception.code, "unauthenticated")
+        self.assertEqual(self.w.issuer.get(aid).status, "pending")
+        # The genuine email voucher is still refused for approvals (C0 has no email channel).
+        with self.assertRaises(ApprovalRefusal) as cm:
+            self.w.issuer.decide(aid, "approve", email_sender, action)
+        self.assertEqual(cm.exception.code, "channel_not_approval_capable")
+        self.assertEqual(self.w.issuer.get(aid).status, "pending")
+
+    def test_mutated_voucher_is_refused(self):
+        sender = self.w.auth.authenticate(self.w.tg_msg("/ack")).sender
+        self.assertTrue(self.w.auth.vouches(sender))
+        object.__setattr__(sender, "channel", "potter_home")
+        self.assertFalse(self.w.auth.vouches(sender))
+
+    def test_voucher_drives_at_most_one_approval(self):
+        from notifier import ApprovalRefusal
+        t1, t2 = self.w.waiting_task("t1"), self.w.waiting_task("t2")
+        a1, a2 = self.w.request(mail_action(t1)), self.w.request(mail_action(t2))
+        sender = self.w.auth.authenticate(self.w.tg_msg("/approve")).sender
+        self.w.issuer.decide(a1, "approve", sender, mail_action(t1))
+        with self.assertRaises(ApprovalRefusal) as cm:
+            self.w.issuer.decide(a2, "approve", sender, mail_action(t2))
+        self.assertEqual(cm.exception.code, "unauthenticated")
+        self.assertFalse(self.w.auth.vouches(sender))
+        self.assertEqual(self.w.issuer.get(a2).status, "pending")
+
+    def test_voucher_from_another_auth_instance_is_refused(self):
+        from notifier import ChannelAuth as CA
+        stranger_auth = CA(inbound_bindings={"telegram": {TG_JOSH: JOSH}},
+                           outbound_addresses={JOSH: {"telegram": "chat-1001"}})
+        foreign = stranger_auth.authenticate(self.w.tg_msg("/stop")).sender
+        self.assertFalse(self.w.auth.vouches(foreign))
+        with self.assertRaises(PermissionError):
+            self.w.notifier.stop(foreign)
+
+
+class WatchdogSameBucket(Base):
+    """P2: a backlog that changes within one 30-min bucket must not crash."""
+
+    def test_two_messages_going_stale_in_one_bucket(self):
+        self.w.tg.up = False
+        for i in range(3):
+            self.w.job_notify("digest", f"r{i}", "routine")
+        self.w.notifier.run()
+        self.w.now = (int(T // 1800) + 1) * 1800 + 60      # early in a fresh bucket
+        self.w.job_notify("digest", "late1", "routine")
+        self.w.now += 31 * 60 - 120                        # r* stale; late1 not yet
+        first = self.w.notifier.watchdog()
+        self.w.job_notify("digest", "late2", "routine")
+        self.w.now += 100                                  # same bucket; late1 now stale too
+        second = self.w.notifier.watchdog()               # must not raise OutboxConflict
+        self.assertGreater(len(second), len(first))
+        alerts = [m for m in (self.w.notifier.outbox.get(f"watchdog:backlog:{b}:email")
+                              for b in range(int(T // 1800), int(self.w.now // 1800) + 1))
+                  if m is not None]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(len(alerts[0].body["stale_messages"]), len(first))   # original content
+
+
+class LongWorkRestart(Base):
+    """P2: update numbering survives a restart without reusing an id."""
+
+    def test_restart_continues_numbering(self):
+        handle = self.w.notifier.handle_for(JobSpec("research", "josh"))
+        work = handle.long_work("w1", T)
+        work.tick("searching", T + 31)                     # ack
+        work.tick("drafting", T + 40)                      # state:1
+        # Restart: new notifier + new LongWork on the same file.
+        restarted = self.w.make_notifier().handle_for(JobSpec("research", "josh"))
+        work2 = restarted.long_work("w1", T)
+        work2.tick("drafting", T + 50)                     # replayed tick: nothing
+        work2.tick("reviewing", T + 60)                    # state:2, not a reused state:1
+        work2.finish("receipt://effects/r", T + 70)
+        self.w.now = T + 70
+        self.w.notifier.run()
+        got = [(m.notification_id.split(":", 3)[-1], m.body.get("state"))
+               for m in self.w.tg.delivered]
+        self.assertEqual(got, [("ack", "searching"), ("state:1", "drafting"),
+                               ("state:2", "reviewing"), ("final", None)])
+        with self.assertRaises(Exception):
+            restarted.long_work("w1", T).tick("again", T + 80)   # finished stays finished
+
+
+class StopAckFallback(Base):
+    """P2: with Telegram down after /stop, the confirmation falls back to email."""
+
+    def test_stop_ack_reaches_email_when_telegram_is_down(self):
+        tid = self.w.waiting_task()
+        self.w.request(mail_action(tid))
+        self.w.job_notify("digest", "d1", "routine")
+        res = self.w.router.handle(self.w.tg_msg("/stop"))
+        self.assertEqual(res.outcome, "stopped")
+        self.w.tg.up = False
+        for _ in range(12):
+            self.w.notifier.run()
+            if any(m.body.get("kind") == "stop_ack" for m in self.w.email.delivered):
+                break
+            self.w.now += 60
+        kinds = [m.body["kind"] for m in self.w.email.delivered]
+        self.assertEqual(kinds, ["stop_ack"])              # only the confirmation, nothing else
+        self.assertEqual(self.w.email.delivered[0].notification_id, res.detail.reply_notification_id)
+        self.assertEqual(self.w.tg.delivered, [])
+
+
 # ============================================================ long work (item 5)
 
 class LongWorkUpdates(Base):
