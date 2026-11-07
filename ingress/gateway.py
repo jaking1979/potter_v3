@@ -6,6 +6,11 @@ The untrusted-source boundary (T11/T12; T19 PASS 2 items 2 and 4):
   emitted only for the command text of a sender that (a) passes the channel's
   own authentication and (b) E1's ``ChannelAuth`` maps to an allowlisted,
   enabled principal. Everything else is an untrusted kind (``events.py``).
+* E1 handoff: ingress is the trusted channel adapter. After the platform proof
+  passes, it signs the exact update with the channel's ``TransportSigner`` and
+  ``ChannelAuth`` verifies MAC, freshness and envelope replay; the resulting
+  voucher must match this channel and this message text. Ingress never
+  constructs an ``InboundMessage``.
 * Telegram: the transport verifier must confirm the update came from Telegram
   (webhook secret token, checked by the injected verifier). The user id must
   be bound and allowlisted in ``ChannelAuth``; the chat must be the private
@@ -41,8 +46,7 @@ from email import policy as email_policy
 from email.parser import BytesParser
 from typing import Callable, Mapping
 
-from notifier import InboundMessage
-from notifier.auth import ChannelAuth
+from notifier.auth import ChannelAuth, TransportSigner
 
 from .content import IngressLimits, injection_flags, is_forward_subject, split_body
 from .events import (EMAIL, EXTERNAL_SENDER, FORWARDED_CONTENT, PRINCIPAL_DIRECT, TELEGRAM,
@@ -65,7 +69,8 @@ REASONS = frozenset({
     "sender_mismatch", "dkim_missing", "dkim_failed", "dkim_unaligned", "spf_failed",
     "email_domain_not_attested", "mailbox_unbound",
     "verifier_error", "unknown_sender", "not_allowlisted", "principal_disabled",
-    "dkim_unverified", "unvouched_sender", "non_private_chat", "via_bot", "unauthenticated_channel",
+    "dkim_unverified", "unvouched_sender", "unauthenticated_transport",
+    "stale_transport", "replayed", "unknown_channel", "non_private_chat", "via_bot", "unauthenticated_channel",
 })
 
 
@@ -156,6 +161,7 @@ class _Draft:
 class IngressGateway:
     def __init__(self, *, store: IngressStore, attachments: AttachmentStore,
                  channel_auth: ChannelAuth, clock: Callable[[], int],
+                 transport_signers: Mapping[str, TransportSigner] | None = None,
                  telegram_transport: TransportVerifier | None = None,
                  email_verifier: EmailVerifier | None = None,
                  email_attested_domains: frozenset[str] = frozenset(),
@@ -165,6 +171,13 @@ class IngressGateway:
         self._store = store
         self._attachments = attachments
         self._auth = channel_auth
+        # E1 c8c8422: ingress is the trusted channel adapter. After the platform
+        # proof passes, it signs the exact update (sender, text, ids, time)
+        # with the channel's transport key; ChannelAuth verifies that MAC,
+        # freshness and envelope replay. No signer for a channel -> nothing on
+        # it is ever authenticated. Ingress never builds an InboundMessage.
+        self._signers = {ch: s for ch, s in (transport_signers or {}).items()
+                         if isinstance(s, TransportSigner) and s.channel == ch}
         self._clock = clock
         self._tg = telegram_transport
         self._email = email_verifier
@@ -275,9 +288,9 @@ class IngressGateway:
             raise _Reject("malformed", record=False)
         if u.from_is_bot:
             raise _Reject("bot_sender", record=True).with_draft(draft)
-        auth = self._auth.authenticate(InboundMessage(TELEGRAM, str(u.from_user_id), "",
-                                                      raw_ref=u.delivery_ref))
-        if self._vouched_principal(auth, TELEGRAM) is None:
+        auth = self._authenticate(TELEGRAM, str(u.from_user_id), u.text, key,
+                                  raw_ref=u.delivery_ref)
+        if self._vouched_principal(auth, TELEGRAM, u.text) is None:
             # A stranger DMing the bot does not drive the runner (E1: ignored + logged).
             raise _Reject("sender_not_allowlisted", record=True).with_draft(draft)
         if u.via_bot:
@@ -292,7 +305,7 @@ class IngressGateway:
         else:
             segs = (Segment(own, u.text),) if u.text else ()
         draft.segments = segs
-        draft.principal = (self._vouched_principal(auth, TELEGRAM)
+        draft.principal = (self._vouched_principal(auth, TELEGRAM, u.text)
                            if own == PRINCIPAL_DIRECT else None)
         draft.trust_reason = trust
         return draft
@@ -313,14 +326,16 @@ class IngressGateway:
             raise _Reject("missing_message_id", record=False)
 
         # -- sender authentication -------------------------------------------
-        trust, addr, principal = self._email_trust(msg, raw, mid)
+        text, atts = self._email_parts(msg)
+        subject = str(msg.get("Subject", "") or "")
+        # The envelope binds the whole message text (subject + plain body), so
+        # the voucher is for this exact message, not a blank command.
+        trust, addr, principal = self._email_trust(msg, raw, mid, f"{subject}\n{text}")
         own = PRINCIPAL_DIRECT if trust == "ok" else EXTERNAL_SENDER
         ns = principal if own == PRINCIPAL_DIRECT else f"untrusted:{sha256(addr.encode())}"
         key = f"email|{ns}|{mid}"
 
         # -- content ---------------------------------------------------------------
-        text, atts = self._email_parts(msg)
-        subject = str(msg.get("Subject", "") or "")
         draft = _Draft(EMAIL, key, mid, sha256(raw), None, (), tuple(atts), trust)
         self._check_sizes(subject + text, draft.attachments, draft)
         fwd = is_forward_subject(subject)
@@ -333,7 +348,8 @@ class IngressGateway:
             draft.principal = principal
         return draft
 
-    def _email_trust(self, msg, raw: bytes, mid: str) -> tuple[str, str, str | None]:
+    def _email_trust(self, msg, raw: bytes, mid: str,
+                     bound_text: str) -> tuple[str, str, str | None]:
         froms = msg.get_all("From") or []
         addr = ""
         try:
@@ -375,23 +391,44 @@ class IngressGateway:
             return "email_domain_not_attested", addr, None
         if v.mailbox_bound is not True:
             return "mailbox_unbound", addr, None
-        auth = self._auth.authenticate(InboundMessage(EMAIL, addr, "", raw_ref=mid))
-        principal = self._vouched_principal(auth, EMAIL)
+        auth = self._authenticate(EMAIL, addr, bound_text, f"email|{mid}", raw_ref=mid)
+        principal = self._vouched_principal(auth, EMAIL, bound_text)
         if principal is None:
             reason = getattr(auth, "reason", None)
             return (reason if reason in REASONS and reason != "ok" else "unvouched_sender"), \
                 addr, None
         return "ok", addr, principal
 
-    def _vouched_principal(self, auth: object, channel: str) -> str | None:
+    def _authenticate(self, channel: str, sender_ref: str, text: str, key: str, *,
+                      raw_ref: str | None) -> object:
+        """Hand the platform-verified update to E1 as a signed envelope.
+
+        ``update_id`` is unique per attempt (``e3:<key digest>:<nonce>``):
+        platform re-delivery is ingress's job (content-bound dedupe, atomic
+        with the durable inbox), while E1's replay table guards this envelope
+        itself. A deterministic id would turn a rolled-back attempt (trace or
+        store failure after authentication) into a permanent ``replayed``
+        rejection of the sender's retry - a lost command."""
+        signer = self._signers.get(channel)
+        if signer is None:
+            return None
+        env = signer.envelope(sender_ref, text,
+                              update_id=f"e3:{sha256(key.encode())[:32]}:{uuid.uuid4().hex}",
+                              sent_at=float(self._clock()), raw_ref=raw_ref)
+        return self._auth.authenticate(env)
+
+    def _vouched_principal(self, auth: object, channel: str, text: str) -> str | None:
         """The principal only if E1 ``ChannelAuth`` itself minted this exact
-        voucher for this channel (``vouches``). A hand-constructed or copied
-        ``AuthenticatedSender`` never yields ``principal_direct``."""
+        voucher for this channel and this exact message text (``vouches``). A
+        hand-constructed or copied ``AuthenticatedSender`` never yields
+        ``principal_direct``."""
         try:
             sender = getattr(auth, "sender", None)
             if sender is None or not self._auth.vouches(sender):
                 return None
             if sender.channel != channel or not isinstance(sender.principal, str):
+                return None
+            if sender.text != text:
                 return None
             return sender.principal or None
         except Exception:

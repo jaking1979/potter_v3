@@ -31,11 +31,13 @@ from ingress import (ATTACHMENT, EXTERNAL_SENDER, FORWARDED_CONTENT, PRINCIPAL_D
                      TelegramUpdate, WebhookDelivery)
 from ingress.gateway import REASONS  # noqa: E402
 from notifier import ChannelAuth, lint  # noqa: E402
+from notifier.auth import TransportSigner  # noqa: E402
 from policy import (ALLOW, DENY, TRUSTED_SOURCES, Caller, Capability,  # noqa: E402
                     CapabilityRegistry, PolicyEngine, PolicyRequest, RiskClass)
 from policy._contracts import approval as c0  # noqa: E402
 
 T = 1_800_000_000
+TG_KEY, MAIL_KEY = b"t" * 32, b"m" * 32   # test-only transport keys (E1 c8c8422)
 TASK_ID = "00000000-0000-4000-8000-000000000001"  # canonical UUID (C1 8c6bf28)
 TG_JOSH, TG_CHRISTIE, TG_STRANGER = 1001, 3003, 2002
 JOSH_MAIL = "josh@potter.test"
@@ -85,16 +87,26 @@ class Fixture(unittest.TestCase):
         self.webhook_ok: set[str] = set()
         self.traces: list[str] = []
         self.attachments = InMemoryAttachmentStore()
-        self.auth = ChannelAuth(
+        self.auth = self.make_auth()
+        self.gw = self.gateway()
+
+    def make_auth(self, cls=ChannelAuth, **kw):
+        args = dict(
+            db=str(Path(self.tmp.name) / "e1.db"),
+            transport_keys={"telegram": TG_KEY, "email": MAIL_KEY},
             inbound_bindings={"telegram": {str(TG_JOSH): JOSH, str(TG_CHRISTIE): CHRISTIE},
                               "email": {JOSH_MAIL: JOSH}},
             outbound_addresses={JOSH: {"telegram": str(TG_JOSH), "email": JOSH_MAIL}},
-            dkim_verifier=lambda m: getattr(self.verdicts.get(m.raw_ref), "dkim", None) == "pass")
-        self.gw = self.gateway()
+            dkim_verifier=lambda m: getattr(self.verdicts.get(m.raw_ref), "dkim", None) == "pass",
+            clock=lambda: float(T))
+        args.update(kw)
+        return cls(**args)
 
     def gateway(self, **kw):
         args = dict(store=IngressStore(self.db), attachments=self.attachments,
                     channel_auth=self.auth, clock=lambda: T,
+                    transport_signers={"telegram": TransportSigner("telegram", TG_KEY),
+                                       "email": TransportSigner("email", MAIL_KEY)},
                     telegram_transport=lambda u: u.delivery_ref in self.tg_ok,
                     email_verifier=self.email_verifier,
                     webhook_verifiers={"billing": lambda d: d.delivery_ref in self.webhook_ok},
@@ -250,8 +262,8 @@ class EmailSenderAuthentication(Fixture):
         self.assertEqual(res.event.provenance, (EXTERNAL_SENDER,))
 
     def test_12_disabled_principal_by_email(self):
-        auth = ChannelAuth(inbound_bindings={"email": {"christie@potter.test": CHRISTIE}},
-                           outbound_addresses={}, dkim_verifier=lambda m: True)
+        auth = self.make_auth(inbound_bindings={"email": {"christie@potter.test": CHRISTIE}},
+                              outbound_addresses={}, dkim_verifier=lambda m: True)
         self.pass_dkim("<m1@potter.test>")
         res = self.gateway(channel_auth=auth).ingest_email(
             make_email(frm="christie@potter.test"))
@@ -560,7 +572,7 @@ class HandBuiltVoucherRefused(Fixture):
 
             def vouches(self, sender):
                 return real.vouches(sender)
-        return ForgingAuth(inbound_bindings={}, outbound_addresses={})
+        return self.make_auth(cls=ForgingAuth)
 
     def test_45_forged_voucher_telegram_rejected(self):
         res = self.gateway(channel_auth=self.forging_auth()).ingest_telegram(self.tg())
@@ -574,15 +586,15 @@ class HandBuiltVoucherRefused(Fixture):
         self.assertIsNone(res.event.principal)
 
     def test_47_voucher_relabelled_to_other_channel_refused(self):
-        from notifier import InboundMessage
         self.pass_dkim("<m1@potter.test>")
-        minted = self.auth.authenticate(InboundMessage("email", JOSH_MAIL, "",
-                                                       raw_ref="<m1@potter.test>"))
+        env = TransportSigner("email", MAIL_KEY).envelope(
+            JOSH_MAIL, "add note", update_id="t47", sent_at=float(T), raw_ref="<m1@potter.test>")
+        minted = self.auth.authenticate(env)
         self.assertTrue(minted.ok)
         relabelled = dataclasses.replace(minted.sender, channel="telegram")
         self.assertFalse(self.auth.vouches(relabelled))
-        self.assertIsNone(self.gw._vouched_principal(minted, "telegram"))
-        self.assertEqual(self.gw._vouched_principal(minted, "email"), JOSH)
+        self.assertIsNone(self.gw._vouched_principal(minted, "telegram", "add note"))
+        self.assertEqual(self.gw._vouched_principal(minted, "email", "add note"), JOSH)
 
 
 class QuoteBoundariesFailClosed(Fixture):
@@ -799,6 +811,81 @@ class DurableHandoff(Fixture):
         self.handoff(self.gw, ev)
         _, created = self.tasks.submit(f"ingress:{ev.event_id}", "ingress_event", {})
         self.assertFalse(created)                   # idempotency lives in the runner queue
+
+
+class MessageBoundTransport(Fixture):
+    """E1 c8c8422: ingress is the trusted adapter. It hands ChannelAuth a signed,
+    message-bound envelope (never a hand-built InboundMessage), and a voucher
+    counts only for the exact text it was minted for."""
+
+    def spy_auth(self):
+        seen = self.seen = []
+
+        class Spy(ChannelAuth):
+            def authenticate(self, msg):
+                seen.append(msg)
+                return super().authenticate(msg)
+        return self.make_auth(cls=Spy)
+
+    def test_67_no_signer_never_authenticates(self):
+        gw = self.gateway(transport_signers={})
+        self.assertEqual(gw.ingest_telegram(self.tg()).reason, "sender_not_allowlisted")
+        self.pass_dkim("<m1@potter.test>")
+        res = gw.ingest_email(make_email())
+        self.assertEqual(res.trust_reason, "unvouched_sender")
+        self.assertEqual(res.event.provenance, (EXTERNAL_SENDER,))
+
+    def test_68_wrong_key_or_mislabelled_signer_refused(self):
+        bad = self.gateway(transport_signers={"telegram": TransportSigner("telegram", b"x" * 32)})
+        self.assertEqual(bad.ingest_telegram(self.tg()).reason, "sender_not_allowlisted")
+        swapped = self.gateway(transport_signers={"telegram": TransportSigner("email", MAIL_KEY)})
+        self.assertEqual(swapped.ingest_telegram(self.tg(msg_id=2, ref="d2")).reason,
+                         "sender_not_allowlisted")
+
+    def test_69_envelope_binds_the_exact_message(self):
+        gw = self.gateway(channel_auth=self.spy_auth())
+        ev = gw.ingest_telegram(self.tg(text="/note add milk")).event
+        self.assertTrue(ev.trusted)
+        (env,) = self.seen
+        self.assertEqual((env.channel, env.sender_ref, env.text),
+                         ("telegram", str(TG_JOSH), "/note add milk"))
+        self.assertTrue(env.transport_mac)
+        self.assertTrue(env.update_id.startswith("e3:"))
+        self.pass_dkim("<m1@potter.test>")
+        gw.ingest_email(make_email(subject="add note", body="add milk to the list"))
+        self.assertEqual(self.seen[1].text, "add note\nadd milk to the list\n")
+
+    def test_70_voucher_for_other_text_refused(self):
+        env = TransportSigner("telegram", TG_KEY).envelope(
+            str(TG_JOSH), "/ack 1", update_id="t70", sent_at=float(T))
+        minted = self.auth.authenticate(env)
+        self.assertTrue(minted.ok)
+        self.assertIsNone(self.gw._vouched_principal(minted, "telegram", "/pay mallory"))
+        self.assertEqual(self.gw._vouched_principal(minted, "telegram", "/ack 1"), JOSH)
+
+    def test_71_stale_envelope_refused(self):
+        gw = self.gateway(channel_auth=self.make_auth(clock=lambda: float(T + 3600)))
+        self.assertEqual(gw.ingest_telegram(self.tg()).reason, "sender_not_allowlisted")
+
+    def test_72_retry_after_rollback_not_locked_out(self):
+        def broken(line):
+            raise OSError("down")
+        self.assertEqual(self.gateway(trace_sink=broken).ingest_telegram(self.tg()).reason,
+                         "trace_error")
+        retry = self.gw.ingest_telegram(self.tg())     # same platform update, new envelope
+        self.assertTrue(retry.accepted)
+        self.assertTrue(retry.event.trusted)
+
+    def test_73_ingress_never_constructs_inbound_message(self):
+        import ast
+        for path in (ROOT / "ingress").glob("*.py"):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    name = getattr(node.func, "id", getattr(node.func, "attr", ""))
+                    self.assertNotEqual(name, "InboundMessage", path.name)
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    self.assertNotIn("InboundMessage", [a.name for a in node.names], path.name)
 
 
 class Structure(unittest.TestCase):

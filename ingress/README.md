@@ -42,7 +42,13 @@ A mixed event (Josh's command plus a forward or an attachment) keeps `principal=
   Any failure, including a missing verifier or one that raises, makes the text `external_sender` with a fixed `trust_reason` (`dkim_failed`, `display_name_spoof`, `reply_to_mismatch`, …). Email from other people is accepted as untrusted (inbox triage), not rejected.
 - **Webhooks.** Each source needs a signature verifier. Unknown sources and unsigned deliveries are rejected and not recorded.
 
-**Vouchers.** For both Telegram and email, a principal counts only if `ChannelAuth.vouches(sender)` confirms that this `ChannelAuth` minted that exact `AuthenticatedSender` for this channel (E1 binds tokens to vouchers). A hand-built, copied or relabelled voucher yields no principal: the Telegram message is rejected, and the email is `external_sender` with `unvouched_sender`.
+**Transport envelope (E1 `c8c8422`).** Ingress is the trusted channel adapter. Once the platform's own proof passes (the Telegram transport verifier, or the email header and DKIM/attestation checks), it signs the exact update with that channel's injected `TransportSigner` and hands the envelope to `ChannelAuth.authenticate`. The signature covers channel, sender, the full message text (for email, subject plus plain body), `raw_ref`, `update_id` and time. `ChannelAuth` checks the MAC, freshness (`max_skew_s`) and envelope replay.
+
+- With no signer for a channel, or a signer whose channel doesn't match, nothing on that channel is authenticated.
+- Ingress never builds an `InboundMessage` itself; `test_73` checks the source for this.
+- `update_id` is `e3:<key digest>:<nonce>`, unique per attempt. Ingress handles platform re-delivery itself: its dedupe is content-bound and atomic with the durable inbox. A deterministic ID would turn a rolled-back attempt into a permanent `replayed` rejection of the sender's retry (`test_72`).
+
+**Vouchers.** For both Telegram and email, a principal counts only if `ChannelAuth.vouches(sender)` confirms that this `ChannelAuth` minted that exact `AuthenticatedSender` for this channel **and this exact message text**. A hand-built, copied, relabelled or other-text voucher yields no principal: the Telegram message is rejected, and the email is `external_sender` with `unvouched_sender`.
 
 ## Content handling
 
