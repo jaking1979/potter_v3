@@ -5,6 +5,10 @@ from retrieval.core import Evidence, FakeBackend, benchmark, retrieve_turn
 
 
 class RetrievalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_retrieval_does_not_grant_consequential_authority(self):
+        r = await retrieve_turn(FakeBackend([Evidence('a', 'synthetic')]), 'q', consequential=True)
+        self.assertEqual((r.status, r.blocked), ('complete', True))
+
     async def test_outage_advisory_and_consequential(self):
         b = FakeBackend(error=True)
         advisory = await retrieve_turn(b, 'q', consequential=False)
