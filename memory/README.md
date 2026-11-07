@@ -8,6 +8,18 @@ cross-process tests. Its injected verifier is a test seam. It has no real
 authentication, Notion adapter, outbox, C1/C2/C6 integration, real user data or effects.
 It is not a production backend, governance receipt, or D3 completion.
 
+`review_snapshot(id, expected_version, operation=..., batch=False)` prepares a
+detached synthetic review packet and deterministic digest. Promotion binds the
+candidate and currently active rows; undo binds the predecessor to be restored;
+forget binds every local row in the deletion set. The mutation transaction
+recomputes that digest and includes it in the injected verifier's payload,
+alongside exact operation, ID, version and batch mode. A binding test verifier
+rejects swapped candidates, changed content, changed predecessor and an enlarged
+deletion set. A callback that ignores the digest remains insecure: no actual
+issuer authentication, single-use approval, expiry, C0/E1 binding or principal
+authority is implemented. The packet contains content and must never be logged
+as a trace. Boolean/nonnumeric versions and ambiguous batch modes are refused.
+
 Run `python3 -m unittest discover -s tests -p 'test_memory*.py'`.
 
 `MemoryStore.bootstrap_offline(path, verifier, environment='synthetic')`

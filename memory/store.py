@@ -13,7 +13,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Callable
 
 
@@ -224,10 +224,54 @@ class MemoryStore:
             self._audit('stage', ident, 1)
             return self._get(ident)
 
+    @staticmethod
+    def _review_args(ident, expected_version, operation, batch):
+        if (not isinstance(ident, str) or not ident
+                or type(expected_version) is not int or expected_version < 1
+                or operation not in ('promote', 'undo', 'forget')
+                or type(batch) is not bool or (operation != 'promote' and batch)):
+            raise Invalid('invalid review binding')
+
+    def _review_snapshot(self, ident, expected_version, operation, batch):
+        self._review_args(ident, expected_version, operation, batch)
+        item = self._get(ident)
+        if item.version != expected_version:
+            raise Conflict('stale review version')
+        # Bind all rows the operation could change/restore. A newly staged
+        # same-key row invalidates a prior forget proposal, rather than silently
+        # enlarging the approved deletion set. No external views are covered.
+        if operation == 'forget':
+            rows = self._db.execute("SELECT * FROM item WHERE key=? AND status!='forgotten' ORDER BY id", (item.key,)).fetchall()
+        elif operation == 'promote':
+            rows = self._db.execute("SELECT * FROM item WHERE key=? AND status='active' ORDER BY id", (item.key,)).fetchall()
+        else:
+            rows = self._db.execute("SELECT * FROM item WHERE id=?", (item.supersedes,)).fetchall()
+        snapshot = dict(schema='potter.memory.review-offline/v0', operation=operation,
+                        expected_version=expected_version, batch=batch,
+                        item=asdict(item), affected=[dict(r) for r in rows])
+        packed = json.dumps(snapshot, sort_keys=True, separators=(',', ':'),
+                            ensure_ascii=False)
+        return dict(snapshot=snapshot, digest=hashlib.sha256(packed.encode('utf-8')).hexdigest())
+
+    def review_snapshot(self, ident, expected_version, *, operation, batch=False):
+        """Detached exact local proposal; contains content, never log as a trace.
+
+        The future issuer/verifier must bind operation + digest. A test callback
+        that ignores that binding still supplies no authentication guarantee.
+        """
+        with self._transaction(write=False):
+            return self._review_snapshot(ident, expected_version, operation, batch)
+
+    def _authorize_snapshot(self, operation, ident, expected_version, proof, batch=False):
+        proposal = self._review_snapshot(ident, expected_version, operation, batch)
+        payload = dict(id=ident, expected_version=expected_version,
+                       snapshot_digest=proposal['digest'], batch=batch)
+        self._auth(operation, proof, payload)
+
     def promote(self, ident: str, expected_version: int, proof: object, *, batch: bool = False) -> Item:
-        payload = dict(id=ident, expected_version=expected_version, batch=batch)
-        self._auth('promote', proof, payload)
+        self._review_args(ident, expected_version, 'promote', batch)
         with self._transaction():
+            self._authorize_snapshot('promote', ident, expected_version, proof, batch)
             item = self._get(ident)
             if item.status != 'staged' or item.version != expected_version:
                 raise Conflict('stale or non-staged candidate')
@@ -247,8 +291,9 @@ class MemoryStore:
             return self._get(ident)
 
     def undo(self, ident: str, expected_version: int, proof: object) -> Item:
-        self._auth('undo', proof, dict(id=ident, expected_version=expected_version))
+        self._review_args(ident, expected_version, 'undo', False)
         with self._transaction():
+            self._authorize_snapshot('undo', ident, expected_version, proof)
             item = self._get(ident)
             if item.status != 'active' or item.version != expected_version or not item.supersedes:
                 raise Conflict('cannot undo changed or root memory')
@@ -262,8 +307,9 @@ class MemoryStore:
             return self._get(prior.id)
 
     def forget(self, ident: str, expected_version: int, proof: object) -> None:
-        self._auth('forget', proof, dict(id=ident, expected_version=expected_version))
+        self._review_args(ident, expected_version, 'forget', False)
         with self._transaction():
+            self._authorize_snapshot('forget', ident, expected_version, proof)
             item = self._get(ident)
             if item.version != expected_version or item.status == 'forgotten':
                 raise Conflict('stale item')
