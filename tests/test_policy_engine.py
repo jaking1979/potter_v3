@@ -709,6 +709,71 @@ class TaskCorrelation(Base):
         self.assertNotIn("alex@example.com", json.dumps(rec))
 
 
+# ---------------------------------------------------------------- final-outcome seam
+
+class FinalOutcomeSeam(Base):
+    """A trace hook may durably commit a candidate 'allow' and then raise. The
+    returned Decision (deny/trace_error) is the only authority; final_hook gets
+    one superseding record so the audit is not left holding only the 'allow'."""
+
+    @staticmethod
+    def commit_then_raise(store):
+        def hook(rec):
+            store.append(dict(rec))
+            raise OSError("sink ack lost")
+        return hook
+
+    def test_commit_then_raise_supersedes_candidate_allow(self):
+        audit, final = [], []
+        e = engine(trace_hook=self.commit_then_raise(audit), final_hook=final.append)
+        d = e.decide(req(SEND, record(SEND)))
+        self.assertDecision(d, DENY, "trace_error")
+        self.assertEqual(audit[0]["outcome"], ALLOW)              # committed candidate
+        self.assertEqual(final, [{"decision_id": d.decision_id, "final_outcome": DENY,
+                                  "reason": "trace_error", "supersedes": "candidate",
+                                  "task_id": T1, "correlation": "request"}])
+        self.assertEqual(final[0]["decision_id"], audit[0]["decision_id"])
+        self.assertEqual(e.trace_failures, 1)
+        self.assertNotIn("7pm works.", json.dumps(final))
+
+    def test_final_hook_also_raising_still_denies_and_counts(self):
+        audit = []
+        e = engine(trace_hook=self.commit_then_raise(audit), final_hook=boom)
+        d = e.decide(req(action_for("calendar.read")))
+        self.assertDecision(d, DENY, "trace_error")
+        self.assertEqual(e.trace_failures, 2)
+        d2 = e.decide(req(action_for("calendar.read")))
+        self.assertDecision(d2, DENY, "trace_error")
+        self.assertEqual(e.trace_failures, 4)
+
+    def test_no_final_hook_still_denies_and_counts(self):
+        e = engine(trace_hook=boom)
+        self.assertDecision(e.decide(req(action_for("calendar.read"))), DENY, "trace_error")
+        self.assertEqual(e.trace_failures, 1)
+
+    def test_final_hook_not_called_on_successful_trace(self):
+        final = []
+        e = engine(final_hook=final.append)
+        self.assertDecision(e.decide(req(action_for("calendar.read"))), ALLOW, "ok")
+        self.assertEqual((final, e.trace_failures), ([], 0))
+
+    def test_supersede_for_uncorrelated_request(self):
+        final = []
+        e = engine(trace_hook=boom, final_hook=final.append)
+        e.decide(None)
+        self.assertEqual((final[0]["task_id"], final[0]["correlation"]), (None, "missing"))
+
+    def test_failure_counter_is_thread_safe(self):
+        e = engine(trace_hook=boom, final_hook=boom)
+        threads = [threading.Thread(target=lambda: [e.decide(req(action_for("calendar.read")))
+                                                    for _ in range(25)]) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(e.trace_failures, 8 * 25 * 2)
+
+
 # ---------------------------------------------------------------- registry
 
 class Registry(unittest.TestCase):

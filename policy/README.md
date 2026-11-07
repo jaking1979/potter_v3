@@ -35,6 +35,15 @@
 
 Reasons are fixed strings from the closed `REASONS` table. C0 refusal messages are mapped to codes and never echoed. `Decision.intent` holds the action parameters and is excluded from `repr` and from `trace_record()`. `trace_hook(record)` is the seam for C6 and is a no-op by default.
 
+**Authority and audit:**
+
+- The returned `Decision` is the only execution authority.
+- Trace-hook records are candidate evaluations. A hook may durably commit a candidate, even an `allow`, and then raise; the decision is then deny with `trace_error`.
+- After a trace failure, C1 makes one best-effort call to the optional `final_hook(record)` with a superseding record: `{decision_id, final_outcome: "deny", reason: "trace_error", supersedes: "candidate", task_id, correlation}`.
+- If `final_hook` raises, the error is swallowed and the decision stays deny.
+- Every failed hook call, from either hook, increments `PolicyEngine.trace_failures`. Ops should alert on any increase.
+- Audit completeness for `trace_error` denials depends on `final_hook`.
+
 Every trace record carries `task_id` and `correlation`:
 
 - `task_id` is taken from the request's frozen `BoundAction.task_id`, never from caller closures. It is used only if it is a canonical UUID: `str(UUID(v)) == v`, which is the form C2 `task_id_for` emits and C6 `DecisionTrace` requires.

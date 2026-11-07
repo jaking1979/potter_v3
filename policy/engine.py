@@ -43,6 +43,7 @@ import dataclasses
 import enum
 import json
 import re
+import threading
 import uuid
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -167,6 +168,13 @@ class Decision:
     # Holds action parameters: never logged, never in repr, never traced.
     intent: c0.EffectIntent | None = field(default=None, repr=False, compare=False)
 
+    def final_record(self) -> dict[str, Any]:
+        """Superseding record emitted to final_hook after a trace failure."""
+        return {"decision_id": self.decision_id, "final_outcome": self.outcome,
+                "reason": self.reason_code, "supersedes": "candidate",
+                "task_id": self.task_id,
+                "correlation": "request" if self.task_id is not None else "missing"}
+
     @property
     def allowed(self) -> bool:
         return self.outcome == ALLOW
@@ -233,7 +241,8 @@ class PolicyEngine:
                  clock: Callable[[], int],
                  verifier: Callable[..., c0.EffectIntent] = c0.verify,
                  new_id: Callable[[str], str] = _default_id,
-                 trace_hook: Callable[[Mapping[str, Any]], None] = _noop_trace):
+                 trace_hook: Callable[[Mapping[str, Any]], None] = _noop_trace,
+                 final_hook: Callable[[Mapping[str, Any]], None] | None = None):
         self._registry = registry
         self._grants = MappingProxyType({p: frozenset(g) for p, g in grants.items()})
         self._ledger = ledger
@@ -242,6 +251,21 @@ class PolicyEngine:
         self._verify = verifier
         self._new_id = new_id
         self._trace = trace_hook
+        self._final = final_hook
+        self._failures = 0
+        self._failures_lock = threading.Lock()
+
+    @property
+    def trace_failures(self) -> int:
+        """Count of failed hook calls (trace_hook or final_hook). Any increase
+        means a trace record may be missing or superseded without a durable
+        final record; ops should alert on it."""
+        with self._failures_lock:
+            return self._failures
+
+    def _count_failure(self) -> None:
+        with self._failures_lock:
+            self._failures += 1
 
     # ---- public ----------------------------------------------------------------
 
@@ -264,14 +288,27 @@ class PolicyEngine:
         except Exception:
             decision = self._make(decision_id, DENY, "engine_error")
         decision = dataclasses.replace(decision, task_id=task_id)
+        # The returned Decision is the ONLY execution authority. trace_hook
+        # records are candidate evaluations: a hook may durably commit a
+        # candidate (even "allow") and then raise.
         try:
             self._trace(decision.trace_record())
         except Exception:
+            self._count_failure()
             # Any consumed nonce stays recorded as a pending intent in the ledger,
             # so C2 recovery reconciles it (T10): nothing is stranded or replayed.
             decision = self._make(decision_id, DENY, "trace_error",
                                   capability=decision.capability, risk=decision.risk,
                                   action_hash=decision.action_hash, task_id=task_id)
+            # One best-effort superseding record so the audit can't be left
+            # holding only the candidate. Audit completeness for trace_error
+            # denials depends on final_hook; its failure is swallowed (the
+            # decision stays deny) but counted.
+            if self._final is not None:
+                try:
+                    self._final(decision.final_record())
+                except Exception:
+                    self._count_failure()
         return decision
 
     # ---- core ------------------------------------------------------------------
