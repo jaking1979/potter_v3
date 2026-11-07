@@ -40,7 +40,6 @@ import hashlib
 import hmac
 import inspect
 import json
-import marshal
 import os
 import sqlite3
 import time
@@ -135,11 +134,14 @@ def _require_loaded_matches_source(code: Any, source: bytes, adapter: Any) -> No
         module_code = compile(source, code.co_filename, "exec", dont_inherit=True)
     except (SyntaxError, ValueError) as exc:
         raise AdapterVerificationError(f"adapter source does not compile: {exc}") from exc
-    stack, want = [module_code], marshal.dumps(code)
+    # marshal embeds reference/interning bookkeeping and can serialize two
+    # equal code objects differently after import/.pyc loading. Code equality
+    # compares compiled code semantics; retain explicit name/location binding.
+    stack = [module_code]
     while stack:
         c = stack.pop()
         if c.co_qualname == code.co_qualname and c.co_firstlineno == code.co_firstlineno \
-                and marshal.dumps(c) == want:
+                and c == code:
             return
         stack.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
     raise AdapterVerificationError(
