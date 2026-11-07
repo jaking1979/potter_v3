@@ -50,7 +50,7 @@ A mixed event (Josh's command plus a forward or an attachment) keeps `principal=
 - Injection indicators (`claims_approval`, `addresses_policy`, `instruction_like`, `payment_request`) are computed over untrusted segments and set as `flags`. They are informational and can never raise trust.
 - Attachments go to the injected `AttachmentStore`. The event carries `AttachmentRef(ref, sha256, size, media_type, filename)`; filename and media type are sender-supplied.
 - Limits (`IngressLimits`): raw size, total text, attachment count and per-attachment size. Exceeding any limit rejects the message.
-- `repr` of events, segments and raw inputs excludes text. The store keeps no text, sender reference or header.
+- `repr` of events, segments and raw inputs excludes text. The dedupe log keeps no text, sender reference or header. The durable inbox (below) holds an accepted event's text locally only until it is acked or expires.
 
 ## Quote boundaries and residual limitations
 
@@ -71,7 +71,8 @@ We do not claim that all quoted or forwarded text is detected.
 
 The dedupe key is the channel message ID: Telegram `chat_id:message_id`, the email `Message-ID`, the webhook `source:delivery_id`, or the web fetch ID. For email the key is scoped by the authentication namespace (`human:josh` vs `untrusted:<sha256(from)>`), so an unauthenticated sender cannot squat Josh's Message-ID. The event ID is UUIDv5 of the key.
 
-- Same key, same content: `duplicate`. No new event; the original `event_id` is returned. This survives a restart.
+- Same key, same content, original already handed off: `duplicate`. No event is returned, only the original `event_id`. This survives a restart.
+- Same key, same content, original accepted but not yet acked: `duplicate_pending`. The stored event is returned again (see durable handoff).
 - Same key, different content: `replay_conflict`, rejected.
 - Rejections after transport authentication are recorded, so they are idempotent too. Pre-authentication rejections (forged transport, unsigned webhook, oversized raw, missing Message-ID) are traced but not recorded, so they can't fill the store.
 
@@ -79,9 +80,18 @@ The dedupe key is the channel message ID: Telegram `chat_id:message_id`, the ema
 
 Each decision runs in one `BEGIN IMMEDIATE` transaction: look up, insert, emit the C6 trace, commit. The trace uses component `task` with outcome `accepted` or `blocked`. Its digest is over channel, decision, reason, trust class and content digest. If the sink raises, the transaction rolls back and the result is `trace_error`, so a re-delivery is processed afresh.
 
+## Durable handoff
+
+An accepted event is written to `ingress_inbox` in the **same transaction** as its dedupe row and its trace, so a commit never leaves a dedupe row without a recoverable event.
+
+- **Recovery.** The event stays `pending` until the runner calls `gateway.ack(event_id)` after a durable enqueue. If the process crashes before that, the event comes back either from `gateway.pending()` (call it at start-up) or from the sender's re-delivery (`duplicate_pending`).
+- **Integrity.** A restored event must match the digest minted at acceptance. A tampered row is never returned.
+- **Retention.** `ack` drops the stored text. `expire_pending(max_age_s)` drops the text of events left pending too long. Those events are lost on purpose and traced as `expired`.
+- **Idempotency.** `vouches()` is an integrity check, not consumption: it stays true on repeated calls. Single processing comes from the runner's queue, keyed on `event_id`; C2 `TaskStore.submit(f"ingress:{event_id}", …)` is idempotent.
+
 ## Runner contract (C8)
 
-1. Act only on `IngressResult.accepted` events for which `gateway.vouches(event)` is true.
+1. On start-up and for every result that carries an `event` (`accepted` or `duplicate_pending`), check `gateway.vouches(event)`, enqueue idempotently on `event_id`, then call `gateway.ack(event_id)`.
 2. Copy `event.provenance` into every `PolicyRequest` the event shaped. Never drop kinds.
 3. Never treat event text as an approval. Approvals come only from E1.
 

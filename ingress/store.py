@@ -5,8 +5,12 @@ content digest, the minted event digest and the decision. It never stores
 message text, sender references or parameters. The ingress log is the same
 row: a fixed reason code per decision.
 
+``ingress_inbox`` is the durable handoff: an accepted event's full local
+record, ``pending`` until the runner acks a durable enqueue. Its text is
+dropped on ack (``handed_off``) or by retention (``expired``).
+
 Every decision runs in one ``BEGIN IMMEDIATE`` transaction: look up the key,
-insert the row, emit the C6 trace, commit. If the trace sink raises, the
+insert the dedupe row (and the inbox row), emit the C6 trace, commit. If the trace sink raises, the
 transaction rolls back, so the re-delivery is processed afresh.
 """
 from __future__ import annotations
@@ -33,6 +37,17 @@ _SCHEMA = (
         reason TEXT NOT NULL,
         trust TEXT NOT NULL CHECK (trust IN ('principal_direct','untrusted','none')),
         received_at INTEGER NOT NULL)""",
+    # Durable handoff: an accepted event is written here in the SAME
+    # transaction as its dedupe row, and stays recoverable until the runner
+    # acks a durable enqueue. The text is dropped on ack or expiry.
+    """CREATE TABLE IF NOT EXISTS ingress_inbox (
+        event_id TEXT PRIMARY KEY,
+        event_json TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending','handed_off','expired')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK ((status = 'pending') = (event_json IS NOT NULL)))""",
+    "CREATE INDEX IF NOT EXISTS ingress_inbox_pending ON ingress_inbox (status, created_at)",
 )
 
 
@@ -87,6 +102,40 @@ class IngressStore:
                             "AND decision='accepted'", (event_id,)).fetchone()
         return row[0] if row else None
 
+    def pending_records(self, limit: int) -> list[tuple[str, str]]:
+        with self._conn() as c:
+            return c.execute("SELECT event_id, event_json FROM ingress_inbox WHERE "
+                             "status='pending' ORDER BY created_at, rowid LIMIT ?",
+                             (limit,)).fetchall()
+
+    def pending_record(self, event_id: str) -> str | None:
+        with self._conn() as c:
+            row = c.execute("SELECT event_json FROM ingress_inbox WHERE event_id=? AND "
+                            "status='pending'", (event_id,)).fetchone()
+        return row[0] if row else None
+
+    def ack(self, event_id: str, now: int) -> bool:
+        """Mark handed off and drop the text. Idempotent: True if the event is
+        (now or already) handed off, False if unknown or expired."""
+        with self.transaction() as tx:
+            row = tx._c.execute("SELECT status FROM ingress_inbox WHERE event_id=?",
+                                (event_id,)).fetchone()
+            if row is None or row[0] == "expired":
+                return False
+            tx._c.execute("UPDATE ingress_inbox SET status='handed_off', event_json=NULL, "
+                          "updated_at=? WHERE event_id=? AND status='pending'", (now, event_id))
+            return True
+
+    def expire(self, before: int, now: int) -> list[str]:
+        """Retention: drop the text of pending events created before ``before``."""
+        with self.transaction() as tx:
+            ids = [r[0] for r in tx._c.execute(
+                "SELECT event_id FROM ingress_inbox WHERE status='pending' AND created_at<?",
+                (before,))]
+            tx._c.executemany("UPDATE ingress_inbox SET status='expired', event_json=NULL, "
+                              "updated_at=? WHERE event_id=?", [(now, i) for i in ids])
+            return ids
+
     def log(self) -> list[tuple]:
         with self._conn() as c:
             return c.execute("SELECT channel, event_id, decision, reason, trust, received_at "
@@ -96,6 +145,15 @@ class IngressStore:
 class _Tx:
     def __init__(self, c: sqlite3.Connection):
         self._c = c
+
+    def inbox_status(self, event_id: str) -> tuple[str, str | None] | None:
+        row = self._c.execute("SELECT status, event_json FROM ingress_inbox WHERE event_id=?",
+                              (event_id,)).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def inbox_put(self, event_id: str, event_json: str, now: int) -> None:
+        self._c.execute("INSERT INTO ingress_inbox VALUES (?,?,'pending',?,?)",
+                        (event_id, event_json, now, now))
 
     def get(self, dedupe_key: str) -> SeenRow | None:
         row = self._c.execute("SELECT event_id, content_digest, event_digest, decision, reason "

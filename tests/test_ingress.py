@@ -428,8 +428,9 @@ class TelegramAndWebhooks(Fixture):
 class DedupeAndReplay(Fixture):
     def test_34_replayed_telegram_message_id(self):
         first = self.gw.ingest_telegram(self.tg())
-        again = self.gw.ingest_telegram(self.tg())
         self.assertTrue(first.accepted)
+        self.assertTrue(self.gw.ack(first.event_id))
+        again = self.gw.ingest_telegram(self.tg())
         self.assertEqual((again.accepted, again.duplicate, again.event), (False, True, None))
         self.assertEqual(again.event_id, first.event_id)
         conflict = self.gw.ingest_telegram(self.tg(text="/pay mallory $900"))
@@ -696,6 +697,107 @@ class EmailMailboxAttestation(Fixture):
         self.verdicts["<m1@potter.test>"] = EmailAuthVerdict("pass", "potter.test", "pass",
                                                              mailbox_bound="yes")
         self.assertEqual(self.gw.ingest_email(make_email()).trust_reason, "mailbox_unbound")
+
+
+class DurableHandoff(Fixture):
+    """Dolores follow-up on dd0fcf6: an accepted command must not be lost between
+    the dedupe commit and the runner's durable enqueue. The event is written to
+    the inbox in the same transaction as its dedupe row; it stays recoverable
+    (pending(), or a re-delivery) until ack(); the runner's enqueue is
+    idempotent on event_id (C2 TaskStore trigger-key dedupe)."""
+
+    def setUp(self):
+        super().setUp()
+        from runtime import TaskStore
+        self.tasks = TaskStore(str(Path(self.tmp.name) / "runtime.db"), clock=lambda: T)
+
+    def handoff(self, gw, ev):
+        """Reference runner step: idempotent durable enqueue, then ack."""
+        self.assertTrue(gw.vouches(ev))
+        task, created = self.tasks.submit(f"ingress:{ev.event_id}", "ingress_event",
+                                          {"event_id": ev.event_id})
+        self.assertTrue(gw.ack(ev.event_id))
+        return task, created
+
+    def test_59_crash_before_handoff_then_redelivery_recovers(self):
+        first = self.gw.ingest_telegram(self.tg())
+        original = first.event
+        del first                                   # process dies before enqueue
+        gw2 = self.gateway()                        # restart on the same DB
+        again = gw2.ingest_telegram(self.tg())      # sender re-delivers
+        self.assertEqual((again.reason, again.duplicate), ("duplicate_pending", True))
+        self.assertEqual(again.event, original)
+        self.assertEqual(again.event.digest(), original.digest())
+        self.assertTrue(gw2.vouches(again.event))
+        self.assertEqual(again.event.provenance, (PRINCIPAL_DIRECT,))
+        _, created = self.handoff(gw2, again.event)
+        self.assertTrue(created)
+        self.assertIsNone(gw2.ingest_telegram(self.tg()).event)   # now plain duplicate
+
+    def test_60_crash_before_handoff_restart_without_redelivery(self):
+        ev = self.gw.ingest_telegram(self.tg()).event
+        gw2 = self.gateway()
+        self.assertEqual(gw2.pending(), [ev])
+        self.handoff(gw2, ev)
+        self.assertEqual(self.gateway().pending(), [])
+
+    def test_61_crash_after_enqueue_before_ack_is_idempotent(self):
+        ev = self.gw.ingest_telegram(self.tg()).event
+        self.tasks.submit(f"ingress:{ev.event_id}", "ingress_event", {"event_id": ev.event_id})
+        gw2 = self.gateway()                        # crashed before ack
+        (recovered,) = gw2.pending()
+        _, created = self.handoff(gw2, recovered)
+        self.assertFalse(created)                   # same task, no second run
+
+    def test_62_crash_after_handoff_redelivery_yields_nothing(self):
+        ev = self.gw.ingest_telegram(self.tg()).event
+        self.handoff(self.gw, ev)
+        gw2 = self.gateway()
+        res = gw2.ingest_telegram(self.tg())
+        self.assertEqual((res.reason, res.event), ("duplicate", None))
+        self.assertEqual(gw2.pending(), [])
+        self.assertTrue(gw2.ack(ev.event_id))       # ack idempotent
+
+    def test_63_text_dropped_on_ack_and_on_expiry(self):
+        import sqlite3
+        a = self.gw.ingest_telegram(self.tg(text="secret words one")).event
+        b = self.gw.ingest_telegram(self.tg(msg_id=2, ref="d2", text="secret words two")).event
+        self.gw.ack(a.event_id)
+        clock = [T + 3600]
+        gw_late = self.gateway(clock=lambda: clock[0])
+        self.assertEqual(gw_late.expire_pending(600), [b.event_id])
+        self.assertEqual(gw_late.pending(), [])
+        self.assertIsNone(gw_late.ingest_telegram(self.tg(msg_id=2, ref="d2",
+                                                          text="secret words two")).event)
+        self.assertFalse(gw_late.ack(b.event_id))   # expired, cannot be acked
+        with sqlite3.connect(self.db) as c:
+            rows = c.execute("SELECT status, event_json FROM ingress_inbox").fetchall()
+        self.assertEqual(sorted(rows), [("expired", None), ("handed_off", None)])
+
+    def test_64_tampered_inbox_row_is_not_restored(self):
+        import sqlite3
+        ev = self.gw.ingest_email(make_email(frm=EVIL)).event
+        with sqlite3.connect(self.db) as c:
+            raw = c.execute("SELECT event_json FROM ingress_inbox").fetchone()[0]
+            forged = raw.replace('"external_sender"', '"principal_direct"')
+            c.execute("UPDATE ingress_inbox SET event_json=?", (forged,))
+        self.assertEqual(self.gateway().pending(), [])
+        self.assertIsNone(self.gateway().ingest_email(make_email(frm=EVIL)).event)
+        self.assertFalse(ev.trusted)
+
+    def test_65_trace_failure_writes_neither_dedupe_nor_inbox(self):
+        def broken(line):
+            raise OSError("down")
+        self.gateway(trace_sink=broken).ingest_telegram(self.tg())
+        self.assertEqual(self.gateway().pending(), [])
+
+    def test_66_vouching_is_not_consumption(self):
+        ev = self.gw.ingest_telegram(self.tg()).event
+        self.assertTrue(self.gw.vouches(ev))
+        self.assertTrue(self.gw.vouches(ev))        # still true: integrity only
+        self.handoff(self.gw, ev)
+        _, created = self.tasks.submit(f"ingress:{ev.event_id}", "ingress_event", {})
+        self.assertFalse(created)                   # idempotency lives in the runner queue
 
 
 class Structure(unittest.TestCase):

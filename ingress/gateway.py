@@ -34,6 +34,7 @@ The untrusted-source boundary (T11/T12; T19 PASS 2 items 2 and 4):
 """
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from email import policy as email_policy
@@ -54,8 +55,8 @@ from .traces import Sink, emit_ingress_trace, ingress_uuid
 REASONS = frozenset({
     # accepted
     "accepted",
-    # rejected
-    "duplicate", "replay_conflict", "transport_unverified", "webhook_unverified",
+    # rejected / not new
+    "duplicate", "duplicate_pending", "expired", "replay_conflict", "transport_unverified", "webhook_unverified",
     "malformed", "missing_message_id", "oversized_raw", "oversized_body",
     "oversized_attachment", "too_many_attachments", "bot_sender", "sender_not_allowlisted",
     "trace_error", "ingress_error",
@@ -190,8 +191,57 @@ class IngressGateway:
     def ingest_web(self, *, fetch_id: str, url: str, body: str) -> IngressResult:
         return self._run(WEB, lambda: self._web(fetch_id, url, body))
 
+    # ---- durable handoff (runner side) ----------------------------------------
+
+    def pending(self, limit: int = 100) -> list[InboundEvent]:
+        """Accepted events not yet acked as handed off, oldest first. Call on
+        runner start-up to recover anything accepted before a crash."""
+        out = []
+        for event_id, raw in self._store.pending_records(limit):
+            ev = self._restore(raw, self._store.lookup_event(event_id))
+            if ev is not None:
+                out.append(ev)
+        return out
+
+    def ack(self, event_id: str) -> bool:
+        """The runner has durably enqueued this event (idempotently, keyed on
+        ``event_id``). Drops the stored text; later re-deliveries are plain
+        ``duplicate``. Idempotent."""
+        try:
+            return self._store.ack(event_id, self._clock())
+        except Exception:
+            return False
+
+    def expire_pending(self, max_age_s: int) -> list[str]:
+        """Retention control: drop the text of events pending longer than
+        ``max_age_s`` (they are then lost on purpose, and traced)."""
+        now = self._clock()
+        ids = self._store.expire(now - max_age_s, now)
+        for event_id in ids:
+            try:
+                emit_ingress_trace(self._sink, event_id=event_id,
+                                   delivery_key=str(uuid.uuid4()), channel="expired",
+                                   accepted=False, reason="expired", trust="none",
+                                   content_digest="0" * 64, now=now, environment=self._env)
+            except Exception:
+                pass
+        return ids
+
+    @staticmethod
+    def _restore(raw: str | None, digest: str | None) -> InboundEvent | None:
+        """Rebuild a stored event; refuse it unless it matches the minted digest."""
+        if not raw or not digest:
+            return None
+        try:
+            ev = InboundEvent.from_record(json.loads(raw))
+        except Exception:
+            return None
+        return ev if ev.digest() == digest else None
+
     def vouches(self, event: object) -> bool:
-        """True only for an event this gateway minted and recorded, unchanged."""
+        """True only for an event this gateway minted and recorded, unchanged.
+        An integrity check, NOT consumption: it stays true on repeated calls,
+        so the runner must enforce its own durable idempotency on event_id."""
         if not isinstance(event, InboundEvent):
             return False
         try:
@@ -469,11 +519,22 @@ class IngressGateway:
             with self._store.transaction() as tx:
                 prior = tx.get(key_digest)
                 if prior is not None:
-                    reason = ("duplicate" if prior.content_digest == d.content_digest
-                              else "replay_conflict")
+                    if prior.content_digest != d.content_digest:
+                        trace(False, "replay_conflict", "none")
+                        return IngressResult(False, "replay_conflict", event_id=prior.event_id)
+                    # Same content again. If the original was accepted but never
+                    # acked as durably handed off (e.g. crash after commit, before
+                    # the runner enqueued it), return it again: recoverable, and
+                    # the runner's enqueue is idempotent on event_id.
+                    recovered = None
+                    if prior.decision == "accepted":
+                        st = tx.inbox_status(prior.event_id)
+                        if st is not None and st[0] == "pending":
+                            recovered = self._restore(st[1], prior.event_digest)
+                    reason = "duplicate_pending" if recovered is not None else "duplicate"
                     trace(False, reason, "none")
                     return IngressResult(False, reason, event_id=prior.event_id,
-                                         duplicate=reason == "duplicate")
+                                         event=recovered, duplicate=True)
                 if reject is not None:
                     tx.put(dedupe_key=key_digest, channel=d.channel, event_id=event_id,
                            content_digest=d.content_digest, event_digest=None,
@@ -485,6 +546,7 @@ class IngressGateway:
                 tx.put(dedupe_key=key_digest, channel=d.channel, event_id=event_id,
                        content_digest=d.content_digest, event_digest=event.digest(),
                        decision="accepted", reason="accepted", trust=trust, received_at=now)
+                tx.inbox_put(event_id, canon(event.to_record()).decode(), now)
                 trace(True, d.trust_reason, trust)
                 return IngressResult(True, "accepted", event_id=event_id, event=event,
                                      trust_reason=d.trust_reason)

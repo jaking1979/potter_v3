@@ -107,12 +107,27 @@ class InboundEvent:
         must carry ``provenance`` in full, never only its direct segments."""
         return not self.trusted
 
-    def digest(self) -> str:
-        return sha256(canon({
+    def to_record(self) -> dict[str, Any]:
+        """Full local record for the durable inbox (holds message text; never
+        logged or traced; dropped on ack or expiry)."""
+        return {
             "event_id": self.event_id, "channel": self.channel,
             "channel_message_id": self.channel_message_id, "received_at": self.received_at,
             "principal": self.principal,
             "segments": [[s.provenance, s.text] for s in self.segments],
             "attachments": [[a.ref, a.sha256, a.size, a.media_type, a.filename, a.provenance]
                             for a in self.attachments],
-            "flags": sorted(self.flags)}))
+            "flags": sorted(self.flags)}
+
+    @classmethod
+    def from_record(cls, rec: dict[str, Any]) -> "InboundEvent":
+        return cls(event_id=rec["event_id"], channel=rec["channel"],
+                   channel_message_id=rec["channel_message_id"],
+                   received_at=rec["received_at"], principal=rec["principal"],
+                   segments=tuple(Segment(k, t) for k, t in rec["segments"]),
+                   attachments=tuple(AttachmentRef(r, h, n, m, f, p)
+                                     for r, h, n, m, f, p in rec["attachments"]),
+                   flags=frozenset(rec["flags"]))
+
+    def digest(self) -> str:
+        return sha256(canon(self.to_record()))
