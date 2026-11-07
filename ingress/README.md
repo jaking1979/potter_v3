@@ -18,8 +18,8 @@ Adapters that turn inbound Telegram updates, email (AgentMail/Gmail raw RFC 5322
 | --- | --- | --- |
 | `principal_direct` | Command text from a sender that passes the channel's own authentication **and** E1 `ChannelAuth` (bound, allowlisted, enabled → `human:josh` only). | trusted |
 | `external_sender` | Text from anyone else, or from a Josh address that failed any check below. | tainted |
-| `forwarded_content` | Forwarded material, even inside Josh's authenticated message (`Fwd:` subject, forward markers, Telegram forwards). | tainted |
-| `quoted_content` | `> …` lines and `On … wrote:` headers. | tainted |
+| `forwarded_content` | Forwarded material, even inside Josh's authenticated message: `Fwd:`-style subjects, forward markers, pasted `From:`/`Sent:` header blocks, Telegram forwards. Runs from the boundary to the end of the body. | tainted |
+| `quoted_content` | Everything from the first `>` line, rule line, or reply header (`On … wrote:`, including wrapped and non-English forms) to the end of the body. | tainted |
 | `attachment` | Every attachment, plus HTML-only bodies. Stored by reference; never read. | tainted |
 | `webhook_payload` | Body of a signature-verified webhook. | tainted |
 | `web_content` | Pages the runner fetched. | tainted |
@@ -29,13 +29,15 @@ A mixed event (Josh's command plus a forward or an attachment) keeps `principal=
 ## Sender authentication
 
 - **Telegram.** The injected transport verifier must confirm the update came from Telegram (production: webhook secret token). Without one, every update is rejected (`transport_unverified`, not recorded). The `from` user ID must pass `ChannelAuth`, otherwise the update is rejected (`sender_not_allowlisted`; E1 ignores strangers too). Bots are rejected. `principal_direct` additionally needs the private chat with that user (`chat_id == from_user_id`) and no `via_bot`. Otherwise the text is `external_sender`.
-- **Email.** The injected `EmailVerifier(raw) → EmailAuthVerdict(dkim, dkim_domain, spf)` judges the exact bytes. `principal_direct` requires all of:
+- **Email.** The injected `EmailVerifier(raw) → EmailAuthVerdict(dkim, dkim_domain, spf, mailbox_bound)` judges the exact bytes. `principal_direct` requires all of:
   1. exactly one `From` header with one address and no header defects;
   2. no `@` in the display name (`"josh@…" <mallory@…>`);
   3. `Reply-To` and `Sender`, when present, equal to `From`;
   4. DKIM `pass` with `d=` equal to the `From` domain (alignment);
   5. SPF not `fail`/`softfail`;
-  6. `ChannelAuth` for the address (which itself requires its own DKIM verifier to pass; `raw_ref` is the Message-ID).
+  6. the From domain is in `email_attested_domains`. This set is **empty by default**, so email is never `principal_direct` unless configured. Adding a domain is a Design Council decision that its signing provider binds DKIM signatures to the authenticated mailbox. An aligned DKIM pass proves the signing domain and message integrity, not that the mailbox owner sent the message (`email_domain_not_attested`);
+  7. `mailbox_bound is True` in the verdict: the verifier attests, for this exact message, that the provider authenticated the submitter *as* the From mailbox (`mailbox_unbound`);
+  8. `ChannelAuth` for the address (which itself requires its own DKIM verifier to pass; `raw_ref` is the Message-ID).
 
   Any failure, including a missing verifier or one that raises, makes the text `external_sender` with a fixed `trust_reason` (`dkim_failed`, `display_name_spoof`, `reply_to_mismatch`, …). Email from other people is accepted as untrusted (inbox triage), not rejected.
 - **Webhooks.** Each source needs a signature verifier. Unknown sources and unsigned deliveries are rejected and not recorded.
@@ -49,6 +51,21 @@ A mixed event (Josh's command plus a forward or an attachment) keeps `principal=
 - Attachments go to the injected `AttachmentStore`. The event carries `AttachmentRef(ref, sha256, size, media_type, filename)`; filename and media type are sender-supplied.
 - Limits (`IngressLimits`): raw size, total text, attachment count and per-attachment size. Exceeding any limit rejects the message.
 - `repr` of events, segments and raw inputs excludes text. The store keeps no text, sender reference or header.
+
+## Quote boundaries and residual limitations
+
+Boundary detection (`content.first_boundary`) is a heuristic. It cannot establish who wrote a piece of text, so it is used only to **fail closed**:
+
+- Only the text *before* the first boundary keeps the sender's kind. Everything from that line to the end of the body is one untrusted run. That includes unprefixed continuation lines, wrapped quotes and Josh's own interleaved replies.
+- Boundaries recognized: forward markers (several languages), pasted header blocks, `>` lines, rule lines (`_____`, `-----`), and any line or 2–4-line wrapped run that ends in a quote verb plus `:` (`wrote`, `a écrit`, `schrieb`, `escribió`, …).
+- Anything derived from an event (a summary, a plan, a request) must carry the event's full `provenance`, never only its direct segments. `event.tainted` is true whenever any part is untrusted.
+
+**Residual limitation (not detected):** text pasted with *no* marker at all, such as third-party words typed or pasted into Josh's own authenticated message or Telegram chat, cannot be told apart from Josh's words. `principal_direct` attests that Josh's authenticated account sent the text, not that he authored every word. The backstops:
+
+- Consequential capabilities always need an E1 approval, whatever the provenance (`test_53` pins this).
+- Email trust is off by default (above).
+
+We do not claim that all quoted or forwarded text is detected.
 
 ## Dedupe and re-delivery
 

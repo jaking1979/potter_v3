@@ -14,9 +14,12 @@ The untrusted-source boundary (T11/T12; T19 PASS 2 items 2 and 4):
   bytes. ``principal_direct`` requires one From header with one address, no
   header defects, no address inside the display name, Reply-To and Sender
   (if present) equal to From, DKIM ``pass`` with ``d=`` equal to the From
-  domain, SPF not ``fail``/``softfail``, and ``ChannelAuth`` (which itself
-  requires a DKIM pass) for the address. Any failure -> ``external_sender``.
-  Forwarded and quoted runs are untrusted even in Josh's own mail.
+  domain, SPF not ``fail``/``softfail``, the From domain in the configured
+  ``email_attested_domains`` (empty by default -> email is never direct), the
+  verifier's ``mailbox_bound`` attestation, and a vouched ``ChannelAuth``
+  sender. Any failure -> ``external_sender``. Only the text before the first
+  quote/forward/pasted-header boundary can be direct; the rest of the body is
+  untrusted (fail closed; see ``content.py`` for the residual limitation).
 * Webhooks need a per-source signature verifier; unsigned or unknown sources
   are rejected. Verified payloads are still ``webhook_payload`` (untrusted).
 * Content: nothing in the text is parsed for provenance or approval. Events
@@ -59,6 +62,7 @@ REASONS = frozenset({
     # trust reasons (why an accepted event is untrusted; "ok" when principal_direct)
     "ok", "multiple_from", "header_defect", "display_name_spoof", "reply_to_mismatch",
     "sender_mismatch", "dkim_missing", "dkim_failed", "dkim_unaligned", "spf_failed",
+    "email_domain_not_attested", "mailbox_unbound",
     "verifier_error", "unknown_sender", "not_allowlisted", "principal_disabled",
     "dkim_unverified", "unvouched_sender", "non_private_chat", "via_bot", "unauthenticated_channel",
 })
@@ -102,6 +106,12 @@ class EmailAuthVerdict:
     dkim: str                        # "pass" | "fail" | "none" | ...
     dkim_domain: str | None = None   # d= of the passing signature
     spf: str = "none"                # "pass" | "fail" | "softfail" | "neutral" | "none"
+    # DKIM proves the signing DOMAIN and integrity, not that the mailbox owner
+    # sent it. True only when the verifier can attest, for this exact message,
+    # that the signing provider authenticated the submitting user AS the From
+    # mailbox (e.g. a provider that refuses unverified From addresses, observed
+    # via its own authenticated-submission evidence). Default False.
+    mailbox_bound: bool = False
 
 
 EmailVerifier = Callable[[bytes], EmailAuthVerdict]
@@ -147,6 +157,7 @@ class IngressGateway:
                  channel_auth: ChannelAuth, clock: Callable[[], int],
                  telegram_transport: TransportVerifier | None = None,
                  email_verifier: EmailVerifier | None = None,
+                 email_attested_domains: frozenset[str] = frozenset(),
                  webhook_verifiers: Mapping[str, WebhookVerifier] | None = None,
                  limits: IngressLimits = IngressLimits(),
                  trace_sink: Sink | None = None, environment: str = "synthetic"):
@@ -156,6 +167,10 @@ class IngressGateway:
         self._clock = clock
         self._tg = telegram_transport
         self._email = email_verifier
+        # Domains whose signing provider is attested (configuration, a Design
+        # Council decision) to bind DKIM signatures to the authenticated
+        # mailbox. Empty by default: email is then never principal_direct.
+        self._email_domains = frozenset(d.lower() for d in email_attested_domains)
         self._webhooks = dict(webhook_verifiers or {})
         self._limits = limits
         self._sink = trace_sink
@@ -306,6 +321,10 @@ class IngressGateway:
             return "dkim_unaligned", addr, None
         if v.spf in ("fail", "softfail"):
             return "spf_failed", addr, None
+        if domain not in self._email_domains:
+            return "email_domain_not_attested", addr, None
+        if v.mailbox_bound is not True:
+            return "mailbox_unbound", addr, None
         auth = self._auth.authenticate(InboundMessage(EMAIL, addr, "", raw_ref=mid))
         principal = self._vouched_principal(auth, EMAIL)
         if principal is None:

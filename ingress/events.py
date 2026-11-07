@@ -100,6 +100,13 @@ class InboundEvent:
     def trusted(self) -> bool:
         return self.provenance == (PRINCIPAL_DIRECT,)
 
+    @property
+    def tainted(self) -> bool:
+        """True if any part is untrusted. Taint is per event, not per segment:
+        anything derived from a tainted event (summaries, plans, requests)
+        must carry ``provenance`` in full, never only its direct segments."""
+        return not self.trusted
+
     def digest(self) -> str:
         return sha256(canon({
             "event_id": self.event_id, "channel": self.channel,

@@ -21,45 +21,66 @@ class IngressLimits:
     max_message_id_len: int = 256
 
 
+# Boundary detection is a heuristic and cannot establish authorship, so it is
+# used only to fail closed: the sender's own kind covers ONLY the text before
+# the first sign of quoted, forwarded or pasted-header material. Everything
+# from that line to the end of the body is untrusted, including any later
+# unprefixed lines (interleaved replies, wrapped quotes, continuations).
+_RE = re.IGNORECASE
 _FORWARD_MARKERS = re.compile(
-    r"^\s*(-{2,}\s*forwarded message\s*-{2,}|begin forwarded message:|"
-    r"-{2,}\s*original message\s*-{2,})\s*$", re.IGNORECASE)
-_REPLY_HEADER = re.compile(r"^\s*on .{1,200} wrote:\s*$", re.IGNORECASE)
-_FWD_SUBJECT = re.compile(r"^\s*(fwd?|fw)\s*:", re.IGNORECASE)
+    r"^\s*(-{2,}\s*(forwarded|original)\s+message\s*-{2,}|begin forwarded message\s*:?|"
+    r"-{2,}\s*(weitergeleitete nachricht|message transf[eé]r[eé]|mensaje reenviado)\s*-{2,})"
+    r"\s*$", _RE)
+_SEPARATOR = re.compile(r"^\s*([-_=*]\s*){5,}$")          # bare rule lines (Outlook etc.)
+_QUOTE_VERB = r"(wrote|writes|said|a [eé]crit|schrieb|escribi[oó]|ha scritto|schreef|skrev)"
+_REPLY_TAIL = re.compile(r"\b" + _QUOTE_VERB + r"\b[^\n]{0,80}:\s*$", _RE)
+_REPLY_START = re.compile(r"^\s*(on|le|am|el|il|op|den)\s+\S", _RE)
+_HEADER_FROM = re.compile(r"^\s*\*?(from|von|de|da|van|fra)\s*:\*?\s*\S", _RE)
+_HEADER_NEXT = re.compile(
+    r"^\s*\*?(sent|date|to|cc|subject|envoy[eé]|gesendet|datum|an|betreff|objet|enviado|"
+    r"asunto|para|à)\s*:", _RE)
+_REPLY_HEADER_SPAN = 4      # a wrapped "On ... wrote:" header may span this many lines
+_HEADER_BLOCK_SPAN = 6
+_FWD_SUBJECT = re.compile(r"^\s*(fwd?|fw|wg|tr|rv|enc)\s*:", _RE)
 
 
 def is_forward_subject(subject: str | None) -> bool:
     return bool(subject and _FWD_SUBJECT.match(subject))
 
 
-def split_body(text: str, own_kind: str, *, forwarded: bool = False) -> tuple[Segment, ...]:
-    """Split an email body into the sender's own text and quoted/forwarded runs.
-    Everything after a forward marker is forwarded; a reply header and ``>``
-    lines are quoted. ``forwarded=True`` marks the whole body forwarded."""
-    if forwarded:
-        return (Segment(FORWARDED_CONTENT, text),) if text else ()
-    out: list[tuple[str, list[str]]] = []
-
-    def push(kind: str, line: str) -> None:
-        if out and out[-1][0] == kind:
-            out[-1][1].append(line)
-        else:
-            out.append((kind, [line]))
-
-    lines = text.splitlines()
+def first_boundary(lines: list[str]) -> tuple[int, str | None]:
+    """Index of the first line that starts quoted/forwarded material, and its
+    kind; ``(len(lines), None)`` when no boundary is seen."""
     for i, line in enumerate(lines):
         if _FORWARD_MARKERS.match(line):
-            push(FORWARDED_CONTENT, "\n".join(lines[i:]))
-            break
-        if _REPLY_HEADER.match(line) or line.lstrip().startswith(">"):
-            push(QUOTED_CONTENT, line)
-        else:
-            push(own_kind, line)
+            return i, FORWARDED_CONTENT
+        if _HEADER_FROM.match(line) and any(
+                _HEADER_NEXT.match(nxt) for nxt in lines[i + 1:i + 1 + _HEADER_BLOCK_SPAN]):
+            return i, FORWARDED_CONTENT          # pasted / forwarded header block
+        if line.lstrip().startswith(">") or _SEPARATOR.match(line) or _REPLY_TAIL.search(line):
+            return i, QUOTED_CONTENT
+        if _REPLY_START.match(line):
+            for j in range(2, _REPLY_HEADER_SPAN + 1):
+                if _REPLY_TAIL.search(" ".join(x.strip() for x in lines[i:i + j])):
+                    return i, QUOTED_CONTENT     # wrapped reply header
+    return len(lines), None
+
+
+def split_body(text: str, own_kind: str, *, forwarded: bool = False) -> tuple[Segment, ...]:
+    """The sender's own text is the prefix before the first boundary; the rest
+    of the body is one untrusted run (fail closed). ``forwarded=True`` marks
+    the whole body forwarded."""
+    if forwarded:
+        return (Segment(FORWARDED_CONTENT, text),) if text.strip() else ()
+    lines = text.splitlines()
+    idx, kind = first_boundary(lines)
     segs = []
-    for kind, ls in out:
-        body = "\n".join(ls)
-        if body.strip():
-            segs.append(Segment(kind, body))
+    own = "\n".join(lines[:idx])
+    if own.strip():
+        segs.append(Segment(own_kind, own))
+    rest = "\n".join(lines[idx:])
+    if kind is not None and rest.strip():
+        segs.append(Segment(kind, rest))
     return tuple(segs)
 
 
