@@ -1,0 +1,1 @@
+[{"description":"Read synthetic notes","input_schema":{"additionalProperties":false,"properties":{"note_id":{"type":"string"}},"required":["note_id"],"type":"object"},"name":"notes.read"}]
