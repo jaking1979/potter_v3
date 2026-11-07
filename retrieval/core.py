@@ -66,13 +66,13 @@ async def retrieve_turn(backend: Backend, query: str, *, consequential: bool,
                         timeout: float = 2.0) -> TurnResult:
     """Advisory timeouts expose no late results; consequential misses block.
 
-    A successful simulated result is NOT permission to take an effect: actual
-    consequential work must additionally revalidate canonical state and policy.
+    Consequential work remains blocked even after a successful simulated search:
+    canonical revalidation and policy integration are not implemented here.
     """
     if not isinstance(consequential, bool) or timeout <= 0:
         raise ValueError('invalid mode or timeout')
     status, items, elapsed = await _bounded(backend, query, timeout)
-    return TurnResult(items, status, elapsed, consequential and status != 'complete')
+    return TurnResult(items, status, elapsed, consequential)
 
 
 @dataclass(frozen=True)
