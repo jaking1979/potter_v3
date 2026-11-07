@@ -8,7 +8,8 @@ from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_
                       EffectFailed, EffectInFlight, EffectJournal, EffectOutcomeUnknown,
                       TrustedIdempotentRegistry, adapter_name, idempotency_key)
 from .fencing import (ACTIVE, FENCED, NODE_STATES, PAUSED, AuthorityUnavailable, Epoch,
-                      EpochAuthority, FencedEffects, FencingError, FencingToken,
+                      EpochAuthority, FencedBoundaryContract, FencedBoundaryRegistry,
+                      FencedEffects, FencingError, FencingToken,
                       FileCopyReplicator, Node, NodeNotActive, Observation, PromotionConflict,
                       Replicator, StaleEpoch, StaleEpochRefused, StubConnector,
                       UnresolvedEffects, owner_epoch)

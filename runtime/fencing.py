@@ -46,16 +46,21 @@ for that window. Staging-only (T22); nothing here performs a real effect.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
+import json
 import os
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Protocol
+from types import MappingProxyType
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
 
 from .db import Database, as_database
-from .effects import (DEFAULT_DISPATCH_TIMEOUT_S, UNKNOWN, Effect, EffectError,
+from .effects import (DEFAULT_DISPATCH_TIMEOUT_S, UNKNOWN, Effect, EffectConflict, EffectError,
+                      adapter_name,
                       EffectFailed, EffectInFlight, EffectJournal)
 
 FENCED, PAUSED, ACTIVE = "fenced", "paused", "active"
@@ -235,6 +240,81 @@ class EpochAuthority:
         return [Epoch(int(e), h) for e, h in rows]
 
 
+# --------------------------------------------------------------------------- boundary registry
+
+DEFAULT_FENCING_SEMANTICS = (
+    "refuses any token below the epoch authority's committed epoch; the check and"
+    " the external apply are one transaction linearized with promotion")
+
+
+@dataclass(frozen=True)
+class FencedBoundaryContract:
+    """A reviewed connector boundary that PROVABLY refuses stale fencing tokens.
+
+    Mirrors C2's ``ConnectorContract``: ``adapter`` is the exact
+    ``perform(effect, token)`` callable reviewed against the guarantee,
+    ``contract_ref`` points at the evidence, ``fencing_semantics`` states the
+    guarantee. ``contract_digest`` is sha256 over the canonical JSON of
+    (kind, identity, contract_ref, adapter qualified name, semantics). It is
+    recorded on each effect when it is dispatched through
+    :class:`FencedEffects`, so a rotated or re-mapped contract stops vouching
+    for effects dispatched under the old one."""
+    identity: str
+    adapter: Callable[[Effect, "FencingToken"], Any]
+    contract_ref: str
+    fencing_semantics: str = DEFAULT_FENCING_SEMANTICS
+    contract_digest: str = field(init=False)
+
+    def __post_init__(self):
+        if not (isinstance(self.identity, str) and self.identity):
+            raise ValueError("identity required")
+        if not (isinstance(self.contract_ref, str) and self.contract_ref):
+            raise ValueError("contract_ref required")
+        if not (isinstance(self.fencing_semantics, str) and self.fencing_semantics):
+            raise ValueError("fencing_semantics required")
+        if not callable(self.adapter):
+            raise TypeError("adapter must be callable")
+        canon = json.dumps(["potter.c4.fenced_boundary/v0", self.identity, self.contract_ref,
+                            adapter_name(self.adapter), self.fencing_semantics],
+                           separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        object.__setattr__(self, "contract_digest", hashlib.sha256(canon).hexdigest())
+
+
+class FencedBoundaryRegistry(Mapping):
+    """Frozen identity -> FencedBoundaryContract mapping, given to a
+    :class:`Node` at construction. Empty by default: then no effect is ever
+    cleared by the fence, and C2 keeps ambiguous effects unresolved."""
+
+    def __init__(self, contracts: Iterable[FencedBoundaryContract] = ()):
+        entries: dict[str, FencedBoundaryContract] = {}
+        for k in contracts:
+            if not isinstance(k, FencedBoundaryContract):
+                raise TypeError("registry entries must be FencedBoundaryContract")
+            if k.identity in entries:
+                raise ValueError(f"duplicate boundary identity {k.identity!r}")
+            entries[k.identity] = k
+        self._entries = MappingProxyType(entries)
+
+    def __getitem__(self, identity: str) -> FencedBoundaryContract:
+        return self._entries[identity]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __setattr__(self, name, value):
+        if name != "_entries" or "_entries" in self.__dict__:
+            raise AttributeError("FencedBoundaryRegistry is frozen")
+        object.__setattr__(self, name, value)
+
+
+_BINDINGS_DDL = ("CREATE TABLE IF NOT EXISTS fenced_bindings ("
+                 " idempotency_key TEXT PRIMARY KEY, connector TEXT NOT NULL,"
+                 " boundary_digest TEXT, bound_at REAL NOT NULL)")
+
+
 # --------------------------------------------------------------------------- node
 
 def _meta_get(db: Database, key: str) -> str | None:
@@ -268,12 +348,20 @@ class Node:
 
     def __init__(self, node_id: str, authority: EpochAuthority, db: Database | str | Path,
                  *, clock: Callable[[], float] = time.time,
-                 dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S):
+                 dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
+                 boundaries: FencedBoundaryRegistry | None = None):
         if not node_id or not isinstance(node_id, str) or "@" in node_id:
             raise ValueError("node_id required (no '@')")
+        if boundaries is None:
+            boundaries = FencedBoundaryRegistry()
+        if not isinstance(boundaries, FencedBoundaryRegistry):
+            raise TypeError("boundaries must be a FencedBoundaryRegistry")
+        self.boundaries = boundaries   # fixed for this node's lifetime
         self.node_id = node_id
         self.authority = authority
         self.db = as_database(db)
+        with self.db.tx() as c:   # C4-owned table in the journal DB (replicated with it)
+            c.execute(_BINDINGS_DDL)
         self.journal = EffectJournal(self.db, clock=clock, dispatch_timeout_s=dispatch_timeout_s,
                                      fence=self.c2_fence)
         self._clock = clock
@@ -366,8 +454,8 @@ class Node:
                 now: float | None = None) -> dict[str, Any]:
         """Reconcile every ``unknown`` effect, then go ACTIVE.
 
-        Live in-flight windows owned by a LOWER epoch are ended first (the owner
-        stays on the row): the promotion is committed, so the boundary already
+        Live in-flight windows owned by a LOWER epoch, on a proven fenced
+        boundary, are ended first (the owner stays on the row): the promotion is committed, so the boundary already
         refuses that dispatcher. C2 then accepts a ``failed`` verdict only
         because :meth:`c2_fence` confirms the earlier dispatcher's epoch is
         older than ours. Windows of our own epoch are respected. If anything is still unknown, the node
@@ -385,7 +473,8 @@ class Node:
             for eff in self.journal.unresolved():
                 if eff.status != UNKNOWN:
                     continue
-                if eff.in_flight_owner and owner_epoch(eff.in_flight_owner) < token.epoch:
+                if eff.in_flight_owner and owner_epoch(eff.in_flight_owner) < token.epoch \
+                        and self._boundary_proven(eff):   # unproven: keep the window
                     if self.journal.expire_in_flight(eff.idempotency_key, eff.in_flight_owner,
                                                      now=now):
                         released.append(eff.idempotency_key)
@@ -424,6 +513,47 @@ class Node:
             self._fence(f"epoch {token.epoch} is stale")
             raise StaleEpoch(f"epoch {token.epoch} of {token.node_id} is no longer current")
 
+    def binding(self, key: str) -> tuple[str, str | None] | None:
+        """(connector, boundary_digest) recorded for ``key`` by FencedEffects."""
+        with self.db.read() as c:
+            row = c.execute("SELECT connector, boundary_digest FROM fenced_bindings"
+                            " WHERE idempotency_key = ?", (key,)).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def bind(self, key: str, connector: str, perform: Callable[..., Any]) -> str | None:
+        """Record which boundary dispatches ``key``, before any dispatch.
+
+        A registered identity requires ``perform`` to be that contract's
+        reviewed adapter, and records its digest. An unregistered identity is
+        recorded with no digest: it may dispatch, but the fence will never
+        clear a re-dispatch for it. A different binding for the same key is
+        refused (``EffectConflict``)."""
+        contract = self.boundaries.get(connector)
+        if contract is not None and perform != contract.adapter:
+            raise EffectConflict(f"perform is not the registered fenced adapter for {connector!r}")
+        digest = contract.contract_digest if contract is not None else None
+        with self.db.tx() as c:
+            row = c.execute("SELECT connector, boundary_digest FROM fenced_bindings"
+                            " WHERE idempotency_key = ?", (key,)).fetchone()
+            if row is None:
+                c.execute("INSERT INTO fenced_bindings (idempotency_key, connector,"
+                          " boundary_digest, bound_at) VALUES (?,?,?,?)",
+                          (key, connector, digest, self._clock()))
+            elif row[0] != connector or row[1] != digest:
+                raise EffectConflict(f"effect {key} is bound to boundary {row[0]!r}"
+                                     f" (digest {row[1]!r}); refusing {connector!r}")
+        return digest
+
+    def _boundary_proven(self, effect: Effect) -> bool:
+        """The effect's recorded connector is a registered fenced boundary whose
+        contract digest matches the one recorded when it was dispatched."""
+        recorded = getattr(effect, "connector", None)
+        bound = self.binding(effect.idempotency_key)
+        if recorded is None or bound is None or bound[0] != recorded or bound[1] is None:
+            return False
+        contract = self.boundaries.get(recorded)
+        return contract is not None and hmac.compare_digest(contract.contract_digest, bound[1])
+
     def c2_fence(self, effect: Effect) -> bool:
         """C2 ``EffectJournal(fence=...)`` seam. True only if a late landing of
         the earlier dispatch of ``effect`` is ruled out by the epoch authority:
@@ -432,19 +562,26 @@ class Node:
           :meth:`unpause`, which reconciles and never dispatches);
         * the authority's current epoch is this node's epoch; and
         * the row names the earlier dispatcher (``node@epoch:N``, or a pre-C4
-          untagged owner, read as epoch 0), and that epoch is older than ours.
-          The boundary refuses any token below the current epoch, so that
-          dispatcher can no longer land the effect.
+          untagged owner, read as epoch 0), and that epoch is older than ours;
+          and
+        * the effect's RECORDED connector (C2 ``effect.connector``) is bound,
+          with a matching contract digest, to a boundary in this node's
+          :class:`FencedBoundaryRegistry`: one that provably refuses tokens
+          below the committed epoch, linearized with promotion. Only then can
+          that older dispatcher no longer land the effect.
 
-        Anything else, including an unknown dispatcher (no owner on the row) or
-        a dispatcher at our own epoch (e.g. a timed-out call of ours still on
-        the wire), returns False, and C2 keeps the effect unresolved."""
+        Anything else returns False and C2 keeps the effect unresolved. That
+        includes: an unknown dispatcher (no owner on the row), a dispatcher at
+        our own epoch (a timed-out call of ours may still be on the wire), and
+        an unproven, unregistered, rotated or unbound connector (an adapter
+        that ignores its token is not fenced by any epoch)."""
         owner = getattr(effect, "in_flight_owner", None)
         decision = False
         try:
             if (self._state == ACTIVE or (self._state == PAUSED and self._reconciling)) \
                     and self._epoch is not None and owner \
-                    and owner_epoch(owner) < self._epoch:
+                    and owner_epoch(owner) < self._epoch \
+                    and self._boundary_proven(effect):
                 decision = self.is_current()
                 if not decision:
                     self._fence("superseded (seen by fence)")
@@ -480,14 +617,20 @@ class FencedEffects:
                 reconcile: Callable[[Effect], str], *, connector: str,
                 now: float | None = None) -> Effect:
         """``connector`` is the C2 connector identity (recorded on the effect;
-        every dispatch must match it). Fencing does not depend on it being in
-        the journal's trusted idempotent registry: re-dispatch after an
-        ambiguous or expired claim is cleared by :meth:`Node.c2_fence` alone.
+        every dispatch must match it). Before anything is claimed, the key is
+        bound to that boundary (:meth:`Node.bind`): for an identity in the
+        node's :class:`FencedBoundaryRegistry`, ``perform`` must be the
+        registered adapter and the contract digest is recorded. Only such
+        effects can later be cleared by :meth:`Node.c2_fence`. Fencing does not
+        use C2's trusted idempotent registry or its digest.
 
         Because ``perform`` is wrapped (to pass the token and re-check the
-        epoch), a connector in the trusted registry cannot be routed through
-        here: C2 requires ``perform`` to be its registered adapter."""
+        epoch), a connector in C2's trusted idempotent registry cannot be
+        routed through here: C2 requires ``perform`` to be its own adapter."""
         token = self.node.require_active()
+        if not (isinstance(connector, str) and connector):
+            raise ValueError("connector identity required")
+        self.node.bind(key, connector, perform)
         refused: list[StaleEpoch] = []
 
         def fence() -> None:
@@ -527,8 +670,10 @@ class StubConnector:
     older token lands, and an apply in progress delays the promotion until it
     has committed. ``reconcile`` reads under the same lock.
 
-    ``after_check`` is a test seam: called inside the transaction after the
-    token passed, before the apply is recorded."""
+    Test seams: ``before_apply(effect, token)`` runs in :meth:`perform` before
+    the boundary transaction (a stall or transport error on the way in; it
+    holds no lock). ``after_check(conn, token)`` runs inside the transaction
+    after the token passed, before the apply is recorded."""
 
     IDENTITY = "stub.epoch-gateway"
 
@@ -540,6 +685,9 @@ class StubConnector:
         self.identity = identity   # C2 connector identity; NOT trusted-idempotent
         self.authority = authority
         self.after_check: Callable[[sqlite3.Connection, FencingToken], None] | None = None
+        # test seam: runs in the reviewed adapter BEFORE the boundary transaction
+        # (network latency / a stalled caller / a transport error on the way in)
+        self.before_apply: Callable[[Effect, FencingToken], None] | None = None
         with authority.boundary() as (c, _):
             c.execute("CREATE TABLE IF NOT EXISTS ext_applied ("
                       " seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL,"
@@ -577,9 +725,19 @@ class StubConnector:
             raise StaleEpochRefused(f"connector refused: {reason}")
         return {"applied": key, "epoch": token.epoch}
 
+    def contract(self) -> FencedBoundaryContract:
+        """This boundary's reviewed fencing contract, for a node's
+        :class:`FencedBoundaryRegistry`. The adapter is ``self.perform``; the
+        evidence is the linearization tests in ``tests/test_fencing.py``."""
+        return FencedBoundaryContract(
+            self.identity, self.perform,
+            "runtime/fencing.py:StubConnector + tests/test_fencing.py:BoundaryLinearization")
+
     # C2 / FencedEffects-compatible callables
     def perform(self, effect: Effect, token: FencingToken) -> dict[str, Any]:
         effect.action()                    # executors run only the journaled action
+        if self.before_apply is not None:
+            self.before_apply(effect, token)
         return self.apply(effect.idempotency_key, token)
 
     def perform_unfenced(self, effect: Effect) -> dict[str, Any]:
