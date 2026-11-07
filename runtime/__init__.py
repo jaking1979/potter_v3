@@ -9,6 +9,12 @@ from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_
                       AdapterVerificationError, IdempotencyScope, adapter_artifact_digest,
                       adapter_name, current_idempotency_scope,
                       idempotency_key)
+from .fencing import (ACTIVE, FENCED, NODE_STATES, PAUSED, AuthorityUnavailable, Epoch,
+                      EpochAuthority, FencedBoundaryContract, FencedBoundaryRegistry,
+                      FencedEffects, FencingError, FencingToken,
+                      FileCopyReplicator, Node, NodeNotActive, Observation, PromotionConflict,
+                      Replicator, StaleEpoch, StaleEpochRefused, StubConnector,
+                      UnresolvedEffects, owner_epoch)
 from .outbox import (ABANDONED_UNKNOWN, ACKED, OUTBOX_NAMESPACE, ROUTINE, SENT, SUPPRESSED,
                      URGENT, Outbox, OutboxConflict, OutboxError, OutboxMessage, QueuedMessage,
                      RelayReport, SendFailed, outbox_idempotency_key)

@@ -7,6 +7,7 @@ Task store + effect journal. Built on the C0 contracts. Staging-only (T22). Noth
 | `db.py` | One SQLite file holds tasks, jobs, effects and approval nonces. It runs in WAL mode with `synchronous=FULL`, so every commit is fsynced. Every write uses `BEGIN IMMEDIATE`, and each operation opens its own connection, so it is safe across threads and processes. |
 | `tasks.py` | `TaskStore` handles trigger-key dedupe (task id = UUIDv5 of the trigger key), the state machine, leases with heartbeats, checkpoints, escalation, and the last-success watchdog. |
 | `effects.py` | `EffectJournal` records the intent before execution, assigns a deterministic UUIDv5 idempotency key, tracks status `pending → unknown → succeeded \| failed`, and reconciles before any retry. |
+| `fencing.py` | **C4 (T35 item 10).** `EpochAuthority` (monotonic epoch, compare-and-set promotion), `Node` lifecycle (FENCED → PAUSED → ACTIVE), `FencedEffects` (epoch-checked dispatch), `StubConnector` (epoch check at the external boundary), and the `Replicator` seam with `FileCopyReplicator` (Litestream stand-in). See "Fencing" below. |
 | `outbox.py` | **C3 (T4/T17, T19 items 1/3/7).** `Outbox.enqueue(tx, message)` writes the notification in the caller's business transaction. `relay(send, reconcile, owner)` records the dispatch (`unknown`) before `send`. An unknown outcome is reconciled first; if it stays unknown, a routine message becomes `abandoned_unknown` and is not resent, and an urgent one is resent once with the same key. `ack()` suppresses sibling channels. `stale_backlog()` feeds the watchdog. The table and `meta.outbox_schema=c3.v0` are created by `Outbox`, so `db.py`'s C2 schema is unchanged. |
 | `approval_ledger.py` | `JournalApprovalLedger` is the production C0 `ApprovalLedger`. `consume(nonce, intent)` is one transaction: it inserts the pending effect intent and marks the nonce used. |
 
@@ -43,10 +44,47 @@ Each worker mutation checks, inside its write transaction, that the worker still
 ## Not in this package
 
 - **C3:** the outbox and durable delivery of escalation notifications. The callback is at-most-once after commit.
-- **C4:** the fencing implementation. C2 provides the `fence` seam and refuses unfenced re-dispatch. Leases are checked in the DB only.
 - **Wiring C2 escalations to C3:** `TaskStore`'s escalate callback is still at-most-once after commit. Moving it onto `Outbox.enqueue` in the same transaction is E1's job (the T19 notifier).
-- **C4:** fencing tokens against a dispatcher that is stalled but still alive past its lease or in-flight window. C2 checks leases in the DB only.
 - Real connectors, schedulers, and the worker loop.
 - `contracts/v0` is loaded as top-level module `approval` (see `_contract.py`), so EffectIntent identity matches the C0 tests.
 
 Evidence: `tests/test_task_effect_journal.py`. That file also runs the whole C0 approval suite against `JournalApprovalLedger`, including the restart test and the 8-process race.
+
+## Fencing (package C4, decision T35 item 10)
+
+```
+start ──▶ FENCED ──rejoin() (authority still names this node)──┐
+            │                                                   ▼
+            └──promote() (takeover, CAS epoch+1)───────────▶ PAUSED ──unpause(reconcile)──▶ ACTIVE
+any state ──authority epoch moved past ours──▶ FENCED
+```
+
+- **Authority.** `EpochAuthority` is one SQLite row `(epoch, holder)` standing in for the shared authority. `promote(node, expected)` succeeds only if the epoch is still `expected`. Concurrent promotions have exactly one winner.
+- **Every activation takes a fresh epoch.** A returning node starts FENCED. `rejoin()` leaves FENCED only if the authority still names it, and then takes epoch+1, so a stalled earlier incarnation of the same node is fenced too. A superseded node stays FENCED. A node restored from a replica can only `promote()`.
+- **Promoted nodes start PAUSED.** `unpause(reconcile)` reconciles every `unknown` effect first. Live windows owned by a lower epoch are ended with `EffectJournal.expire_in_flight`, which keeps the owner on the row. If anything stays unknown, the node stays PAUSED (`UnresolvedEffects`).
+- **C2 `fence` seam.** `Node` builds its journal with `fence=node.c2_fence`. It returns `True` only when all of these hold:
+  - the node is ACTIVE, or PAUSED inside `unpause`, which reconciles but never dispatches;
+  - the node holds the authority's current epoch;
+  - the row names the earlier dispatcher (`node@epoch:N`; an untagged pre-C4 owner counts as epoch 0), and that epoch is older than the node's;
+  - the effect's **recorded** connector (C2 `effect.connector`) is bound to a boundary in the node's `FencedBoundaryRegistry`, and the contract digest recorded at dispatch still matches.
+
+  An epoch only protects an effect if its connector refuses stale tokens at a boundary that is linearized with promotion. A `perform` that ignores its token gets nothing from the epoch. Anything else returns `False` and C2 keeps the effect unresolved. That includes:
+  - no owner on the row, or our own epoch (a timed-out call of ours may still be on the wire);
+  - a connector that is unregistered, rotated (digest mismatch), or unbound (dispatched around `FencedEffects`). Every decision is appended to `node.fence_log`. To keep that evidence, an ambiguous settle in C2 now keeps `in_flight_owner` and only expires the window.
+- **Fenced boundary registry.** `FencedBoundaryContract(identity, adapter, contract_ref, fencing_semantics)` mirrors C2's `ConnectorContract`. Its digest is a sha256 over the canonical JSON of the kind tag, identity, `contract_ref`, the adapter's qualified name (C2's `adapter_name`) and the semantics.
+  - `FencedBoundaryRegistry` is frozen and given to `Node(boundaries=...)` at construction. It is **empty by default**, so by default the fence vouches for nothing.
+  - Before anything is claimed, `FencedEffects.execute` binds the key to its connector in the C4 table `fenced_bindings`. The table lives in the journal DB, so it replicates with the journal.
+  - For a registered identity, `perform` must be the reviewed adapter, and the digest is recorded.
+  - An unregistered identity may still dispatch, but it is recorded without a digest and is never cleared by the fence.
+  - A different binding for the same key is refused (`EffectConflict`).
+  - `StubConnector.contract()` is the reviewed contract for the stub. Its `before_apply` hook (a stall or transport error before the boundary transaction) runs inside that adapter, so tests can stall without swapping the adapter.
+  - Fencing does not use C2's trusted idempotent registry or its digest.
+- **Three checks per dispatch.** `FencedEffects.execute` checks the token before the journal is touched, inside the claim transaction (`EffectJournal.execute(guard=...)`), and just before `perform(effect, token)`.
+- **Connector identity.** `FencedEffects.execute(..., connector=...)` passes the required C2 connector identity through. C2 records it on the effect, and every later dispatch must match it. `StubConnector.identity` (default `stub.epoch-gateway`) is deliberately **not** in the journal's `TrustedIdempotentRegistry`. Re-dispatch after an expired or ambiguous claim is cleared by `c2_fence` alone, using the fenced boundary registry above. `FencedEffects` wraps `perform` to pass the token, so a trusted connector, whose `perform` C2 requires to be the registered adapter, can't be routed through it as-is.
+- **Boundary.** `StubConnector` keeps its state (highest epoch seen, applied and refused rows) in the **authority's** SQLite DB. `apply` runs inside `EpochAuthority.boundary()`, one `BEGIN IMMEDIATE` transaction that `promote()` also needs. In that transaction it refuses a token below the highest epoch seen, or not equal to the committed epoch, and otherwise records the apply. So an apply and a promotion are strictly ordered. Once a promotion commits, no older token lands, and an apply already in progress delays the promotion until it commits. `reconcile` reads under the same lock. A refusal is `StaleEpochRefused` (an `EffectFailed`: definitely not applied).
+- **C1.** `PolicyEngine(node_state=node.policy_state)` denies every write (`node_fenced`, `node_paused`, `node_not_active`) before any approval is verified or consumed. Reads are unaffected. Without the seam, C1 is unchanged.
+- **Replication.** `Replicator` is the seam. `FileCopyReplicator` writes consistent snapshots (SQLite online backup) as numbered generations, and `restore` marks the copy so it starts fenced. Real Litestream is deferred to Phase F.
+
+Limits: third-party APIs can't check our tokens. In production the boundary is an egress gateway running this check. The gateway must share one transactional store, or one lock, with the epoch authority, as the stub does. Reading the authority from a separate store reopens the gap where a promotion commits between the check and the apply. A window also remains between the gateway's commit and the third party applying the call. **Registering a real network gateway** in `FencedBoundaryRegistry` requires proven external fencing for the calls it has already accepted but not yet completed. The provider must refuse, or deduplicate, a late call carrying an older token or the same idempotency key. Without that proof, keep the gateway unregistered: its ambiguous effects stay unresolved until reconciled authoritatively. A replica can lag, so intents journaled after the last snapshot are missing from a restore. For both, the deterministic C2 idempotency key passed to the external system is the backstop.
+
+Evidence: `tests/test_fencing.py`.
