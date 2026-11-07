@@ -1,9 +1,12 @@
 import tempfile
+import sqlite3
+import subprocess
+import sys
 import threading
 import unittest
 from pathlib import Path
 
-from model_broker.broker import Broker, Candidate, Caps, Refused, Request
+from model_broker.broker import Broker, Candidate, Caps, Refused, Request, LedgerUnavailable
 
 
 def req(call="c1", task="t1", privacy="private", day="2026-11-06", month="2026-11"):
@@ -74,5 +77,134 @@ class BrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "budget_ceiling"):
             self.b.reserve(req(), [candidate("cheap",1,21), candidate("expensive",2,10)])
 
+    def test_settlement_appends_only_unused_difference_and_survives_restart(self):
+        self.b.reserve(req(), [candidate()])
+        self.b.dispatch_once('c1')
+        self.b.settle('c1', 3)
+        reopened = Broker(self.path, self.caps)
+        self.assertEqual(reopened.entries('c1'),
+                         (('reservation', 10, 'operation'), ('settlement', -7, 'operation')))
+        self.assertEqual(reopened.status('c1')[2:], (10, 3, 'settled'))
+        reopened.reserve(req('c2'), [candidate(worst=17)])
+        with self.assertRaisesRegex(Refused, 'budget_ceiling'):
+            reopened.reserve(req('c3'), [candidate(worst=1, expected=1)])
+
+    def test_concurrent_settlements_release_once(self):
+        self.b.reserve(req(), [candidate()])
+        self.b.dispatch_once('c1')
+        barrier, outcomes = threading.Barrier(2), []
+        def settle():
+            b = Broker(self.path, self.caps)
+            barrier.wait()
+            try:
+                b.settle('c1', 3)
+                outcomes.append('ok')
+            except Refused as exc:
+                outcomes.append(str(exc))
+        threads = [threading.Thread(target=settle) for _ in range(2)]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=5)
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertCountEqual(outcomes, ['ok', 'not_dispatched'])
+        self.assertEqual(len(self.b.entries('c1')), 2)
+
+    def test_failed_settlement_transaction_keeps_full_reservation(self):
+        self.b.reserve(req(), [candidate()])
+        self.b.dispatch_once('c1')
+        with sqlite3.connect(self.path) as db:
+            db.execute("""CREATE TRIGGER injected_failure BEFORE UPDATE ON broker_calls
+                        BEGIN SELECT RAISE(ABORT,'injected_failure'); END""")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected_failure'):
+            self.b.settle('c1', 3)
+        self.assertEqual(self.b.entries('c1'), (('reservation', 10, 'operation'),))
+        self.assertEqual(self.b.status('c1')[-1], 'dispatched')
+
+    def test_process_crash_before_commit_preserves_reservation(self):
+        self.b.reserve(req(), [candidate()])
+        self.b.dispatch_once('c1')
+        code = '''import os,sqlite3,sys
+db=sqlite3.connect(sys.argv[1],isolation_level=None)
+db.execute('BEGIN IMMEDIATE')
+db.execute("INSERT INTO broker_entries(call_id,kind,amount,origin) VALUES ('c1','settlement',-7,'operation')")
+db.execute("UPDATE broker_calls SET state='settled',actual=3 WHERE call_id='c1'")
+os._exit(0)
+'''
+        subprocess.run([sys.executable, '-c', code, str(self.path)], check=True, timeout=10)
+        reopened = Broker(self.path, self.caps)
+        self.assertEqual(reopened.entries('c1'), (('reservation', 10, 'operation'),))
+        self.assertEqual(reopened.status('c1')[-1], 'dispatched')
+
+    def test_entry_update_and_delete_are_refused(self):
+        self.b.reserve(req(), [candidate()])
+        for statement in ('UPDATE broker_entries SET amount=0', 'DELETE FROM broker_entries'):
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'append_only'):
+                with sqlite3.connect(self.path) as db:
+                    db.execute(statement)
+        self.assertEqual(self.b.entries('c1'), (('reservation', 10, 'operation'),))
+
+    def test_overrun_entry_persists_and_blocks_after_restart(self):
+        self.b.reserve(req(), [candidate()])
+        self.b.dispatch_once('c1')
+        with self.assertRaisesRegex(Refused, 'cost_variance'):
+            self.b.settle('c1', 12)
+        reopened = Broker(self.path, self.caps)
+        self.assertEqual(reopened.entries('c1')[-1], ('settlement', 2, 'operation'))
+        with self.assertRaisesRegex(Refused, 'unresolved_cost_variance'):
+            reopened.reserve(req('c2'), [candidate()])
+
+    def test_unknown_schema_version_refused_even_by_existing_instance(self):
+        with sqlite3.connect(self.path) as db:
+            db.execute('UPDATE broker_meta SET version=999')
+        with self.assertRaisesRegex(LedgerUnavailable, 'unknown_schema_version'):
+            Broker(self.path, self.caps)
+        with self.assertRaisesRegex(LedgerUnavailable, 'unknown_schema_version'):
+            self.b.reserve(req(), [candidate()])
+
+    def test_inconsistent_call_row_does_not_free_budget(self):
+        self.b.reserve(req(), [candidate()])
+        self.b.dispatch_once('c1')
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE broker_calls SET state='settled',actual=0")
+        with self.assertRaisesRegex(LedgerUnavailable, 'ledger_inconsistent'):
+            self.b.reserve(req('c2'), [candidate()])
+
+    def _legacy(self, path, actual=3):
+        with sqlite3.connect(path) as db:
+            db.execute('''CREATE TABLE broker_calls (
+                call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+                task_class TEXT NOT NULL, privacy_class TEXT NOT NULL,
+                day TEXT NOT NULL, month TEXT NOT NULL, model TEXT NOT NULL,
+                provider TEXT NOT NULL, expected INTEGER NOT NULL,
+                worst INTEGER NOT NULL, actual INTEGER,
+                state TEXT NOT NULL CHECK(state IN ('reserved','dispatched','settled','overrun')))''')
+            db.execute('INSERT INTO broker_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                       ('old', 't1', 'research', 'private', '2026-11-06', '2026-11',
+                        'fake', 'synthetic', 4, 10, actual, 'settled'))
+            db.execute('INSERT INTO broker_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                       ('unknown', 't2', 'research', 'private', '2026-11-06', '2026-11',
+                        'fake', 'synthetic', 4, 10, None, 'dispatched'))
+
+    def test_known_legacy_snapshot_migrates_atomically_without_releasing_unknown(self):
+        path = Path(self.tmp.name) / 'legacy.sqlite'
+        self._legacy(path)
+        b = Broker(path, self.caps)
+        self.assertEqual(b.entries('old'), (('reservation', 10, 'legacy_snapshot'),
+                                            ('settlement', -7, 'legacy_snapshot')))
+        self.assertEqual(b.entries('unknown'), (('reservation', 10, 'legacy_snapshot'),))
+        Broker(path, self.caps)
+        self.assertEqual(len(b.entries('old')), 2)
+        with self.assertRaisesRegex(Refused, 'not_reserved'):
+            b.dispatch_once('unknown')
+
+    def test_invalid_legacy_snapshot_refused_without_partial_migration(self):
+        path = Path(self.tmp.name) / 'invalid.sqlite'
+        self._legacy(path, actual=11)  # settled contradicts actual > worst
+        with self.assertRaisesRegex(LedgerUnavailable, 'invalid_call_state'):
+            Broker(path, self.caps)
+        with sqlite3.connect(path) as db:
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertEqual(tables, {'broker_calls'})
+
 
 if __name__ == "__main__": unittest.main()
+

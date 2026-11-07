@@ -7,12 +7,21 @@ This prototype does not establish their provenance or enforce provider costs.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 
 class Refused(Exception):
     pass
+
+
+class LedgerUnavailable(Refused):
+    """Unknown schema or inconsistent local accounting: no budget is released."""
+
+
+_COLUMNS = ('call_id', 'task_id', 'task_class', 'privacy_class', 'day', 'month',
+            'model', 'provider', 'expected', 'worst', 'actual', 'state')
 
 
 @dataclass(frozen=True)
@@ -46,24 +55,124 @@ class Caps:
 
 
 class Broker:
-    """Select and reserve atomically in SQLite. Each instance uses its own connection."""
+    """Offline local accounting. Every operation closes its SQLite connection.
+
+    Ledger triggers prevent ordinary UPDATE/DELETE, not a database owner's
+    deliberate tampering or restoration of an older whole database.
+    """
 
     def __init__(self, path: str | Path, caps: Caps):
         if any(type(x) is not int or x < 0 for x in vars(caps).values()):
             raise ValueError("caps must be nonnegative integer microdollars")
         self.path, self.caps = str(path), caps
         with self._db() as db:
-            db.execute("""CREATE TABLE IF NOT EXISTS broker_calls (
+            db.execute("BEGIN IMMEDIATE")
+            tables = {r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            if not tables:
+                db.execute("""CREATE TABLE broker_calls (
                 call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
                 task_class TEXT NOT NULL, privacy_class TEXT NOT NULL,
                 day TEXT NOT NULL, month TEXT NOT NULL, model TEXT NOT NULL,
                 provider TEXT NOT NULL, expected INTEGER NOT NULL,
                 worst INTEGER NOT NULL, actual INTEGER,
                 state TEXT NOT NULL CHECK(state IN ('reserved','dispatched','settled','overrun'))
-            )""")
+                )""")
+            elif tables not in ({'broker_calls'}, {'broker_calls', 'broker_meta', 'broker_entries'}):
+                raise LedgerUnavailable('unknown_schema')
+            if tuple(r[1] for r in db.execute('PRAGMA table_info(broker_calls)')) != _COLUMNS:
+                raise LedgerUnavailable('unknown_calls_schema')
+            if 'broker_meta' in tables:
+                if db.execute('SELECT version FROM broker_meta').fetchall() != [(1,)]:
+                    raise LedgerUnavailable('unknown_schema_version')
+            else:
+                # The only supported migration is the original unversioned
+                # prototype. Snapshot entries are explicitly not history.
+                rows = db.execute('SELECT * FROM broker_calls').fetchall()
+                for row in rows:
+                    self._validate_call(row)
+                db.execute('CREATE TABLE broker_meta (version INTEGER NOT NULL)')
+                db.execute('INSERT INTO broker_meta VALUES (1)')
+                db.execute("""CREATE TABLE broker_entries (
+                    sequence INTEGER PRIMARY KEY, call_id TEXT NOT NULL REFERENCES broker_calls(call_id),
+                    kind TEXT NOT NULL CHECK(kind IN ('reservation','settlement')),
+                    amount INTEGER NOT NULL CHECK(typeof(amount)='integer'),
+                    origin TEXT NOT NULL CHECK(origin IN ('operation','legacy_snapshot')),
+                    UNIQUE(call_id,kind))""")
+                db.execute("""CREATE TRIGGER broker_entries_no_update BEFORE UPDATE ON broker_entries
+                    BEGIN SELECT RAISE(ABORT,'append_only'); END""")
+                db.execute("""CREATE TRIGGER broker_entries_no_delete BEFORE DELETE ON broker_entries
+                    BEGIN SELECT RAISE(ABORT,'append_only'); END""")
+                for row in rows:
+                    self._entry(db, row[0], 'reservation', row[9], 'legacy_snapshot')
+                    if row[11] in ('settled', 'overrun'):
+                        self._entry(db, row[0], 'settlement', row[10] - row[9], 'legacy_snapshot')
+            self._validate_ledger(db)
+            db.commit()
 
+    @contextmanager
     def _db(self):
-        return sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        try:
+            db.execute('PRAGMA foreign_keys=ON')
+            db.execute('PRAGMA synchronous=FULL')
+            yield db
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _validate_call(row):
+        strings, expected, worst, actual, state = row[:8], *row[8:]
+        if (not all(isinstance(x, str) and x for x in strings)
+                or type(expected) is not int or type(worst) is not int
+                or not 0 <= expected <= worst):
+            raise LedgerUnavailable('invalid_call_record')
+        if state in ('reserved', 'dispatched'):
+            valid = actual is None
+        elif state in ('settled', 'overrun'):
+            valid = (type(actual) is int and actual >= 0
+                     and (actual > worst) == (state == 'overrun'))
+        else:
+            valid = False
+        if not valid:
+            raise LedgerUnavailable('invalid_call_state')
+
+    @staticmethod
+    def _entry(db, call_id, kind, amount, origin='operation'):
+        db.execute('INSERT INTO broker_entries(call_id,kind,amount,origin) VALUES (?,?,?,?)',
+                   (call_id, kind, amount, origin))
+
+    def _validate_ledger(self, db):
+        if db.execute('SELECT version FROM broker_meta').fetchall() != [(1,)]:
+            raise LedgerUnavailable('unknown_schema_version')
+        rows = db.execute('SELECT * FROM broker_calls').fetchall()
+        expected = {}
+        for row in rows:
+            self._validate_call(row)
+            expected[(row[0], 'reservation')] = row[9]
+            if row[11] in ('settled', 'overrun'):
+                expected[(row[0], 'settlement')] = row[10] - row[9]
+        actual = {}
+        for call_id, kind, amount, origin in db.execute(
+                'SELECT call_id,kind,amount,origin FROM broker_entries'):
+            key = (call_id, kind)
+            if (key in actual or type(amount) is not int
+                    or origin not in ('operation', 'legacy_snapshot')):
+                raise LedgerUnavailable('invalid_ledger_entry')
+            actual[key] = amount
+        if actual != expected:
+            raise LedgerUnavailable('ledger_inconsistent')
+
+    def entries(self, call_id):
+        """Return immutable tuples for offline inspection, never provider evidence."""
+        with self._db() as db:
+            db.execute('BEGIN')
+            self._validate_ledger(db)
+            return tuple(db.execute('SELECT kind,amount,origin FROM broker_entries '
+                                    'WHERE call_id=? ORDER BY sequence', (call_id,)))
 
     def reserve(self, req: Request, candidates: list[Candidate]):
         if not all(isinstance(v, str) and v for v in vars(req).values()):
@@ -82,15 +191,17 @@ class Broker:
         # exceeds any ceiling, refuse rather than picking a dearer route.
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._validate_ledger(db)
             if db.execute("SELECT 1 FROM broker_calls WHERE state='overrun' LIMIT 1").fetchone():
                 raise Refused("unresolved_cost_variance")
             if db.execute("SELECT 1 FROM broker_calls WHERE call_id=?", (req.call_id,)).fetchone():
                 raise Refused("duplicate_call_id")
-            # Actual for settled calls; worst-case reservation for every other
-            # state, including crashes after dispatch. Never expire on restart.
+            # Original reservation remains forever; a separate settlement
+            # entry adjusts only its unused difference (or records overrun).
             def total(where, value):
-                row = db.execute("SELECT COALESCE(SUM(CASE WHEN state='settled' THEN actual "
-                                 "ELSE worst END),0) FROM broker_calls WHERE " + where + "=?", (value,)).fetchone()
+                row = db.execute('SELECT COALESCE(SUM(e.amount),0) FROM broker_entries e '
+                                 'JOIN broker_calls c USING(call_id) WHERE c.' + where + '=?',
+                                 (value,)).fetchone()
                 return row[0]
             task_used = total("task_id", req.task_id)
             day_used = total("day", req.day)
@@ -103,6 +214,7 @@ class Broker:
             db.execute("INSERT INTO broker_calls VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'reserved')",
                        (req.call_id, req.task_id, req.task_class, req.privacy_class,
                         req.day, req.month, c.model, c.provider, c.expected_usd_micros, w))
+            self._entry(db, req.call_id, 'reservation', w)
             db.commit()
             return c
 
@@ -110,6 +222,7 @@ class Broker:
         """Record the point after which a charge may exist; do not retry blindly."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._validate_ledger(db)
             changed = db.execute("UPDATE broker_calls SET state='dispatched' WHERE call_id=? AND state='reserved'", (call_id,)).rowcount
             if changed != 1:
                 raise Refused("not_reserved")
@@ -120,10 +233,12 @@ class Broker:
             raise Refused("unknown_or_invalid_cost")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._validate_ledger(db)
             row = db.execute("SELECT state,worst FROM broker_calls WHERE call_id=?", (call_id,)).fetchone()
             if row is None or row[0] != "dispatched":
                 raise Refused("not_dispatched")
             state = "overrun" if actual_usd_micros > row[1] else "settled"
+            self._entry(db, call_id, 'settlement', actual_usd_micros - row[1])
             db.execute("UPDATE broker_calls SET state=?,actual=? WHERE call_id=?", (state,actual_usd_micros,call_id))
             db.commit()
             if state == "overrun":
@@ -131,4 +246,7 @@ class Broker:
 
     def status(self, call_id: str):
         with self._db() as db:
+            db.execute('BEGIN')
+            self._validate_ledger(db)
             return db.execute("SELECT model,provider,worst,actual,state FROM broker_calls WHERE call_id=?", (call_id,)).fetchone()
+
