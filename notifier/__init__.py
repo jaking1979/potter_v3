@@ -1,6 +1,6 @@
 """E1: approval issuance + the T19 notifier. Staging-only (T22): channels are
 injected and only offline fakes exist here; nothing enables real delivery."""
-from .auth import AuthenticatedSender, AuthResult, ChannelAuth
+from .auth import AuthenticatedSender, AuthResult, ChannelAuth, TransportSigner
 from .channels import EMAIL, POTTER_HOME, TELEGRAM, FakeChannel, InboundMessage
 from .issuer import (APPROVE, DENY, ApprovalIssuer, ApprovalRefusal, HmacIssuerKey,
                      IssuerKey, PendingApproval)
