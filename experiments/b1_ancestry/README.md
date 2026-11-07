@@ -17,6 +17,11 @@ authenticate the source, rehash Git object bytes, read a repository, reject
 object replacement, establish freshness, verify T39 signatures, or enforce
 real consumers. A compromised source can provide a self-consistent fake graph.
 
+`compare()` accepts both the shipped `ancestry-observation/v0` document
+(`observed_tip`) and normalized `ancestry-inventory/v0` documents (`tip`). It
+rejects unknown schemas, missing fields and ambiguous documents carrying both
+tip fields, and recomputes graph information rather than trusting summary data.
+
 Run from this directory:
 
 ```sh

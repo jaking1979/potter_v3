@@ -78,10 +78,26 @@ def inventory(tip, records):
             "commits": ordered, "authority": "observation-only"}
 
 
+def _validated_document(document):
+    if type(document) is not dict:
+        raise InventoryError('expected observation or inventory document')
+    schema = document.get('schema')
+    if schema == 'potter.t39.ancestry-observation/v0':
+        tip_key, other_key = 'observed_tip', 'tip'
+    elif schema == 'potter.t39.ancestry-inventory/v0':
+        tip_key, other_key = 'tip', 'observed_tip'
+    else:
+        raise InventoryError('unsupported document schema')
+    if tip_key not in document or 'commits' not in document or other_key in document:
+        raise InventoryError('missing or ambiguous ancestry fields')
+    # Recompute from graph data; never trust a supplied digest/count/authority.
+    return inventory(document[tip_key], document['commits'])
+
+
 def compare(expected, actual):
     """Compare two validated observations without granting receipt authority."""
-    a = inventory(expected["tip"], expected["commits"])
-    b = inventory(actual["tip"], actual["commits"])
+    a = _validated_document(expected)
+    b = _validated_document(actual)
     old = {c["sha"]: c for c in a["commits"]}
     new = {c["sha"]: c for c in b["commits"]}
     return {"tip_changed": a["tip"] != b["tip"],

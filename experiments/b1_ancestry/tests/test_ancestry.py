@@ -67,6 +67,27 @@ class InventoryTests(unittest.TestCase):
         rows = [node(1)] + [node(n, n-1) for n in range(2, 2001)]
         self.assertEqual(inventory(sha(2000), rows)["commit_count"], 2000)
 
+    def test_shipped_observation_self_compare_and_added_commit(self):
+        observed = json.loads((Path(__file__).parents[1] / "observed-main.json").read_text())
+        self.assertEqual(compare(observed, observed),
+                         {'tip_changed': False, 'added': [], 'missing': [], 'changed': []})
+        changed = copy.deepcopy(observed)
+        changed['observed_tip'] = sha(99999)
+        changed['commits'].append({'sha': sha(99999), 'tree': sha(99998),
+                                   'parents': [observed['observed_tip']]})
+        self.assertEqual(compare(observed, changed),
+                         {'tip_changed': True, 'added': [sha(99999)], 'missing': [], 'changed': []})
+        normalized = inventory(observed['observed_tip'], observed['commits'])
+        self.assertEqual(compare(observed, normalized)['changed'], [])
+
+    def test_unknown_or_ambiguous_document_refused(self):
+        result = inventory(sha(4), self.rows)
+        ambiguous = {**result, 'observed_tip': result['tip']}
+        for bad in (None, {}, {**result, 'schema': 'unknown'}, ambiguous,
+                    {'schema': result['schema'], 'commits': result['commits']}):
+            with self.subTest(bad=bad), self.assertRaises(InventoryError):
+                compare(result, bad)
+
 
 if __name__ == "__main__":
     unittest.main()
