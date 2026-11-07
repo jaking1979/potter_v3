@@ -16,11 +16,13 @@ review surface. Advisory retrieval exposes staged entries as `provisional`.
 Promotion uses an explicit proof seam, and batch mode refuses sensitive and
 non-direct items. Competing corrections must be restaged after a new active
 version appears. Undo uses an exact item version and refuses a stale chain.
+Forget clears the values of all local rows for a fact key, including staged
+and superseded rows; idempotency entries retain only payload digests.
 
 Open before integration: independently authenticated subject/operation/content
 binding; principal permissions; T15's full metadata and validity intervals;
 idempotency under durable multiprocess concurrency; source-safe conflict and
-scope handling; forget across prior versions, staged rows, caches and all
+scope handling; forget across external systems, caches, backups and all
 views; Notion staging, outbox and replay; C1/C2/C6 wiring; freshness-bounded
 canonical revalidation; generation rebuilds and retrieval indexes; atomic
 trace/audit; import/rollback; T21 change governance; full adversarial and
