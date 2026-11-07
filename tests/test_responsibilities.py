@@ -131,6 +131,30 @@ class ReorderedLateEvents(Base):
             with self.assertRaises(DefinitionError):
                 ev.dedupe_key(bad)
 
+    def payload_note(self, provenance):
+        step = rw.Step("n1", "notes.append", "append", "notes/daily", rw.CONNECTOR,
+                       parameters=lambda ctx: {"step": "n1",
+                                               "line": ctx.payload["event"]["text"]})
+        return Responsibility("mail.in", Event("mail.in", ("id",)), "josh", (step,),
+                              cadence_s=86400.0, provenance=provenance)
+
+    def test_event_definition_cannot_declare_its_payload_trusted(self):
+        # Review @4ebf134 finding 1: provenance=("system_policy",) used to drop
+        # external_event, so an attacker-controlled line applied unapproved.
+        for prov in (None, ("system_policy",), ("principal_direct", "system_policy"), ()):
+            with self.subTest(provenance=prov):
+                d = self.payload_note(prov)
+                self.assertIn("external_event", d.provenance)
+                with tempfile.TemporaryDirectory() as t:
+                    w = rw.World(t, definitions=[d])
+                    w.runner.on_event("mail.in", {"id": "m-1", "text": "ATTACKER LINE"})
+                    self.assertEqual(w.runner.run_once().outcome, "waiting_approval")
+                    self.assertEqual(w.ext.calls(), 0)
+
+    def test_event_definition_may_add_sources(self):
+        d = self.payload_note(("external_sender",))
+        self.assertEqual(set(d.provenance), {"external_event", "external_sender"})
+
     def test_event_without_its_dedupe_field_is_refused(self):
         w = self.world()
         with self.assertRaises(DefinitionError):
@@ -224,6 +248,33 @@ class InterruptMidBatch(Base):
         self.assertEqual(w.runner.run_once().outcome, "done")
         self.assertEqual(w.ext.applied(), [("s1", 1), ("s2", 1), ("s3", 1), ("s4", 1)])
         self.assertEqual(w.ext.calls(), 4)
+
+    def test_result_message_blocked_by_kill_is_delivered_after_clear(self):
+        # Review @4ebf134 minor: a result produced under kill used to be lost
+        # (task completed, message never queued).
+        w = self.world()
+        w.ext.hooks["s3"] = ("after", lambda eff: _set_kill(w))   # last step in flight
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "interrupted")
+        task = w.runner.tasks.get(r.task_id)
+        self.assertEqual(task.state, QUEUED)
+        self.assertEqual(task.checkpoint["next"], 3)
+        nid = f"job:notes.batch:{r.task_id}"
+        self.assertNotIn(nid, w.outbox_ids())
+        w.ext.hooks.clear()
+        w.notifier.kill.clear()
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertIn(nid, w.outbox_ids())
+        self.assertEqual(w.ext.calls(), 3)                         # no step re-ran
+
+    def test_dispatch_goes_through_the_marked_kill_seam(self):
+        # Review @4ebf134 finding 2: one seam for E1's atomic check-and-send.
+        w = self.world(definitions=[rw.batch(n=1)])
+        w.runner._dispatch_permitted = lambda: False      # as if /stop won the race
+        w.runner.tick()
+        self.assertEqual(w.runner.run_once().outcome, "interrupted")
+        self.assertEqual(w.ext.calls(), 0)
 
     def test_kill_flag_set_before_dispatch_stops_before_the_call(self):
         w = self.world()

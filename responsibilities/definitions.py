@@ -162,6 +162,10 @@ class Responsibility:
     to the schedule period. An event responsibility must state one explicitly,
     for example the longest normal gap between bills.
 
+    ``provenance`` is the trigger's source kinds. A schedule defaults to
+    ``system_policy``. An event always carries ``external_event``: a declared
+    value can add sources but never remove that one.
+
     ``report`` builds the result text that is delivered on success (``None``
     means no result message). It must not include secrets or raw action
     parameters."""
@@ -195,9 +199,17 @@ class Responsibility:
         if not self.cadence_s > 0 or self.tolerance < 1:
             raise DefinitionError("cadence_s > 0 and tolerance >= 1 required")
         if self.provenance is None:
-            object.__setattr__(self, "provenance",
-                               TRUSTED_SCHEDULE_PROVENANCE if isinstance(self.trigger, Schedule)
-                               else DEFAULT_EVENT_PROVENANCE)
+            prov = (TRUSTED_SCHEDULE_PROVENANCE if isinstance(self.trigger, Schedule)
+                    else DEFAULT_EVENT_PROVENANCE)
+        else:
+            prov = tuple(self.provenance)
+            if not all(isinstance(k, str) and k for k in prov):
+                raise DefinitionError("provenance must name source kinds")
+        if isinstance(self.trigger, Event):
+            # Add-only, like result provenance: a definition can add sources to
+            # an event but never declare its payload trusted.
+            prov = tuple(sorted(set(prov) | set(DEFAULT_EVENT_PROVENANCE)))
+        object.__setattr__(self, "provenance", prov)
 
     @property
     def job_spec(self) -> JobSpec:

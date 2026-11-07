@@ -248,6 +248,7 @@ class ResponsibilityRunner:
                 self.tasks.checkpoint(task.id, self._worker,
                                       {"next": i + 1, "approvals": approvals})
                 self._report(d, task.id, RUNNING)
+            index = len(d.steps)
             return self._finish(d, task, results)
         except LeaseLost:
             return RunResult(task.id, d.id, OUT_LEASE_LOST)
@@ -318,7 +319,7 @@ class ResponsibilityRunner:
             eff = self.journal.for_step(task.id, step.id)
             dec = self._decide(d, step, action, ctx, provenance)
             if dec.outcome == ALLOW:
-                if self.kill.is_set():
+                if not self._dispatch_permitted():
                     raise _Interrupt()
                 try:
                     eff = self.journal.record_intent(task.id, step.id, action)
@@ -346,9 +347,20 @@ class ResponsibilityRunner:
                 raise _Fatal(f"policy denied resumed {step.id}: {dec.reason_code}")
         if eff is None or eff.task_id != task.id:
             raise _Fatal(f"no journaled intent for approved {step.id}")
-        if self.kill.is_set():
+        if not self._dispatch_permitted():
             raise _Interrupt()
         return self._execute(eff, conn)
+
+    def _dispatch_permitted(self) -> bool:
+        """SEAM (E1 #28 / C2): the kill check right before a dispatch.
+
+        Today this is a plain read of E1's kill flag, followed by a separate C2
+        ``execute`` call. A ``/stop`` that commits between the two can still be
+        followed by one dispatch. That is the same check-to-send window found in
+        E1. When E1 lands its atomic check-and-send primitive, or C2 ``execute``
+        accepts a kill predicate evaluated inside its claim transaction, the
+        dispatch must use it here. Until then the window is open; see README."""
+        return not self.kill.is_set()
 
     def _execute(self, eff: Effect, conn: Connector) -> Any:
         try:
@@ -469,18 +481,24 @@ class ResponsibilityRunner:
 
     # ---------------------------------------------------------------- endings
     def _finish(self, d: Responsibility, task: Task, results: Mapping[str, Any]) -> RunResult:
+        """Messages first, then complete: the enqueue is idempotent, so a crash
+        in between re-runs no effect and re-enqueues nothing new. If the kill
+        flag stops the result message, the task is NOT completed: it is
+        interrupted at ``len(steps)``, so the run resumes after the flag is
+        cleared, re-runs no step, and delivers the result then."""
         ctx = StepContext(task.payload, MappingProxyType(dict(results)))
-        # Messages first, then complete: the enqueue is idempotent, so a crash
-        # in between re-runs no effect and re-enqueues nothing new.
-        if not self.kill.is_set():
-            self._report(d, task.id, DONE)
-            text = d.report(ctx) if d.report is not None else None
-            self._final_messages(d, task, text, outcome=DONE)
+        if self.kill.is_set():
+            raise _Interrupt()
+        self._report(d, task.id, DONE)
+        text = d.report(ctx) if d.report is not None else None
+        if not self._final_messages(d, task, text, outcome=DONE):
+            raise _Interrupt()
         self.tasks.complete(task.id, self._worker)
         return RunResult(task.id, d.id, OUT_DONE)
 
     def _final_messages(self, d: Responsibility, task: Task, text: str | None, *,
-                        outcome: str | None = None) -> None:
+                        outcome: str | None = None) -> bool:
+        """Enqueue the final messages. False if the kill flag stopped them."""
         outcome = outcome or task.state
         receipt = receipt_link(task.id)
         try:
@@ -497,7 +515,8 @@ class ResponsibilityRunner:
                                   text=f"{d.id} failed. Receipt: {receipt}")
                 # ESCALATED: the escalation alert goes through the ops job.
         except Stopped:
-            pass
+            return False
+        return True
 
     def _retry(self, d: Responsibility, task: Task, error: str, outcome: str) -> RunResult:
         try:
