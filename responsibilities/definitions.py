@@ -125,8 +125,9 @@ class Step:
             if not self.result_provenance or not all(
                     isinstance(k, str) and k for k in self.result_provenance):
                 raise DefinitionError(f"step {self.id}: result_provenance must name sources")
-        for name in ("capability", "operation", "target", "connector"):
-            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+        for name, value in (("capability", self.capability), ("operation", self.operation),
+                            ("target", self.target), ("connector", self.connector)):
+            if not isinstance(value, str) or not value:
                 raise DefinitionError(f"step {self.id}: {name} required")
 
     @property

@@ -356,10 +356,13 @@ class ResponsibilityRunner:
 
         Today this is a plain read of E1's kill flag, followed by a separate C2
         ``execute`` call. A ``/stop`` that commits between the two can still be
-        followed by one dispatch. That is the same check-to-send window found in
-        E1. When E1 lands its atomic check-and-send primitive, or C2 ``execute``
-        accepts a kill predicate evaluated inside its claim transaction, the
-        dispatch must use it here. Until then the window is open; see README."""
+        followed by one dispatch. E1 (1b88a01) closed that window for notifier
+        sends with a private gate (kill check + ``notifier_sending`` row in one
+        transaction, which ``stop()`` waits on), but that gate does not cover
+        connector effects and is not a public API. This dispatch must use either
+        a public form of that gate, which ``stop()`` would also wait on, or a C2
+        ``execute`` kill predicate evaluated inside its claim transaction. Until
+        one exists, the window is open; see README."""
         return not self.kill.is_set()
 
     def _execute(self, eff: Effect, conn: Connector) -> Any:
