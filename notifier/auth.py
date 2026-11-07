@@ -10,9 +10,15 @@ Transport authentication (message-bound, integrity- and replay-protected):
   same keys and refuses any message whose MAC does not verify, so a
   hand-built ``InboundMessage('telegram', josh_id, '/stop')`` is ignored, and
   so is a genuine update whose text or reply target was changed.
-* Replay: each ``(channel, update_id)`` is accepted once, durably (the
-  ``inbound_seen`` table in the shared SQLite file), and only within
-  ``max_skew_s`` of its signed time.
+* Replay without loss: each authentic ``(channel, update_id)`` is recorded
+  durably in ``inbound_seen`` as ``pending`` with its verified command, and
+  only within ``max_skew_s`` of its signed time. The command's effect marks
+  it ``processed`` in the same transaction (``complete``). Redelivery of a
+  ``processed`` update is ignored (``replayed``); redelivery of a ``pending``
+  one - the process crashed after authenticating but before the effect
+  committed - is authenticated again so the command runs once. Two
+  concurrent deliveries of a pending update race on ``complete``'s
+  compare-and-set; the loser's effect rolls back.
 * No key for a channel -> nothing on that channel is ever authenticated.
 
 Principal checks (after the transport check):
@@ -90,6 +96,10 @@ class TransportSigner:
         return replace(msg, transport_mac=mac)
 
 
+class AlreadyProcessed(Exception):
+    """The update behind this voucher has already been executed."""
+
+
 @dataclass(frozen=True)
 class AuthenticatedSender:
     principal: str
@@ -149,7 +159,8 @@ class ChannelAuth:
 
     # ------------------------------------------------------------------ transport
     def _transport_ok(self, msg: InboundMessage) -> str | None:
-        """None if the envelope is authentic, fresh and new; else a reason."""
+        """None if the envelope is authentic and fresh; else a reason.
+        (Replay is decided against ``inbound_seen`` in ``authenticate``.)"""
         key = self._keys.get(msg.channel)
         if key is None:
             return "unknown_channel"
@@ -166,13 +177,29 @@ class ChannelAuth:
             return "unauthenticated_transport"
         if not isinstance(msg.sent_at, (int, float)) or abs(self._clock() - msg.sent_at) > self._skew:
             return "stale_transport"
-        try:
-            with self.db.tx() as c:
-                c.execute("INSERT INTO inbound_seen (channel, update_id, at) VALUES (?,?,?)",
-                          (msg.channel, msg.update_id, self._clock()))
-        except sqlite3.IntegrityError:
-            return "replayed"
         return None
+
+    def _principal(self, msg: InboundMessage) -> tuple[str | None, str]:
+        """(principal, "ok") or (None, reason) for an authentic envelope."""
+        principal = self._in.get(msg.channel, {}).get(msg.sender_ref)
+        if principal is None:
+            return None, "unknown_sender"
+        if principal not in self._allow:
+            return None, "not_allowlisted"
+        p = self._dir.get(principal)
+        if p is None or not p.enabled:
+            return None, "principal_disabled"
+        if msg.channel == TELEGRAM:
+            pass  # adapter-verified update (MAC), bound user id
+        elif msg.channel == EMAIL:
+            if not self._verified(self._dkim, msg):
+                return None, "dkim_unverified"
+        elif msg.channel == POTTER_HOME:
+            if not self._verified(self._session, msg):
+                return None, "session_unverified"
+        else:
+            return None, "unknown_channel"
+        return principal, "ok"
 
     # ------------------------------------------------------------------ authenticate
     def authenticate(self, msg: InboundMessage) -> AuthResult:
@@ -181,31 +208,51 @@ class ChannelAuth:
         bad = self._transport_ok(msg)
         if bad:
             return AuthResult(None, bad)
-        principal = self._in.get(msg.channel, {}).get(msg.sender_ref)
+        principal, reason = self._principal(msg)
+        now = self._clock()
+        text = msg.text or ""
+        with self.db.tx() as c:
+            row = c.execute("SELECT status, command, reply_to FROM inbound_seen"
+                            " WHERE channel=? AND update_id=?",
+                            (msg.channel, msg.update_id)).fetchone()
+            if row is not None:
+                status, command, reply_to = row
+                if status == "processed" or command != text or reply_to != msg.reply_to:
+                    return AuthResult(None, "replayed")
+                # pending: crashed before the effect committed -> resume below
+            elif principal is None:
+                # Authentic but not obeyed: record as done so it is never retried.
+                c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
+                          " command, reply_to, processed_at) VALUES (?,?,?,'processed',NULL,?,?,?)",
+                          (msg.channel, msg.update_id, now, text, msg.reply_to, now))
+            else:
+                c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
+                          " command, reply_to) VALUES (?,?,?,'pending',?,?,?)",
+                          (msg.channel, msg.update_id, now, principal, text, msg.reply_to))
         if principal is None:
-            return AuthResult(None, "unknown_sender")
-        if principal not in self._allow:
-            return AuthResult(None, "not_allowlisted")
-        p = self._dir.get(principal)
-        if p is None or not p.enabled:
-            return AuthResult(None, "principal_disabled")
-        if msg.channel == TELEGRAM:
-            pass  # adapter-verified update (MAC above), bound user id
-        elif msg.channel == EMAIL:
-            if not self._verified(self._dkim, msg):
-                return AuthResult(None, "dkim_unverified")
-        elif msg.channel == POTTER_HOME:
-            if not self._verified(self._session, msg):
-                return AuthResult(None, "session_unverified")
-        else:
-            return AuthResult(None, "unknown_channel")
+            return AuthResult(None, reason)
         serial = next(self._serials)
         token = secrets.token_hex(32)
-        sender = AuthenticatedSender(principal, msg.channel, serial, token, msg.text or "",
+        sender = AuthenticatedSender(principal, msg.channel, serial, token, text,
                                      msg.reply_to, msg.update_id)
         with self._lock:
             self._minted[token] = (sender, self._claims(sender))
         return AuthResult(sender, "ok")
+
+    def complete(self, c: sqlite3.Connection, sender: AuthenticatedSender) -> bool:
+        """Mark the voucher's update ``processed`` inside the caller's effect
+        transaction. False if it was already processed (the caller must not
+        apply its effect; raising rolls the transaction back)."""
+        cur = c.execute("UPDATE inbound_seen SET status='processed', processed_at=?"
+                        " WHERE channel=? AND update_id=? AND status='pending'",
+                        (self._clock(), sender.channel, sender.update_id))
+        return cur.rowcount == 1
+
+    def finish(self, sender: AuthenticatedSender) -> None:
+        """Mark processed in its own transaction (idempotent). For outcomes
+        with no effect of their own (refusals) or an idempotent one (ack)."""
+        with self.db.tx() as c:
+            self.complete(c, sender)
 
     @staticmethod
     def _claims(s: AuthenticatedSender) -> tuple[str, ...]:

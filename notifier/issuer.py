@@ -60,7 +60,7 @@ APPROVE, DENY = "approve", "deny"
 REFUSALS = frozenset({
     "unauthenticated", "channel_not_approval_capable", "stopped", "unknown_approval",
     "already_decided", "expired", "state_changed", "bad_decision", "issuer_error",
-    "task_not_waiting", "command_mismatch",
+    "task_not_waiting", "command_mismatch", "replayed",
 })
 
 
@@ -197,6 +197,10 @@ class ApprovalIssuer:
         return outcome
 
     def _decide_tx(self, c, approval_id, decision, sender, live_action, now):
+        # The reply is marked processed in this transaction, together with
+        # whatever it decides (record, or an expiry/void it triggers).
+        if not self._auth.complete(c, sender):
+            return ApprovalRefusal("replayed")
         if self.kill.is_set(c):
             return ApprovalRefusal("stopped")
         row = c.execute("SELECT task_id, action_hash, screenshot_ref, expires_at, status"

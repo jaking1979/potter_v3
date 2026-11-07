@@ -22,6 +22,10 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
    - **Honest boundary:** in-process Python cannot be a hard isolation boundary. Code in the same interpreter can always reach the private registry or the channels through some route a lint doesn't anticipate. The handle design and the lint are defence in depth. Hard enforcement is the runtime/process boundary in C8: jobs run where the notifier's channels and credentials don't exist. So the T19 release test "a job sending directly fails" holds for jobs written against the handle API and checked by the lint; it is not a claim about hostile code inside the notifier's process.
 2. **Identity.** The allowlist is `human:josh`. `human:christie` is listed but disabled in the C5 seed, so she is ignored. Everyone else is ignored and logged.
    - A hand-built `InboundMessage` (for example `('telegram', josh_id, '/stop')`) has no valid adapter MAC and is ignored as `unauthenticated_transport`. So is a genuine update whose text, reply target, sender, channel or update ID was changed, and so is one signed with another key. A replayed update is ignored as `replayed`, and an old one as `stale_transport`.
+   - **No lost commands after a crash.** An authentic update is recorded in `inbound_seen` as `pending`, together with its verified command. The command's effect marks it `processed` in the same transaction: the `/stop` transaction, or the approval-decision transaction. Refusals, and the idempotent ack, are marked right after.
+     - If the process crashes after authenticating but before the effect commits, the update stays `pending`, and redelivery runs it once.
+     - Redelivery of a `processed` update is ignored as `replayed`.
+     - If two deliveries race, one wins the compare-and-set; the other's effect rolls back.
    - A voucher can drive only the command it was minted for. `stop()` needs `/stop`, `ack(nid)` needs `/ack nid`, and `decide(id, approve)` needs `/approve id`. A voucher for `/ack` therefore cannot stop or approve.
    - A boundary test wires a fake Telegram webhook adapter to the router. The adapter checks the webhook secret and signs the envelope. A forged webhook never reaches the router.
    - Transport keys are test constants; real adapter key custody is T11/T12.
@@ -39,13 +43,19 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
 6. **`/stop`.** One transaction sets the kill flag, marks every `pending`/`unknown` outbox row `suppressed`, cancels pending approvals, and enqueues a reply that lists what was cancelled.
    - **Gate:** every send passes a gate that checks the kill flag and records the send in `notifier_sending`, in one `BEGIN IMMEDIATE` transaction. `stop()` sets the flag under the same write lock.
    - **Recheck:** immediately before `channel.send`, the sender re-checks in its own transaction that its gate row still exists, that the row is younger than the dispatch timeout, and that the kill flag is clear. If any check fails, it deletes its row and aborts.
-   - **Boundary:** only a call already inside `channel.send` may complete after the flag is set, and that call completes before `stop()` returns. A sender past the gate but not yet in the channel aborts at its recheck. No send of any kind can start after `stop()` returns, except the `/stop` confirmation. An expired gate can never send, `/stop` or not. C3 records a completed delivery, but the row stays suppressed, so nothing follows it.
-   - **Never an all-clear from age:** `stop()` waits, up to `stop_wait_s` (default 30 s), for unexpired rows. It then reports *every* row still present in `StopReport.unconfirmed_in_flight`. Expired rows are not waited for, because their senders must abort at the recheck; they also appear in `expired_in_flight`. If the bounded wait expires, the unconfirmed set is returned as it stands. `all_clear` is true only when that set is empty. A process that died while past the gate leaves a row that keeps being reported as expired, until an operator clears it (follow-up).
+   - **Boundary.** Telegram and email can't be fenced at the provider, so the contract is stated honestly:
+     - no send starts its final recheck after `stop()` commits;
+     - a sender already past its final recheck may still deliver once;
+     - `stop()` returns every such sender as unconfirmed, and also as expired if it has aged past the dispatch timeout.
+
+     A sender that reaches its final recheck after the flag is set, or after its gate aged out, aborts. The `/stop` confirmation is the only send exempt from the flag. C3 records any completed delivery, but the row stays suppressed, so nothing follows it.
+   - **Never an all-clear from age:** `stop()` waits, up to `stop_wait_s` (default 30 s), for unexpired rows. It then reports *every* row still present in `StopReport.unconfirmed_in_flight`. Expired rows are not waited for, but they stay in the report and also appear in `expired_in_flight`. A sender that hasn't yet reached its final recheck will abort there, but one already past it may still deliver once. If the bounded wait expires, the unconfirmed set is returned as it stands. `all_clear` is true only when that set is empty. A process that died while past the gate leaves a row that keeps being reported as expired, until an operator clears it (follow-up).
    - The gate is shared through the SQLite file, so it holds across threads and processes. Deterministic pause tests cover five cases:
      - paused before the gate: `stop()` returns at once, and nothing is sent;
      - paused past the gate: `stop()` waits, and the sender aborts;
      - already inside the channel: the send completes before `stop()` returns;
-     - Dolores's case, a sender paused past the gate with `/stop` at T+21 against a 20 s dispatch timeout: the row is reported expired and the sender aborts;
+     - Dolores's case, a sender paused past the gate with `/stop` at T+21 against a 20 s dispatch timeout: the row is reported expired and the sender aborts at its final recheck;
+     - a sender paused *after* its final recheck, with `/stop` at T+21: `stop()` returns it as unconfirmed and expired, and on resume it does deliver once. This is the documented boundary, tested as such;
      - the bounded wait expires: the row is reported unconfirmed and the late sender aborts.
    - New enqueues, approval requests and decisions all raise or refuse.
 7. **Outage.**
