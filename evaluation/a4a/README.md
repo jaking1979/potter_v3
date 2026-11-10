@@ -2,7 +2,7 @@
 
 Status: IN PROGRESS. Package A4a (L15); decisions T1, T9, T33, T36. Owner Dolores, reviewer Claude. A4a is offline only. A4b baselines require A1; A5 waits on A4b. This scaffold is not completion evidence.
 
-The draft set and grading prototype live in the canonical Notion Build Execution Plan. They have not yet been confirmed by Josh and must not be treated as final benchmark tasks. T1 requires 25–30 real tasks from the preceding 60 days, including 18–22 one-shot and 6–8 ongoing-responsibility cases. Cover all T36 classes, T33 behavior, the T27 memory ablation, T29 handoff, and the T26 silent-failure case.
+The draft set and grading prototype live in the canonical Notion Build Execution Plan. Josh approved the proposed direction of 20 one-shot and seven ongoing cases, including the rain-jacket substitution. Final fixture selection, source alignment, anchors and freeze remain outstanding; these drafts are not final benchmark tasks. T1 requires 25–30 real tasks from the preceding 60 days, including 18–22 one-shot and 6–8 ongoing-responsibility cases. Cover all T36 classes, T33 behavior, the T27 memory ablation, T29 handoff, and the T26 silent-failure case.
 
 ## Case fixture contract (draft)
 
@@ -20,7 +20,7 @@ The current case-agreement helper is a preparation aid only; it does not calcula
 
 ## Evidence still required
 
-- Confirm the task list with Josh; freeze versioned, representative fixtures and success anchors.
+- Complete final fixture selection and source alignment; freeze versioned, representative fixtures and success anchors.
 - Complete a usable prebuilt Notion grading form and verify blind presentation and access boundaries.
 - Demonstrate automatic timing, cost and intervention collection without raw sensitive data.
 - Give independent graders the same fixed outputs and anchors; record reproducibility, disagreements, duration, and any refinements without inventing an acceptance threshold.
