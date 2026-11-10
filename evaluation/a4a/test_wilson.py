@@ -10,11 +10,11 @@ class WilsonTest(unittest.TestCase):
 
     def test_zero_and_all_success_boundary(self):
         low, high = wilson_95(0, 20)
-        self.assertAlmostEqual(low, 0)
+        self.assertEqual(low, 0.0)
         self.assertAlmostEqual(high, 0.16112515805281938)
         low2, high2 = wilson_95(20, 20)
         self.assertAlmostEqual(low2, 1 - high)
-        self.assertAlmostEqual(high2, 1)
+        self.assertEqual(high2, 1.0)
         self.assertIsNone(wilson_95(0, 0))
 
     def test_bad_counts_rejected(self):
