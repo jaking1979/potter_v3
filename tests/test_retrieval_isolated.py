@@ -2,12 +2,63 @@ import asyncio
 import multiprocessing
 import time
 import unittest
+from unittest.mock import patch
 
 from retrieval.core import benchmark, retrieve_turn
 from retrieval.isolated import SyntheticProcessBackend, _decode, bounded_search
 
 
 class IsolatedRetrievalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_drains_buffer_after_worker_exits(self):
+        import struct
+        from retrieval.isolated import _search
+
+        payload = b'{"items":[["a","ok"]]}'
+        frame = struct.pack('!I', len(payload)) + payload
+        class Reader:
+            chunks = iter((frame[:2], frame[2:]))
+            def setblocking(self, value): pass
+            def recv(self, size): return next(self.chunks, b'')
+            def close(self): pass
+        class Sender:
+            def close(self): pass
+        class Process:
+            def start(self): pass
+            def is_alive(self): return False
+        class Context:
+            def Process(self, **kwargs): return Process()
+        with patch('retrieval.isolated.socket.socketpair', return_value=(Reader(), Sender())), \
+             patch('retrieval.isolated.multiprocessing.get_context', return_value=Context()), \
+             patch('retrieval.isolated._stop'):
+            status, items, _ = await _search(SyntheticProcessBackend(), 'q', 1)
+        self.assertEqual((status, items[0].item_id), ('complete', 'a'))
+
+    async def test_cleanup_does_not_block_loop_and_repeated_cancel_waits(self):
+        from retrieval.isolated import _search
+        import threading
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        # Save the real function before replacing the module reference.
+        from retrieval.isolated import _stop as real_stop
+        def delayed_real_stop(process):
+            entered.set()
+            release.wait(2)
+            real_stop(process)
+            finished.set()
+        with patch('retrieval.isolated._stop', side_effect=delayed_real_stop):
+            task = asyncio.create_task(_search(SyntheticProcessBackend(delay_s=10), 'q', 2))
+            await asyncio.sleep(.15)
+            task.cancel()
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            task.cancel()
+            await asyncio.sleep(.02)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(finished.is_set())
+
     def setUp(self):
         self.children_before = {p.pid for p in multiprocessing.active_children()}
 
@@ -145,3 +196,4 @@ class IsolatedRetrievalContract(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

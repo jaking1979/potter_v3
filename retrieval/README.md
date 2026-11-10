@@ -21,7 +21,10 @@ reported elapsed time. Results finishing cleanup after the deadline are dropped.
 Scheduling/startup/cleanup overhead means this is not proof of a hard wall-clock
 two-second SLA. A process is lifecycle isolation, not an OS security sandbox;
 do not put effectful or untrusted adapters here. Process start and bounded joins
-can briefly occupy the parent thread. Real sandbox/process-tree containment,
+can briefly occupy the parent thread during startup; process joins run in a worker
+thread and repeated caller cancellation waits for reaping. Failure to reap is an
+intentional RuntimeError alarm rather than an ordinary unavailable status.
+Real sandbox/process-tree containment,
 cross-platform qualification and host resource quotas remain future work.
 
 IPC is capped at 16KiB, three items, 256 characters per ID and 2048 per text;
@@ -48,3 +51,4 @@ revalidates its fields into a new record before multiprocessing serializes it.
 Caller subclasses/custom reduction hooks and altered invalid records are refused.
 This guards the simulator interface; trusted module/process code and runtime
 remain assumptions, and it does not create a security sandbox.
+

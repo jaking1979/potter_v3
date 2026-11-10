@@ -177,8 +177,9 @@ async def _search(config, query, timeout):
                         return 'complete', items, elapsed
                     except (ValueError, TypeError, UnicodeError):
                         return 'unavailable', (), time.monotonic() - start
-            if not process.is_alive():
-                return 'unavailable', (), time.monotonic() - start
+            # A process can exit while complete or partial data remains buffered.
+            # Drain until a complete frame or socket EOF instead of consulting
+            # process liveness here.
             await asyncio.sleep(min(.005, timeout - elapsed))
     except Exception:
         return 'unavailable', (), time.monotonic() - start
@@ -186,6 +187,18 @@ async def _search(config, query, timeout):
         sender.close()
         receiver.close()
         if started:
-            _stop(process)
+            # A resistant child can consume the full join grace. Do that work
+            # off the event loop and finish reaping even on repeated cancellation.
+            cleanup = asyncio.create_task(asyncio.to_thread(_stop, process))
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup.result()  # Reaping failure is an intentional hard alarm.
+            if cancelled:
+                raise asyncio.CancelledError
         else:
             process.close()
+
