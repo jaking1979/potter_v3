@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 from policy._contracts import approval as c0
 
-from .auth import ChannelAuth
+from .auth import AlreadyProcessed, ChannelAuth
 from .channels import InboundMessage
 from .issuer import APPROVE, DENY, ApprovalIssuer, ApprovalRefusal
 from .service import Notifier
@@ -52,6 +52,17 @@ class CommandRouter:
             self._log(msg, "ignored", res.reason, now)
             return RouteResult("ignored", res.reason)
         sender = res.sender
+        try:
+            return self._dispatch(msg, sender, now)
+        except AlreadyProcessed:
+            return RouteResult("ignored", "replayed")
+        finally:
+            # Outcomes without their own effect transaction (refusals, unknown
+            # commands) and the idempotent ack are marked processed here; for
+            # /stop and approval decisions this is a no-op (already marked).
+            self._auth.finish(sender)
+
+    def _dispatch(self, msg: InboundMessage, sender, now: float) -> RouteResult:
         words = (msg.text or "").strip().split()
         cmd = words[0].lower() if words else ""
         arg = words[1] if len(words) > 1 else None
