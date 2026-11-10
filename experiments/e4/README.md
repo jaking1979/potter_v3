@@ -13,9 +13,9 @@ Package E4a, T1 · Dolores → Claude review. Governing contracts: T25 and T37 c
 
 ## Failure and presentation behavior
 
-Missing or malformed sections are unavailable and stale with unknown age. Other sections remain readable. Future observations, duplicate IDs, malformed timestamps/statuses/IDs and sections over 100 records refuse per section. Unknown top-level/item content is dropped. Both section and item age are shown independently; strictly more than 300 seconds is stale. A fresh empty section is described only as no items in that snapshot, not proof that the underlying system is healthy. Health-stopped input does not disable the detached read model. All output is explicitly an offline read-only preview. Approval/recovery instructions direct the reader to the established authenticated channel without inventing a destination.
+Missing or malformed sections are unavailable and stale with unknown age. Other sections remain readable. Future observations, duplicate IDs, malformed timestamps/statuses/IDs and sections over 100 records refuse per section. Unknown top-level/item content is dropped. Section freshness is determined from observed_at: strictly more than 300 seconds is stale. Item age is shown neutrally as time since last change, not evidence that data is stale. A fresh empty section is described only as no items in that snapshot, not proof that the underlying system is healthy. Health-stopped input does not disable the detached read model. All output is explicitly an offline read-only preview. Approval/recovery instructions direct the reader to the established authenticated channel without inventing a destination.
 
-HTML includes landmarks, a skip link, headings, language, table captions and header scope. It has no form, buttons, scripts or remote resources; response headers prohibit forms and framing and disable caching. These static checks do **not** establish WCAG 2.2 AA, keyboard/screen-reader usability or a real-browser S2 result. The complete Today/Work/Activity/Memory/More PWA and E4b approval/status/recovery UX remain unfinished.
+HTML includes landmarks, a skip link, headings, language, table captions and header scope. It has no form, buttons, scripts or remote resources; response headers prohibit forms and framing, disable caching, and set Referrer-Policy: no-referrer. These static checks do **not** establish WCAG 2.2 AA, keyboard/screen-reader usability or a real-browser S2 result. The complete Today/Work/Activity/Memory/More PWA and E4b approval/status/recovery UX remain unfinished.
 
 ## Evidence and remaining gates
 
@@ -49,3 +49,4 @@ clinical filtering, a C7 adapter, a service-down S2 test or actual browser and
 accessibility evidence. No actual server/authentication, action endpoint or
 E4b capability exists. C7/E1/E2 integration dependencies and independent Claude
 review remain open. Existing T22/T39/readiness requirements still apply.
+

@@ -40,14 +40,14 @@ def section(name, raw, now):
             or when>timestamp(raw['observed_at'])): raise ValueError('invalid item')
         seen.add(ident); item_age=(now-when).total_seconds()
         items.append({'id':ident,'status':status,'updated_at':item['updated_at'],
-                      'age_s':int(item_age),'stale':item_age>300})
+                      'age_s':int(item_age)})
     return {'availability':'available','observed_at':raw['observed_at'],
             'age_s':int(age),'stale':age>300,'items':items}
 
 
 def project(snapshot, *, now):
     """Malformed/missing sections become unavailable; unknown payloads vanish.
-    Both each item and each section carry their own age. No call to the harness.
+    Item age is time since change; section age determines data freshness.
     """
     if not isinstance(now,datetime) or now.tzinfo is None or now.utcoffset().total_seconds()!=0:
         raise ValueError('aware UTC clock required')
@@ -90,9 +90,9 @@ def render(view):
             out.append('<p>'+label+'. Snapshot age: '+str(s['age_s'])+' seconds.</p>')
             if not s['items']: out.append('<p>No items in this snapshot.</p>')
             else:
-                out.append('<table><caption>'+name.title()+' status</caption><thead><tr><th scope="col">ID</th><th scope="col">Status</th><th scope="col">Age</th></tr></thead><tbody>')
+                out.append('<table><caption>'+name.title()+' status</caption><thead><tr><th scope="col">ID</th><th scope="col">Status</th><th scope="col">Last changed</th></tr></thead><tbody>')
                 for item in s['items']:
-                    out.append('<tr><td>'+escape(item['id'])+'</td><td>'+escape(item['status'])+'</td><td>'+str(item['age_s'])+' seconds'+(' — stale' if item['stale'] else '')+'</td></tr>')
+                    out.append('<tr><td>'+escape(item['id'])+'</td><td>'+escape(item['status'])+'</td><td>'+str(item['age_s'])+' seconds ago</td></tr>')
                 out.append('</tbody></table>')
         out.append('</section>')
     return ''.join(out)+'</main></body></html>'
@@ -102,10 +102,11 @@ def respond(method,path,snapshot,*,now):
     """Pure response formatter, NOT a network listener or auth boundary.
     All write methods and unknown paths refuse before reading snapshot or clock.
     """
-    headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',
+    headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',
              'Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}
     if method!='GET': return 405,{**headers,'Allow':'GET','Content-Type':'text/plain; charset=utf-8'},'Read-only surface'
     if path not in ('/','/api/status'): return 404,{**headers,'Content-Type':'text/plain; charset=utf-8'},'Not found'
     view=project(snapshot,now=now)
     if path=='/api/status': return 200,{**headers,'Content-Type':'application/json'},json.dumps(view,sort_keys=True,allow_nan=False)
     return 200,{**headers,'Content-Type':'text/html; charset=utf-8'},render(view)
+

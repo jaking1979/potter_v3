@@ -18,7 +18,13 @@ class Tests(unittest.TestCase):
         for age,stale in ((300,False),(301,True)):
             self.assertEqual(project(fixture(age),now=NOW)['sections']['tasks']['stale'],stale)
         s=fixture();s['tasks']['items'][0]['updated_at']=stamp(301);v=project(s,now=NOW)['sections']['tasks']
-        self.assertFalse(v['stale']);self.assertTrue(v['items'][0]['stale'])
+        self.assertFalse(v['stale']);self.assertEqual(v['items'][0]['age_s'],301)
+        self.assertNotIn('stale',v['items'][0])
+        html=render(project(s,now=NOW))
+        self.assertIn('Last changed',html);self.assertIn('301 seconds ago',html)
+        self.assertNotIn('301 seconds — stale',html)
+        s['tasks']['observed_at']=stamp(301);s['tasks']['items'][0]['updated_at']=stamp(301)
+        self.assertTrue(project(s,now=NOW)['sections']['tasks']['stale'])
     def test_malformed_missing_fail_closed(self):
         changes=(lambda s:s.pop('tasks'),lambda s:s['tasks'].update(observed_at=stamp(-1)),
           lambda s:s['tasks']['items'][0].update(status='<script>secret</script>'),
@@ -41,6 +47,8 @@ class Tests(unittest.TestCase):
     def test_response_headers(self):
         code,h,b=respond('GET','/api/status',fixture(),now=NOW)
         self.assertEqual(code,200);self.assertEqual(h['Cache-Control'],'no-store')
+        for method,path in (('GET','/'),('GET','/api/status'),('GET','/missing'),('POST','/')):
+            self.assertEqual(respond(method,path,fixture(),now=NOW)[1]['Referrer-Policy'],'no-referrer')
         self.assertIn("form-action 'none'",h['Content-Security-Policy']);self.assertEqual(json.loads(b)['mode'],'offline_read_only')
     def test_accessible_semantics_no_actions(self):
         class Parser(HTMLParser):
@@ -63,3 +71,4 @@ class Tests(unittest.TestCase):
         v=project(fixture(),now=NOW);v['sections']['tasks']['items'][0]['status']='<script>CANARY_SECRET</script>'
         self.assertNotIn('CANARY_SECRET',render(v))
 if __name__=='__main__':unittest.main()
+
