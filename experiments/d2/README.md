@@ -18,3 +18,5 @@ Local reconstructed candidate: 13 tests passed, including original four plus pin
 
 Current local suite: 20 synthetic tests passed, adding definition name/description/schema drift, unknown/deferred omission, observed-order/whitespace determinism, forged admission annotations, malformed/duplicate observations and source/registry drift refusal. This is component evidence only, with no CI, canonical-source, runtime, T36 benchmark or OS-isolation claim.
 
+
+Review follow-up: manifest and observation JSON parsing both reject non-finite constants and numeric literals that overflow to infinity. The manifest tests simulate a bad synthetic pin solely to exercise parsing behind the digest check. These strict parsers do not authenticate the synthetic source or make the generated exposure a runtime authorization. Real MCP fields such as title, annotations, and outputSchema currently cause refusal; real integration needs an agreed canonical schema that pins all security-relevant fields.

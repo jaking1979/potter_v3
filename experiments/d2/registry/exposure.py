@@ -3,15 +3,12 @@ from hashlib import sha256
 import json
 import re
 
-from .bound import generate_bound, verify_bound, _unique_object, MAX_MANIFEST_BYTES
+from .bound import (generate_bound, verify_bound, _unique_object, _reject_constant,
+                    _finite_float, MAX_MANIFEST_BYTES)
 from .deferred import RegistryError
 from .synthetic_authority import EXPECTED_VERSION, TOOL_DEFINITION_PINS
 
 _NAME = re.compile(r'^[a-z][a-z0-9_.-]{0,127}$')
-
-
-def _reject_constant(value):
-    raise ValueError('non-finite JSON constant')
 
 
 def definition_hash(definition):
@@ -46,7 +43,7 @@ def generate_exposure(manifest_bytes, registry_bytes, observed_bytes):
         raise RegistryError('invalid observed definitions')
     try:
         observed = json.loads(observed_bytes, object_pairs_hook=_unique_object,
-                              parse_constant=_reject_constant)
+                              parse_constant=_reject_constant, parse_float=_finite_float)
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise RegistryError('invalid observed JSON') from exc
     if type(observed) is not list:

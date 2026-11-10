@@ -126,6 +126,13 @@ class BoundRegistryTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assert_invalid_trusted_source(raw)
 
+    def test_repinned_nonfinite_numbers_fail_during_json_parsing(self):
+        for token in (b'NaN', b'Infinity', b'-Infinity', b'1e400', b'-1e400'):
+            raw = self.source.rstrip()[:-1] + b',"extra":' + token + b'}'
+            with self.subTest(token=token), patch.object(bound, 'EXPECTED_DIGEST', sha256(raw).hexdigest()):
+                with self.assertRaisesRegex(RegistryError, 'invalid manifest JSON'):
+                    bound.generate_bound(raw)
+
 
 if __name__ == '__main__':
     unittest.main()

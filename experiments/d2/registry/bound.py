@@ -2,6 +2,7 @@
 from hashlib import sha256
 from hmac import compare_digest
 import json
+import math
 
 from .deferred import RegistryError, generate, serialize, authorize
 from .synthetic_authority import (
@@ -10,6 +11,17 @@ from .synthetic_authority import (
 )
 
 MAX_MANIFEST_BYTES = 65536
+
+
+def _reject_constant(value):
+    raise ValueError('non-finite JSON constant')
+
+
+def _finite_float(value):
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError('non-finite JSON number')
+    return result
 
 
 def _unique_object(pairs):
@@ -32,7 +44,8 @@ def generate_bound(manifest_bytes):
     if not compare_digest(sha256(manifest_bytes).hexdigest(), EXPECTED_DIGEST):
         raise RegistryError('manifest authority mismatch')
     try:
-        manifest = json.loads(manifest_bytes, object_pairs_hook=_unique_object)
+        manifest = json.loads(manifest_bytes, object_pairs_hook=_unique_object,
+                              parse_constant=_reject_constant, parse_float=_finite_float)
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise RegistryError('invalid manifest JSON') from exc
     if type(manifest) is not dict or set(manifest) != {'schema', 'version', 'classes', 'capabilities'}:

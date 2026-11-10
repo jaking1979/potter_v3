@@ -88,6 +88,12 @@ class ExposureTests(unittest.TestCase):
             with self.assertRaises(RegistryError):
                 definition_hash(definition)
 
+    def test_nonfinite_observation_numbers_fail_during_parsing(self):
+        for token in (b'NaN', b'Infinity', b'-Infinity', b'1e400', b'-1e400'):
+            raw = b'[{"name":"a","description":"x","input_schema":{"x":' + token + b'}}]'
+            with self.subTest(token=token), self.assertRaisesRegex(RegistryError, 'invalid observed JSON'):
+                generate_exposure(self.manifest, self.registry, raw)
+
 
 if __name__ == '__main__':
     unittest.main()
