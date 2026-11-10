@@ -211,6 +211,10 @@ class MemoryStore:
         with self._transaction():
             old = self._db.execute('SELECT * FROM request WHERE request_id=?', (request_id,)).fetchone()
             if old:
+                # A forgotten request ID remains burned, but its old payload
+                # cannot be tested by retrying guesses against this endpoint.
+                if old['payload'] == '':
+                    raise Conflict('request ID unavailable')
                 if old['payload'] != packed:
                     raise Conflict('idempotency key reused with different payload')
                 return self._get(old['item_id'])
@@ -315,9 +319,14 @@ class MemoryStore:
                 raise Conflict('stale item')
             # Erase every local revision and staged claim under this fact key,
             # not just the selected current row. External views and external
-            # backups remain outside this isolated experiment.
+            # backups remain outside this isolated experiment. SQLite secure
+            # deletion is not a guarantee about storage snapshots, backups,
+            # journals, external copies, or earlier materialized views.
             rows = self._db.execute("SELECT id,version FROM item WHERE key=? AND status!='forgotten'", (item.key,)).fetchall()
-            self._db.execute("UPDATE item SET status='forgotten', value='', version=version+1 WHERE key=? AND status!='forgotten'", (item.key,))
+            for row in rows:
+                # Burn every original request ID, without retaining its hash.
+                self._db.execute("UPDATE request SET payload='' WHERE item_id=?", (row['id'],))
+            self._db.execute("UPDATE item SET status='forgotten', key='', value='', source_ref='', version=version+1 WHERE key=? AND status!='forgotten'", (item.key,))
             for row in rows:
                 self._audit('forget', row['id'], row['version'] + 1)
 
