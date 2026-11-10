@@ -1128,6 +1128,144 @@ class TaskAuthority(Base):
         self.assertEqual(self.w.issuer.get(aid).status, "voided")
 
 
+# ============================================================ crash safety + honest stop boundary (Dolores, #28 @ c8c8422)
+
+class CommandCrashSafety(Base):
+    """A verified command is never lost to a crash, and never runs twice."""
+
+    def reopen(self):
+        """Simulated restart: fresh objects (auth, notifier, issuer, router) on the same file."""
+        w2 = World(self._tmp.name)
+        w2.now = self.w.now
+        w2.live = self.w.live
+        return w2
+
+    def test_crash_after_auth_before_stop_then_redelivery_stops(self):
+        msg = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)      # recorded pending ... crash
+        self.assertFalse(self.w.notifier.kill.is_set())
+        w2 = self.reopen()
+        res = w2.router.handle(msg)                            # adapter redelivers
+        self.assertEqual(res.outcome, "stopped")
+        self.assertTrue(w2.notifier.kill.is_set())
+        self.assertEqual(w2.router.handle(msg).reason, "replayed")   # processed: once only
+
+    def test_crash_after_stop_commits_before_reply_is_not_rerun(self):
+        msg = self.w.tg_msg("/stop")
+        real_stop = self.w.notifier.stop
+
+        def stop_then_crash(sender, now=None):
+            real_stop(sender, now)
+            raise Crash()                                      # dies before replying
+        self.w.notifier.stop = stop_then_crash
+        with self.assertRaises(Crash):
+            self.w.router.handle(msg)
+        w2 = self.reopen()
+        self.assertTrue(w2.notifier.kill.is_set())
+        self.assertEqual(w2.router.handle(msg).reason, "replayed")
+        w2.notifier.run()
+        self.assertEqual([m.body["kind"] for m in w2.tg.delivered], ["stop_ack"])   # one reply
+
+    def test_crash_after_auth_before_approve_then_redelivery_approves_once(self):
+        tid = self.w.waiting_task()
+        action = mail_action(tid)
+        aid = self.w.request(action)
+        msg = self.w.tg_msg(f"/approve {aid}")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)      # crash before decide
+        w2 = self.reopen()
+        res = w2.router.handle(msg)
+        self.assertEqual(res.outcome, "approved")
+        self.assertEqual(w2.c1(action, res.detail).outcome, ALLOW)
+        again = w2.router.handle(msg)
+        self.assertEqual((again.outcome, again.reason), ("ignored", "replayed"))
+
+    def test_crash_after_approve_commits_is_not_rerun(self):
+        tid = self.w.waiting_task()
+        aid = self.w.request(mail_action(tid))
+        msg = self.w.tg_msg(f"/approve {aid}")
+        real = self.w.issuer.decide
+
+        def decide_then_crash(*a, **kw):
+            real(*a, **kw)
+            raise Crash()
+        self.w.issuer.decide = decide_then_crash
+        with self.assertRaises(Crash):
+            self.w.router.handle(msg)
+        w2 = self.reopen()
+        with w2.db.read() as c:
+            nonce = c.execute("SELECT nonce FROM approval_requests").fetchone()[0]
+        self.assertEqual(w2.router.handle(msg).reason, "replayed")
+        with w2.db.read() as c:   # still exactly one decision, same nonce
+            self.assertEqual(c.execute("SELECT nonce FROM approval_requests").fetchone()[0], nonce)
+
+    def test_duplicate_pending_deliveries_execute_once(self):
+        msg = self.w.tg_msg("/stop")
+        first = self.w.auth.authenticate(msg).sender            # pending, voucher 1
+        self.assertEqual(self.w.router.handle(msg).outcome, "stopped")   # resumes, voucher 2
+        from notifier.auth import AlreadyProcessed
+        with self.assertRaises(AlreadyProcessed):
+            self.w.notifier.stop(first)                         # loser rolls back
+        self.w.notifier.run()
+        self.assertEqual([m.body["kind"] for m in self.w.tg.delivered], ["stop_ack"])
+
+    def test_refused_command_is_marked_processed(self):
+        msg = self.w.tg_msg("/approve appr-nonexistent")
+        self.assertEqual(self.w.router.handle(msg).reason, "unknown_approval")
+        self.assertEqual(self.w.router.handle(msg).reason, "replayed")
+        with self.w.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM inbound_seen WHERE status='pending'"
+                                       ).fetchone()[0], 0)
+
+
+class StopBoundaryAfterFinalRecheck(Base):
+    """The documented boundary: past the final recheck may deliver once, reported unconfirmed."""
+
+    def setUp(self):
+        super().setUp()
+        import threading
+        self.threading = threading
+        self.paused, self.resume = threading.Event(), threading.Event()
+
+    def _pause_once(self, msg):
+        if msg.notification_id == "job:digest:d1" and not self.paused.is_set():
+            self.paused.set()
+            self.assertTrue(self.resume.wait(10))
+
+    def _start(self):
+        t = self.threading.Thread(target=self.w.notifier.run)
+        t.start()
+        self.assertTrue(self.paused.wait(10))
+        return t
+
+    def test_after_final_recheck_aged_sender_is_reported_and_may_deliver_once(self):
+        self.w.notifier._hook_after_recheck = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        worker = self._start()
+        self.w.now = T + 21                                    # past the 20 s dispatch timeout
+        res = self.w.router.handle(self.w.tg_msg("/stop"))
+        self.assertEqual(res.detail.unconfirmed_in_flight, ("job:digest:d1:telegram",))
+        self.assertEqual(res.detail.expired_in_flight, ("job:digest:d1:telegram",))
+        self.assertFalse(res.detail.all_clear)
+        self.resume.set()
+        worker.join(10)
+        self.assertEqual(self.w.tg.delivered_notifications().count("job:digest:d1"), 1)
+
+    def test_after_final_recheck_bounded_wait_expiry_reports_unconfirmed(self):
+        self.w.notifier = quick = self.w.make_notifier(stop_wait_s=0.1)
+        self.w.router = CommandRouter(auth=self.w.auth, notifier=quick, issuer=self.w.issuer,
+                                      live_action=lambda aid, tid: None, clock=lambda: self.w.now)
+        quick._hook_after_recheck = self._pause_once
+        self.w.job_notify("digest", "d1", "x")
+        worker = self._start()
+        res = self.w.router.handle(self.w.tg_msg("/stop"))
+        self.assertEqual(res.detail.unconfirmed_in_flight, ("job:digest:d1:telegram",))
+        self.assertEqual(res.detail.expired_in_flight, ())
+        self.assertFalse(res.detail.all_clear)
+        self.resume.set()
+        worker.join(10)
+        self.assertEqual(self.w.tg.delivered_notifications().count("job:digest:d1"), 1)
+
+
 # ============================================================ long work (item 5)
 
 class LongWorkUpdates(Base):

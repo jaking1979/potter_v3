@@ -36,12 +36,16 @@ the caller's transaction, through the C3 outbox. Nothing else holds a channel.
   Immediately before ``channel.send`` the sender re-checks, in its own
   transaction, that its gate row still exists, that it is younger than the
   dispatch timeout and that the kill flag is clear; otherwise it removes its
-  row and aborts. So a sender paused past the gate cannot deliver after a
-  /stop, and an expired gate cannot deliver at all. ``stop()`` never gives an
-  all-clear from age: it waits (up to ``stop_wait_s``) for unexpired rows,
-  and returns EVERY row still present in ``StopReport.unconfirmed_in_flight``
-  (expired ones also in ``expired_in_flight``: those senders must abort at
-  their recheck). An empty ``unconfirmed_in_flight`` is the only all-clear.
+  row and aborts.
+
+  The contract (honest: Telegram/email cannot be fenced at the provider):
+  no send starts its final recheck after ``stop()`` commits; a sender
+  already past its final recheck may still deliver once; ``stop()`` returns
+  every such sender as unconfirmed (and expired if aged). ``stop()`` waits
+  (up to ``stop_wait_s``) for unexpired rows, then returns EVERY row still
+  present in ``StopReport.unconfirmed_in_flight`` - age never removes one;
+  rows past the dispatch timeout are also listed in ``expired_in_flight``.
+  An empty ``unconfirmed_in_flight`` is the only all-clear.
 * Long work: ``LongWork`` sends one acknowledgement after 30 s, an update only
   when the state changes, and a final message with the receipt link.
 
@@ -64,7 +68,7 @@ from runtime import (ABANDONED_UNKNOWN, ROUTINE, SUPPRESSED, URGENT, Database, O
 from runtime.db import as_database
 
 from . import _schema
-from .auth import AuthenticatedSender, ChannelAuth
+from .auth import AlreadyProcessed, AuthenticatedSender, ChannelAuth
 from .channels import EMAIL, TELEGRAM, Channel
 from .kill import KillFlag
 from .traces import Sink, emit_trace
@@ -128,7 +132,7 @@ class StopReport:
     already_stopped: bool
     reply_notification_id: str
     unconfirmed_in_flight: tuple[str, ...] = ()   # every unreturned send, never filtered by age
-    expired_in_flight: tuple[str, ...] = ()       # subset past dispatch timeout: must abort
+    expired_in_flight: tuple[str, ...] = ()       # subset past dispatch timeout (still unconfirmed)
 
     @property
     def all_clear(self) -> bool:
@@ -172,6 +176,7 @@ class Notifier:
         # Test seams for the /stop race (deterministic pauses); None in production.
         self._hook_before_gate: Callable[[QueuedMessage], None] | None = None
         self._hook_after_gate: Callable[[QueuedMessage], None] | None = None
+        self._hook_after_recheck: Callable[[QueuedMessage], None] | None = None
         for ch in (primary, fallback):
             if auth.address(recipient, ch) is None:
                 raise ValueError(f"no {ch} address for {recipient}")
@@ -265,6 +270,8 @@ class Notifier:
             if self._hook_after_gate is not None:
                 self._hook_after_gate(msg)
             self._recheck(msg)                   # last word before the channel call
+            if self._hook_after_recheck is not None:
+                self._hook_after_recheck(msg)
             try:
                 result = channel.send(msg)
             except BaseException:
@@ -403,6 +410,11 @@ class Notifier:
             raise PermissionError("voucher was not minted for /stop")
         now = self._now(now)
         with self.db.tx() as c:
+            # Mark the /stop update processed in the SAME transaction as its
+            # effect: a crash before commit leaves it pending (redelivery
+            # resumes it); a duplicate delivery rolls back here.
+            if not self._auth.complete(c, sender):
+                raise AlreadyProcessed("this /stop was already executed")
             first = self.kill.set(c, by=sender.principal, at=now)
             msgs = self._sweep_tx(c, now)
             appr = [r[0] for r in c.execute(
@@ -426,8 +438,10 @@ class Notifier:
     def _await_in_flight(self) -> tuple[list[str], list[str]]:
         """Wait (bounded by ``stop_wait_s``) for unexpired sends past the gate
         to return, then report EVERY row still present - age never removes an
-        entry from the report. Expired rows are not waited for: their senders
-        cannot pass the recheck. The caller's own in-flight send (``/stop``
+        entry from the report. Expired rows are not waited for (a sender that
+        has not yet reached its final recheck will abort there), but they stay
+        in the report: one already past its final recheck may still deliver
+        once. The caller's own in-flight send (``/stop``
         handled from inside a send on this thread) is excluded.
 
         Returns (unconfirmed, expired). When the wait expires the unconfirmed
