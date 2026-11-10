@@ -96,6 +96,13 @@ class IngressStore:
                 raise
             c.execute("COMMIT")
 
+    def seen_content(self, dedupe_key: str) -> str | None:
+        """Content digest already recorded for this dedupe key, if any."""
+        with self._conn() as c:
+            row = c.execute("SELECT content_digest FROM ingress_seen WHERE dedupe_key=?",
+                            (dedupe_key,)).fetchone()
+        return row[0] if row else None
+
     def lookup_event(self, event_id: str) -> str | None:
         with self._conn() as c:
             row = c.execute("SELECT event_digest FROM ingress_seen WHERE event_id=? "

@@ -42,11 +42,13 @@ A mixed event (Josh's command plus a forward or an attachment) keeps `principal=
   Any failure, including a missing verifier or one that raises, makes the text `external_sender` with a fixed `trust_reason` (`dkim_failed`, `display_name_spoof`, `reply_to_mismatch`, …). Email from other people is accepted as untrusted (inbox triage), not rejected.
 - **Webhooks.** Each source needs a signature verifier. Unknown sources and unsigned deliveries are rejected and not recorded.
 
-**Transport envelope (E1 `c8c8422`).** Ingress is the trusted channel adapter. Once the platform's own proof passes (the Telegram transport verifier, or the email header and DKIM/attestation checks), it signs the exact update with that channel's injected `TransportSigner` and hands the envelope to `ChannelAuth.authenticate`. The signature covers channel, sender, the full message text (for email, subject plus plain body), `raw_ref`, `update_id` and time. `ChannelAuth` checks the MAC, freshness (`max_skew_s`) and envelope replay.
+**Transport envelope (E1 `c8c8422`, `f14e564`).** Ingress is the trusted channel adapter. Once the platform's own proof passes, it signs the update with that channel's injected `TransportSigner` and hands the envelope to `ChannelAuth.authenticate`, which checks the MAC, freshness and replay. With no signer for a channel, or a mismatched one, nothing on that channel is authenticated. Ingress never builds an `InboundMessage` itself (`test_73`).
 
-- With no signer for a channel, or a signer whose channel doesn't match, nothing on that channel is authenticated.
-- Ingress never builds an `InboundMessage` itself; `test_73` checks the source for this.
-- `update_id` is `e3:<key digest>:<nonce>`, unique per attempt. Ingress handles platform re-delivery itself: its dedupe is content-bound and atomic with the durable inbox. A deterministic ID would turn a rolled-back attempt into a permanent `replayed` rejection of the sender's retry (`test_72`).
+The handoff has a bounded lifetime and holds no text:
+- **A digest, not the body.** The envelope's text is `bind_text(text)` = `e3-sha256:<sha256 of the exact text>` (for email, subject plus plain body). The MAC still binds this exact message, but E1's in-memory voucher and its durable `inbound_seen` row only ever hold the digest. `e3-sha256:` is not an E1 command word, so an E3 voucher can't drive `/stop`, `/ack` or `/approve` (`test_83`).
+- **Vouchers are retired immediately.** Each voucher is checked, then retired with `consume()` on every path (accepted, untrusted, rejected or exception), so nothing stays in `ChannelAuth`'s minted table (`test_79`, `test_82`).
+- **One replay row per platform message.** `update_id` is `e3:<key digest>`, so retries add no rows. Re-deliveries that E3 has already decided are answered by E3's dedupe *before* any E1 handoff (`test_80`). A rolled-back attempt leaves the row `pending`, and E1 (`f14e564`) resumes it on retry (`test_72`, `test_82`). Once E3's decision commits, `finish()` marks it `processed`.
+- **Open (E1-owned):** E1 has no retention policy or prune API for `processed` `inbound_seen` rows. They hold only a digest, one per platform message, and pruning them is E1's decision.
 
 **Vouchers.** For both Telegram and email, a principal counts only if `ChannelAuth.vouches(sender)` confirms that this `ChannelAuth` minted that exact `AuthenticatedSender` for this channel **and this exact message text**. A hand-built, copied, relabelled or other-text voucher yields no principal: the Telegram message is rejected, and the email is `external_sender` with `unvouched_sender`.
 
@@ -54,6 +56,7 @@ A mixed event (Josh's command plus a forward or an attachment) keeps `principal=
 
 - Provenance is computed from authentication results only. No text is parsed for provenance, approval or policy fields. `InboundEvent` has no approval field, and ingress exposes no policy API.
 - Injection indicators (`claims_approval`, `addresses_policy`, `instruction_like`, `payment_request`) are computed over untrusted segments and set as `flags`. They are informational and can never raise trust.
+- MIME boundaries are decided before descending: any `message/*` part (an attached or forwarded email, inline or not), and any part with `Content-Disposition: attachment` or a filename (multipart included), is kept whole as one opaque attachment and never parsed. An attached email's body can therefore never become the outer sender's text (`test_74`–`test_78`).
 - Attachments go to the injected `AttachmentStore`. The event carries `AttachmentRef(ref, sha256, size, media_type, filename)`; filename and media type are sender-supplied.
 - Limits (`IngressLimits`): raw size, total text, attachment count and per-attachment size. Exceeding any limit rejects the message.
 - `repr` of events, segments and raw inputs excludes text. The dedupe log keeps no text, sender reference or header. The durable inbox (below) holds an accepted event's text locally only until it is acked or expires.

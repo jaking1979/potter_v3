@@ -8,8 +8,10 @@ The untrusted-source boundary (T11/T12; T19 PASS 2 items 2 and 4):
   enabled principal. Everything else is an untrusted kind (``events.py``).
 * E1 handoff: ingress is the trusted channel adapter. After the platform proof
   passes, it signs the exact update with the channel's ``TransportSigner`` and
-  ``ChannelAuth`` verifies MAC, freshness and envelope replay; the resulting
-  voucher must match this channel and this message text. Ingress never
+  ``ChannelAuth`` verifies MAC, freshness and replay; the resulting voucher
+  must match this channel and this message. The envelope carries a SHA-256
+  commitment to the text (never the body), the voucher is retired at once,
+  and the E1 row is marked processed after E3 commits. Ingress never
   constructs an ``InboundMessage``.
 * Telegram: the transport verifier must confirm the update came from Telegram
   (webhook secret token, checked by the injected verifier). The user id must
@@ -156,6 +158,13 @@ class _Draft:
     segments: tuple[Segment, ...]
     attachments: tuple[RawAttachment, ...]
     trust_reason: str
+    voucher: object = None      # E1 voucher (already retired) to finish() after commit
+
+
+def bind_text(text: str) -> str:
+    """What the E1 envelope carries for ``text``: a SHA-256 commitment, so the
+    MAC binds the exact message while E1 never stores or holds the body."""
+    return "e3-sha256:" + sha256(text.encode("utf-8", "surrogatepass"))
 
 
 class IngressGateway:
@@ -288,9 +297,11 @@ class IngressGateway:
             raise _Reject("malformed", record=False)
         if u.from_is_bot:
             raise _Reject("bot_sender", record=True).with_draft(draft)
-        auth = self._authenticate(TELEGRAM, str(u.from_user_id), u.text, key,
-                                  raw_ref=u.delivery_ref)
-        if self._vouched_principal(auth, TELEGRAM, u.text) is None:
+        if self._store.seen_content(sha256(key.encode())) == digest:
+            return draft      # re-delivery: _finalize answers duplicate; no new E1 handoff
+        principal, draft.voucher, _ = self._authenticate(
+            TELEGRAM, str(u.from_user_id), u.text, key, raw_ref=u.delivery_ref)
+        if principal is None:
             # A stranger DMing the bot does not drive the runner (E1: ignored + logged).
             raise _Reject("sender_not_allowlisted", record=True).with_draft(draft)
         if u.via_bot:
@@ -305,8 +316,7 @@ class IngressGateway:
         else:
             segs = (Segment(own, u.text),) if u.text else ()
         draft.segments = segs
-        draft.principal = (self._vouched_principal(auth, TELEGRAM, u.text)
-                           if own == PRINCIPAL_DIRECT else None)
+        draft.principal = principal if own == PRINCIPAL_DIRECT else None
         draft.trust_reason = trust
         return draft
 
@@ -330,13 +340,20 @@ class IngressGateway:
         subject = str(msg.get("Subject", "") or "")
         # The envelope binds the whole message text (subject + plain body), so
         # the voucher is for this exact message, not a blank command.
-        trust, addr, principal = self._email_trust(msg, raw, mid, f"{subject}\n{text}")
+        # Dedupe namespace: "verified:" only for a fully authenticated sender,
+        # so an unauthenticated sender can never squat or pre-empt that key.
+        verified_key = f"email|verified:{sha256(self._from_addr(msg).encode())}|{mid}"
+        if self._store.seen_content(sha256(verified_key.encode())) == sha256(raw):
+            return _Draft(EMAIL, verified_key, mid, sha256(raw), None, (), (), "ok")
+        trust, addr, principal, voucher = self._email_trust(msg, raw, mid,
+                                                            f"{subject}\n{text}")
         own = PRINCIPAL_DIRECT if trust == "ok" else EXTERNAL_SENDER
-        ns = principal if own == PRINCIPAL_DIRECT else f"untrusted:{sha256(addr.encode())}"
-        key = f"email|{ns}|{mid}"
+        key = (verified_key if own == PRINCIPAL_DIRECT
+               else f"email|untrusted:{sha256(addr.encode())}|{mid}")
 
         # -- content ---------------------------------------------------------------
         draft = _Draft(EMAIL, key, mid, sha256(raw), None, (), tuple(atts), trust)
+        draft.voucher = voucher
         self._check_sizes(subject + text, draft.attachments, draft)
         fwd = is_forward_subject(subject)
         segs: list[Segment] = []
@@ -349,114 +366,174 @@ class IngressGateway:
         return draft
 
     def _email_trust(self, msg, raw: bytes, mid: str,
-                     bound_text: str) -> tuple[str, str, str | None]:
+                     bound_text: str) -> tuple[str, str, str | None, object]:
         froms = msg.get_all("From") or []
         addr = ""
         try:
             if len(froms) != 1 or len(froms[0].addresses) != 1:
-                return "multiple_from", str(froms[0]) if froms else "", None
+                return "multiple_from", str(froms[0]) if froms else "", None, None
             hdr = froms[0]
             a = hdr.addresses[0]
             addr = (a.addr_spec or "").lower()
             if hdr.defects or not a.username or not a.domain:
-                return "header_defect", addr, None
+                return "header_defect", addr, None, None
             if "@" in (a.display_name or ""):
-                return "display_name_spoof", addr, None
+                return "display_name_spoof", addr, None, None
             for name, code in (("Reply-To", "reply_to_mismatch"), ("Sender", "sender_mismatch")):
                 hs = msg.get_all(name) or []
                 for h in hs:
                     if h.defects or any((x.addr_spec or "").lower() != addr
                                         for x in h.addresses) or not h.addresses:
-                        return code, addr, None
+                        return code, addr, None, None
         except Exception:
-            return "header_defect", addr, None
+            return "header_defect", addr, None, None
         domain = addr.rsplit("@", 1)[-1]
         if self._email is None:
-            return "dkim_missing", addr, None
+            return "dkim_missing", addr, None, None
         try:
             v = self._email(raw)
             if not isinstance(v, EmailAuthVerdict):
-                return "verifier_error", addr, None
+                return "verifier_error", addr, None, None
         except Exception:
-            return "verifier_error", addr, None
+            return "verifier_error", addr, None, None
         if v.dkim == "none":
-            return "dkim_missing", addr, None
+            return "dkim_missing", addr, None, None
         if v.dkim != "pass":
-            return "dkim_failed", addr, None
+            return "dkim_failed", addr, None, None
         if not isinstance(v.dkim_domain, str) or v.dkim_domain.lower() != domain:
-            return "dkim_unaligned", addr, None
+            return "dkim_unaligned", addr, None, None
         if v.spf in ("fail", "softfail"):
-            return "spf_failed", addr, None
+            return "spf_failed", addr, None, None
         if domain not in self._email_domains:
-            return "email_domain_not_attested", addr, None
+            return "email_domain_not_attested", addr, None, None
         if v.mailbox_bound is not True:
-            return "mailbox_unbound", addr, None
-        auth = self._authenticate(EMAIL, addr, bound_text, f"email|{mid}", raw_ref=mid)
-        principal = self._vouched_principal(auth, EMAIL, bound_text)
+            return "mailbox_unbound", addr, None, None
+        principal, voucher, reason = self._authenticate(
+            EMAIL, addr, bound_text, f"email|{sha256(addr.encode())}|{mid}", raw_ref=mid)
         if principal is None:
-            reason = getattr(auth, "reason", None)
-            return (reason if reason in REASONS and reason != "ok" else "unvouched_sender"), \
-                addr, None
-        return "ok", addr, principal
+            return reason, addr, None, voucher
+        return "ok", addr, principal, voucher
 
     def _authenticate(self, channel: str, sender_ref: str, text: str, key: str, *,
-                      raw_ref: str | None) -> object:
-        """Hand the platform-verified update to E1 as a signed envelope.
+                      raw_ref: str | None) -> tuple[str | None, object, str]:
+        """Hand the platform-verified update to E1 as a signed envelope and
+        return ``(principal or None, voucher or None, reason)``. Bounded lifetime:
 
-        ``update_id`` is unique per attempt (``e3:<key digest>:<nonce>``):
-        platform re-delivery is ingress's job (content-bound dedupe, atomic
-        with the durable inbox), while E1's replay table guards this envelope
-        itself. A deterministic id would turn a rolled-back attempt (trace or
-        store failure after authentication) into a permanent ``replayed``
-        rejection of the sender's retry - a lost command."""
+        * The envelope carries ``bind_text(text)`` (a SHA-256 commitment to the
+          exact text), not the text: the MAC still binds this exact message,
+          but neither E1's in-memory voucher nor its durable ``inbound_seen``
+          row ever holds the body. ``e3-sha256:`` is not an E1 command word,
+          so an E3 voucher cannot drive ``/stop`` / ``/ack`` / ``/approve``.
+        * The voucher is checked and then retired (``consume``) before this
+          returns, on every path: nothing stays in ``ChannelAuth._minted``.
+        * ``update_id`` is deterministic per platform message
+          (``e3:<key digest>``), so retries never add rows. A rolled-back
+          attempt leaves the row ``pending`` and E1 resumes it on retry (E1
+          f14e564); ``_finalize`` marks it ``processed`` (``finish``) once
+          E3's decision commits."""
         signer = self._signers.get(channel)
         if signer is None:
-            return None
-        env = signer.envelope(sender_ref, text,
-                              update_id=f"e3:{sha256(key.encode())[:32]}:{uuid.uuid4().hex}",
+            return None, None, "unvouched_sender"
+        bound = bind_text(text)
+        env = signer.envelope(sender_ref, bound, update_id=f"e3:{sha256(key.encode())[:32]}",
                               sent_at=float(self._clock()), raw_ref=raw_ref)
-        return self._auth.authenticate(env)
+        auth = self._auth.authenticate(env)
+        sender = getattr(auth, "sender", None)
+        try:
+            principal = self._vouched_principal(auth, channel, text)
+            reason = getattr(auth, "reason", None)
+            if principal is not None:
+                reason = "ok"
+            elif reason not in REASONS or reason == "ok":
+                reason = "unvouched_sender"
+            return principal, sender, reason
+        finally:
+            if sender is not None:
+                try:
+                    self._auth.consume(sender)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _from_addr(msg) -> str:
+        try:
+            froms = msg.get_all("From") or []
+            if len(froms) == 1 and len(froms[0].addresses) == 1:
+                return (froms[0].addresses[0].addr_spec or "").lower()
+        except Exception:
+            pass
+        return ""
 
     def _vouched_principal(self, auth: object, channel: str, text: str) -> str | None:
         """The principal only if E1 ``ChannelAuth`` itself minted this exact
-        voucher for this channel and this exact message text (``vouches``). A
-        hand-constructed or copied ``AuthenticatedSender`` never yields
-        ``principal_direct``."""
+        voucher for this channel and this exact message (its text must be
+        ``bind_text(text)``). A hand-constructed or copied
+        ``AuthenticatedSender`` never yields ``principal_direct``."""
         try:
             sender = getattr(auth, "sender", None)
             if sender is None or not self._auth.vouches(sender):
                 return None
             if sender.channel != channel or not isinstance(sender.principal, str):
                 return None
-            if sender.text != text:
+            if sender.text != bind_text(text):
                 return None
             return sender.principal or None
         except Exception:
             return None
 
+    def _release(self, voucher: object) -> None:
+        """Mark E1's (digest-only) replay row processed once E3 has committed."""
+        if voucher is None:
+            return
+        try:
+            self._auth.finish(voucher)
+        except Exception:
+            pass   # stays pending; E3 dedupe answers any redelivery first
+
     @staticmethod
     def _email_parts(msg) -> tuple[str, list[RawAttachment]]:
+        """Inline ``text/plain`` of the outer message only. Attachment and
+        message boundaries are decided BEFORE descending: any ``message/*``
+        part (an attached or forwarded email, inline or not), and any part
+        with ``Content-Disposition: attachment`` or a filename (including a
+        multipart one), is kept whole as one opaque attachment and never
+        parsed - so an attached email's body can never become the outer
+        sender's text, nor vanish from provenance."""
         texts: list[str] = []
         htmls: list[RawAttachment] = []
         atts: list[RawAttachment] = []
-        for part in msg.walk():
-            if part.is_multipart():
-                continue
-            ctype = part.get_content_type()
-            disp = part.get_content_disposition()
-            fname = part.get_filename()
-            if disp != "attachment" and fname is None and ctype == "text/plain":
-                try:
-                    texts.append(part.get_content())
-                    continue
-                except Exception:
-                    pass  # undecodable -> keep as an opaque attachment
-            data = part.get_payload(decode=True)
+
+        def opaque(part) -> RawAttachment:
+            data = None
+            if not part.is_multipart() and part.get_content_maintype() != "message":
+                data = part.get_payload(decode=True)
             if data is None:
                 data = part.as_bytes()
-            ra = RawAttachment(data, ctype, fname)
-            (htmls if ctype == "text/html" and disp != "attachment" and fname is None
-             else atts).append(ra)
+            return RawAttachment(data, part.get_content_type(), part.get_filename())
+
+        def visit(part, depth: int) -> None:
+            if depth > 32:
+                raise _Reject("malformed", record=False)
+            disp = part.get_content_disposition()
+            fname = part.get_filename()
+            if (part.get_content_maintype() == "message" or disp == "attachment"
+                    or fname is not None):
+                atts.append(opaque(part))
+                return
+            if part.is_multipart():
+                for sub in part.iter_parts():
+                    visit(sub, depth + 1)
+                return
+            ctype = part.get_content_type()
+            if ctype == "text/plain":
+                try:
+                    texts.append(part.get_content())
+                    return
+                except Exception:
+                    pass  # undecodable -> keep as an opaque attachment
+            (htmls if ctype == "text/html" else atts).append(opaque(part))
+
+        visit(msg, 0)
         if not texts:
             atts = htmls + atts       # HTML-only body: by reference, never parsed
         return "\n".join(texts), atts
@@ -539,6 +616,12 @@ class IngressGateway:
         return IngressResult(False, reason)
 
     def _finalize(self, d: _Draft, now: int, *, reject: str | None) -> IngressResult:
+        result = self._decide(d, now, reject=reject)
+        if result.reason not in ("trace_error", "ingress_error"):
+            self._release(d.voucher)     # committed: E1 row -> processed
+        return result
+
+    def _decide(self, d: _Draft, now: int, *, reject: str | None) -> IngressResult:
         key_digest = sha256(d.dedupe_key.encode())
         event_id = ingress_uuid(d.dedupe_key)
         delivery = str(uuid.uuid4())
