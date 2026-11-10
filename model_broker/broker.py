@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import sqlite3
 import os
+from datetime import date
+from uuid import UUID
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +25,18 @@ class LedgerUnavailable(Refused):
 
 _COLUMNS = ('call_id', 'task_id', 'task_class', 'privacy_class', 'day', 'month',
             'model', 'provider', 'expected', 'worst', 'actual', 'state')
+
+
+def _canonical_buckets(task_id, day, month):
+    """Validate syntax only; callers must still supply authenticated identities/time."""
+    if not all(type(x) is str for x in (task_id, day, month)):
+        return False
+    try:
+        parsed_date = date.fromisoformat(day)
+        return (str(UUID(task_id)) == task_id and parsed_date.isoformat() == day
+                and month == day[:7])
+    except (ValueError, AttributeError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -159,6 +173,7 @@ class Broker:
     def _validate_call(row):
         strings, expected, worst, actual, state = row[:8], *row[8:]
         if (not all(isinstance(x, str) and x for x in strings)
+                or not _canonical_buckets(row[1], row[4], row[5])
                 or type(expected) is not int or type(worst) is not int
                 or not 0 <= expected <= worst):
             raise LedgerUnavailable('invalid_call_record')
@@ -209,6 +224,8 @@ class Broker:
     def reserve(self, req: Request, candidates: list[Candidate]):
         if not all(isinstance(v, str) and v for v in vars(req).values()):
             raise Refused("invalid_request")
+        if not _canonical_buckets(req.task_id, req.day, req.month):
+            raise Refused("invalid_budget_bucket")
         eligible = []
         for c in candidates:
             if (c.approved is True and c.available is True and req.task_class in c.validated_tasks

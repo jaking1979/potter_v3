@@ -9,7 +9,7 @@ from pathlib import Path
 from model_broker.broker import Broker, Candidate, Caps, Refused, Request, LedgerUnavailable
 
 
-def req(call="c1", task="t1", privacy="private", day="2026-11-06", month="2026-11"):
+def req(call="c1", task="12345678-1234-4234-8234-123456789abc", privacy="private", day="2026-11-06", month="2026-11"):
     return Request(call, task, "research", privacy, day, month)
 
 
@@ -26,6 +26,47 @@ class BrokerTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "broker.sqlite"
         self.caps = Caps(50, 20, 30, 60)
         self.b = Broker.bootstrap(self.path, self.caps)
+
+    def test_budget_bucket_variants_cannot_bypass_ceilings(self):
+        task = "12345678-1234-4234-8234-123456789abc"
+        strict = Broker(self.path, Caps(100, 100, 100, 100))
+        strict.reserve(req(task=task), [candidate(expected=100, worst=100)])
+        variants = [
+            dict(day="2026-11-6"), dict(day="2026-11-06 "),
+            dict(day="26-11-06"), dict(day="20261106"),
+            dict(day="2026-02-30", month="2026-02"),
+            dict(month="2026-11 "), dict(month="2026-1"),
+            dict(month="2026-12"),
+            dict(task=task.upper()), dict(task="{" + task + "}"),
+            dict(task=task.replace("-", "")), dict(task=task + " "),
+        ]
+        for i, variant in enumerate(variants):
+            with self.subTest(variant=variant):
+                with self.assertRaisesRegex(Refused, "invalid_budget_bucket"):
+                    strict.reserve(req("alternate-" + str(i), **variant),
+                                   [candidate(expected=100, worst=100)])
+        with self.assertRaisesRegex(Refused, "budget_ceiling"):
+            strict.reserve(req("same-bucket"), [candidate(expected=1, worst=1)])
+
+    def test_bad_bucket_already_in_ledger_fails_closed_on_reopen_and_use(self):
+        self.b.reserve(req(), [candidate()])
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE broker_calls SET day='2026-11-6'")
+        with self.assertRaisesRegex(LedgerUnavailable, 'invalid_call_record'):
+            Broker(self.path, self.caps)
+        with self.assertRaisesRegex(LedgerUnavailable, 'invalid_call_record'):
+            self.b.reserve(req('next'), [candidate()])
+
+    def test_invalid_legacy_bucket_refused_before_migration(self):
+        path = Path(self.tmp.name) / 'bad-buckets.sqlite'
+        self._legacy(path)
+        with sqlite3.connect(path) as db:
+            db.execute("UPDATE broker_calls SET task_id='t1' WHERE call_id='old'")
+        with self.assertRaisesRegex(LedgerUnavailable, 'invalid_call_record'):
+            Broker(path, self.caps)
+        with sqlite3.connect(path) as db:
+            self.assertEqual({r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}, {'broker_calls'})
 
     def test_selects_cheapest_validated_approved_private_available(self):
         selected = self.b.reserve(req(), [candidate("badprivacy", 1, 2, privacy={"public"}),
@@ -178,10 +219,10 @@ os._exit(0)
                 worst INTEGER NOT NULL, actual INTEGER,
                 state TEXT NOT NULL CHECK(state IN ('reserved','dispatched','settled','overrun')))''')
             db.execute('INSERT INTO broker_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-                       ('old', 't1', 'research', 'private', '2026-11-06', '2026-11',
+                       ('old', '12345678-1234-4234-8234-123456789abc', 'research', 'private', '2026-11-06', '2026-11',
                         'fake', 'synthetic', 4, 10, actual, 'settled'))
             db.execute('INSERT INTO broker_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-                       ('unknown', 't2', 'research', 'private', '2026-11-06', '2026-11',
+                       ('unknown', '22345678-1234-4234-8234-123456789abc', 'research', 'private', '2026-11-06', '2026-11',
                         'fake', 'synthetic', 4, 10, None, 'dispatched'))
 
     def test_known_legacy_snapshot_migrates_atomically_without_releasing_unknown(self):
