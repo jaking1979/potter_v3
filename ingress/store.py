@@ -48,6 +48,22 @@ _SCHEMA = (
         updated_at INTEGER NOT NULL,
         CHECK ((status = 'pending') = (event_json IS NOT NULL)))""",
     "CREATE INDEX IF NOT EXISTS ingress_inbox_pending ON ingress_inbox (status, created_at)",
+    # Attachment lifecycle. A blob is written to the (independent, non-
+    # transactional) AttachmentStore only after a durable ``staged`` marker is
+    # committed; the event's ``attachment_refs`` rows are written in the same
+    # transaction as the event and clear that marker. A blob is garbage only
+    # when it has a staged/released marker older than the grace period AND no
+    # ref row - so a rolled-back or crashed ingest is reclaimable, while a blob
+    # shared with any committed event is never deleted.
+    """CREATE TABLE IF NOT EXISTS attachment_staged (
+        stage_id TEXT NOT NULL,
+        ref TEXT NOT NULL,
+        staged_at INTEGER NOT NULL,
+        PRIMARY KEY (stage_id, ref))""",
+    """CREATE TABLE IF NOT EXISTS attachment_refs (
+        ref TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        PRIMARY KEY (ref, event_id))""",
 )
 
 
@@ -134,14 +150,53 @@ class IngressStore:
             return True
 
     def expire(self, before: int, now: int) -> list[str]:
-        """Retention: drop the text of pending events created before ``before``."""
+        """Retention: drop the text of pending events created before ``before``,
+        and release their attachment references (blobs become GC candidates)."""
         with self.transaction() as tx:
             ids = [r[0] for r in tx._c.execute(
                 "SELECT event_id FROM ingress_inbox WHERE status='pending' AND created_at<?",
                 (before,))]
             tx._c.executemany("UPDATE ingress_inbox SET status='expired', event_json=NULL, "
                               "updated_at=? WHERE event_id=?", [(now, i) for i in ids])
+            for event_id in ids:
+                refs = [r[0] for r in tx._c.execute(
+                    "SELECT ref FROM attachment_refs WHERE event_id=?", (event_id,))]
+                tx._c.execute("DELETE FROM attachment_refs WHERE event_id=?", (event_id,))
+                tx._c.executemany("INSERT OR REPLACE INTO attachment_staged VALUES (?,?,?)",
+                                  [(f"release:{event_id}", r, now) for r in refs])
             return ids
+
+    # ---- attachments ---------------------------------------------------------
+
+    def stage_attachments(self, stage_id: str, refs: list[str], now: int) -> None:
+        """Durably mark blobs about to be written (committed BEFORE any put)."""
+        with self.transaction() as tx:
+            tx._c.executemany("INSERT OR REPLACE INTO attachment_staged VALUES (?,?,?)",
+                              [(stage_id, r, now) for r in refs])
+
+    def collect_garbage(self, older_than: int, delete) -> list[str]:
+        """Delete blobs whose every staged/released marker is older than
+        ``older_than`` and that no committed event references. Runs under
+        ``BEGIN IMMEDIATE``, so no ingest can commit a new reference to a blob
+        between the check and the delete; an ingest that staged it again
+        recently has a fresh marker and is skipped. ``delete`` must be
+        idempotent; if it raises, nothing is forgotten (retried next run)."""
+        with self.transaction() as tx:
+            refs = [r[0] for r in tx._c.execute(
+                "SELECT ref FROM attachment_staged GROUP BY ref HAVING MAX(staged_at) < ? "
+                "AND ref NOT IN (SELECT ref FROM attachment_refs)", (older_than,))]
+            for ref in refs:
+                delete(ref)
+            tx._c.executemany("DELETE FROM attachment_staged WHERE ref=?", [(r,) for r in refs])
+            # Markers for blobs that ended up referenced are no longer needed.
+            tx._c.execute("DELETE FROM attachment_staged WHERE staged_at < ? AND ref IN "
+                          "(SELECT ref FROM attachment_refs)", (older_than,))
+            return refs
+
+    def attachment_state(self) -> tuple[list[tuple], list[tuple]]:
+        with self._conn() as c:
+            return (c.execute("SELECT ref, staged_at FROM attachment_staged").fetchall(),
+                    c.execute("SELECT ref, event_id FROM attachment_refs").fetchall())
 
     def log(self) -> list[tuple]:
         with self._conn() as c:
@@ -157,6 +212,13 @@ class _Tx:
         row = self._c.execute("SELECT status, event_json FROM ingress_inbox WHERE event_id=?",
                               (event_id,)).fetchone()
         return (row[0], row[1]) if row else None
+
+    def attach(self, event_id: str, refs: list[str]) -> None:
+        self._c.executemany("INSERT OR IGNORE INTO attachment_refs VALUES (?,?)",
+                            [(r, event_id) for r in refs])
+
+    def unstage(self, stage_id: str) -> None:
+        self._c.execute("DELETE FROM attachment_staged WHERE stage_id=?", (stage_id,))
 
     def inbox_put(self, event_id: str, event_json: str, now: int) -> None:
         self._c.execute("INSERT INTO ingress_inbox VALUES (?,?,'pending',?,?)",
@@ -177,10 +239,23 @@ class _Tx:
 
 # ---- attachments -------------------------------------------------------------------
 
+def attachment_ref(digest: str) -> str:
+    """The reference format E3 owns: content-addressed by SHA-256."""
+    return f"att://sha256/{digest}"
+
+
 class AttachmentStore(Protocol):
-    def put(self, data: bytes) -> str:
-        """Store bytes; return an opaque reference. Must not interpret them."""
-        ...
+    """Content-addressed blob store. Contract:
+
+    * ``put(data)`` stores the bytes and returns ``attachment_ref(sha256(data))``
+      (idempotent; E3 refuses any other return value). Must not interpret them.
+    * ``delete(ref)`` removes the blob; idempotent (a missing blob is fine).
+
+    It is not transactional with E3's database: E3 owns the lifecycle
+    (stage -> put -> commit refs; ``collect_garbage`` for anything orphaned)."""
+    def put(self, data: bytes) -> str: ...
+
+    def delete(self, ref: str) -> None: ...
 
 
 class InMemoryAttachmentStore:
@@ -189,6 +264,9 @@ class InMemoryAttachmentStore:
         self.blobs: dict[str, bytes] = {}
 
     def put(self, data: bytes) -> str:
-        ref = f"att://sha256/{sha256(data)}"
+        ref = attachment_ref(sha256(data))
         self.blobs[ref] = bytes(data)
         return ref
+
+    def delete(self, ref: str) -> None:
+        self.blobs.pop(ref, None)

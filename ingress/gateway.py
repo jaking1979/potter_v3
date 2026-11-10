@@ -48,13 +48,13 @@ from email import policy as email_policy
 from email.parser import BytesParser
 from typing import Callable, Mapping
 
-from notifier.auth import ChannelAuth, TransportSigner
+from notifier.auth import DEFAULT_MAX_SKEW_S, ChannelAuth, TransportSigner
 
 from .content import IngressLimits, injection_flags, is_forward_subject, split_body
 from .events import (EMAIL, EXTERNAL_SENDER, FORWARDED_CONTENT, PRINCIPAL_DIRECT, TELEGRAM,
                      WEB, WEB_CONTENT, WEBHOOK, WEBHOOK_PAYLOAD, AttachmentRef, InboundEvent,
                      Segment, canon, sha256)
-from .store import AttachmentStore, IngressStore
+from .store import AttachmentStore, IngressStore, attachment_ref
 from .traces import Sink, emit_ingress_trace, ingress_uuid
 
 # Closed reason table (decision reasons and trust reasons).
@@ -171,6 +171,9 @@ class IngressGateway:
     def __init__(self, *, store: IngressStore, attachments: AttachmentStore,
                  channel_auth: ChannelAuth, clock: Callable[[], int],
                  transport_signers: Mapping[str, TransportSigner] | None = None,
+                 transport_max_skew_s: float = DEFAULT_MAX_SKEW_S,
+                 transport_replay_horizon_s: float | None = None,
+                 attachment_grace_s: int = 3600,
                  telegram_transport: TransportVerifier | None = None,
                  email_verifier: EmailVerifier | None = None,
                  email_attested_domains: frozenset[str] = frozenset(),
@@ -180,6 +183,22 @@ class IngressGateway:
         self._store = store
         self._attachments = attachments
         self._auth = channel_auth
+        # Replay-record retention, bound to the transport contract: an E1
+        # envelope is accepted only while |now - sent_at| <= max_skew, and its
+        # inbound_seen row is written at authentication time, so any envelope
+        # for a row older than 2*max_skew is already stale. Pruning E3-owned
+        # rows past that horizon (plus margin) can never reopen replay. It
+        # MUST be configured with the same max_skew as the ChannelAuth.
+        if transport_max_skew_s <= 0:
+            raise ValueError("transport_max_skew_s must be positive")
+        horizon = (2 * transport_max_skew_s + 60 if transport_replay_horizon_s is None
+                   else transport_replay_horizon_s)
+        if horizon < 2 * transport_max_skew_s:
+            raise ValueError("replay horizon must be >= 2 * transport max skew")
+        self._replay_horizon = float(horizon)
+        if attachment_grace_s < 0:
+            raise ValueError("attachment_grace_s must be >= 0")
+        self._grace = int(attachment_grace_s)
         # E1 c8c8422: ingress is the trusted channel adapter. After the platform
         # proof passes, it signs the exact update (sender, text, ids, time)
         # with the channel's transport key; ChannelAuth verifies that MAC,
@@ -249,6 +268,27 @@ class IngressGateway:
                 pass
         return ids
 
+    def gc_attachments(self, grace_s: int | None = None) -> list[str]:
+        """Reclaim blobs left by rolled-back or crashed ingests and blobs
+        released by ``expire_pending``: only those staged/released longer than
+        ``grace_s`` ago and referenced by no committed event."""
+        grace = self._grace if grace_s is None else grace_s
+        return self._store.collect_garbage(self._clock() - grace, self._attachments.delete)
+
+    def prune_transport_records(self) -> int:
+        """Bounded retention for the E1 ``inbound_seen`` rows E3 creates
+        (``update_id`` prefix ``e3:``): delete those authenticated more than
+        the replay horizon ago. Replay stays closed: any envelope for such a
+        row fails E1's freshness check, and a platform re-delivery is answered
+        by E3's own dedupe (which settles a fresh row, then finishes it).
+        Never touches rows that E1's own router or other adapters created.
+        Interim: E1 has no prune API yet; this should move to one."""
+        cutoff = self._clock() - self._replay_horizon
+        with self._auth.db.tx() as c:
+            cur = c.execute("DELETE FROM inbound_seen WHERE update_id LIKE 'e3:%' AND at < ?",
+                            (cutoff,))
+            return cur.rowcount
+
     @staticmethod
     def _restore(raw: str | None, digest: str | None) -> InboundEvent | None:
         """Rebuild a stored event; refuse it unless it matches the minted digest."""
@@ -298,7 +338,16 @@ class IngressGateway:
         if u.from_is_bot:
             raise _Reject("bot_sender", record=True).with_draft(draft)
         if self._store.seen_content(sha256(key.encode())) == digest:
-            return draft      # re-delivery: _finalize answers duplicate; no new E1 handoff
+            # Re-delivery of a decision E3 already committed: answer from E3's
+            # dedupe, but first settle E1's record for this message. If the
+            # process died after E3 committed and before E1 finish(), the row
+            # is still pending; re-signing the same deterministic envelope
+            # lets E1 resume it and we finish it now. If it is already
+            # processed, E1 answers "replayed" and nothing changes.
+            _, voucher, _ = self._authenticate(TELEGRAM, str(u.from_user_id), u.text, key,
+                                               raw_ref=u.delivery_ref)
+            self._release(voucher)
+            return draft
         principal, draft.voucher, _ = self._authenticate(
             TELEGRAM, str(u.from_user_id), u.text, key, raw_ref=u.delivery_ref)
         if principal is None:
@@ -344,6 +393,11 @@ class IngressGateway:
         # so an unauthenticated sender can never squat or pre-empt that key.
         verified_key = f"email|verified:{sha256(self._from_addr(msg).encode())}|{mid}"
         if self._store.seen_content(sha256(verified_key.encode())) == sha256(raw):
+            addr = self._from_addr(msg)       # settle E1's record (see _telegram)
+            _, voucher, _ = self._authenticate(EMAIL, addr, f"{subject}\n{text}",
+                                               f"email|{sha256(addr.encode())}|{mid}",
+                                               raw_ref=mid)
+            self._release(voucher)
             return _Draft(EMAIL, verified_key, mid, sha256(raw), None, (), (), "ok")
         trust, addr, principal, voucher = self._email_trust(msg, raw, mid,
                                                             f"{subject}\n{text}")
@@ -616,12 +670,27 @@ class IngressGateway:
         return IngressResult(False, reason)
 
     def _finalize(self, d: _Draft, now: int, *, reject: str | None) -> IngressResult:
-        result = self._decide(d, now, reject=reject)
+        stage_id = None
+        if reject is None and d.attachments:
+            # Stage (committed) -> put -> commit refs in the decision's
+            # transaction. Any failure after staging leaves a marker that
+            # gc_attachments() reclaims; a committed event's blobs never are.
+            stage_id = f"ingest:{uuid.uuid4()}"
+            refs = [attachment_ref(sha256(a.data)) for a in d.attachments]
+            try:
+                self._store.stage_attachments(stage_id, refs, now)
+                for a, ref in zip(d.attachments, refs):
+                    if self._attachments.put(a.data) != ref:
+                        raise RuntimeError("attachment store is not content-addressed")
+            except Exception:
+                return IngressResult(False, "ingress_error")
+        result = self._decide(d, now, reject=reject, stage_id=stage_id)
         if result.reason not in ("trace_error", "ingress_error"):
             self._release(d.voucher)     # committed: E1 row -> processed
         return result
 
-    def _decide(self, d: _Draft, now: int, *, reject: str | None) -> IngressResult:
+    def _decide(self, d: _Draft, now: int, *, reject: str | None,
+                stage_id: str | None = None) -> IngressResult:
         key_digest = sha256(d.dedupe_key.encode())
         event_id = ingress_uuid(d.dedupe_key)
         delivery = str(uuid.uuid4())
@@ -637,6 +706,8 @@ class IngressGateway:
 
         try:
             with self._store.transaction() as tx:
+                if stage_id is not None:
+                    tx.unstage(stage_id)      # committed with whatever is decided below
                 prior = tx.get(key_digest)
                 if prior is not None:
                     if prior.content_digest != d.content_digest:
@@ -667,6 +738,7 @@ class IngressGateway:
                        content_digest=d.content_digest, event_digest=event.digest(),
                        decision="accepted", reason="accepted", trust=trust, received_at=now)
                 tx.inbox_put(event_id, canon(event.to_record()).decode(), now)
+                tx.attach(event_id, [a.ref for a in event.attachments])
                 trace(True, d.trust_reason, trust)
                 return IngressResult(True, "accepted", event_id=event_id, event=event,
                                      trust_reason=d.trust_reason)
@@ -676,7 +748,7 @@ class IngressGateway:
             return IngressResult(False, "trace_error" if trace_failed else "ingress_error")
 
     def _mint(self, d: _Draft, event_id: str, now: int) -> InboundEvent:
-        refs = tuple(AttachmentRef(self._attachments.put(a.data), sha256(a.data), len(a.data),
+        refs = tuple(AttachmentRef(attachment_ref(sha256(a.data)), sha256(a.data), len(a.data),
                                    a.media_type, a.filename) for a in d.attachments)
         segs = d.segments
         principal = d.principal if any(s.provenance == PRINCIPAL_DIRECT for s in segs) else None
