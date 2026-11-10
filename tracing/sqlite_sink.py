@@ -8,6 +8,7 @@ context, restore authority, retention, host fencing, or production durability.
 The path and its parents must be trusted and not concurrently replaced.
 """
 import json
+import hashlib
 from pathlib import Path
 import re
 import sqlite3
@@ -15,7 +16,7 @@ from uuid import UUID
 
 from .trace import DecisionTrace, validate_timestamp
 
-VERSION = 'potter.trace.sqlite-offline/v0'
+VERSION = 'potter.trace.sqlite-offline/v1'
 MAX_RECORD_BYTES = 2048
 ENVIRONMENTS = frozenset({'synthetic', 'replay'})
 DECISION_SCHEMA = 'potter.trace.decision/v0'
@@ -26,8 +27,15 @@ _DECISION_KEYS = frozenset({'schema', 'task.id', 'trace.id', 'potter.component',
 _DENIAL_KEYS = frozenset({'schema', 'decision.id', 'potter.environment', 'time'})
 _DDL = {
     'metadata': 'CREATE TABLE metadata (version TEXT NOT NULL, environment TEXT NOT NULL)',
-    'events': 'CREATE TABLE events (event_id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)'
+    'events': 'CREATE TABLE events (seq INTEGER PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, record TEXT NOT NULL, prev_hash TEXT NOT NULL, entry_hash TEXT NOT NULL)'
 }
+_GENESIS = '0' * 64
+
+
+def _entry_hash(environment, seq, event_id, record, prev_hash):
+    body = json.dumps([VERSION, environment, seq, event_id, record, prev_hash],
+                      ensure_ascii=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(body).hexdigest()
 
 
 class TraceStoreRefused(ValueError):
@@ -156,13 +164,18 @@ class SqliteTraceSink:
         try:
             c.execute('BEGIN IMMEDIATE')
             self._verify(c)
+            rows = self._checked_rows(c)
             prior = c.execute('SELECT record FROM events WHERE event_id=?', (event_id,)).fetchone()
             if prior:
                 if prior[0] != canonical:
                     raise TraceStoreRefused('event retry conflicts with stored record')
                 c.execute('COMMIT')
                 return False
-            c.execute('INSERT INTO events VALUES (?, ?)', (event_id, canonical))
+            seq = len(rows) + 1
+            prev_hash = rows[-1][4] if rows else _GENESIS
+            digest = _entry_hash(self.environment, seq, event_id, canonical, prev_hash)
+            c.execute('INSERT INTO events VALUES (?, ?, ?, ?, ?)',
+                      (seq, event_id, canonical, prev_hash, digest))
             c.execute('COMMIT')
             return True
         finally:
@@ -179,11 +192,18 @@ class SqliteTraceSink:
         try:
             c.execute('BEGIN')
             self._verify(c)
-            rows = c.execute('SELECT event_id, record FROM events ORDER BY event_id').fetchall()
-            result = []
-            for event_id, record in rows:
-                _uuid(event_id)
-                result.append((event_id, validate_jsonl(record, self.environment)))
-            return tuple(result)
+            return tuple((row[1], row[2]) for row in self._checked_rows(c))
         finally:
             c.close()
+
+    def _checked_rows(self, c):
+        rows = c.execute('SELECT seq, event_id, record, prev_hash, entry_hash FROM events ORDER BY seq').fetchall()
+        prev = _GENESIS
+        for expected, (seq, event_id, record, prev_hash, entry_hash) in enumerate(rows, 1):
+            _uuid(event_id)
+            if (seq != expected or prev_hash != prev or
+                validate_jsonl(record, self.environment) != record or
+                entry_hash != _entry_hash(self.environment, seq, event_id, record, prev_hash)):
+                raise TraceStoreRefused('trace sequence or hash chain invalid')
+            prev = entry_hash
+        return rows

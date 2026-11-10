@@ -35,7 +35,7 @@ def crash_writer(path, commit):
     else:
         c = sqlite3.connect(path, isolation_level=None)
         c.execute('BEGIN IMMEDIATE')
-        c.execute('INSERT INTO events VALUES (?, ?)', (EVENT, line()))
+        c.execute('INSERT INTO events VALUES (?, ?, ?, ?, ?)', (1, EVENT, line(), 'x', 'y'))
     os._exit(17)
 
 
@@ -164,7 +164,7 @@ class SqliteTraceTests(unittest.TestCase):
             with self.assertRaises(TraceStoreRefused):
                 call()
         with sqlite3.connect(self.path) as c:
-            c.execute("UPDATE metadata SET version='potter.trace.sqlite-offline/v0'")
+            c.execute("UPDATE metadata SET version='potter.trace.sqlite-offline/v1'")
             c.execute('CREATE TABLE unexpected (raw TEXT)')
         with self.assertRaises(TraceStoreRefused):
             self.sink.put(EVENT, line())
@@ -185,6 +185,30 @@ class SqliteTraceTests(unittest.TestCase):
         alias.symlink_to(self.path)
         with self.assertRaises(TraceStoreRefused):
             SqliteTraceSink.open_existing(alias, environment='synthetic')
+
+    def test_insertion_order_and_retry(self):
+        ids = [str(uuid4()) for _ in range(3)]
+        for event in ids:
+            self.sink.put(event, line())
+        self.assertFalse(self.sink.put(ids[0], line()))
+        self.assertEqual([row[0] for row in self.sink.records()], ids)
+
+    def test_mid_chain_deletion_or_valid_record_edit_is_refused(self):
+        for tamper in ('delete', 'edit'):
+            with self.subTest(tamper=tamper):
+                path = self.path.parent / (tamper + '.sqlite')
+                sink = SqliteTraceSink.bootstrap(path, environment='synthetic')
+                for _ in range(3):
+                    sink.put(str(uuid4()), line())
+                with sqlite3.connect(path) as c:
+                    if tamper == 'delete':
+                        c.execute('DELETE FROM events WHERE seq=2')
+                    else:
+                        c.execute('UPDATE events SET record=? WHERE seq=2', (line(outcome='deny'),))
+                with self.assertRaises(TraceStoreRefused):
+                    sink.records()
+                with self.assertRaises(TraceStoreRefused):
+                    sink.put(str(uuid4()), line())
 
 
 if __name__ == '__main__':
