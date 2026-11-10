@@ -1,10 +1,32 @@
 import asyncio
+import time
 import unittest
 
 from retrieval.core import Evidence, FakeBackend, benchmark, retrieve_turn
 
 
 class RetrievalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_blocking_backend_cannot_return_late_turn_or_benchmark(self):
+        class Blocking:
+            async def search(self, query):
+                time.sleep(.06)
+                return [Evidence('late', 'must not enter turn')]
+        turn = await retrieve_turn(Blocking(), 'q', consequential=False, timeout=.01)
+        scored = await benchmark(Blocking(), 'q', ['late'], timeout=.01)
+        self.assertEqual((turn.status, turn.items), ('deadline', ()))
+        self.assertEqual((scored.status, scored.top_ids, scored.hit), ('deadline', (), False))
+
+    async def test_result_materialization_cannot_cross_deadline(self):
+        class SlowItems:
+            def __iter__(self):
+                time.sleep(.06)
+                yield Evidence('late', 'must not enter turn')
+        class Backend:
+            async def search(self, query):
+                return SlowItems()
+        turn = await retrieve_turn(Backend(), 'q', consequential=False, timeout=.01)
+        self.assertEqual((turn.status, turn.items), ('deadline', ()))
+
     async def test_invalid_durations_rejected_before_backend_work(self):
         class Never:
             async def search(self, query):
