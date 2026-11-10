@@ -52,11 +52,18 @@ async def _bounded(backend: Backend, query: str, timeout: float):
             task.cancel()
             task.add_done_callback(_drain)
             return 'deadline', (), time.monotonic() - start
+        # asyncio's timer can run late when a backend blocks the event loop.
+        # A completed task is not proof that its result met the deadline.
+        if time.monotonic() - start >= timeout:
+            _drain(task)
+            return 'deadline', (), time.monotonic() - start
         try:
             raw = task.result()
             items = tuple(raw)
             if any(not isinstance(item, Evidence) or not item.item_id for item in items):
                 raise ValueError('invalid evidence')
+            if time.monotonic() - start >= timeout:
+                return 'deadline', (), time.monotonic() - start
             return 'complete', items[:3], time.monotonic() - start
         except Exception:
             return 'unavailable', (), time.monotonic() - start
