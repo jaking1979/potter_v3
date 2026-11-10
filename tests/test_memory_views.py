@@ -36,6 +36,23 @@ class ViewsTests(unittest.TestCase):
             self.assertTrue(result.index_stale)
         self.assertNotIn('private', repr(self.view._entries))
 
+    def test_sensitive_key_never_retained_in_view_even_after_forget(self):
+        sensitive_key = 'synthetic.health.sensitive-key'
+        item = self.promote(self.stage('private', key=sensitive_key))
+        self.view.rebuild([sensitive_key, 'missing-key'], now=1)
+        self.assertNotIn(sensitive_key, repr(self.view._entries))
+        self.assertNotIn('missing-key', repr(self.view._entries))
+        self.assertEqual(self.view.retrieve(sensitive_key, consequential=True, now=2).source,
+                         'canonical_revalidated')
+        self.assertEqual(self.view.retrieve('missing-key', consequential=True, now=2).source,
+                         'canonical_fallback')
+        self.store.forget(item.id, item.version, 'forget')
+        self.assertNotIn(sensitive_key, repr(self.view._entries))
+        result = self.view.retrieve(sensitive_key, consequential=True, now=3)
+        self.assertFalse(result.retrieval.active)
+        self.assertTrue(result.index_stale)
+        self.assertEqual(result.source, 'canonical_fallback')
+
     def test_failed_rebuild_retains_complete_prior_generation(self):
         self.stage('one')
         self.view.rebuild(['k'], now=1)

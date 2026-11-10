@@ -46,10 +46,10 @@ Promotion uses an explicit proof seam, and batch mode refuses sensitive and
 non-direct items. Competing corrections must be restaged after a new active
 version appears. Undo uses an exact item version and refuses a stale chain.
 Forget logically clears the values of all local rows for a fact key, including
-staged and superseded rows; idempotency entries retain payload digests, and key,
-source references, links and audit metadata remain. SQLite secure deletion is
+staged and superseded rows; affected request IDs are retained as payload-free tombstones; keys and
+source references on affected rows are cleared. Opaque row links and audit metadata remain. SQLite secure deletion is
 requested but physical erasure, backup/WAL/snapshot sanitization and external
-deletion are not proven. Digests can themselves reveal low-entropy facts.
+deletion are not proven. Other copies and pre-forget snapshots may still contain sensitive data.
 
 Open before integration: independently authenticated subject/operation/content
 binding; principal permissions; T15's full metadata and validity intervals;
@@ -81,3 +81,9 @@ external forgetting, backup erasure, restore authority and runtime integration
 remain open. Generations contain canonical IDs and versions but do not yet
 implement T15's full provenance/validity fields. The bounded snapshot API has
 an explicit 1,000-key limit; this is a local test limit, not a product contract.
+
+The synthetic derived view stores nonempty groups of opaque item IDs, versions
+and status only, rather than retaining queried fact keys. Empty results use a
+canonical fallback and are never marked as index hits. ID and status metadata
+may still persist in memory, and neither this change nor a local forget can
+recall caller-held objects or prove erasure of external copies.

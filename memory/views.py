@@ -7,7 +7,6 @@ does not provide an action-time fence; C1/C2 must still revalidate at dispatch.
 from dataclasses import dataclass
 import math
 import threading
-from types import MappingProxyType
 
 from .store import MemoryStore, Retrieval, Invalid
 
@@ -51,7 +50,7 @@ class LocalView:
         self._lock = threading.RLock()
         self._rebuild_lock = threading.Lock()
         self._generation = 0
-        self._entries = MappingProxyType({})
+        self._entries = frozenset()
         self._built_at = None
         self._failed = False
 
@@ -68,7 +67,10 @@ class LocalView:
             try:
                 # One canonical snapshot, never a mixture of versions.
                 snapshot = self._store.snapshot(keys)
-                entries = MappingProxyType({k: _identity(v) for k, v in snapshot.items()})
+                # Do not retain fact keys, including sensitive keys, in a derived view.
+                # Empty snapshots are deliberately never treated as cache hits.
+                entries = frozenset(identity for v in snapshot.values()
+                                    if (identity := _identity(v)))
             except BaseException:
                 with self._lock:
                     self._failed = True
@@ -85,7 +87,8 @@ class LocalView:
         # Always use the store's actual tier filtering, never cached content.
         current, advisory = self._store.view_read(key, consequential=consequential)
         with self._lock:
-            matched = key in self._entries and self._entries[key] == _identity(advisory)
+            identity = _identity(advisory)
+            matched = bool(identity) and identity in self._entries
             stale = (self._failed or self._built_at is None or now < self._built_at
                      or now - self._built_at > 86400 or not matched)
             return ViewResult(current, self._generation, stale,
