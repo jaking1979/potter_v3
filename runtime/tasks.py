@@ -10,6 +10,8 @@
   still holds an unexpired lease (LeaseLost otherwise). A task whose lease
   expired (worker killed) is reclaimed by the next ``claim`` and resumes from
   its persisted checkpoint; its effects are protected by the effect journal.
+* Release: the lease holder can hand a running task back to ``queued``
+  without recording a failure (``release``; a pause such as the kill flag).
 * Escalation: ``escalate_after`` (3) consecutive failures of a task - an
   explicit ``fail`` or an expired lease - move it to ``escalated`` and fire the
   ``escalate`` callback once. A scheduled job escalates after 3 consecutive
@@ -277,6 +279,17 @@ class TaskStore:
                 out = _load(c, task_id)
         self._fire(fired)   # only reached once the transaction committed
         return out
+
+    def release(self, task_id: str, worker_id: str, *, now: float | None = None) -> Task:
+        """Hand a running task back to ``queued`` WITHOUT recording a failure:
+        a pause (e.g. the kill flag), not an error. The lease is checked inside
+        the same write transaction, so only the live lease holder can release.
+        Failure counters (task and job) are untouched; the next claim resumes
+        from the persisted checkpoint. Added for E2 (T16 interrupt)."""
+        now = self._now(now)
+        with self.db.tx() as c:
+            self._owned(c, task_id, worker_id, now)
+            return self._move(c, task_id, RUNNING, QUEUED, now)
 
     def complete(self, task_id: str, worker_id: str, *, now: float | None = None) -> Task:
         now = self._now(now)

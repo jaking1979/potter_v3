@@ -300,6 +300,85 @@ def _set_kill(w):
         w.notifier.kill.set(c, by="test", at=w.now)
 
 
+class StopIsAPause(Base):
+    """Dolores @9c186f8: an interrupt used to be a C2 failure, so the third
+    one escalated the task (claim never picks it up again) while the runner
+    still reported 'resume'. It is now a lease-checked C2 release."""
+
+    def result_ids(self, w):
+        return [i for i in w.outbox_ids() if i.startswith("job:notes.batch:")]
+
+    def test_two_failures_then_success_then_stop_during_finish_delivers_once(self):
+        w = self.world(definitions=[rw.batch(n=1)])
+        calls = {"n": 0}
+
+        def flaky_then_stop(eff):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                rw.fail_definitely(eff)            # two transient failures
+            _set_kill(w)                           # 3rd attempt applies; /stop lands
+
+        w.ext.hooks["s1"] = ("before", flaky_then_stop)
+        w.runner.tick()
+        self.assertEqual([r.outcome for r in w.runner.run_pending()],
+                         ["retry", "retry", "interrupted"])
+        task = w.runner.tasks.by_trigger(
+            f"resp:notes.batch:slot:{int(rw.T0 // 3600)}")
+        self.assertEqual(task.state, QUEUED)                 # not escalated
+        self.assertEqual(task.consecutive_failures, 2)       # the pause added none
+        self.assertEqual(self.result_ids(w), [])
+        self.assertFalse(any("escalation" in i for i in w.outbox_ids()))
+        w.ext.hooks.clear()
+        w.notifier.kill.clear()
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(self.result_ids(w), [f"job:notes.batch:{task.id}"])
+        self.assertEqual(w.ext.applied(), [("s1", 1)])
+        self.assertEqual(w.runner.tasks.get(task.id).consecutive_failures, 0)
+        self.assertIsNone(w.runner.run_once())
+        self.assertEqual(len(self.result_ids(w)), 1)         # delivered exactly once
+
+    def test_repeated_stop_resume_cycles_with_a_restart_never_escalate(self):
+        n = 5
+        w = self.world(definitions=[rw.batch(n=n)])
+        w.runner.tick()
+        for cycle in range(n):
+            if cycle == 2:                                   # restart mid-way
+                later = w.now + 10
+                w = rw.World(self.tmp, worker=f"w-restart-{cycle}",
+                             definitions=[rw.batch(n=n)])
+                w.now = later
+            w.ext.hooks.clear()
+            w.ext.hooks[f"s{cycle + 1}"] = ("after", lambda eff, w=w: _set_kill(w))
+            r = w.runner.run_once()
+            self.assertEqual(r.outcome, "interrupted", f"cycle {cycle}")
+            task = w.runner.tasks.get(r.task_id)
+            self.assertEqual(task.state, QUEUED)
+            self.assertEqual(task.consecutive_failures, 0)
+            w.notifier.kill.clear()
+        w.ext.hooks.clear()
+        self.assertEqual(w.runner.run_once().outcome, "done")   # held result delivered
+        self.assertEqual(w.ext.applied(), [(f"s{i}", 1) for i in range(1, n + 1)])
+        self.assertEqual(w.ext.calls(), n)
+        self.assertEqual(len(self.result_ids(w)), 1)
+        self.assertFalse(any("escalation" in i for i in w.outbox_ids()))
+
+    def test_release_is_lease_checked_and_counts_no_failure(self):
+        from runtime import LeaseLost
+        w = self.world(definitions=[rw.batch(n=1)])
+        store = w.runner.tasks
+        task, _ = store.submit("t:release", "notes.batch", job="notes.batch")
+        claimed = store.claim("w-a", 60)
+        self.assertEqual(claimed.id, task.id)
+        with self.assertRaises(LeaseLost):
+            store.release(task.id, "w-intruder")             # not the lease holder
+        t = store.release(task.id, "w-a")
+        self.assertEqual((t.state, t.consecutive_failures, t.lease_owner),
+                         (QUEUED, 0, None))
+        with self.assertRaises(LeaseLost):
+            store.release(task.id, "w-a")                    # no longer running
+        self.assertEqual(store.job("notes.batch").consecutive_failures, 0)
+
+
 class ApprovalFlow(Base):
     def test_waiting_approval_then_approve_continues_once(self):
         w = self.world()

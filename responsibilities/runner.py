@@ -575,14 +575,19 @@ class ResponsibilityRunner:
 
     def _interrupt(self, d: Responsibility, task: Task, index: int,
                    approvals: Mapping[str, str]) -> RunResult:
-        """Kill flag: record where to resume, release the task back to the
-        queue. C2 has no pause transition, so this is a retryable failure."""
+        """Kill flag: record where to resume, then hand the task back to the
+        queue with C2's lease-checked ``release``. A pause is not a failure:
+        no counter moves, so repeated stops never escalate a task, and a
+        result held back in ``_finish`` is delivered after the flag clears.
+        The reported outcome is the state C2 actually recorded."""
         try:
             self.tasks.checkpoint(task.id, self._worker, {"next": index, "approvals":
                                                           dict(approvals), "interrupted": True})
-            self.tasks.fail(task.id, self._worker, "interrupted: kill flag set", retryable=True)
+            t = self.tasks.release(task.id, self._worker)
         except LeaseLost:
             return RunResult(task.id, d.id, OUT_LEASE_LOST)
+        if t.state != QUEUED:          # defensive: never claim a resume C2 did not record
+            return RunResult(task.id, d.id, t.state, "interrupt did not release the task")
         return RunResult(task.id, d.id, OUT_INTERRUPTED, f"resume at step {index}")
 
     # ---------------------------------------------------------------- long work (E1)
