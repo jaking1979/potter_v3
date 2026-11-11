@@ -27,6 +27,22 @@ class BrokerTests(unittest.TestCase):
         self.caps = Caps(50, 20, 30, 60)
         self.b = Broker.bootstrap(self.path, self.caps)
 
+    def test_sqlite_amount_overflow_refuses_and_preserves_state(self):
+        huge = 1 << 63
+        with self.assertRaises(ValueError):
+            Broker(self.path, Caps(huge, 20, 30, 60))
+        with self.assertRaisesRegex(Refused, 'no_eligible_candidate'):
+            self.b.reserve(req('overflow'), [candidate(expected=0, worst=huge)])
+        self.assertIsNone(self.b.status('overflow'))
+        self.b.reserve(req(), [candidate()])
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
+        with self.assertRaisesRegex(Refused, 'unknown_or_invalid_cost'):
+            self.b.settle('c1', huge)
+        self.assertEqual(self.b.status('c1')[-1], 'dispatched')
+        self.assertEqual(self.b.entries('c1'), (('reservation', 10, 'operation'),))
+        reopened = Broker(self.path, self.caps)
+        self.assertEqual(reopened.status('c1')[-1], 'dispatched')
+
     def test_rollover_refuses_stale_without_releasing_after_restart(self):
         b = Broker(self.path, Caps(100, 1000, 100, 1000))
         b.reserve(req('old', day='2026-11-30', month='2026-11'),
