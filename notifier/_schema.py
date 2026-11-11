@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from runtime import Database, JournalUnavailable, Outbox
+from runtime import Database, JournalUnavailable
 
 NOTIFIER_SCHEMA_VERSION = "e1.v1"
 PREVIOUS_SCHEMA_VERSION = "e1.v0"          # layout as of 225e7df; migrated by ensure()
@@ -196,18 +196,36 @@ def _migrate_v0(c: sqlite3.Connection, now: float) -> None:
 
 
 def ensure(db: Database, *, clock=None) -> None:
+    """Classify, validate, migrate and create - in ONE BEGIN IMMEDIATE
+    transaction. Every refusal happens before anything is written (and would
+    roll back if it didn't), so a refused database is left byte-identical:
+    no C3 outbox, no E1 tables, no meta rows are added. C3's objects are
+    created here from C3's own statements (``runtime.outbox.OUTBOX_SCHEMA``)
+    only once the version has been accepted; ``Outbox(db)`` constructed
+    afterwards finds them in place."""
     import time as _time
-    Outbox(db)   # idempotent: creates C3's table + meta.outbox_schema if absent
+    from runtime.outbox import OUTBOX_SCHEMA, OUTBOX_SCHEMA_VERSION
+    if OUTBOX_SCHEMA_VERSION != EXPECTED_OUTBOX_SCHEMA:
+        raise JournalUnavailable("notifier is pinned to the C3 outbox schema c3.v0")
     try:
         with db.tx() as c:
+            # 1. Read and classify. No writes until every check has passed.
             row = c.execute("SELECT value FROM meta WHERE key='notifier_schema'").fetchone()
             version = row[0] if row else None
             if version not in (None, PREVIOUS_SCHEMA_VERSION, NOTIFIER_SCHEMA_VERSION):
                 raise JournalUnavailable(
                     f"notifier schema {version!r} is not supported (expected"
                     f" {NOTIFIER_SCHEMA_VERSION!r}); refusing")
+            row = c.execute("SELECT value FROM meta WHERE key='outbox_schema'").fetchone()
+            if row is not None and row[0] != EXPECTED_OUTBOX_SCHEMA:
+                raise JournalUnavailable(f"outbox schema {row[0]!r}, need c3.v0; refusing")
             if version == PREVIOUS_SCHEMA_VERSION:
-                _migrate_v0(c, (clock or _time.time)())
+                _migrate_v0(c, (clock or _time.time)())     # catalog check precedes writes
+            # 2. Accepted: create C3's and E1's objects in this same transaction.
+            for stmt in OUTBOX_SCHEMA:
+                c.execute(stmt)
+            c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('outbox_schema', ?)",
+                      (OUTBOX_SCHEMA_VERSION,))
             for stmt in SCHEMA:
                 c.execute(stmt)
             if version is None:

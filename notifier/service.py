@@ -160,9 +160,9 @@ class Notifier:
         if primary not in channels or fallback not in channels or primary == fallback:
             raise ValueError("primary and fallback must be distinct configured channels")
         self.db = as_database(db)
+        _schema.ensure(self.db, clock=clock)    # validate/migrate BEFORE any outbox write
         self.outbox = Outbox(self.db, clock=clock, dispatch_timeout_s=dispatch_timeout_s,
                              max_attempts=max_attempts, backoff_s=backoff_s)
-        _schema.ensure(self.db, clock=clock)
         self.kill = KillFlag(self.db)
         self._channels = dict(channels)
         self._auth = auth

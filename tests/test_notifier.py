@@ -2012,6 +2012,89 @@ class SchemaMigration(unittest.TestCase):
         self.assertEqual(self.schema_version(), "e1.v1")
 
 
+# ============================================================ refusal is atomic (Dolores, #28/#29 @ 0d8395b)
+
+class AtomicRefusal(unittest.TestCase):
+    """A refused database is left byte-identical: nothing at all is written."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "potter.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def c2_only(self, **meta):
+        db = Database(self.path)                       # C2 only: no C3 outbox, no E1
+        with db.tx() as c:
+            for k, v in meta.items():
+                c.execute("INSERT INTO meta (key, value) VALUES (?,?)", (k, v))
+        return db
+
+    def snapshot(self):
+        c = sqlite3.connect(self.path)
+        try:
+            schema = c.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"
+                               " ORDER BY type, name").fetchall()
+            meta = c.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+            return schema, meta
+        finally:
+            c.close()
+
+    def assertRefusedByteIdentical(self, db, why):
+        from notifier import _schema, KillFlag
+        from runtime import JournalUnavailable
+        before = self.snapshot()
+        refusals = [
+            ("ensure", lambda: _schema.ensure(db)),
+            ("ChannelAuth", lambda: ChannelAuth(db=db, transport_keys=TRANSPORT_KEYS,
+                                                inbound_bindings={}, outbound_addresses={})),
+            ("KillFlag", lambda: KillFlag(db)),
+        ]
+        # Notifier: auth from a separate, valid database; only `db` is under test.
+        ok_db = Database(Path(self._tmp.name) / "other.db")
+        ok_auth = ChannelAuth(db=ok_db, transport_keys=TRANSPORT_KEYS, inbound_bindings={},
+                              outbound_addresses={JOSH: {"telegram": "a", "email": "b"}})
+        refusals.append(("Notifier", lambda: Notifier(
+            db, channels={"telegram": FakeChannel("telegram"), "email": FakeChannel("email")},
+            auth=ok_auth)))
+        for name, make in refusals:
+            with self.subTest(path=name):
+                with self.assertRaises(JournalUnavailable, msg=f"{why} via {name}"):
+                    make()
+                self.assertEqual(self.snapshot(), before, f"{why} via {name}: database mutated")
+
+    def test_future_version_on_c2_only_db_is_refused_byte_identical(self):
+        db = self.c2_only(notifier_schema="e1.v9")
+        self.assertRefusedByteIdentical(db, "future notifier schema")
+        tables = {r[1] for r in self.snapshot()[0]}
+        self.assertNotIn("outbox", tables)
+
+    def test_v0_mismatch_on_c2_only_db_is_refused_byte_identical(self):
+        from notifier import _schema
+        db = self.c2_only(notifier_schema="e1.v0")
+        with db.tx() as c:                                    # v0 tables, but no C3 outbox
+            for stmt in _schema.V0_SCHEMA:
+                c.execute(stmt)
+        self.assertRefusedByteIdentical(db, "e1.v0 catalog mismatch (no outbox)")
+
+    def test_foreign_outbox_schema_is_refused_byte_identical(self):
+        db = self.c2_only(outbox_schema="c3.v9")
+        self.assertRefusedByteIdentical(db, "unsupported C3 outbox schema")
+
+    def test_accepted_fresh_c2_only_db_is_set_up_in_one_step(self):
+        from notifier import _schema
+        db = self.c2_only()
+        _schema.ensure(db)
+        schema, meta = self.snapshot()
+        self.assertIn("outbox", {r[1] for r in schema})
+        self.assertIn(("notifier_schema", "e1.v1"), meta)
+        self.assertIn(("outbox_schema", "c3.v0"), meta)
+        before = self.snapshot()
+        _schema.ensure(db)                                    # idempotent
+        self.assertEqual(self.snapshot(), before)
+
+
 # ============================================================ long work (item 5)
 
 class LongWorkUpdates(Base):
