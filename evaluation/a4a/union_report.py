@@ -26,5 +26,3 @@ def summarize_dimensions(planned_ids, dimensions):
         result['forced_disagree'] = sorted(affected)
     return {'status': 'descriptive_only', 'affected_ids': sorted(affected),
             'affected_reasons': reasons, 'dimensions': individual}
-
-
