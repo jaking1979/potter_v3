@@ -1,5 +1,5 @@
 """Synthetic multi-dimension summary; caller classifications are unverified."""
-from .synthetic_validity import _summarize_dimension
+from evaluation.a4a.synthetic_validity import _summarize_dimension
 
 def summarize_dimensions(planned_ids, dimensions):
     if type(dimensions) is not dict or not dimensions or len(dimensions) > 100:
@@ -26,4 +26,5 @@ def summarize_dimensions(planned_ids, dimensions):
         result['forced_disagree'] = sorted(affected)
     return {'status': 'descriptive_only', 'affected_ids': sorted(affected),
             'affected_reasons': reasons, 'dimensions': individual}
+
 

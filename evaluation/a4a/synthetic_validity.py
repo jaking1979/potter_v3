@@ -4,7 +4,7 @@ Inputs are preclassified by a caller. This does not prove prespecification,
 realignment, independent grading, blinding, provenance, or correct labels.
 The agreed preparation protocol is not a ratified acceptance rule.
 """
-from .wilson import wilson_95
+from evaluation.a4a.wilson import wilson_95
 
 
 def _summarize_dimension(planned_ids, classifications):
@@ -38,3 +38,4 @@ def _summarize_dimension(planned_ids, classifications):
     result.update(status='descriptive_only', agreements=agreements,
                   interval_95=wilson_95(agreements, n))
     return result
+

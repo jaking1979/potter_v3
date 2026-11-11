@@ -1,5 +1,5 @@
 import unittest
-from .union_report import summarize_dimensions
+from evaluation.a4a.union_report import summarize_dimensions
 
 class UnionTests(unittest.TestCase):
     def test_union_invalidates_all(self):
@@ -49,4 +49,5 @@ class UnionTests(unittest.TestCase):
                 summarize_dimensions(ids, dims)
 
 if __name__ == '__main__': unittest.main()
+
 
