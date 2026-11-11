@@ -162,7 +162,7 @@ class Notifier:
         self.db = as_database(db)
         self.outbox = Outbox(self.db, clock=clock, dispatch_timeout_s=dispatch_timeout_s,
                              max_attempts=max_attempts, backoff_s=backoff_s)
-        _schema.ensure(self.db)
+        _schema.ensure(self.db, clock=clock)
         self.kill = KillFlag(self.db)
         self._channels = dict(channels)
         self._auth = auth

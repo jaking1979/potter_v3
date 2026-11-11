@@ -12,7 +12,7 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
 | `channels.py` | The `Channel` interface (`send`, `reconcile`, `probe`), `InboundMessage` and `FakeChannel`. |
 | `lint.py` | Structural check: no direct channel use and no reach-through into notifier internals outside `notifier/`. Run it with `python3 -m notifier.lint .`. |
 | `traces.py` | Emits C6 `DecisionTrace` records for issue, decide and send. The records are redaction-safe. |
-| `_schema.py` | The `notifier_state`, `approval_requests` and `inbound_log` tables, pinned by `meta.notifier_schema=e1.v0`. |
+| `_schema.py` | E1's tables, pinned by `meta.notifier_schema=e1.v1`. `ensure()` migrates an `e1.v0` database inside one `BEGIN IMMEDIATE` transaction (see Schema migration below). It refuses an unknown or future version, or an `e1.v0` layout it doesn't recognise, before routing any traffic. |
 
 ## T19 PASS 2 mapping
 
@@ -94,6 +94,16 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
    - A `probe()` every `probe_interval_s` (60 s) ends the outage.
    - `watchdog()` reports C3 `stale_backlog` older than 30 min and raises one urgent alert per 30-minute bucket; a later change in the same bucket keeps the first alert.
    - While stopped, outage handling still runs for the `/stop` confirmation only, so it falls back to email if Telegram is down.
+
+## Schema migration (`e1.v0` → `e1.v1`)
+
+- **Trigger.** `e1.v0` is the layout as of `225e7df`, detected column for column. `inbound_seen` gained a required `sent_at` column. The migration runs in `_schema.ensure()`, which every E1 constructor calls, inside **one** `BEGIN IMMEDIATE` transaction.
+- **Failure.** A crash or error rolls everything back. The database stays `e1.v0` with its rows intact, and the next start migrates it cleanly. Startup fails closed with `JournalUnavailable`, so no traffic is routed.
+- **Old processed rows** stay as burned replay records. Their `sent_at` is set to the migration time, which becomes their floor, and they are flagged `migration_flag='sent_at_unknown'`. No envelope time is invented, and they can never become replayable.
+- **Old pending commands (decision: not auto-recovered).** They become `needs_operator`, have no effect, and are listed by `ChannelAuth.needs_operator()`. A redelivery is ignored as `needs_operator`. An operator can only burn one with `burn_needs_operator(channel, update_id)`; it is never executed. I chose this over refusing the migration until they're drained, because a refusal would block `/stop` on the upgraded system.
+- **High-water seed.** The mark is seeded from max(now, latest `processed_at`) under `hw:__migration__`, which applies to every transport's floor and clock check. A pre-migration envelope whose row v0 had already pruned is therefore below the floor (`stale_transport`).
+- **Refused.** An unknown or future version (for example `e1.v9`), and an `e1.v0` database whose tables don't match the `225e7df` layout (for example an earlier unreleased layout). In both cases nothing is changed.
+- **Fidelity check.** The test fixture's `e1.v0` DDL was checked against a database created by the real `225e7df` code: columns, types, NOT NULL, keys, indexes and CHECKs all match. That real database migrates and authenticates normally.
 
 ## Known gaps / decisions for review
 

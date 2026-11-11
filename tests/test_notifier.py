@@ -1750,6 +1750,173 @@ class ClockRollback(_Reopen):
             self.w.auth.max_skew_s = 1
 
 
+# ============================================================ schema migration e1.v0 -> e1.v1 (Dolores @ c23ecd9)
+
+V0_DDL = (   # exact e1.v0 notifier tables as of 225e7df
+    """CREATE TABLE notifier_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)""",
+    """CREATE TABLE approval_requests (approval_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+        action_hash TEXT NOT NULL, action_canonical TEXT NOT NULL, capability TEXT NOT NULL,
+        screenshot_ref TEXT, notification_id TEXT NOT NULL, requested_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL, status TEXT NOT NULL CHECK (status IN
+        ('pending','approved','denied','expired','voided','cancelled')), nonce TEXT UNIQUE,
+        decided_at INTEGER, decided_channel TEXT, status_reason TEXT, record TEXT)""",
+    "CREATE INDEX approval_requests_task ON approval_requests (task_id, status)",
+    """CREATE TABLE notifier_sending (message_id TEXT NOT NULL, dispatch INTEGER NOT NULL,
+        owner TEXT NOT NULL, since REAL NOT NULL, status TEXT NOT NULL CHECK (status IN
+        ('gated','dispatching','unknown')), dispatched_at REAL,
+        PRIMARY KEY (message_id, dispatch))""",
+    """CREATE TABLE inbound_seen (channel TEXT NOT NULL, update_id TEXT NOT NULL,
+        at REAL NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending','processed')),
+        principal TEXT, envelope_digest TEXT NOT NULL, processed_at REAL,
+        PRIMARY KEY (channel, update_id))""",
+    """CREATE TABLE inbound_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL,
+        channel TEXT NOT NULL, sender_ref TEXT NOT NULL, outcome TEXT NOT NULL,
+        reason TEXT NOT NULL)""",
+)
+
+
+class SchemaMigration(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "potter.db"
+        self.signer = TransportSigner("telegram", TRANSPORT_KEYS["telegram"])
+
+    def tearDown(self):
+        from notifier import _schema
+        _schema._MIGRATION_FAULT = None
+        self._tmp.cleanup()
+
+    def make_v0(self, rows=()):
+        """A database as 225e7df left it: C2/C3 tables, e1.v0 notifier tables, rows."""
+        from runtime import Outbox
+        db = Database(self.path)
+        Outbox(db)
+        with db.tx() as c:
+            for stmt in V0_DDL:
+                c.execute(stmt)
+            c.execute("INSERT INTO meta (key, value) VALUES ('notifier_schema', 'e1.v0')")
+            for r in rows:
+                c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
+                          " envelope_digest, processed_at) VALUES (?,?,?,?,?,?,?)", r)
+        return db
+
+    def envelope(self, text, update_id, sent_at=T):
+        return self.signer.envelope(TG_JOSH, text, update_id=update_id, sent_at=sent_at)
+
+    def v0_row(self, msg, status, processed_at=T):
+        digest = ChannelAuth._digest(msg)
+        return ("telegram", msg.update_id, msg.sent_at, status,
+                "human:josh" if status == "pending" else None, digest,
+                processed_at if status == "processed" else None)
+
+    def open_world(self, now=T + 10):
+        w = World.__new__(World)
+        World.__init__(w, self._tmp.name)          # migrates on first construction
+        w.now = now
+        return w
+
+    def schema_version(self):
+        with Database(self.path).read() as c:
+            return c.execute("SELECT value FROM meta WHERE key='notifier_schema'").fetchone()[0]
+
+    def test_v0_database_is_migrated_and_old_processed_row_stays_burned(self):
+        stop = self.envelope("/stop", "old-1")
+        self.make_v0([self.v0_row(stop, "processed")])
+        w = self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v1")
+        with w.db.read() as c:
+            row = c.execute("SELECT status, sent_at, migration_flag FROM inbound_seen"
+                            " WHERE update_id='old-1'").fetchone()
+        self.assertEqual(row[0], "processed")
+        self.assertEqual(row[2], "sent_at_unknown")
+        # Replay of the pre-migration envelope after migration: rejected.
+        w.now = T + 10
+        self.assertEqual(w.router.handle(stop).reason, "replayed")
+        self.assertFalse(w.notifier.kill.is_set())
+        # ... and still rejected once its row is long pruned.
+        w.now = T + 10_000
+        w.router.handle(w.tg_msg("/noop"))
+        self.assertEqual(w.router.handle(stop).reason, "stale_transport")
+
+    def test_old_pending_command_needs_operator_and_never_runs(self):
+        stop = self.envelope("/stop", "old-p")
+        self.make_v0([self.v0_row(stop, "pending")])
+        w = self.open_world()
+        self.assertEqual(w.auth.needs_operator(), [("telegram", "old-p")])
+        res = w.router.handle(stop)
+        self.assertEqual((res.outcome, res.reason), ("ignored", "needs_operator"))
+        self.assertFalse(w.notifier.kill.is_set())
+        self.assertTrue(w.auth.burn_needs_operator("telegram", "old-p"))
+        self.assertEqual(w.auth.needs_operator(), [])
+        self.assertEqual(w.router.handle(stop).reason, "replayed")   # burned, never executed
+        self.assertFalse(w.notifier.kill.is_set())
+
+    def test_high_water_is_seeded_at_migration(self):
+        old = self.envelope("/noop", "old-2", sent_at=T)
+        self.make_v0([self.v0_row(old, "processed", processed_at=T + 50)])
+        w = self.open_world(now=T + 10)
+        hw = w.auth.high_water("telegram")
+        self.assertEqual(hw, {"max_sent_at": T + 50, "max_clock": T + 50})   # max(now=T, T+50)
+        # A pre-migration envelope whose row v0 had already pruned: below the floor.
+        pruned_earlier = self.envelope("/stop", "old-gone", sent_at=T - 400)
+        w.now = T + 60
+        self.assertEqual(w.router.handle(pruned_earlier).reason, "stale_transport")
+
+    def test_interrupted_migration_rolls_back_then_restart_migrates_cleanly(self):
+        from notifier import _schema
+        from runtime import JournalUnavailable
+        stop = self.envelope("/stop", "old-3")
+        self.make_v0([self.v0_row(stop, "processed"), self.v0_row(
+            self.envelope("/ack x", "old-4"), "pending")])
+
+        def crash():
+            raise sqlite3.OperationalError("simulated crash mid-migration")
+        _schema._MIGRATION_FAULT = crash
+        with self.assertRaises(JournalUnavailable):
+            self.open_world()
+        # Nothing half-done: still e1.v0, original table and rows intact.
+        self.assertEqual(self.schema_version(), "e1.v0")
+        with Database(self.path).read() as c:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(inbound_seen)")]
+            n = c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0]
+            tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
+        self.assertNotIn("sent_at", cols)
+        self.assertEqual(n, 2)
+        self.assertNotIn("inbound_seen_v0", tables)
+        _schema._MIGRATION_FAULT = None
+        w = self.open_world()                           # restart: clean migration
+        self.assertEqual(self.schema_version(), "e1.v1")
+        self.assertEqual(w.auth.needs_operator(), [("telegram", "old-4")])
+        self.assertEqual(w.router.handle(stop).reason, "replayed")
+
+    def test_unknown_future_schema_version_is_refused(self):
+        from runtime import JournalUnavailable
+        db = self.make_v0()
+        with db.tx() as c:
+            c.execute("UPDATE meta SET value='e1.v9' WHERE key='notifier_schema'")
+        with self.assertRaises(JournalUnavailable):
+            self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v9")      # untouched
+
+    def test_unrecognised_v0_layout_is_refused(self):
+        from runtime import JournalUnavailable
+        db = self.make_v0()
+        with db.tx() as c:                               # e.g. an older pre-225e7df layout
+            c.execute("DROP TABLE inbound_seen")
+            c.execute("CREATE TABLE inbound_seen (channel TEXT, update_id TEXT, at REAL,"
+                      " PRIMARY KEY (channel, update_id))")
+        with self.assertRaises(JournalUnavailable):
+            self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v0")
+
+    def test_fresh_database_starts_at_v1_and_reopen_is_idempotent(self):
+        w = self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v1")
+        self.assertEqual(w.router.handle(w.tg_msg("/stop")).outcome, "stopped")
+        self.open_world()                                # second start: no migration, no error
+        self.assertEqual(self.schema_version(), "e1.v1")
+
+
 # ============================================================ long work (item 5)
 
 class LongWorkUpdates(Base):

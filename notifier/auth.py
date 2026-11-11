@@ -167,7 +167,7 @@ class ChannelAuth:
         ``inbound_bindings[channel][sender_ref] -> principal``;
         ``outbound_addresses[principal][channel] -> address``."""
         self.db = as_database(db)
-        _schema.ensure(self.db)
+        _schema.ensure(self.db, clock=clock)
         self._keys = {ch: bytes(k) for ch, k in transport_keys.items()}
         self._in = {ch: dict(m) for ch, m in inbound_bindings.items()}
         self._out = {p: dict(m) for p, m in outbound_addresses.items()}
@@ -230,8 +230,32 @@ class ChannelAuth:
 
     @staticmethod
     def _hw(c: sqlite3.Connection, channel: str) -> dict:
-        raw = _schema.get_state(c, f"hw:{channel}")
-        return json.loads(raw) if raw else {"max_sent_at": None, "max_clock": None}
+        """The channel's mark, never below the migration seed (if any)."""
+        out = {"max_sent_at": None, "max_clock": None}
+        for key in (_schema.SEED_KEY, f"hw:{channel}"):
+            raw = _schema.get_state(c, key)
+            if not raw:
+                continue
+            for k, v in json.loads(raw).items():
+                if k in out and v is not None:
+                    out[k] = v if out[k] is None else max(out[k], v)
+        return out
+
+    # ------------------------------------------------------------------ migrated pending rows
+    def needs_operator(self) -> list[tuple[str, str]]:
+        """Pre-migration pending commands: never auto-recovered (status)."""
+        with self.db.read() as c:
+            return [tuple(r) for r in c.execute(
+                "SELECT channel, update_id FROM inbound_seen WHERE status='needs_operator'"
+                " ORDER BY channel, update_id")]
+
+    def burn_needs_operator(self, channel: str, update_id: str) -> bool:
+        """Operator act: close a migrated pending command WITHOUT executing it."""
+        with self.db.tx() as c:
+            cur = c.execute("UPDATE inbound_seen SET status='processed', processed_at=?"
+                            " WHERE channel=? AND update_id=? AND status='needs_operator'",
+                            (self._clock(), channel, update_id))
+            return cur.rowcount == 1
 
     @staticmethod
     def _max_clock(c: sqlite3.Connection) -> float | None:
@@ -308,6 +332,8 @@ class ChannelAuth:
                             (msg.channel, msg.update_id)).fetchone()
             if row is not None:
                 status, stored = row
+                if status == "needs_operator":
+                    return AuthResult(None, "needs_operator")      # migrated: never resumed
                 if status == "processed" or not hmac.compare_digest(stored, digest):
                     self._advance(c, msg.channel, clock=now, sent_at=None)
                     return AuthResult(None, "replayed")
