@@ -8,6 +8,23 @@
 | --- | --- |
 | `allow` | Every gate passed. If an approval was required or presented, C0 `verify()` authenticated it and consumed its nonce atomically with the pending `EffectIntent`, which is returned as `decision.intent`. |
 | `reconcile` | A retry of an already-consumed approval that carries the **same** `EffectIntent` the ledger recorded. The caller reconciles per T10 by reading external state first. This outcome never permits re-execution. |
+
+**Recovery after expiry.** An approval that was consumed while valid stays reconcilable after it expires, whether it ran past `expires_at` or past the 24 h cap. The authority is the durable consumption row that C0 `verify()` wrote only after full validation, holding the intent bytes that are integrity-checked against the approved hash.
+
+The retry gets `reconcile_after_expiry` only when all of these hold:
+
+- it carries a `retry_intent`;
+- the record still authenticates against the pinned issuer key;
+- the record matches every C0 claim except the window;
+- the ledger holds a consumed row for its signed nonce;
+- the retry's intent and action equal that row exactly.
+
+An expired approval that was never consumed, or one presented without a retry intent, is denied with `approval_window`. A fresh effect is never allowed.
+
+Limits:
+
+- If the issuer key is rotated out of the authenticator or revoked, this path denies with `approval_unauthenticated`. C2 journal recovery, which reads the row directly, is the backstop.
+- Revoking an approval after it is consumed cannot un-consume it. Reconciliation reads external state first (T10) and starts nothing new.
 | `deny` | Every other case, including any exception inside the engine. |
 
 ## Gates (the first failure denies)

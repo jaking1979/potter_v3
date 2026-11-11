@@ -32,6 +32,9 @@ Gates, in order (first failure denies):
  8. Approval: required by the capability (or by taint) -> must be present and
     pass C0 ``verify``; presented but not required -> must still verify (a bad
     approval is never silently ignored).
+    Recovery after expiry: a retry carrying a consumed intent whose approval
+    has since expired reconciles from the durable consumption row (see
+    _recover_expired); it can never yield `allow`.
 
 Redaction: reasons are fixed strings chosen from a closed table. Nothing from
 the action's parameters, target, preconditions, the approval record, or
@@ -64,6 +67,7 @@ REASONS: Mapping[str, str] = MappingProxyType({
     "ok": "all policy gates passed",
     "ok_approved": "all policy gates passed; approval verified and consumed",
     "reconcile_pending_intent": "approval already consumed; route the recorded intent to reconciliation",
+    "reconcile_after_expiry": "approval consumed before it expired; route the recorded intent to reconciliation",
     "malformed_request": "request is malformed",
     "invalid_task_id": "action task ID is not a canonical task UUID",
     "capability_mismatch": "requested capability does not match the bound action",
@@ -442,7 +446,10 @@ class PolicyEngine:
             self._verify(record, req.action, now, probe, self._auth, "probe")
         except c0.ApprovalRefused as e:
             if not (probe.reached and str(e).startswith("replay")):
-                return DENY, _c0_code(e), None
+                code = _c0_code(e)
+                if code == "approval_window" and req.retry_intent is not None:
+                    return self._recover_expired(record, req)
+                return DENY, code, None
         else:
             raise RuntimeError("verifier accepted without consuming")  # -> engine_error
         nonce = probe.nonce   # from C0's authenticated snapshot
@@ -454,8 +461,7 @@ class PolicyEngine:
                 return DENY, "retry_without_consumption", None
             if req.retry_intent is None:
                 return DENY, "approval_replayed", None
-            if (req.retry_intent != prior or prior.action_hash != req.action.hash()
-                    or prior.action() != req.action):
+            if not self._intent_matches(prior, req, record):
                 return DENY, "retry_intent_mismatch", None
             return RECONCILE, "reconcile_pending_intent", prior
 
@@ -468,3 +474,62 @@ class PolicyEngine:
         if not isinstance(intent, c0.EffectIntent) or intent.action_hash != req.action.hash():
             raise RuntimeError("verifier returned an unexpected intent")
         return ALLOW, "ok_approved", intent
+
+    @staticmethod
+    def _intent_matches(prior: c0.EffectIntent, req: PolicyRequest, record: Mapping) -> bool:
+        """The retry carries exactly the durably recorded intent, for exactly
+        this action and this approval. EffectIntent.action() re-checks the
+        stored canonical bytes against the approved hash (tamper -> refuse)."""
+        try:
+            stored_action = prior.action()
+        except c0.ApprovalRefused:
+            return False
+        return (req.retry_intent == prior and prior.action_hash == req.action.hash()
+                and prior.action_hash == record.get("action_hash")
+                and prior.approval_id == record.get("approval_id")
+                and prior.task_id == req.action.task_id and stored_action == req.action)
+
+    def _recover_expired(self, record: Mapping, req: PolicyRequest):
+        """Recovery of an approval that was consumed while valid and has since
+        expired (outage past expires_at or the 24 h cap). Only `reconcile` or
+        `deny`, never `allow`.
+
+        Authority is the trusted durable consumption record: the ledger row
+        that C0 verify() wrote only after full validation, holding the intent
+        whose canonical action is integrity-checked against the approved hash.
+        The approval record must still authenticate against the pinned issuer
+        key and match every C0 claim EXCEPT the validity window; that only
+        locates the row (by its signed nonce) and binds it to this action.
+
+        Limits (documented): if the issuer key is rotated out or revoked from
+        the authenticator, this path denies (approval_unauthenticated); C2
+        journal recovery, which reads the row directly, is the backstop.
+        Revoking an approval after consumption cannot un-consume it;
+        reconciliation reads external state first (T10) and starts no new effect.
+        """
+        try:
+            c0.check_shape(record)
+        except c0.ApprovalRefused:
+            return DENY, "approval_malformed", None
+        if self._auth is None:
+            return DENY, "approval_no_issuer", None
+        if not self._auth.verify(record["issuer_key_id"], c0.signing_payload(record),
+                                 record["issuer_signature"]):
+            return DENY, "approval_unauthenticated", None
+        if record["schema"] != "potter.approval/v0":
+            return DENY, "approval_malformed", None
+        if record["decided_by"] != "josh" or record["channel"] not in c0.CHANNELS:
+            return DENY, "approval_unauthorized", None
+        if record["decision"] != "approve":
+            return DENY, "approval_denied", None
+        if record["task_id"] != req.action.task_id:
+            return DENY, "approval_task_mismatch", None
+        if record["action_hash"] != req.action.hash():
+            return DENY, "approval_action_mismatch", None
+        prior = self._ledger.pending(record["nonce"])
+        if prior is None:
+            # Never consumed while valid: an expired approval cannot start anything.
+            return DENY, "approval_window", None
+        if not self._intent_matches(prior, req, record):
+            return DENY, "retry_intent_mismatch", None
+        return RECONCILE, "reconcile_after_expiry", prior

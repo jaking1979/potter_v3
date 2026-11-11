@@ -322,12 +322,6 @@ class Retry(Base):
         self.assertDecision(engine().decide(req(SEND, retry_intent=fake)),
                             DENY, "retry_without_consumption")
 
-    def test_expired_retry_denied(self):
-        ledger = c0.MemoryApprovalLedger()
-        first = engine(ledger).decide(req(SEND, record(SEND)))
-        late = engine(ledger, clock=lambda: NOW + c0.MAX_VALIDITY_S)
-        self.assertDecision(late.decide(req(SEND, record(SEND), retry_intent=first.intent)),
-                            DENY, "approval_window")
 
     def test_stateful_retry_after_state_changed_reconciles(self):
         """P1 regression: the effect succeeded and moved balance_version b1 -> b2,
@@ -387,6 +381,142 @@ class Retry(Base):
             self.assertDecision(d, RECONCILE)
             self.assertDecision(restarted.decide(req(SEND, record(SEND))), DENY,
                                 "approval_replayed")
+
+
+# ---------------------------------------------------------------- recovery after expiry
+
+class RecoveryAfterExpiry(Base):
+    """Dolores review at 5131b4c: an approval consumed while valid must stay
+    reconcilable after it expires; nothing expired may start a fresh effect."""
+    LATE = NOW + 3 * 24 * 3600             # past expires_at AND past the 24 h cap
+
+    def consume(self, ledger, act=SEND, appr=None):
+        d = engine(ledger).decide(req(act, appr or record(act)))
+        self.assertDecision(d, ALLOW, "ok_approved")
+        return d.intent
+
+    def late(self, ledger, **kw):
+        return engine(ledger, clock=lambda: self.LATE, **kw)
+
+    def test_consumed_then_expired_reconciles(self):
+        ledger = c0.MemoryApprovalLedger()
+        intent = self.consume(ledger)
+        for when in (NOW + 300, NOW - 10 + c0.MAX_VALIDITY_S, self.LATE):   # expiry, cap, far
+            with self.subTest(when=when):
+                d = engine(ledger, clock=lambda w=when: w).decide(
+                    req(SEND, record(SEND), retry_intent=intent))
+                self.assertDecision(d, RECONCILE, "reconcile_after_expiry")
+                self.assertEqual(d.intent, intent)
+                self.assertEqual(d.intent.action(), SEND)
+        self.assertEqual(ledger.pending("a" * 32), intent)          # still single use
+
+    def test_restart_before_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "ledger.sqlite")
+            intent = self.consume(c0.SqliteApprovalLedger(db))
+            restarted = self.late(c0.SqliteApprovalLedger(db))     # fresh process, after expiry
+            d = restarted.decide(req(SEND, record(SEND), retry_intent=intent))
+            self.assertDecision(d, RECONCILE, "reconcile_after_expiry")
+            self.assertEqual(d.intent.action(), SEND)
+            self.assertDecision(restarted.decide(req(SEND, record(SEND))), DENY, "approval_window")
+
+    def test_tampered_intent_denied(self):
+        ledger = c0.MemoryApprovalLedger()
+        i = self.consume(ledger)
+        bad = [EffectIntent("eff-other", i.task_id, i.action_hash, i.approval_id, i.action_canonical),
+               EffectIntent(i.effect_id, i.task_id, i.action_hash, i.approval_id,
+                            i.action_canonical.replace("7pm", "9pm")),
+               EffectIntent(i.effect_id, i.task_id, i.action_hash, "appr-9999", i.action_canonical)]
+        for t in bad:
+            with self.subTest(t=t.effect_id):
+                self.assertDecision(self.late(ledger).decide(req(SEND, record(SEND), retry_intent=t)),
+                                    DENY, "retry_intent_mismatch")
+
+    def test_tampered_ledger_row_denied(self):
+        ledger = c0.MemoryApprovalLedger()
+        i = self.consume(ledger)
+        forged = EffectIntent(i.effect_id, i.task_id, i.action_hash, i.approval_id,
+                              i.action_canonical.replace("7pm", "9pm"))
+        ledger._intents["a" * 32] = forged                         # storage-level tamper
+        self.assertDecision(self.late(ledger).decide(req(SEND, record(SEND), retry_intent=forged)),
+                            DENY, "retry_intent_mismatch")
+
+    def test_never_consumed_and_expired_denied(self):
+        ledger = c0.MemoryApprovalLedger()
+        fake = EffectIntent("eff-x", T1, SEND.hash(), "appr-0001", SEND.canonical_json().decode())
+        self.assertDecision(self.late(ledger).decide(req(SEND, record(SEND), retry_intent=fake)),
+                            DENY, "approval_window")
+        self.assertNotIn("a" * 32, ledger)
+
+    def test_expired_fresh_request_denied(self):
+        ledger = c0.MemoryApprovalLedger()
+        self.assertDecision(self.late(ledger).decide(req(SEND, record(SEND))), DENY, "approval_window")
+        self.assertNotIn("a" * 32, ledger)
+        # Consumed then expired, but no intent carried: still not a fresh allow.
+        self.consume(ledger)
+        self.assertDecision(self.late(ledger).decide(req(SEND, record(SEND))), DENY, "approval_window")
+
+    def test_forged_or_edited_record_denied_after_expiry(self):
+        ledger = c0.MemoryApprovalLedger()
+        intent = self.consume(ledger)
+        edited = record(SEND)
+        edited["expires_at"] = self.LATE + 10                      # extend after signing
+        for r, code in ((record(SEND, auth=ATTACKER), "approval_unauthenticated"),
+                        (edited, "approval_unauthenticated"),
+                        (record(SEND, decision="deny"), "approval_denied"),
+                        (record(SEND, decided_by="dolores"), "approval_unauthorized")):
+            with self.subTest(code=code):
+                self.assertDecision(self.late(ledger).decide(req(SEND, r, retry_intent=intent)),
+                                    DENY, code)
+        self.assertDecision(self.late(ledger, authenticator=None).decide(
+            req(SEND, record(SEND), retry_intent=intent)), DENY, "approval_no_issuer")
+
+    def test_recovery_reauthenticates_even_if_verifier_reports_window_first(self):
+        """Defense in depth: recovery does not rely on C0's check order."""
+        def window_first(*a, **k):
+            raise c0.ApprovalRefused("outside validity window (max 24 h)")
+        ledger = c0.MemoryApprovalLedger()
+        intent = self.consume(ledger)
+        for r, code in ((record(SEND, auth=ATTACKER), "approval_unauthenticated"),
+                        (record(SEND, decision="deny"), "approval_denied"),
+                        (record(SEND, channel="email"), "approval_unauthorized"),
+                        (record(SEND, schema="potter.approval/v1"), "approval_malformed"),
+                        ({**record(SEND), "nonce": None}, "approval_malformed")):
+            with self.subTest(code=code):
+                self.assertDecision(self.late(ledger, verifier=window_first).decide(
+                    req(SEND, r, retry_intent=intent)), DENY, code)
+        self.assertDecision(self.late(ledger, verifier=window_first).decide(
+            req(SEND, record(SEND), retry_intent=intent)), RECONCILE, "reconcile_after_expiry")
+
+    def test_task_mismatch_after_expiry_denied(self):
+        ledger = c0.MemoryApprovalLedger()
+        intent = self.consume(ledger)
+        other = BoundAction(T2, "gmail.send", "send", "alex@example.com", SEND.parameters)
+        self.assertDecision(self.late(ledger).decide(req(other, record(SEND), retry_intent=intent)),
+                            DENY, "approval_task_mismatch")
+
+    def test_different_action_after_expiry_denied(self):
+        ledger = c0.MemoryApprovalLedger()
+        intent = self.consume(ledger)
+        other = BoundAction(T1, "gmail.send", "send", "mallory@evil.test", SEND.parameters)
+        self.assertDecision(self.late(ledger).decide(req(other, record(SEND), retry_intent=intent)),
+                            DENY, "approval_action_mismatch")
+
+    def test_key_rotated_out_denies_documented_limit(self):
+        ledger = c0.MemoryApprovalLedger()
+        intent = self.consume(ledger)
+        rotated = c0.HmacAuthenticator({"e1-2027": b"next-issuer-key"})
+        self.assertDecision(self.late(ledger, authenticator=rotated).decide(
+            req(SEND, record(SEND), retry_intent=intent)), DENY, "approval_unauthenticated")
+
+    def test_stateful_consumed_expired_and_state_moved_reconciles(self):
+        act = BoundAction(T1, "payments.transfer", "pay", "acct:9", {"amount": 50},
+                          {"balance_version": "b1"})
+        ledger = c0.MemoryApprovalLedger()
+        intent = self.consume(ledger, act)
+        d = self.late(ledger).decide(req(act, record(act), live_state={"balance_version": "b2"},
+                                         retry_intent=intent))
+        self.assertDecision(d, RECONCILE, "reconcile_after_expiry")
 
 
 # ---------------------------------------------------------------- delegation
