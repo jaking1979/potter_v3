@@ -21,7 +21,7 @@ class Tests(unittest.TestCase):
         self.assertFalse(v['stale']);self.assertEqual(v['items'][0]['age_s'],301)
         self.assertNotIn('stale',v['items'][0])
         html=render(project(s,now=NOW))
-        self.assertIn('Last changed',html);self.assertIn('301 seconds ago',html)
+        self.assertIn('Last changed',html);self.assertIn(stamp(301),html);self.assertNotIn('301 seconds ago',html)
         self.assertNotIn('301 seconds — stale',html)
         s['tasks']['observed_at']=stamp(301);s['tasks']['items'][0]['updated_at']=stamp(301)
         self.assertTrue(project(s,now=NOW)['sections']['tasks']['stale'])
