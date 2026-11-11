@@ -38,4 +38,3 @@ def _summarize_dimension(planned_ids, classifications):
     result.update(status='descriptive_only', agreements=agreements,
                   interval_95=wilson_95(agreements, n))
     return result
-
