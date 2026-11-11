@@ -28,7 +28,9 @@
                           reason only; message text is never stored.
 
 ``meta.notifier_schema`` pins the layout (``e1.v1``). ``ensure()`` migrates an
-``e1.v0`` database (layout as of 225e7df, detected column-for-column) inside
+``e1.v0`` database (every non-``sqlite_%`` object in the file must equal, with
+byte-identical ``sqlite_master`` SQL, what ``V0_SCHEMA`` - verbatim 225e7df -
+plus the C2/C3 allowlist produce) inside
 ONE ``BEGIN IMMEDIATE`` transaction, and refuses anything else (an unknown or
 future version, or an ``e1.v0`` database whose tables don't match) before any
 table is created or any traffic is routed. Migration of ``inbound_seen``
@@ -114,14 +116,43 @@ SCHEMA = (
 )
 
 
-V0_COLUMNS = {
-    "inbound_seen": ["channel", "update_id", "at", "status", "principal", "envelope_digest",
-                     "processed_at"],
-    "notifier_sending": ["message_id", "dispatch", "owner", "since", "status",
-                         "dispatched_at"],
-    "notifier_state": ["key", "value"],
-    "inbound_log": ["seq", "at", "channel", "sender_ref", "outcome", "reason"],
-}
+V0_SCHEMA = (   # verbatim SCHEMA of notifier/_schema.py at 225e7df (the accepted e1.v0)
+    'CREATE TABLE IF NOT EXISTS notifier_state (\n        key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+    "CREATE TABLE IF NOT EXISTS approval_requests (\n        approval_id TEXT PRIMARY KEY,\n        task_id TEXT NOT NULL,\n        action_hash TEXT NOT NULL,\n        action_canonical TEXT NOT NULL,\n        capability TEXT NOT NULL,\n        screenshot_ref TEXT,\n        notification_id TEXT NOT NULL,\n        requested_at INTEGER NOT NULL,\n        expires_at INTEGER NOT NULL,\n        status TEXT NOT NULL CHECK (status IN\n            ('pending','approved','denied','expired','voided','cancelled')),\n        nonce TEXT UNIQUE,\n        decided_at INTEGER,\n        decided_channel TEXT,\n        status_reason TEXT,\n        record TEXT)",
+    'CREATE INDEX IF NOT EXISTS approval_requests_task ON approval_requests (task_id, status)',
+    "CREATE TABLE IF NOT EXISTS notifier_sending (\n        message_id TEXT NOT NULL,\n        dispatch INTEGER NOT NULL,\n        owner TEXT NOT NULL,\n        since REAL NOT NULL,\n        status TEXT NOT NULL CHECK (status IN ('gated','dispatching','unknown')),\n        dispatched_at REAL,\n        PRIMARY KEY (message_id, dispatch))",
+    "CREATE TABLE IF NOT EXISTS inbound_seen (\n        channel TEXT NOT NULL,\n        update_id TEXT NOT NULL,\n        at REAL NOT NULL,\n        status TEXT NOT NULL CHECK (status IN ('pending','processed')),\n        principal TEXT,\n        envelope_digest TEXT NOT NULL,\n        processed_at REAL,\n        PRIMARY KEY (channel, update_id))",
+    'CREATE TABLE IF NOT EXISTS inbound_log (\n        seq INTEGER PRIMARY KEY AUTOINCREMENT,\n        at REAL NOT NULL,\n        channel TEXT NOT NULL,\n        sender_ref TEXT NOT NULL,\n        outcome TEXT NOT NULL,\n        reason TEXT NOT NULL)',
+)
+
+def _catalog(c: sqlite3.Connection) -> set:
+    """EVERY schema object in the database except SQLite's own (``sqlite_%``):
+    tables, indexes, triggers and views, whatever table they hang off, with
+    their exact stored SQL (no normalization)."""
+    return {tuple(r) for r in c.execute(
+        # Exact prefix test: in LIKE, '_' is a wildcard (and LIKE ignores case),
+        # so "NOT LIKE 'sqlite_%'" would hide e.g. a view named sqliteXleak.
+        "SELECT type, name, tbl_name, sql FROM sqlite_master"
+        " WHERE substr(name, 1, 7) <> 'sqlite_'")}
+
+
+def _expected_v0_catalog() -> set:
+    """What a 225e7df database must contain, byte for byte: the objects C2
+    (``runtime.db.SCHEMA``) and C3 (``runtime.outbox.OUTBOX_SCHEMA``) create -
+    an explicit allowlist of objects owned by others, with their exact SQL -
+    plus the e1.v0 objects (``V0_SCHEMA``). Built by running those same
+    statements in ``:memory:``; SQLite stores the statement text itself."""
+    from runtime.db import SCHEMA as C2_SCHEMA
+    from runtime.outbox import OUTBOX_SCHEMA as C3_SCHEMA
+    mem = sqlite3.connect(":memory:")
+    try:
+        for stmt in (*C2_SCHEMA, *C3_SCHEMA, *V0_SCHEMA):
+            mem.execute(stmt)
+        return _catalog(mem)
+    finally:
+        mem.close()
+
+
 V1_INBOUND_COLUMNS = ["channel", "update_id", "at", "status", "principal", "envelope_digest",
                       "sent_at", "processed_at", "migration_flag"]
 
@@ -135,12 +166,13 @@ def _columns(c: sqlite3.Connection, table: str) -> list[str]:
 
 
 def _migrate_v0(c: sqlite3.Connection, now: float) -> None:
-    for table, cols in V0_COLUMNS.items():
-        got = _columns(c, table)
-        if got and got != cols:
-            raise JournalUnavailable(f"e1.v0 table {table} has an unrecognised layout; refusing")
-    if not _columns(c, "inbound_seen"):
-        raise JournalUnavailable("e1.v0 database without inbound_seen; refusing")
+    # The whole database schema must equal the accepted one exactly: e1.v0
+    # objects as created at 225e7df plus C2/C3's own objects, every table,
+    # index, trigger and view, byte-for-byte SQL. Anything else - a changed
+    # literal, an extra view or trigger anywhere - is refused untouched.
+    if _catalog(c) != _expected_v0_catalog():
+        raise JournalUnavailable("e1.v0 schema does not match the accepted 225e7df layout;"
+                                 " refusing")
     latest = c.execute("SELECT MAX(processed_at) FROM inbound_seen").fetchone()[0]
     seed = max(now, latest) if latest is not None else now
     c.execute("ALTER TABLE inbound_seen RENAME TO inbound_seen_v0")
