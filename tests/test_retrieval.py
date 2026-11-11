@@ -2,10 +2,38 @@ import asyncio
 import time
 import unittest
 
-from retrieval.core import Evidence, FakeBackend, benchmark, retrieve_turn
+from retrieval.core import Evidence, FakeBackend, benchmark, retrieve_turn, MAX_ASYNC_RESULTS
 
 
 class RetrievalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_unbounded_and_oversized_iterables_fail_closed(self):
+        class Repeating:
+            async def search(self, query):
+                def values():
+                    while True:
+                        yield Evidence('id', 'text')
+                return values()
+        class Many:
+            async def search(self, query):
+                return [Evidence(str(i), '') for i in range(MAX_ASYNC_RESULTS + 1)]
+        for adapter in (Repeating(), Many()):
+            turn = await retrieve_turn(adapter, 'q', consequential=True)
+            self.assertEqual((turn.status, turn.items, turn.blocked), ('unavailable', (), True))
+            result = await benchmark(adapter, 'q', ['id'])
+            self.assertEqual((result.status, result.top_ids, result.hit), ('unavailable', (), False))
+
+    async def test_result_cap_accepts_limit_and_validates_beyond_top_three(self):
+        class AtLimit:
+            async def search(self, query):
+                return [Evidence(str(i), '') for i in range(MAX_ASYNC_RESULTS)]
+        class InvalidLater:
+            async def search(self, query):
+                return [Evidence('1', ''), Evidence('2', ''), Evidence('3', ''), object()]
+        result = await retrieve_turn(AtLimit(), 'q', consequential=False)
+        self.assertEqual((result.status, len(result.items)), ('complete', 3))
+        bad = await retrieve_turn(InvalidLater(), 'q', consequential=False)
+        self.assertEqual((bad.status, bad.items), ('unavailable', ()))
+
     async def test_malformed_evidence_fields_are_unavailable(self):
         for item in (Evidence(['unhashable'], 'text'), Evidence(1, 'text'),
                      Evidence('id', None), Evidence('id', {'body': 'object'})):

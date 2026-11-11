@@ -12,6 +12,9 @@ import time
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
+# Bound synthetic async-adapter result materialization. This does not preempt
+# a backend or iterator that blocks the event loop; real adapters need isolation.
+MAX_ASYNC_RESULTS = 1024
 
 @dataclass(frozen=True)
 class Evidence:
@@ -64,7 +67,19 @@ async def _bounded(backend: Backend, query: str, timeout: float):
             return 'deadline', (), time.monotonic() - start
         try:
             raw = task.result()
-            items = tuple(raw)
+            values = []
+            iterator = iter(raw)
+            while True:
+                if time.monotonic() - start >= timeout:
+                    return 'deadline', (), time.monotonic() - start
+                try:
+                    value = next(iterator)
+                except StopIteration:
+                    break
+                if len(values) >= MAX_ASYNC_RESULTS:
+                    return 'unavailable', (), time.monotonic() - start
+                values.append(value)
+            items = tuple(values)
             if any(not isinstance(item, Evidence) or type(item.item_id) is not str
                    or not item.item_id or type(item.text) is not str for item in items):
                 raise ValueError('invalid evidence')
