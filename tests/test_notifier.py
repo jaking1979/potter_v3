@@ -1622,6 +1622,134 @@ class DurableInFlightRecord(_Reopen):
         self.assertFalse(report.all_clear)
 
 
+# ============================================================ clock rollback (Dolores @ 225e7df)
+
+class ClockRollback(_Reopen):
+    """Replay protection must not trust a wall clock that moves backwards."""
+
+    def jump_then_prune(self):
+        stop = self.w.tg_msg("/stop")                               # signed at T
+        self.assertEqual(self.w.router.handle(stop).outcome, "stopped")
+        self.w.notifier.kill.clear()                                # operator clears kill
+        self.w.now = T + 1000
+        self.w.router.handle(self.w.tg_msg("/noop"))                # prunes the /stop row
+        with self.w.db.read() as c:
+            self.assertIsNone(c.execute("SELECT 1 FROM inbound_seen WHERE update_id=?",
+                                        (stop.update_id,)).fetchone())
+        return stop
+
+    def test_dolores_jump_forward_then_roll_back(self):
+        stop = self.jump_then_prune()
+        self.w.now = T                                              # clock rolls back
+        res = self.w.router.handle(stop)
+        self.assertEqual((res.outcome, res.reason), ("ignored", "clock_regression"))
+        self.assertFalse(self.w.notifier.kill.is_set())
+        # Fail closed: even a brand-new, correctly signed command is refused.
+        self.assertEqual(self.w.router.handle(self.w.tg_msg("/stop")).reason,
+                         "clock_regression")
+        self.assertFalse(self.w.notifier.kill.is_set())
+
+    def test_restart_between_jump_and_rollback(self):
+        stop = self.jump_then_prune()
+        self.w.now = T
+        w2 = self.reopen()                                          # nothing process-local survives
+        self.assertEqual(w2.router.handle(stop).reason, "clock_regression")
+        self.assertFalse(w2.notifier.kill.is_set())
+
+    def test_rollback_on_another_transport_also_fails_closed(self):
+        self.jump_then_prune()
+        self.w.now = T
+        res = self.w.router.handle(self.w.mail_msg("/stop", dkim=True))
+        self.assertEqual(res.reason, "clock_regression")
+
+    def test_operator_reconcile_keeps_old_envelopes_rejected(self):
+        stop = self.jump_then_prune()
+        self.w.now = T
+        self.w.auth.reconcile_clock()                               # operator accepts clock T
+        # The sent_at watermark did not move back: the replay is still refused.
+        self.assertEqual(self.w.router.handle(stop).reason, "stale_transport")
+        self.assertFalse(self.w.notifier.kill.is_set())
+        # Once the clock passes the watermark floor again, new commands work.
+        self.w.now = T + 1000
+        self.assertEqual(self.w.router.handle(self.w.tg_msg("/stop")).outcome, "stopped")
+
+    def test_pruned_envelope_rejected_by_watermark_without_rollback(self):
+        stop = self.jump_then_prune()
+        self.w.now = T + 1000
+        self.assertEqual(self.w.router.handle(stop).reason, "stale_transport")
+
+    def test_restore_of_db_copy_taken_after_acceptance(self):
+        import shutil
+        stop = self.w.tg_msg("/stop")
+        self.assertEqual(self.w.router.handle(stop).outcome, "stopped")
+        self.w.notifier.kill.clear()
+        db_path = Path(self._tmp.name) / "potter.db"
+        backup = Path(self._tmp.name) / "backup"
+        backup.mkdir()
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(db_path) + suffix)
+            if src.exists():
+                shutil.copy(src, backup / (db_path.name + suffix))
+        self.jump_then_prune_existing()
+        # Restore the older copy (it still holds the processed /stop row), roll back.
+        for suffix in ("", "-wal", "-shm"):
+            dst = Path(str(db_path) + suffix)
+            if dst.exists():
+                dst.unlink()
+            src = backup / (db_path.name + suffix)
+            if src.exists():
+                shutil.copy(src, dst)
+        self.w.now = T
+        w2 = self.reopen()
+        self.assertEqual(w2.router.handle(stop).reason, "replayed")
+        self.assertFalse(w2.notifier.kill.is_set())
+
+    def jump_then_prune_existing(self):
+        self.w.now = T + 1000
+        self.w.router.handle(self.w.tg_msg("/noop"))
+
+    def test_restore_of_db_copy_taken_after_jump_fails_closed(self):
+        import shutil
+        stop = self.jump_then_prune()
+        db_path = Path(self._tmp.name) / "potter.db"
+        snap = Path(self._tmp.name) / "snap"
+        snap.mkdir()
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(db_path) + suffix)
+            if src.exists():
+                shutil.copy(src, snap / (db_path.name + suffix))
+        self.w.now = T + 2000
+        self.w.router.handle(self.w.tg_msg("/noop"))
+        for suffix in ("", "-wal", "-shm"):
+            dst = Path(str(db_path) + suffix)
+            if dst.exists():
+                dst.unlink()
+            src = snap / (db_path.name + suffix)
+            if src.exists():
+                shutil.copy(src, dst)
+        self.w.now = T                                              # restored + rolled back
+        w2 = self.reopen()
+        self.assertEqual(w2.router.handle(stop).reason, "clock_regression")
+        self.assertFalse(w2.notifier.kill.is_set())
+
+    def test_small_backward_step_within_tolerance_is_tolerated(self):
+        self.w.now = T + 100
+        self.w.router.handle(self.w.tg_msg("/noop"))
+        self.w.now = T + 97                                         # 3 s back (< 5 s)
+        self.assertEqual(self.w.router.handle(self.w.tg_msg("/stop")).outcome, "stopped")
+
+    def test_high_water_and_skew_are_exposed_read_only(self):
+        self.w.router.handle(self.w.tg_msg("/noop"))
+        hw = self.w.auth.high_water("telegram")
+        self.assertEqual(hw, {"max_sent_at": T, "max_clock": T})
+        hw["max_sent_at"] = 0                                       # a copy: no effect
+        self.assertEqual(self.w.auth.high_water("telegram")["max_sent_at"], T)
+        self.assertEqual(self.w.auth.max_skew_s, 300.0)
+        self.assertEqual(self.w.auth.prune_horizon_s, 660.0)
+        with self.assertRaises(AttributeError):
+            self.w.auth.max_skew_s = 1
+
+
 # ============================================================ long work (item 5)
 
 class LongWorkUpdates(Base):

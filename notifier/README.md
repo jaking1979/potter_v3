@@ -26,6 +26,20 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
      - **Known outcomes only.** The router marks a refusal, an unknown command or the idempotent ack `processed` only after that outcome completes. If anything raises first (a signing key, the trace sink, the database), the transaction rolls back and the update stays `pending`. A failure *after* the effect commits leaves it `processed`, so the effect is never reapplied.
      - **Recovery path.** Redelivery of a `pending` update resumes it, even after an outage longer than the 300 s freshness window. The redelivered envelope must match the stored digest byte for byte, and authorization is rechecked: binding, allowlist, enabled status, DKIM or session. A different envelope under the same update ID is refused as `replayed`. An update never seen before must still be fresh (`stale_transport` otherwise), and nothing is recorded for it.
      - Redelivery of a `processed` update is ignored as `replayed`. If two deliveries race, one wins the compare-and-set and the other's effect rolls back.
+   - **Clock rollback fails closed.** Each transport keeps a durable high-water mark in the shared DB (`notifier_state['hw:<channel>']`). It holds the highest accepted signed `sent_at` and the highest clock reading seen; both only move forward.
+     - If the clock reads more than 5 s behind the highest clock of *any* transport, every command is refused as `clock_regression`. Refusal continues until an operator calls `ChannelAuth.reconcile_clock()`, which lowers only the clock mark, never the `sent_at` mark.
+     - A never-seen envelope must be fresh against the clock *and* have `sent_at ≥ max_sent_at − 300 s`. So an envelope whose row was pruned can't be accepted again, whatever the wall clock says.
+     - Pruning removes processed rows with `sent_at < max_sent_at − (2 × 300 s + 60 s)`, never by wall time.
+     - E3 reads `max_skew_s`, `prune_horizon_s`, `clock_tolerance_s` and `high_water(channel)` as read-only values.
+     - Tests:
+       - Dolores's jump-forward-then-roll-back;
+       - a restart from the DB between the jump and the rollback;
+       - a rollback seen on another transport;
+       - operator reconcile;
+       - restoring a DB copy taken after acceptance (`replayed`) and after the jump (`clock_regression`);
+       - a small step back within tolerance;
+       - unchanged forward operation.
+     - **Limit:** restoring a DB copy taken *before* an envelope was first accepted is indistinguishable from first delivery, while the clock is still within 300 s of that envelope. Detecting it needs an external monotonic anchor, such as a signed counter held outside the DB.
    - **Retention.** Vouchers, which carry the verified text for command binding, are released after dispatch and capped at 1024 in memory. Journal rows keep only the digest. Processed rows are pruned after `2 × 300 s + 60 s`, once any replay of them would be rejected as stale anyway. Pending rows are never pruned.
    - A voucher can drive only the command it was minted for. `stop()` needs `/stop`, `ack(nid)` needs `/ack nid`, and `decide(id, approve)` needs `/approve id`. A voucher for `/ack` therefore cannot stop or approve.
    - A boundary test wires a fake Telegram webhook adapter to the router. The adapter checks the webhook secret and signs the envelope. A forged webhook never reaches the router.

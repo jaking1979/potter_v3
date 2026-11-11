@@ -19,7 +19,10 @@
                           (marked ``processed`` in the SAME transaction),
                           so a crash between authentication and effect is
                           resumed on redelivery, and a processed update is
-                          never executed twice.
+                          never executed twice. Its signed ``sent_at`` drives
+                          pruning (against the transport high-water mark).
+* ``notifier_state['hw:<channel>']`` - transport high-water mark: max
+                          accepted ``sent_at`` and max observed clock.
 * ``inbound_log``       - commands that were ignored (non-allowlisted or
                           unauthenticated senders). Sender reference and
                           reason only; message text is never stored.
@@ -79,6 +82,7 @@ SCHEMA = (
         status TEXT NOT NULL CHECK (status IN ('pending','processed')),
         principal TEXT,
         envelope_digest TEXT NOT NULL,
+        sent_at REAL NOT NULL,
         processed_at REAL,
         PRIMARY KEY (channel, update_id))""",
     """CREATE TABLE IF NOT EXISTS inbound_log (
