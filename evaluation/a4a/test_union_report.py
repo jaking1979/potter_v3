@@ -26,6 +26,8 @@ class UnionTests(unittest.TestCase):
         result = summarize_dimensions(ids, {'done': a, 'trust': b})
         self.assertEqual(result['dimensions']['done']['agreements'], 19)
         self.assertEqual(result['dimensions']['trust']['agreements'], 19)
+        self.assertEqual(result['dimensions']['trust']['forced_disagree'], ['0'])
+        self.assertNotIn('affected', result['dimensions']['trust'])
         self.assertEqual(result['affected_reasons'], {'0': {'done': 'unalignable'}})
 
     def test_invalid_retains_reasons_by_dimension(self):
