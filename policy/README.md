@@ -1,0 +1,77 @@
+# PolicyEngine v0 (package C1, T11/T12)
+
+`PolicyEngine.decide(PolicyRequest) -> Decision` is the fail-closed decision core. It builds on the C0 contracts (`contracts/v0/approval.py`) and does not re-implement them.
+
+## Outcomes
+
+| Outcome | Meaning |
+| --- | --- |
+| `allow` | Every gate passed. If an approval was required or presented, C0 `verify()` authenticated it and consumed its nonce atomically with the pending `EffectIntent`, which is returned as `decision.intent`. |
+| `reconcile` | A retry of an already-consumed approval that carries the **same** `EffectIntent` the ledger recorded. The caller reconciles per T10 by reading external state first. This outcome never permits re-execution. |
+
+**Recovery after expiry.** An approval that was consumed while valid stays reconcilable after it expires, whether it ran past `expires_at` or past the 24 h cap. The authority is the durable consumption row that C0 `verify()` wrote only after full validation, holding the intent bytes that are integrity-checked against the approved hash.
+
+The retry gets `reconcile_after_expiry` only when all of these hold:
+
+- it carries a `retry_intent`;
+- the record still authenticates against the pinned issuer key;
+- the record matches every C0 claim except the window;
+- the ledger holds a consumed row for its signed nonce;
+- the retry's intent and action equal that row exactly.
+
+An expired approval that was never consumed, or one presented without a retry intent, is denied with `approval_window`. A fresh effect is never allowed.
+
+Limits:
+
+- If the issuer key is rotated out of the authenticator or revoked, this path denies with `approval_unauthenticated`. C2 journal recovery, which reads the row directly, is the backstop.
+- Revoking an approval after it is consumed cannot un-consume it. Reconciliation reads external state first (T10) and starts nothing new.
+| `deny` | Every other case, including any exception inside the engine. |
+
+## Gates (the first failure denies)
+
+1. **Request shape:** types, non-empty IDs, and the requested capability must equal `action.capability`.
+2. **Clock:** it must return an `int`. If it raises or returns anything else, the request is denied.
+3. **Registry:** an unknown capability is denied. Registration itself rejects unsafe declarations, such as a consequential capability that doesn't require approval.
+4. **Forbidden:** always denied. A genuine approval cannot unlock a forbidden capability.
+5. **Delegation:** root grants come from engine configuration and are never taken from the request. Each hop (`subagent` / `cron` / `retry`) can only narrow them, so the effective grants are the intersection. The maximum depth is 8.
+6. **Live state (stateful capabilities):** preconditions must be non-empty, every declared key must be present, and the values must equal the live state the caller just observed. This gate applies to fresh execution only. A retry that carries a consumed intent skips it, because the original effect may already have changed that state. Such a retry can still only end in `reconcile` or `deny`.
+7. **Provenance:** the engine decides trust from the source *kind*. Only `principal_direct` and `system_policy` are trusted. Unknown, missing or mixed sources taint the request. A tainted request for any write needs an approval.
+8. **Approval:** C0 `verify` first runs against a probe ledger that refuses consumption. If the nonce turns out to be consumed already, only `reconcile` is possible. Otherwise a real `verify` consumes it. If an approval is presented but not required, it must still verify.
+
+## Risk matrix (reference: `RiskMatrix` in `tests/test_policy_engine.py`)
+
+| Risk class | No approval, trusted | No approval, untrusted | Valid approval |
+| --- | --- | --- | --- |
+| read | allow | allow | allow (consumed) |
+| reversible_write (no approval needed) | allow | **deny** | allow |
+| reversible_write (approval needed) | deny | deny | allow |
+| consequential | deny | deny | allow |
+| forbidden | deny | deny | deny |
+
+## Redaction and tracing
+
+Reasons are fixed strings from the closed `REASONS` table. C0 refusal messages are mapped to codes and never echoed. `Decision.intent` holds the action parameters and is excluded from `repr` and from `trace_record()`. `trace_hook(record)` is the seam for C6 and is a no-op by default.
+
+**Authority and audit:**
+
+- The returned `Decision` is the only execution authority.
+- Trace-hook records are candidate evaluations. A hook may durably commit a candidate, even an `allow`, and then raise; the decision is then deny with `trace_error`.
+- After a trace failure, C1 makes one best-effort call to the optional `final_hook(record)` with a superseding record: `{decision_id, final_outcome: "deny", reason: "trace_error", supersedes: "candidate", task_id, correlation}`.
+- If `final_hook` raises, the error is swallowed and the decision stays deny.
+- Every failed hook call, from either hook, increments `PolicyEngine.trace_failures`. Ops should alert on any increase.
+- Audit completeness for `trace_error` denials depends on `final_hook`.
+
+Every trace record carries `task_id` and `correlation`:
+
+- `task_id` is taken from the request's frozen `BoundAction.task_id`, never from caller closures. It is used only if it is a canonical UUID: `str(UUID(v)) == v`, which is the form C2 `task_id_for` emits and C6 `DecisionTrace` requires.
+- A non-UUID task ID is denied with `invalid_task_id`.
+- When no valid ID can be established (a malformed request or an invalid ID), the record carries `task_id: None` and `correlation: "missing"`. The decision still denies and is still traced. Otherwise `correlation` is `"request"`. If the trace hook raises, the decision becomes a deny. Any nonce already consumed stays recorded as a pending intent, so C2/T10 recovery reconciles it.
+
+## Not in this package
+
+- Harness wiring (C8).
+- Real connectors.
+- A production ledger (C2's effect journal).
+- Key custody.
+
+Nothing here enables runtime behavior (T22).
