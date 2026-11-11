@@ -28,8 +28,9 @@
                           reason only; message text is never stored.
 
 ``meta.notifier_schema`` pins the layout (``e1.v1``). ``ensure()`` migrates an
-``e1.v0`` database (the exact 225e7df schema, ``V0_SCHEMA``: every table and
-index on the e1.v0 tables, compared as normalized ``sqlite_master`` SQL) inside
+``e1.v0`` database (every non-``sqlite_%`` object in the file must equal, with
+byte-identical ``sqlite_master`` SQL, what ``V0_SCHEMA`` - verbatim 225e7df -
+plus the C2/C3 allowlist produce) inside
 ONE ``BEGIN IMMEDIATE`` transaction, and refuses anything else (an unknown or
 future version, or an ``e1.v0`` database whose tables don't match) before any
 table is created or any traffic is routed. Migration of ``inbound_seen``
@@ -123,31 +124,26 @@ V0_SCHEMA = (   # verbatim SCHEMA of notifier/_schema.py at 225e7df (the accepte
     "CREATE TABLE IF NOT EXISTS inbound_seen (\n        channel TEXT NOT NULL,\n        update_id TEXT NOT NULL,\n        at REAL NOT NULL,\n        status TEXT NOT NULL CHECK (status IN ('pending','processed')),\n        principal TEXT,\n        envelope_digest TEXT NOT NULL,\n        processed_at REAL,\n        PRIMARY KEY (channel, update_id))",
     'CREATE TABLE IF NOT EXISTS inbound_log (\n        seq INTEGER PRIMARY KEY AUTOINCREMENT,\n        at REAL NOT NULL,\n        channel TEXT NOT NULL,\n        sender_ref TEXT NOT NULL,\n        outcome TEXT NOT NULL,\n        reason TEXT NOT NULL)',
 )
-V0_TABLES = ("notifier_state", "approval_requests", "notifier_sending", "inbound_seen",
-             "inbound_log")
-
-
-def _norm_sql(sql):
-    if sql is None:
-        return None
-    import re
-    sql = re.sub(r"\s+", " ", sql.replace("IF NOT EXISTS ", "")).strip()
-    return re.sub(r"\s*([(),])\s*", r"\1", sql)
-
 
 def _catalog(c: sqlite3.Connection) -> set:
-    """Every table/index/trigger/view on the e1.v0 tables, with normalized SQL
-    (autoindexes included by name, so PRIMARY KEY / UNIQUE changes show)."""
-    marks = ",".join("?" * len(V0_TABLES))
-    return {(t, n, tbl, _norm_sql(sql)) for t, n, tbl, sql in c.execute(
-        f"SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name IN ({marks})",
-        V0_TABLES)}
+    """EVERY schema object in the database except SQLite's own (``sqlite_%``):
+    tables, indexes, triggers and views, whatever table they hang off, with
+    their exact stored SQL (no normalization)."""
+    return {tuple(r) for r in c.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
 
 
 def _expected_v0_catalog() -> set:
+    """What a 225e7df database must contain, byte for byte: the objects C2
+    (``runtime.db.SCHEMA``) and C3 (``runtime.outbox.OUTBOX_SCHEMA``) create -
+    an explicit allowlist of objects owned by others, with their exact SQL -
+    plus the e1.v0 objects (``V0_SCHEMA``). Built by running those same
+    statements in ``:memory:``; SQLite stores the statement text itself."""
+    from runtime.db import SCHEMA as C2_SCHEMA
+    from runtime.outbox import OUTBOX_SCHEMA as C3_SCHEMA
     mem = sqlite3.connect(":memory:")
     try:
-        for stmt in V0_SCHEMA:
+        for stmt in (*C2_SCHEMA, *C3_SCHEMA, *V0_SCHEMA):
             mem.execute(stmt)
         return _catalog(mem)
     finally:
@@ -167,8 +163,10 @@ def _columns(c: sqlite3.Connection, table: str) -> list[str]:
 
 
 def _migrate_v0(c: sqlite3.Connection, now: float) -> None:
-    # The whole accepted e1.v0 schema - types, NOT NULL, keys, CHECKs, every
-    # index - must match 225e7df exactly; anything else is refused untouched.
+    # The whole database schema must equal the accepted one exactly: e1.v0
+    # objects as created at 225e7df plus C2/C3's own objects, every table,
+    # index, trigger and view, byte-for-byte SQL. Anything else - a changed
+    # literal, an extra view or trigger anywhere - is refused untouched.
     if _catalog(c) != _expected_v0_catalog():
         raise JournalUnavailable("e1.v0 schema does not match the accepted 225e7df layout;"
                                  " refusing")

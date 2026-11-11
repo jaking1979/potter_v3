@@ -1970,6 +1970,30 @@ class SchemaMigration(unittest.TestCase):
             "CREATE TRIGGER inbound_seen_t AFTER INSERT ON inbound_seen BEGIN SELECT 1; END",),
             "extra trigger")
 
+    def test_same_column_changed_literal_is_refused(self):
+        # Dolores: the CHECK literal 'pending' becomes 'IF NOT EXISTS pending'.
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "('pending','processed')", "('IF NOT EXISTS pending','processed')"),
+            "changed literal inside CHECK")
+
+    def test_whitespace_inside_literal_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "('pending','processed')", "('pending ','processed')"),
+            "changed whitespace inside a literal")
+
+    def test_extra_view_is_refused(self):
+        self.assertRefusedUntouched(
+            _v0_ddl() + ("CREATE VIEW leaked AS SELECT * FROM inbound_seen",), "extra view")
+
+    def test_extra_trigger_on_non_v0_table_referencing_v0_is_refused(self):
+        self.assertRefusedUntouched(_v0_ddl() + (
+            "CREATE TRIGGER outbox_leak AFTER INSERT ON outbox BEGIN"
+            " DELETE FROM inbound_seen; END",), "trigger on outbox touching inbound_seen")
+
+    def test_extra_unrelated_table_is_refused(self):
+        self.assertRefusedUntouched(
+            _v0_ddl() + ("CREATE TABLE stray (x TEXT)",), "unexpected table")
+
     def test_fresh_database_starts_at_v1_and_reopen_is_idempotent(self):
         w = self.open_world()
         self.assertEqual(self.schema_version(), "e1.v1")
