@@ -60,6 +60,23 @@ class UnwiredForgetBoundary(unittest.TestCase):
         self.assertEqual(states, ['unknown'])
         self.assertEqual(visible, [{'text': 'synthetic-forget-value'}])
 
+    def test_expired_unknown_urgent_message_can_be_retried_after_forget(self):
+        # A crash after claim leaves an ambiguous outcome.  Independently built
+        # C3 has no tombstone authority and can issue its urgent resend.
+        with self.db.tx() as tx:
+            self.outbox.enqueue(tx, OutboxMessage('urgent-1', 'fake', 'fake-josh',
+                                {'text': self.item.value}, urgency='urgent'), now=1.0)
+        kind, claimed = self.outbox._claim('crashed-worker', 2.0)
+        self.assertEqual((kind, claimed.message_id, claimed.status),
+                         ('send', 'urgent-1', 'unknown'))
+        self.forget()
+        visible = []
+        report = self.outbox.relay(lambda m: visible.append((m.message_id, m.body)),
+                                   lambda m: 'still_unknown', owner='recovery',
+                                   now=100000.0, limit=1)
+        self.assertEqual(report.resent_unknown, ['urgent-1'])
+        self.assertEqual(visible, [('urgent-1', {'text': 'synthetic-forget-value'})])
+
 
 if __name__ == '__main__':
     unittest.main()
