@@ -65,7 +65,8 @@ REASONS = frozenset({
     "duplicate", "duplicate_pending", "expired", "replay_conflict", "transport_unverified", "webhook_unverified",
     "malformed", "missing_message_id", "oversized_raw", "oversized_body",
     "oversized_attachment", "too_many_attachments", "bot_sender", "sender_not_allowlisted",
-    "trace_error", "ingress_error", "attachment_reclaimed",
+    "trace_error", "ingress_error", "attachment_reclaimed", "clock_regression",
+    "needs_operator",
     # trust reasons (why an accepted event is untrusted; "ok" when principal_direct)
     "ok", "multiple_from", "header_defect", "display_name_spoof", "reply_to_mismatch",
     "sender_mismatch", "dkim_missing", "dkim_failed", "dkim_unaligned", "spf_failed",
@@ -163,6 +164,18 @@ class _Draft:
     attachments: tuple[RawAttachment, ...]
     trust_reason: str
     voucher: object = None      # E1 voucher (already retired) to finish() after commit
+
+
+# E1 refusals that say nothing about the sender - the transport is paused
+# (clock rollback) or the record awaits an operator. They must never become a
+# recorded rejection (which would turn the sender's retry into a duplicate of
+# it) nor an accepted untrusted event: unrecorded, retryable rejections.
+# ``stale_transport`` is included: it is returned only after E3 has already
+# re-signed once with a fresh sent_at, i.e. E3's and E1's clocks disagree.
+E1_RETRYABLE = frozenset({"clock_regression", "needs_operator", "stale_transport"})
+# E1 refusals after which E1 holds a settled (processed) row for the update.
+_E1_SETTLED = frozenset({"replayed", "unknown_sender", "not_allowlisted",
+                         "principal_disabled", "dkim_unverified", "session_unverified"})
 
 
 def bind_text(text: str) -> str:
@@ -329,8 +342,10 @@ class IngressGateway:
                                                raw_ref=u.delivery_ref)
             self._release(voucher)
             return draft
-        principal, draft.voucher, _ = self._authenticate(
+        principal, draft.voucher, reason = self._authenticate(
             TELEGRAM, str(u.from_user_id), u.text, key, raw_ref=u.delivery_ref)
+        if reason in E1_RETRYABLE:
+            raise _Reject(reason, record=False)
         if principal is None:
             # A stranger DMing the bot does not drive the runner (E1: ignored + logged).
             raise _Reject("sender_not_allowlisted", record=True).with_draft(draft)
@@ -382,6 +397,8 @@ class IngressGateway:
             return _Draft(EMAIL, verified_key, mid, sha256(raw), None, (), (), "ok")
         trust, addr, principal, voucher = self._email_trust(msg, raw, mid,
                                                             f"{subject}\n{text}")
+        if trust in E1_RETRYABLE:
+            raise _Reject(trust, record=False)
         own = PRINCIPAL_DIRECT if trust == "ok" else EXTERNAL_SENDER
         key = (verified_key if own == PRINCIPAL_DIRECT
                else f"email|untrusted:{sha256(addr.encode())}|{mid}")
@@ -488,7 +505,7 @@ class IngressGateway:
                                   raw_ref=raw_ref)
             auth = self._auth.authenticate(env)
         sender = getattr(auth, "sender", None)
-        if sender is None and getattr(auth, "reason", None) != "stale_transport":
+        if sender is None and getattr(auth, "reason", None) in _E1_SETTLED:
             self._store.handoff_drop(hkey)    # E1 holds a settled (processed) row
         sender = (sender, hkey) if sender is not None else None
         try:

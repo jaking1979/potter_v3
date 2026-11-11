@@ -52,11 +52,16 @@ The handoff has a bounded lifetime and holds no text:
   - **Fresh `sent_at`:** taken only when E1 answers `stale_transport`, which it does only when it holds **no** row (`test_98`).
   - **Dropped:** once E1's row is settled.
 - **Settled exactly once on re-delivery.** If the process dies after E3 commits but before `finish()`, the row stays `pending`. A re-delivery answered by E3's dedupe re-presents the identical envelope; E1 resumes it and E3 finishes it. A processed row answers `replayed` (`test_85`, `test_90`). The same holds for a rolled-back attempt retried long after the freshness window (`test_97`).
-- **Retention is E1's.** E1 prunes its own `processed` rows after `2 × max_skew + margin` using its own configured skew, and never prunes `pending` ones. E3 never deletes from E1's table, so no E3 setting can reopen replay. The earlier skew-mismatch path is gone (`test_88`).
+- **Retention is E1's.** E1 (`2e01315`) prunes its own `processed` rows by its durable `sent_at` watermark (never wall time), using its own configured skew, and never prunes `pending` ones. E3 never deletes from E1's table, so no E3 setting can reopen replay. The earlier skew-mismatch path is gone (`test_88`).
   - A pending row survives E1's prune and still settles (`test_86`).
   - A captured envelope replayed after its row is pruned is `stale_transport`. Nothing is recorded and it never reaches recovery (`test_87`).
   - Moving the clock backwards produces no second event (`test_99`).
-  - **Open:** E1's persisted high-water clock is pending.
+- **E1 refusals that say nothing about the sender** are not accepted and not recorded, and so stay retryable (`E1_RETRYABLE`):
+  - `clock_regression`: E1's clock went backwards; the transport is paused until the clock catches up or an operator reconciles it.
+  - `needs_operator`: a migrated record is awaiting an operator.
+  - `stale_transport`: still stale after one re-sign, meaning E3's and E1's clocks disagree.
+
+  None of these ever becomes an accepted event (not even an untrusted one), nor a recorded rejection that would turn the sender's retry into a duplicate. E3 keeps the stored `sent_at`, and drops it only after E1 reports a settled outcome (`test_104`–`test_108`).
 
 **Vouchers.** For both Telegram and email, a principal counts only if `ChannelAuth.vouches(sender)` confirms that this `ChannelAuth` minted that exact `AuthenticatedSender` for this channel **and this exact message text**. A hand-built, copied, relabelled or other-text voucher yields no principal: the Telegram message is rejected, and the email is `external_sender` with `unvouched_sender`.
 

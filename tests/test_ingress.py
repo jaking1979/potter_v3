@@ -893,7 +893,11 @@ class MessageBoundTransport(Fixture):
 
     def test_71_stale_envelope_refused(self):
         gw = self.gateway(channel_auth=self.make_auth(clock=lambda: float(T + 3600)))
-        self.assertEqual(gw.ingest_telegram(self.tg()).reason, "sender_not_allowlisted")
+        res = gw.ingest_telegram(self.tg())
+        # E3 re-signs once; still stale => clocks disagree: not accepted, not
+        # recorded (retryable), never a "not Josh" rejection.
+        self.assertEqual((res.accepted, res.reason, res.event), (False, "stale_transport", None))
+        self.assertEqual(IngressStore(self.db).log(), [])
 
     def test_72_retry_after_rollback_not_locked_out(self):
         def broken(line):
@@ -1412,6 +1416,97 @@ class AttachmentStageOwnership(Fixture):
             self.gateway(clock=lambda t=t: t).gc_attachments(grace_s=3600 * 10)
         self.assertIn(committed, self.attachments.blobs)
         self.assertIn(inflight, self.attachments.blobs)
+
+
+class E1WatermarkRefusals(Fixture):
+    """E1 2e01315: a clock rollback (``clock_regression``) or a migrated record
+    awaiting an operator (``needs_operator``) says nothing about the sender.
+    E3 must treat both as not accepted and retryable: never an accepted
+    (even untrusted) event, never a recorded rejection that would turn the
+    sender's retry into a duplicate."""
+
+    def setUp(self):
+        super().setUp()
+        self.e1_now = [float(T)]
+        self.auth = self.make_auth(clock=lambda: self.e1_now[0])
+        self.gw = self.gateway(clock=lambda: int(self.e1_now[0]))   # one clock for both
+        self.e1db = str(Path(self.tmp.name) / "e1.db")
+
+    def update_id(self, key):
+        import hashlib
+        return "e3:" + hashlib.sha256(key.encode()).hexdigest()[:32]
+
+    def test_104_clock_regression_telegram_is_unrecorded_and_retryable(self):
+        self.assertTrue(self.gw.ingest_telegram(self.tg()).accepted)   # sets the high-water
+        self.e1_now[0] = float(T - 600)                                 # clock rolled back
+        res = self.gw.ingest_telegram(self.tg(msg_id=2, ref="d2"))
+        self.assertEqual((res.accepted, res.reason, res.event), (False, "clock_regression", None))
+        self.assertEqual(len(IngressStore(self.db).log()), 1)          # nothing recorded for #2
+        self.assertEqual(len(IngressStore(self.db).handoffs()), 1)     # sent_at kept
+        self.e1_now[0] = float(T)                                       # clock restored
+        retry = self.gw.ingest_telegram(self.tg(msg_id=2, ref="d2"))
+        self.assertTrue(retry.accepted and retry.event.trusted)        # not a duplicate
+        self.assertEqual(IngressStore(self.db).handoffs(), [])
+
+    def test_105_clock_regression_email_is_never_an_untrusted_event(self):
+        self.pass_dkim("<c0@potter.test>")
+        self.gw.ingest_email(make_email(mid="<c0@potter.test>"))
+        self.e1_now[0] = float(T - 600)
+        self.pass_dkim("<c1@potter.test>")
+        res = self.gw.ingest_email(make_email(mid="<c1@potter.test>"))
+        self.assertEqual((res.accepted, res.reason, res.event), (False, "clock_regression", None))
+        self.auth.reconcile_clock()                                     # operator act
+        # Until the clock passes the sent_at watermark again, E1 keeps refusing
+        # (fail closed); E3 keeps it retryable and unrecorded.
+        self.assertEqual(self.gw.ingest_email(make_email(mid="<c1@potter.test>")).reason,
+                         "stale_transport")
+        self.e1_now[0] = float(T)
+        retry = self.gw.ingest_email(make_email(mid="<c1@potter.test>"))
+        self.assertTrue(retry.accepted)
+        self.assertEqual(retry.event.provenance, (PRINCIPAL_DIRECT,))
+
+    def test_106_needs_operator_is_unrecorded_and_never_accepted(self):
+        import sqlite3
+        uid = self.update_id(f"telegram|{TG_JOSH}|1")
+        self.gw.ingest_telegram(self.tg(msg_id=99, ref="d99"))         # create E1 schema
+        with sqlite3.connect(self.e1db) as c:
+            c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
+                      " envelope_digest, sent_at, migration_flag) VALUES"
+                      " ('telegram', ?, ?, 'needs_operator', ?, 'x', ?, 'sent_at_unknown')",
+                      (uid, float(T), JOSH, float(T)))
+        for _ in range(2):
+            res = self.gw.ingest_telegram(self.tg())
+            self.assertEqual((res.accepted, res.reason, res.event),
+                             (False, "needs_operator", None))
+        self.assertEqual([r for r in IngressStore(self.db).log() if r[3] != "accepted"], [])
+        self.assertEqual(self.auth.needs_operator(), [("telegram", uid)])
+
+    def test_108_e3_e1_clock_disagreement_is_retryable_not_recorded(self):
+        skewed = self.gateway(clock=lambda: T + 3600)        # E3 clock 1 h ahead of E1
+        res = skewed.ingest_telegram(self.tg())
+        self.assertEqual((res.accepted, res.reason), (False, "stale_transport"))
+        self.pass_dkim("<k1@potter.test>")
+        res = skewed.ingest_email(make_email(mid="<k1@potter.test>"))
+        self.assertEqual((res.accepted, res.reason, res.event), (False, "stale_transport", None))
+        self.assertEqual(IngressStore(self.db).log(), [])     # nothing recorded
+        self.assertTrue(self.gw.ingest_telegram(self.tg()).event.trusted)   # clocks agree
+        self.assertEqual(self.gw.ingest_email(make_email(mid="<k1@potter.test>"))
+                         .event.provenance, (PRINCIPAL_DIRECT,))
+
+    def test_107_replay_after_watermark_prune_stays_refused(self):
+        self.gw.ingest_telegram(self.tg())
+        first_env_auth = self.make_auth(clock=lambda: self.e1_now[0])
+        signer = TransportSigner("telegram", TG_KEY)
+        old = signer.envelope(str(TG_STRANGER), "x", update_id="old-1", sent_at=float(T))
+        self.assertFalse(first_env_auth.authenticate(old).ok)          # stranger, recorded
+        self.e1_now[0] = float(T + 100_000)                             # advance + prune
+        later = signer.envelope(str(TG_STRANGER), "y", update_id="new-1",
+                                sent_at=float(T + 100_000))
+        first_env_auth.authenticate(later)
+        replay = first_env_auth.authenticate(old)                       # its row is pruned
+        self.assertEqual((replay.ok, replay.reason), (False, "stale_transport"))
+        self.e1_now[0] = float(T)                                       # rewind wall clock
+        self.assertEqual(first_env_auth.authenticate(old).reason, "clock_regression")
 
 
 class Structure(unittest.TestCase):
