@@ -65,6 +65,10 @@ async def _bounded(backend: Backend, query: str, timeout: float):
             if time.monotonic() - start >= timeout:
                 return 'deadline', (), time.monotonic() - start
             return 'complete', items[:3], time.monotonic() - start
+        except asyncio.CancelledError:
+            # The backend may cancel itself. The caller was not cancelled:
+            # report a failed retrieval instead of cancelling the whole turn.
+            return 'unavailable', (), time.monotonic() - start
         except Exception:
             return 'unavailable', (), time.monotonic() - start
     except BaseException:
