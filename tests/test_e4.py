@@ -66,7 +66,13 @@ class Tests(unittest.TestCase):
     def test_fractional_staleness_survives_html_render(self):
         v=project(fixture(300),now=NOW+timedelta(microseconds=1))
         self.assertTrue(v['sections']['tasks']['stale'])
-        self.assertIn('Stale. Snapshot age: 300 seconds.',render(v))
+        self.assertIn('Stale at generation. Snapshot age: 300 seconds.',render(v))
+    def test_static_page_explains_freshness_as_of_generation(self):
+        body=render(project(fixture(),now=NOW))
+        self.assertIn('Snapshot generated at 2026-11-07T00:00:00.000000Z',body)
+        self.assertIn('does not update automatically; refresh',body)
+        self.assertIn('Within five minutes at generation',body)
+
     def test_forged_projection_revalidated(self):
         v=project(fixture(),now=NOW);v['sections']['tasks']['items'][0]['status']='<script>CANARY_SECRET</script>'
         self.assertNotIn('CANARY_SECRET',render(v))
