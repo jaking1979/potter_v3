@@ -93,7 +93,7 @@ def render(view):
             else:
                 out.append('<table><caption>'+name.title()+' status</caption><thead><tr><th scope="col">ID</th><th scope="col">Status</th><th scope="col">Last changed</th></tr></thead><tbody>')
                 for item in s['items']:
-                    out.append('<tr><td>'+escape(item['id'])+'</td><td>'+escape(item['status'])+'</td><td>'+str(item['age_s'])+' seconds ago</td></tr>')
+                    out.append('<tr><td>'+escape(item['id'])+'</td><td>'+escape(item['status'])+'</td><td>'+escape(item['updated_at'])+'</td></tr>')
                 out.append('</tbody></table>')
         out.append('</section>')
     return ''.join(out)+'</main></body></html>'
