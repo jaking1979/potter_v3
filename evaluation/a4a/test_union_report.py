@@ -19,6 +19,24 @@ class UnionTests(unittest.TestCase):
         ids = [str(x) for x in range(20)]
         with self.assertRaises(ValueError): summarize_dimensions(ids, {'a': {}})
 
+    def test_affected_case_cannot_agree_in_other_dimension(self):
+        ids = [str(x) for x in range(20)]
+        a = dict.fromkeys(ids, 'agree'); b = dict(a)
+        a['0'] = 'unalignable'
+        result = summarize_dimensions(ids, {'done': a, 'trust': b})
+        self.assertEqual(result['dimensions']['done']['agreements'], 19)
+        self.assertEqual(result['dimensions']['trust']['agreements'], 19)
+        self.assertEqual(result['affected_reasons'], {'0': {'done': 'unalignable'}})
+
+    def test_invalid_retains_reasons_by_dimension(self):
+        ids = [str(x) for x in range(20)]
+        a = dict.fromkeys(ids, 'agree'); b = dict(a)
+        for k in ids[:3]: a[k] = 'missing'
+        b['0'] = 'duplicate'
+        result = summarize_dimensions(ids, {'a': a, 'b': b})
+        self.assertEqual(result['status'], 'invalid_rerun')
+        self.assertEqual(result['affected_reasons']['0'], {'a': 'missing', 'b': 'duplicate'})
+
 
 
     def test_dimension_label_validation(self):
@@ -29,3 +47,4 @@ class UnionTests(unittest.TestCase):
                 summarize_dimensions(ids, dims)
 
 if __name__ == '__main__': unittest.main()
+
