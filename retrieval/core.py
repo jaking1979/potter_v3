@@ -45,7 +45,12 @@ async def _bounded(backend: Backend, query: str, timeout: float):
     if isinstance(backend, SyntheticProcessBackend):
         return await bounded_search(backend, query, timeout)
     start = time.monotonic()
-    task = asyncio.create_task(backend.search(query))
+    async def invoke():
+        # Include adapter setup and invocation in the task. A broken adapter
+        # can raise before returning an awaitable; it must be unavailable too.
+        return await backend.search(query)
+
+    task = asyncio.create_task(invoke())
     try:
         done, _ = await asyncio.wait({task}, timeout=timeout)
         if not done:
