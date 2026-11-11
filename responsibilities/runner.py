@@ -36,6 +36,7 @@ repository are test fakes.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -404,13 +405,15 @@ class ResponsibilityRunner:
     # ---------------------------------------------------------------- approvals
     def _approval_for(self, task_id: str, action_hash: str
                       ) -> tuple[str | None, str | None, dict | None]:
-        """(approval id, status, signed record if approved) of the latest E1
-        request for this task and action. Read-only over E1's table: E1 has no
-        API that returns the issued record (see README gaps)."""
+        """(approval id, status, signed record if approved) of THE request
+        claimed for this task and action (``responsibility_approvals``; at most
+        one exists). Read-only over E1's table: E1 has no API that returns the
+        issued record (see README gaps)."""
         with self.db.read() as c:
-            row = c.execute("SELECT approval_id, status, record FROM approval_requests"
-                            " WHERE task_id=? AND action_hash=?"
-                            " ORDER BY requested_at DESC, rowid DESC LIMIT 1",
+            row = c.execute("SELECT a.approval_id, r.status, r.record"
+                            " FROM responsibility_approvals a LEFT JOIN approval_requests r"
+                            " ON r.approval_id = a.approval_id"
+                            " WHERE a.task_id=? AND a.action_hash=?",
                             (task_id, action_hash)).fetchone()
         if row is None:
             return None, None, None
@@ -431,17 +434,34 @@ class ResponsibilityRunner:
         raise _Waiting(self._issue(task.id, step, action) or "")
 
     def _issue(self, task_id: str, step: Step, action) -> str | None:
-        """The pending/approved request for this exact action, or a new one.
-        None if E1 refuses (kill flag set, task no longer waiting)."""
-        aid, status, _ = self._approval_for(task_id, action.hash())
-        if aid is not None and status in ("pending", "approved"):
-            return aid
+        """Find-or-create the ONE approval request for this exact action, as a
+        single BEGIN IMMEDIATE transaction: the claim lookup, E1's
+        ``ApprovalIssuer.request`` (which writes in the caller's transaction)
+        and the claim insert commit together or not at all. Concurrent workers
+        or processes serialize on SQLite's write lock, so the second sees the
+        first's claim; the primary key on (task, action hash) enforces it.
+
+        Returns the claimed approval id whatever its status: an approval that
+        was denied, expired, voided or cancelled is never re-issued for the
+        same action (``poll_approvals`` ends the run instead). None if E1
+        refuses (kill flag set, task no longer waiting)."""
+        h = action.hash()
         try:
             with self.db.tx() as c:
-                return self._issuer.request(c, action, summary=step.approval_summary,
-                                            now=self._now())
+                row = c.execute("SELECT approval_id FROM responsibility_approvals"
+                                " WHERE task_id=? AND action_hash=?", (task_id, h)).fetchone()
+                if row is not None:
+                    return row[0]
+                aid = self._issuer.request(c, action, summary=step.approval_summary,
+                                           now=self._now())
+                c.execute("INSERT INTO responsibility_approvals (task_id, action_hash,"
+                          " approval_id, created_at) VALUES (?,?,?,?)",
+                          (task_id, h, aid, self._now()))
+                return aid
         except (Stopped, ApprovalRefusal):
             return None
+        except sqlite3.IntegrityError:      # defensive: someone else's claim won
+            return self._approval_for(task_id, h)[0]
 
     def _waiting_step(self, task: Task) -> tuple[Responsibility, Step, Any] | None:
         """(definition, waiting step, its action rebuilt now) for a waiting task."""

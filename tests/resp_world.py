@@ -214,5 +214,18 @@ def child_main(tmp: str, signal_path: str, phase: str) -> None:
     w.runner.run_once()
 
 
+def child_poll(tmp: str, go_path: str, worker: str) -> None:
+    """Spawned by the approval-race test: wait for the start signal, then
+    run one poll_approvals at the same moment as the other children."""
+    w = World(tmp, worker=worker)
+    deadline = time.time() + 30
+    while not Path(go_path).exists() and time.time() < deadline:
+        time.sleep(0.005)
+    w.runner.poll_approvals()
+
+
 if __name__ == "__main__":
-    child_main(*sys.argv[1:4])
+    if sys.argv[1] == "poll":
+        child_poll(*sys.argv[2:5])
+    else:
+        child_main(*sys.argv[1:4])

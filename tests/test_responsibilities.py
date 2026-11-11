@@ -379,6 +379,124 @@ class StopIsAPause(Base):
         self.assertEqual(store.job("notes.batch").consecutive_failures, 0)
 
 
+class ApprovalIssuanceIsAtomic(Base):
+    """Dolores @467b2b9: the find-or-create of an approval request was a read
+    followed by a separate write, so overlapping workers could each prompt
+    Josh for the same action. It is now one BEGIN IMMEDIATE transaction with
+    a primary-key claim on (task, action hash)."""
+
+    def parked_without_request(self, key="race-1"):
+        """A bill.watch task in waiting_approval whose request was never issued
+        (the worker died between parking and issuing)."""
+        w = self.world()
+        w.runner.on_event("bill.due", {"id": key, "amount": 10})
+
+        class Crash(BaseException):
+            pass
+
+        def boom(*a, **k):
+            raise Crash()
+
+        real = w.runner._issue
+        w.runner._issue = boom
+        with self.assertRaises(Crash):
+            w.runner.run_once()
+        w.runner._issue = real
+        task = w.runner.on_event("bill.due", {"id": key, "amount": 10})[0][0]
+        self.assertEqual(task.state, WAITING_APPROVAL)
+        self.assertEqual(self.rows(w), (0, 0))
+        return w, task
+
+    def rows(self, w):
+        with w.db.read() as c:
+            return (c.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0],
+                    c.execute("SELECT COUNT(*) FROM responsibility_approvals").fetchone()[0])
+
+    def test_two_overlapping_workers_issue_one_request(self):
+        import threading
+        w, task = self.parked_without_request()
+        w2 = rw.World(self.tmp, worker="w2")
+        inside, release = threading.Event(), threading.Event()
+        real_request = w.issuer.request
+
+        def paused_request(*a, **k):                 # A holds the write lock here
+            aid = real_request(*a, **k)
+            inside.set()
+            release.wait(10)
+            return aid
+
+        w.issuer.request = paused_request
+        out = {}
+        a = threading.Thread(target=lambda: out.setdefault("a", w.runner.poll_approvals()))
+        a.start()
+        self.assertTrue(inside.wait(10))
+        b = threading.Thread(target=lambda: out.setdefault("b", w2.runner.poll_approvals()))
+        b.start()
+        b.join(0.5)
+        self.assertTrue(b.is_alive())                 # B is serialized behind A's lookup+insert
+        release.set()
+        a.join(10)
+        b.join(10)
+        self.assertEqual((out["a"], out["b"]), ([], []))  # both keep waiting
+        self.assertEqual(self.rows(w), (1, 1))            # ONE prompt, one claim
+        self.assertEqual(len([i for i in w.outbox_ids() if i.startswith("approval:")]), 1)
+
+    def test_concurrent_processes_polling_issue_one_request(self):
+        w, task = self.parked_without_request("race-2")
+        go = Path(self.tmp) / "go"
+        procs = [subprocess.Popen([sys.executable, str(HERE / "resp_world.py"), "poll",
+                                   self.tmp, str(go), f"p{i}"]) for i in range(4)]
+        time.sleep(0.5)
+        go.write_text("go")
+        for p in procs:
+            self.assertEqual(p.wait(timeout=60), 0)
+        self.assertEqual(self.rows(w), (1, 1))
+
+    def test_restart_after_issue_does_not_prompt_again(self):
+        w, task = self.parked_without_request("race-3")
+        w.runner.poll_approvals()
+        w2 = rw.World(self.tmp, worker="w-restarted")
+        w2.runner.poll_approvals()
+        w2.runner.run_pending()
+        self.assertEqual(self.rows(w2), (1, 1))
+
+    def test_expired_request_ends_the_run_and_is_not_reissued(self):
+        w, task = self.parked_without_request("race-4")
+        w.runner.poll_approvals()
+        w.now += 24 * 3600 + 1
+        self.assertEqual([r.outcome for r in w.runner.poll_approvals()], ["failed"])
+        self.assertEqual(w.runner.poll_approvals(), [])
+        self.assertEqual(self.rows(w), (1, 1))
+        self.assertEqual(w.ext.calls("pay"), 0)
+
+    def test_request_cancelled_by_stop_is_not_reissued(self):
+        w, task = self.parked_without_request("race-5")
+        w.runner.poll_approvals()
+        w.say("/stop")
+        w.notifier.kill.clear()
+        self.assertEqual([r.outcome for r in w.runner.poll_approvals()], ["failed"])
+        self.assertEqual(self.rows(w), (1, 1))
+        self.assertEqual(w.ext.calls("pay"), 0)
+
+    def test_only_the_claimed_prompt_drives_the_run(self):
+        # A stray second E1 request for the same action (issued outside the
+        # runner) can neither resume the run nor shadow the claimed one.
+        w, task = self.parked_without_request("race-6")
+        w.runner.poll_approvals()
+        claimed = w.runner._approval_for(task.id, task.checkpoint["approvals"]["pay"])[0]
+        action = w.runner._waiting_step(w.runner.tasks.get(task.id))[2]
+        w.now += 5
+        with w.db.tx() as c:
+            stray = w.issuer.request(c, action, summary="stray")
+        self.assertNotEqual(stray, claimed)
+        self.assertEqual(w.say(f"/approve {stray}").outcome, "approved")
+        self.assertEqual(w.runner.poll_approvals(), [])         # still waits on the claim
+        self.assertEqual(w.say(f"/approve {claimed}").outcome, "approved")
+        self.assertEqual([r.outcome for r in w.runner.poll_approvals()], [QUEUED])
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(w.ext.calls("pay"), 1)
+
+
 class ApprovalFlow(Base):
     def test_waiting_approval_then_approve_continues_once(self):
         w = self.world()
