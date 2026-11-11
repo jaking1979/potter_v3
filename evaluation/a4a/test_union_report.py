@@ -19,4 +19,13 @@ class UnionTests(unittest.TestCase):
         ids = [str(x) for x in range(20)]
         with self.assertRaises(ValueError): summarize_dimensions(ids, {'a': {}})
 
+
+
+    def test_dimension_label_validation(self):
+        ids = [str(x) for x in range(20)]
+        cases = dict.fromkeys(ids, 'agree')
+        for dims in ({}, {'': cases}, {1: cases}, {'ok': {**cases, 'extra': 'agree'}}):
+            with self.subTest(dims=dims), self.assertRaises(ValueError):
+                summarize_dimensions(ids, dims)
+
 if __name__ == '__main__': unittest.main()
