@@ -230,8 +230,15 @@ class Broker:
             raise Refused("invalid_budget_bucket")
         eligible = []
         for c in candidates:
-            if (c.approved is True and c.available is True and req.task_class in c.validated_tasks
-                and req.privacy_class in c.privacy_classes and c.model and c.provider
+            if (type(c) is Candidate
+                and type(c.model) is str and bool(c.model)
+                and type(c.provider) is str and bool(c.provider)
+                and type(c.validated_tasks) is frozenset
+                and all(type(v) is str and bool(v) for v in c.validated_tasks)
+                and type(c.privacy_classes) is frozenset
+                and all(type(v) is str and bool(v) for v in c.privacy_classes)
+                and c.approved is True and c.available is True and req.task_class in c.validated_tasks
+                and req.privacy_class in c.privacy_classes
                 and type(c.expected_usd_micros) is int and type(c.worst_usd_micros) is int
                 and 0 <= c.expected_usd_micros <= c.worst_usd_micros <= _MAX_I64):
                 eligible.append(c)
