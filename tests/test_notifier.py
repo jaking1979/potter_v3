@@ -1423,6 +1423,32 @@ class PendingRecoveryPath(_Reopen):
             self.assertEqual(c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0], 0)
         self.assertFalse(self.w.notifier.kill.is_set())
 
+    def test_pruned_pending_row_is_never_resurrected(self):
+        # E3 (or any pruner) removes an E1 pending row after 2x skew; a later
+        # redelivery of that exact envelope is stale, never resumed or re-recorded.
+        msg = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)         # pending ... crash
+        with self.w.db.tx() as c:
+            c.execute("DELETE FROM inbound_seen WHERE update_id=?", (msg.update_id,))
+        self.w.now += 2 * 300 + 1
+        w2 = self.reopen()
+        res = w2.router.handle(msg)
+        self.assertEqual((res.outcome, res.reason), ("ignored", "stale_transport"))
+        self.assertFalse(w2.notifier.kill.is_set())
+        with w2.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0], 0)
+
+    def test_pruned_processed_row_is_stale_not_replayable(self):
+        msg = self.w.tg_msg("/noop")
+        self.w.router.handle(msg)                                  # processed
+        self.w.now += 2 * 300 + 61
+        self.w.router.handle(self.w.tg_msg("/noop"))               # prune runs
+        res = self.w.router.handle(msg)
+        self.assertEqual(res.reason, "stale_transport")
+        with self.w.db.read() as c:
+            self.assertIsNone(c.execute("SELECT 1 FROM inbound_seen WHERE update_id=?",
+                                        (msg.update_id,)).fetchone())
+
     def test_recovery_rechecks_authorization(self):
         msg = self.w.tg_msg("/stop")
         self.assertTrue(self.w.auth.authenticate(msg).ok)         # pending ... crash
