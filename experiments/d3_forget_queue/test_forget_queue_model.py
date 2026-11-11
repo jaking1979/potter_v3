@@ -110,4 +110,69 @@ class OrderingTests(unittest.TestCase):
         self.assertEqual(self.b.db.execute('SELECT value, active FROM fact').fetchone(), ('synthetic-secret', 1))
         self.assertEqual(self.b.db.execute('SELECT payload, state FROM work').fetchone(), ('synthetic-secret', 'pending'))
 
+
+# Multiprocess contention exercises the toy's shared SQLite ordering only.
+def _race_operation(path, kind, gate, outcomes):
+    db = QueueModel(path)
+    try:
+        gate.wait(timeout=10)
+        if kind == 'claim':
+            result = db.claim('q')
+        else:
+            db.forget('f')
+            result = 'forgotten'
+        outcomes.put((kind, result, None))
+    except BaseException as exc:
+        outcomes.put((kind, None, repr(exc)))
+    finally:
+        db.db.close()
+
+
+class ProcessOrderingTests(unittest.TestCase):
+    def test_concurrent_claim_and_forget_have_only_two_safe_model_outcomes(self):
+        import multiprocessing as mp
+        ctx = mp.get_context('spawn')
+        with tempfile.TemporaryDirectory() as tmp:
+            for iteration in range(20):
+                path = os.path.join(tmp, f'{iteration}.sqlite')
+                QueueModel.bootstrap(path)
+                setup = QueueModel(path)
+                setup.transaction('INSERT INTO fact VALUES (?, ?, ?)', ('f', 'synthetic-secret', 1))
+                self.assertTrue(setup.enqueue('q', 'f'))
+                setup.db.close()
+                gate, outcomes = ctx.Barrier(3), ctx.Queue()
+                procs = [ctx.Process(target=_race_operation, args=(path, op, gate, outcomes))
+                         for op in ('claim', 'forget')]
+                try:
+                    for proc in procs:
+                        proc.start()
+                    gate.wait(timeout=10)
+                    results = [outcomes.get(timeout=10) for _ in procs]
+                    for proc in procs:
+                        proc.join(10)
+                        self.assertEqual(proc.exitcode, 0)
+                    self.assertTrue(all(error is None for _, _, error in results), results)
+                    claimed = next(result for kind, result, _ in results if kind == 'claim')
+                    self.assertIn(claimed, (None, 'synthetic-secret'))
+                    check = QueueModel(path)
+                    try:
+                        self.assertEqual(check.db.execute('SELECT value, active FROM fact').fetchone(), (None, 0))
+                        work = check.db.execute('SELECT payload, state FROM work').fetchall()
+                        unknown = check.db.execute('SELECT work_id FROM unknown').fetchall()
+                        if claimed is None:
+                            self.assertEqual((work, unknown), ([], []))
+                        else:
+                            self.assertEqual((work, unknown), ([(None, 'in_flight')], [('q',)]))
+                        self.assertFalse(check.enqueue('new', 'f'))
+                    finally:
+                        check.db.close()
+                finally:
+                    for proc in procs:
+                        if proc.is_alive():
+                            proc.terminate()
+                            proc.join(5)
+                    outcomes.close()
+                    outcomes.join_thread()
+
+
 if __name__ == '__main__': unittest.main()
