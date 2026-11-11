@@ -1,5 +1,5 @@
 import unittest
-from wilson import wilson_95
+from evaluation.a4a.wilson import wilson_95
 
 
 class WilsonTest(unittest.TestCase):

@@ -44,3 +44,22 @@ class SyntheticValidityTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UnionValidityTests(unittest.TestCase):
+    def test_union_invalidates_every_dimension(self):
+        from evaluation.a4a.synthetic_validity import summarize_dimensions
+        ids = [str(i) for i in range(20)]
+        a = {x: 'agree' for x in ids}; b = a.copy()
+        a['0'] = 'missing'; a['1'] = 'missing'; b['2'] = 'duplicate'
+        result = summarize_dimensions(ids, {'a': a, 'b': b})
+        self.assertEqual(result['status'], 'invalid_rerun')
+        self.assertNotIn('dimensions', result)
+    def test_same_affected_case_counts_once(self):
+        from evaluation.a4a.synthetic_validity import summarize_dimensions
+        ids = [str(i) for i in range(20)]
+        a = {x: 'agree' for x in ids}; b = a.copy()
+        a['0'] = 'missing'; b['0'] = 'unalignable'; b['1'] = 'missing'
+        result = summarize_dimensions(ids, {'a': a, 'b': b})
+        self.assertEqual(result['status'], 'descriptive_only')
+        self.assertEqual(result['affected_cases'], ['0', '1'])

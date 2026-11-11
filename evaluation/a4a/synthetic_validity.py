@@ -38,3 +38,21 @@ def summarize(planned_ids, classifications):
     result.update(status='descriptive_only', agreements=agreements,
                   interval_95=wilson_95(agreements, n))
     return result
+
+
+def summarize_dimensions(planned_ids, dimensions):
+    """Summarize dimensions only after joint distinct-case validity check.
+
+    Caller-supplied labels do not prove realignment, independence or blinding.
+    """
+    if type(dimensions) is not dict or not dimensions or len(dimensions) > 100:
+        raise ValueError('expected bounded nonempty dimensions')
+    if any(type(k) is not str or not k or len(k) > 200 for k in dimensions):
+        raise ValueError('invalid dimension')
+    results = {name: summarize(planned_ids, labels) for name, labels in dimensions.items()}
+    affected = {case for result in results.values() for case in result['affected']}
+    if len(affected) * 10 > len(planned_ids):
+        return {'status': 'invalid_rerun', 'planned_cases': len(planned_ids),
+                'affected_cases': sorted(affected)}
+    return {'status': 'descriptive_only', 'planned_cases': len(planned_ids),
+            'affected_cases': sorted(affected), 'dimensions': results}
