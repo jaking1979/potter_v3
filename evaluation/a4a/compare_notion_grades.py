@@ -5,7 +5,7 @@ graders saw the same material, that grading was blind, or that graders were
 independent. No Notion calls or output text are read or stored by this module.
 """
 import re
-from notion_grades import convert
+from evaluation.a4a.notion_grades import convert
 
 PAIR = re.compile(r'[0-9a-f]{64}\Z')
 

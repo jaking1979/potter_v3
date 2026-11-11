@@ -3,7 +3,7 @@
 Accepts explicit, preselected categorical fields only. It does not access Notion,
 read outputs, prove blinding, or establish independent grading or authorization.
 """
-from blind_grading import validate_grades
+from evaluation.a4a.blind_grading import validate_grades
 
 DIMENSIONS = {
     'Done': 'done', 'Re-explaining': 'reexplaining',

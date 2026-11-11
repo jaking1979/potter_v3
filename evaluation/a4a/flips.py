@@ -3,7 +3,7 @@
 This cannot prove mapping, blinding, exercise validity, or the absence of flips
 in excluded records. It never renders a pass/fail verdict.
 """
-from blind_grading import validate_grades
+from evaluation.a4a.blind_grading import validate_grades
 
 
 def two_step_flips(first, second):

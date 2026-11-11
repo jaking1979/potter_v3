@@ -1,6 +1,6 @@
 import copy
 import unittest
-from flips import two_step_flips
+from evaluation.a4a.flips import two_step_flips
 
 
 def sample(responsibility=False):

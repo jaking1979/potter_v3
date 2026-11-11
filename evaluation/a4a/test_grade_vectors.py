@@ -1,7 +1,7 @@
 import json
 import unittest
 from pathlib import Path
-from blind_grading import validate_grades
+from evaluation.a4a.blind_grading import validate_grades
 
 class GradeVectors(unittest.TestCase):
     def test_shared_vectors(self):

@@ -1,5 +1,5 @@
 import unittest
-from compare_notion_grades import compare
+from evaluation.a4a.compare_notion_grades import compare
 
 def row():
     r={'Task':'synthetic','Scenario type':'One-shot'}

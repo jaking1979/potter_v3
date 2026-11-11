@@ -3,7 +3,7 @@
 Inputs are already aligned complete grade records. This cannot establish the
 protected mapping, independence, blinding, or exercise validity.
 """
-from blind_grading import DIMENSIONS, validate_grades
+from evaluation.a4a.blind_grading import DIMENSIONS, validate_grades
 
 
 def category_prevalence(first, second):
@@ -55,7 +55,7 @@ def synthetic_usable_prevalence(first, second, expected_cases):
     planned N. When affected cases exceed 10% or none remain, prevalence is
     unavailable. Caller must independently verify mapping and exercise validity.
     """
-    from case_agreement import count_case_agreement, affected_case_summary
+    from evaluation.a4a.case_agreement import count_case_agreement, affected_case_summary
 
     counts = count_case_agreement(first, second, expected_cases)
     affected = affected_case_summary(counts, expected_cases)

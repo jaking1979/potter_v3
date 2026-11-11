@@ -1,6 +1,6 @@
 import copy
 import unittest
-from blind_grading import validate_grades
+from evaluation.a4a.blind_grading import validate_grades
 
 
 def valid():

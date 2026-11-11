@@ -1,6 +1,6 @@
 import copy
 import unittest
-from prevalence import category_prevalence, synthetic_usable_prevalence
+from evaluation.a4a.prevalence import category_prevalence, synthetic_usable_prevalence
 
 
 def record(i, responsibility=False):

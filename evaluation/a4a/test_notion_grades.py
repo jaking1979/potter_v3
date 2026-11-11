@@ -1,5 +1,5 @@
 import unittest
-from notion_grades import convert
+from evaluation.a4a.notion_grades import convert
 
 def row():
     x={'Task':'synthetic-1','Scenario type':'One-shot'}
