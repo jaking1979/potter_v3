@@ -115,7 +115,7 @@ class ApprovalIssuer:
         if not getattr(key, "key_id", None):
             raise ValueError("issuer key needs a key_id")
         self.db = as_database(db)
-        _schema.ensure(self.db)
+        _schema.ensure(self.db, clock=clock)
         self.kill = KillFlag(self.db)
         self._key = key
         self._notifier = notifier

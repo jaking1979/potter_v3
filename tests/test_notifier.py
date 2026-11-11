@@ -17,6 +17,7 @@ Offline only: every channel is a FakeChannel; keys are test constants.
 import contextlib
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import textwrap
@@ -920,7 +921,8 @@ class StopSendRace(Base):
 
     def test_unreturned_row_is_always_reported_never_aged_out(self):
         with self.w.db.tx() as c:
-            c.execute("INSERT INTO notifier_sending VALUES ('ghost:telegram', 'dead', ?)",
+            c.execute("INSERT INTO notifier_sending (message_id, dispatch, owner, since, status)"
+                      " VALUES ('ghost:telegram', 1, 'dead', ?, 'dispatching')",
                       (self.w.now - 10,))
         quick = self.w.make_notifier(stop_wait_s=0.05)
         # Bounded wait expires on a live-looking row: returned as unconfirmed, not all-clear.
@@ -1264,6 +1266,833 @@ class StopBoundaryAfterFinalRecheck(Base):
         self.resume.set()
         worker.join(10)
         self.assertEqual(self.w.tg.delivered_notifications().count("job:digest:d1"), 1)
+
+
+# ============================================================ Dolores review @ f14e564
+
+class _Reopen(Base):
+    def reopen(self, **auth_kw):
+        w2 = World(self._tmp.name)
+        w2.now, w2.live = self.w.now, self.w.live
+        if auth_kw:
+            w2.auth = ChannelAuth(db=w2.db, transport_keys=TRANSPORT_KEYS, clock=lambda: w2.now,
+                                  outbound_addresses={JOSH: {"telegram": "chat-1001",
+                                                             "email": MAIL_JOSH}}, **auth_kw)
+            w2.router = CommandRouter(auth=w2.auth, notifier=w2.notifier, issuer=w2.issuer,
+                                      live_action=lambda aid, tid: w2.live.get(tid),
+                                      clock=lambda: w2.now)
+        return w2
+
+    def pending_count(self):
+        with self.w.db.read() as c:
+            return c.execute("SELECT COUNT(*) FROM inbound_seen WHERE status='pending'"
+                             ).fetchone()[0]
+
+
+class FailureLeavesCommandPending(_Reopen):
+    """Finding 1: only a known, completed outcome marks an update processed."""
+
+    def test_signing_failure_inside_decide_then_redelivery_approves_once(self):
+        tid = self.w.waiting_task()
+        action = mail_action(tid)
+        aid = self.w.request(action)
+        real_key = self.w.issuer._key
+
+        class FlakyKey:
+            key_id = real_key.key_id
+            calls = 0
+
+            def sign(self, payload):
+                FlakyKey.calls += 1
+                if FlakyKey.calls == 1:
+                    raise OSError("HSM unavailable")
+                return real_key.sign(payload)
+        self.w.issuer._key = FlakyKey()
+        msg = self.w.tg_msg(f"/approve {aid}")
+        with self.assertRaises(OSError):
+            self.w.router.handle(msg)
+        self.assertEqual(self.pending_count(), 1)                 # not marked processed
+        self.assertEqual(self.w.issuer.get(aid).status, "pending")  # tx rolled back
+        res = self.w.router.handle(msg)                           # adapter redelivers
+        self.assertEqual(res.outcome, "approved")
+        self.assertEqual(self.w.c1(action, res.detail).outcome, ALLOW)
+        self.assertEqual(self.w.router.handle(msg).reason, "replayed")
+
+    def test_trace_failure_inside_decide_then_restart_redelivery_approves_once(self):
+        tid = self.w.waiting_task()
+        aid = self.w.request(mail_action(tid))
+        self.w.issuer._sink = lambda line: (_ for _ in ()).throw(OSError("sink down"))
+        msg = self.w.tg_msg(f"/approve {aid}")
+        with self.assertRaises(OSError):
+            self.w.router.handle(msg)
+        w2 = self.reopen()
+        self.assertEqual(w2.router.handle(msg).outcome, "approved")
+        with w2.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM approval_requests WHERE"
+                                       " status='approved'").fetchone()[0], 1)
+
+    def test_failure_inside_stop_transaction_then_redelivery_stops_once(self):
+        real = self.w.notifier._sweep_tx
+        calls = []
+
+        def flaky_sweep(c, now):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("disk hiccup")
+            return real(c, now)
+        self.w.notifier._sweep_tx = flaky_sweep
+        msg = self.w.tg_msg("/stop")
+        with self.assertRaises(RuntimeError):
+            self.w.router.handle(msg)
+        self.assertFalse(self.w.notifier.kill.is_set())           # rolled back
+        self.assertEqual(self.pending_count(), 1)
+        self.assertEqual(self.w.router.handle(msg).outcome, "stopped")
+        self.assertEqual(self.w.router.handle(msg).reason, "replayed")
+        self.w.notifier.run()
+        self.assertEqual([m.body["kind"] for m in self.w.tg.delivered], ["stop_ack"])
+
+    def test_failure_after_commit_is_not_reapplied(self):
+        tid = self.w.waiting_task()
+        aid = self.w.request(mail_action(tid))
+        real = self.w.issuer.decide
+
+        def decide_then_fail(*a, **kw):
+            real(*a, **kw)
+            raise RuntimeError("reply path failed after commit")
+        self.w.issuer.decide = decide_then_fail
+        msg = self.w.tg_msg(f"/approve {aid}")
+        with self.assertRaises(RuntimeError):
+            self.w.router.handle(msg)
+        self.assertEqual(self.pending_count(), 0)                 # marked in the effect tx
+        with self.w.db.read() as c:
+            nonce = c.execute("SELECT nonce FROM approval_requests").fetchone()[0]
+        self.assertEqual(self.reopen().router.handle(msg).reason, "replayed")
+        with self.w.db.read() as c:
+            self.assertEqual(c.execute("SELECT nonce FROM approval_requests").fetchone()[0], nonce)
+
+    def test_ack_failure_leaves_pending_and_redelivery_acks(self):
+        self.w.job_notify("digest", "d1", "x")
+        real_ack = self.w.notifier.outbox.ack
+        calls = []
+
+        def flaky(mid, now=None):
+            calls.append(mid)
+            if len(calls) == 1:
+                raise RuntimeError("busy")
+            return real_ack(mid, now=now)
+        self.w.notifier.outbox.ack = flaky
+        msg = self.w.tg_msg("/ack job:digest:d1")
+        with self.assertRaises(RuntimeError):
+            self.w.router.handle(msg)
+        self.assertEqual(self.pending_count(), 1)
+        self.assertEqual(self.w.router.handle(msg).outcome, "acked")
+        self.assertEqual(self.w.notifier.outbox.get("job:digest:d1:telegram").status, "acked")
+
+
+class PendingRecoveryPath(_Reopen):
+    """Finding 2: pending commands survive long outages; nothing else gets in."""
+
+    def test_restart_after_freshness_window_resumes_pending_command(self):
+        msg = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)         # journaled pending ... crash
+        self.w.now += 3600                                        # outage far beyond 300 s
+        w2 = self.reopen()
+        self.assertEqual(w2.router.handle(msg).outcome, "stopped")
+        self.assertTrue(w2.notifier.kill.is_set())
+
+    def test_altered_envelope_for_pending_update_is_refused(self):
+        msg = self.w.tg_msg("/ack job:digest:d1")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)         # pending
+        self.w.now += 3600
+        w2 = self.reopen()
+        # Same update id, validly signed but different content: not the journaled envelope.
+        swapped = w2.signers["telegram"].envelope(TG_JOSH, "/stop", update_id=msg.update_id,
+                                                  sent_at=msg.sent_at)
+        res = w2.router.handle(swapped)
+        self.assertEqual((res.outcome, res.reason), ("ignored", "replayed"))
+        self.assertFalse(w2.notifier.kill.is_set())
+        from dataclasses import replace
+        self.assertEqual(w2.router.handle(replace(msg, text="/stop")).reason,
+                         "unauthenticated_transport")
+
+    def test_stale_never_seen_update_is_refused_and_not_recorded(self):
+        msg = self.w.tg_msg("/stop")
+        self.w.now += 301
+        self.assertEqual(self.w.router.handle(msg).reason, "stale_transport")
+        with self.w.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0], 0)
+        self.assertFalse(self.w.notifier.kill.is_set())
+
+    def test_pruned_pending_row_is_never_resurrected(self):
+        # E3 (or any pruner) removes an E1 pending row after 2x skew; a later
+        # redelivery of that exact envelope is stale, never resumed or re-recorded.
+        msg = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)         # pending ... crash
+        with self.w.db.tx() as c:
+            c.execute("DELETE FROM inbound_seen WHERE update_id=?", (msg.update_id,))
+        self.w.now += 2 * 300 + 1
+        w2 = self.reopen()
+        res = w2.router.handle(msg)
+        self.assertEqual((res.outcome, res.reason), ("ignored", "stale_transport"))
+        self.assertFalse(w2.notifier.kill.is_set())
+        with w2.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0], 0)
+
+    def test_pruned_processed_row_is_stale_not_replayable(self):
+        msg = self.w.tg_msg("/noop")
+        self.w.router.handle(msg)                                  # processed
+        self.w.now += 2 * 300 + 61
+        self.w.router.handle(self.w.tg_msg("/noop"))               # prune runs
+        res = self.w.router.handle(msg)
+        self.assertEqual(res.reason, "stale_transport")
+        with self.w.db.read() as c:
+            self.assertIsNone(c.execute("SELECT 1 FROM inbound_seen WHERE update_id=?",
+                                        (msg.update_id,)).fetchone())
+
+    def test_recovery_rechecks_authorization(self):
+        msg = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)         # pending ... crash
+        w2 = self.reopen(inbound_bindings={"telegram": {}})        # Josh's binding revoked
+        self.assertEqual(w2.router.handle(msg).reason, "unknown_sender")
+        self.assertFalse(w2.notifier.kill.is_set())
+        self.assertEqual(self.pending_count(), 0)                 # closed, never executed
+
+
+class RetentionBounds(_Reopen):
+    def test_journal_keeps_digest_only_and_vouchers_are_released(self):
+        self.w.job_notify("digest", "d1", "x")
+        self.w.router.handle(self.w.tg_msg("/ack job:digest:d1"))
+        with self.w.db.read() as c:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(inbound_seen)")]
+            blob = json.dumps(c.execute("SELECT * FROM inbound_seen").fetchall())
+        self.assertNotIn("command", cols)
+        self.assertNotIn("reply_to", cols)
+        self.assertNotIn("/ack", blob)
+        self.assertNotIn("job:digest:d1", blob)
+        self.assertEqual(self.w.auth._minted, {})                  # released after dispatch
+
+    def test_voucher_map_is_capped(self):
+        from notifier import auth as auth_mod
+        for _ in range(auth_mod.MAX_MINTED + 50):
+            self.w.auth.authenticate(self.w.tg_msg("/noop"))
+        self.assertLessEqual(len(self.w.auth._minted), auth_mod.MAX_MINTED)
+
+    def test_old_processed_rows_are_pruned_pending_rows_kept(self):
+        done = self.w.tg_msg("/noop")
+        self.w.router.handle(done)                                 # processed
+        pending = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(pending).ok)     # pending
+        self.w.now += 2 * 300 + 61
+        self.w.router.handle(self.w.tg_msg("/noop"))               # triggers prune
+        with self.w.db.read() as c:
+            ids = {r[0]: r[1] for r in c.execute("SELECT update_id, status FROM inbound_seen")}
+        self.assertNotIn(done.update_id, ids)
+        self.assertEqual(ids[pending.update_id], "pending")
+        # The pruned envelope cannot come back: it is stale now.
+        self.assertEqual(self.w.router.handle(done).reason, "stale_transport")
+
+
+class DurableInFlightRecord(_Reopen):
+    """T19: the in-flight record is durable and only resolution removes it."""
+
+    def rows(self, db=None):
+        with (db or self.w.db).read() as c:
+            return c.execute("SELECT message_id, dispatch, status FROM notifier_sending"
+                             " ORDER BY message_id, dispatch").fetchall()
+
+    def stop(self, w=None):
+        w = w or self.w
+        return w.router.handle(w.tg_msg("/stop")).detail
+
+    def test_crash_before_dispatch_leaves_no_record_and_no_send(self):
+        def crash(msg):
+            raise Crash()
+        self.w.notifier._hook_after_gate = crash
+        self.w.job_notify("digest", "d1", "x")
+        with self.assertRaises(Crash):
+            self.w.notifier.run()
+        self.assertEqual(self.rows(), [])                           # never dispatched
+        self.assertEqual(self.w.tg.calls, 0)
+        self.assertTrue(self.stop().all_clear)
+
+    def test_crash_after_dispatch_is_reported_unknown_across_restart_and_age(self):
+        self.w.tg.crash_after_delivery = Crash()
+        self.w.job_notify("digest", "d1", "x")
+        with self.assertRaises(Crash):
+            self.w.notifier.run()
+        self.assertEqual(self.rows(), [("job:digest:d1:telegram", 1, "unknown")])
+        self.w.now += 3600                                         # leases long expired
+        w2 = self.reopen()
+        w2.notifier.run()                                          # reconcile: still unknown
+        self.assertEqual(w2.notifier.outbox.get("job:digest:d1:telegram").status,
+                         "abandoned_unknown")
+        report = self.stop(w2)
+        self.assertEqual(report.unknown_outcome, ("job:digest:d1:telegram",))
+        self.assertIn("job:digest:d1:telegram", report.unconfirmed_in_flight)
+        self.assertFalse(report.all_clear)
+        self.assertEqual(self.rows(w2.db), [("job:digest:d1:telegram", 1, "unknown")])
+
+    def test_dead_process_dispatching_record_never_ages_out(self):
+        self.w.job_notify("digest", "d1", "x")
+        with self.w.db.tx() as c:                                  # killed -9 mid-dispatch
+            c.execute("INSERT INTO notifier_sending (message_id, dispatch, owner, since,"
+                      " status) VALUES ('job:digest:d1:telegram', 1, 'dead', ?, 'dispatching')",
+                      (self.w.now,))
+        for hours in (1, 24, 24 * 30):
+            self.w.now = T + hours * 3600
+            report = self.reopen().router.handle(self.w.tg_msg("/stop")).detail
+            self.assertEqual(report.unconfirmed_in_flight, ("job:digest:d1:telegram",))
+            self.assertEqual(report.expired_in_flight, ("job:digest:d1:telegram",))
+            self.assertFalse(report.all_clear)
+
+    def test_provider_timeout_is_unknown_until_reconciled_delivered(self):
+        self.w.tg.ambiguous_after_delivery = True
+        self.w.job_notify("digest", "d1", "x")
+        self.w.notifier.run()                                      # timeout -> unknown, routine abandoned
+        self.w.tg.ambiguous_after_delivery = False
+        self.assertEqual(self.rows(), [("job:digest:d1:telegram", 1, "unknown")])
+        self.assertEqual(self.stop().unknown_outcome, ("job:digest:d1:telegram",))
+        # Provider later confirms delivery (e.g. Josh acks): the record resolves.
+        self.w.notifier.outbox.ack("job:digest:d1:telegram")
+        self.w.notifier.run()
+        self.assertEqual(self.rows(), [])
+
+    def test_retry_and_duplicate_send_are_recorded_per_dispatch(self):
+        self.w.tg.ambiguous_after_delivery = True
+        seen = []
+        self.w.tg.on_send = lambda m: seen.append(self.rows())
+        self.w.job_notify("monitor", "fire", "alarm", urgency="urgent")
+        self.w.notifier.run()                                      # dispatch 1 unknown, 2 resent
+        self.assertEqual(self.w.tg.delivered_notifications(), ["job:monitor:fire"] * 2)
+        self.assertEqual(seen[1], [("job:monitor:fire:telegram", 1, "unknown"),
+                                   ("job:monitor:fire:telegram", 2, "dispatching")])
+        self.assertEqual(self.rows(), [("job:monitor:fire:telegram", 1, "unknown"),
+                                       ("job:monitor:fire:telegram", 2, "unknown")])
+        self.assertEqual(self.stop().unknown_outcome, ("job:monitor:fire:telegram",))
+
+    def test_reconciled_success_clears_record(self):
+        self.w.tg.crash_after_delivery = Crash()
+        self.w.job_notify("digest", "d1", "x")
+        with self.assertRaises(Crash):
+            self.w.notifier.run()
+        self.w.now += 60
+        w2 = self.reopen()
+        w2.tg.reconcile_verdict = "succeeded"
+        w2.notifier.run()
+        self.assertEqual(w2.notifier.outbox.get("job:digest:d1:telegram").status, "sent")
+        self.assertEqual(self.rows(w2.db), [])
+        self.assertTrue(self.stop(w2).all_clear)
+
+    def test_concurrent_stop_and_dispatch_never_reports_all_clear_falsely(self):
+        import threading
+        for trial in range(15):
+            with self.subTest(trial=trial):
+                self.tearDown()
+                self.setUp()
+                for i in range(6):
+                    self.w.job_notify("digest", f"b{i}", f"{i}")
+                done = threading.Event()
+                late = []                                       # sends after stop() returned
+                started = threading.Event()
+
+                def on_send(m):
+                    started.set()
+                    if done.is_set() and not m.notification_id.startswith("stop:"):
+                        late.append(m.message_id)
+                self.w.tg.on_send = on_send
+                worker = threading.Thread(target=self.w.notifier.run)
+                worker.start()
+                self.assertTrue(started.wait(10))
+                report = self.stop()
+                done.set()
+                worker.join(10)
+                # Any send that landed after stop() returned was reported unconfirmed.
+                self.assertTrue(set(late) <= set(report.unconfirmed_in_flight),
+                                (late, report))
+                if late:
+                    self.assertFalse(report.all_clear)
+                self.assertEqual(self.rows(), [])
+
+    def test_unreadable_in_flight_state_is_never_all_clear(self):
+        def broken():
+            raise sqlite3.OperationalError("disk I/O error")
+        self.w.notifier._await_in_flight = broken
+        report = self.stop()
+        self.assertTrue(report.state_unknown)
+        self.assertFalse(report.all_clear)
+
+
+# ============================================================ clock rollback (Dolores @ 225e7df)
+
+class ClockRollback(_Reopen):
+    """Replay protection must not trust a wall clock that moves backwards."""
+
+    def jump_then_prune(self):
+        stop = self.w.tg_msg("/stop")                               # signed at T
+        self.assertEqual(self.w.router.handle(stop).outcome, "stopped")
+        self.w.notifier.kill.clear()                                # operator clears kill
+        self.w.now = T + 1000
+        self.w.router.handle(self.w.tg_msg("/noop"))                # prunes the /stop row
+        with self.w.db.read() as c:
+            self.assertIsNone(c.execute("SELECT 1 FROM inbound_seen WHERE update_id=?",
+                                        (stop.update_id,)).fetchone())
+        return stop
+
+    def test_dolores_jump_forward_then_roll_back(self):
+        stop = self.jump_then_prune()
+        self.w.now = T                                              # clock rolls back
+        res = self.w.router.handle(stop)
+        self.assertEqual((res.outcome, res.reason), ("ignored", "clock_regression"))
+        self.assertFalse(self.w.notifier.kill.is_set())
+        # Fail closed: even a brand-new, correctly signed command is refused.
+        self.assertEqual(self.w.router.handle(self.w.tg_msg("/stop")).reason,
+                         "clock_regression")
+        self.assertFalse(self.w.notifier.kill.is_set())
+
+    def test_restart_between_jump_and_rollback(self):
+        stop = self.jump_then_prune()
+        self.w.now = T
+        w2 = self.reopen()                                          # nothing process-local survives
+        self.assertEqual(w2.router.handle(stop).reason, "clock_regression")
+        self.assertFalse(w2.notifier.kill.is_set())
+
+    def test_rollback_on_another_transport_also_fails_closed(self):
+        self.jump_then_prune()
+        self.w.now = T
+        res = self.w.router.handle(self.w.mail_msg("/stop", dkim=True))
+        self.assertEqual(res.reason, "clock_regression")
+
+    def test_operator_reconcile_keeps_old_envelopes_rejected(self):
+        stop = self.jump_then_prune()
+        self.w.now = T
+        self.w.auth.reconcile_clock()                               # operator accepts clock T
+        # The sent_at watermark did not move back: the replay is still refused.
+        self.assertEqual(self.w.router.handle(stop).reason, "stale_transport")
+        self.assertFalse(self.w.notifier.kill.is_set())
+        # Once the clock passes the watermark floor again, new commands work.
+        self.w.now = T + 1000
+        self.assertEqual(self.w.router.handle(self.w.tg_msg("/stop")).outcome, "stopped")
+
+    def test_pruned_envelope_rejected_by_watermark_without_rollback(self):
+        stop = self.jump_then_prune()
+        self.w.now = T + 1000
+        self.assertEqual(self.w.router.handle(stop).reason, "stale_transport")
+
+    def test_restore_of_db_copy_taken_after_acceptance(self):
+        import shutil
+        stop = self.w.tg_msg("/stop")
+        self.assertEqual(self.w.router.handle(stop).outcome, "stopped")
+        self.w.notifier.kill.clear()
+        db_path = Path(self._tmp.name) / "potter.db"
+        backup = Path(self._tmp.name) / "backup"
+        backup.mkdir()
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(db_path) + suffix)
+            if src.exists():
+                shutil.copy(src, backup / (db_path.name + suffix))
+        self.jump_then_prune_existing()
+        # Restore the older copy (it still holds the processed /stop row), roll back.
+        for suffix in ("", "-wal", "-shm"):
+            dst = Path(str(db_path) + suffix)
+            if dst.exists():
+                dst.unlink()
+            src = backup / (db_path.name + suffix)
+            if src.exists():
+                shutil.copy(src, dst)
+        self.w.now = T
+        w2 = self.reopen()
+        self.assertEqual(w2.router.handle(stop).reason, "replayed")
+        self.assertFalse(w2.notifier.kill.is_set())
+
+    def jump_then_prune_existing(self):
+        self.w.now = T + 1000
+        self.w.router.handle(self.w.tg_msg("/noop"))
+
+    def test_restore_of_db_copy_taken_after_jump_fails_closed(self):
+        import shutil
+        stop = self.jump_then_prune()
+        db_path = Path(self._tmp.name) / "potter.db"
+        snap = Path(self._tmp.name) / "snap"
+        snap.mkdir()
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(db_path) + suffix)
+            if src.exists():
+                shutil.copy(src, snap / (db_path.name + suffix))
+        self.w.now = T + 2000
+        self.w.router.handle(self.w.tg_msg("/noop"))
+        for suffix in ("", "-wal", "-shm"):
+            dst = Path(str(db_path) + suffix)
+            if dst.exists():
+                dst.unlink()
+            src = snap / (db_path.name + suffix)
+            if src.exists():
+                shutil.copy(src, dst)
+        self.w.now = T                                              # restored + rolled back
+        w2 = self.reopen()
+        self.assertEqual(w2.router.handle(stop).reason, "clock_regression")
+        self.assertFalse(w2.notifier.kill.is_set())
+
+    def test_small_backward_step_within_tolerance_is_tolerated(self):
+        self.w.now = T + 100
+        self.w.router.handle(self.w.tg_msg("/noop"))
+        self.w.now = T + 97                                         # 3 s back (< 5 s)
+        self.assertEqual(self.w.router.handle(self.w.tg_msg("/stop")).outcome, "stopped")
+
+    def test_high_water_and_skew_are_exposed_read_only(self):
+        self.w.router.handle(self.w.tg_msg("/noop"))
+        hw = self.w.auth.high_water("telegram")
+        self.assertEqual(hw, {"max_sent_at": T, "max_clock": T})
+        hw["max_sent_at"] = 0                                       # a copy: no effect
+        self.assertEqual(self.w.auth.high_water("telegram")["max_sent_at"], T)
+        self.assertEqual(self.w.auth.max_skew_s, 300.0)
+        self.assertEqual(self.w.auth.prune_horizon_s, 660.0)
+        with self.assertRaises(AttributeError):
+            self.w.auth.max_skew_s = 1
+
+
+# ============================================================ schema migration e1.v0 -> e1.v1 (Dolores @ c23ecd9)
+
+def _v0_ddl():
+    """The e1.v0 fixture is generated from the accepted schema text itself
+    (``_schema.V0_SCHEMA``, verbatim from 225e7df), so it cannot drift."""
+    from notifier import _schema
+    return tuple(_schema.V0_SCHEMA)
+
+
+class SchemaMigration(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "potter.db"
+        self.signer = TransportSigner("telegram", TRANSPORT_KEYS["telegram"])
+
+    def tearDown(self):
+        from notifier import _schema
+        _schema._MIGRATION_FAULT = None
+        self._tmp.cleanup()
+
+    def make_v0(self, rows=(), ddl=None):
+        """A database as 225e7df left it: C2/C3 tables, e1.v0 notifier tables, rows."""
+        from runtime import Outbox
+        db = Database(self.path)
+        Outbox(db)
+        with db.tx() as c:
+            for stmt in (ddl if ddl is not None else _v0_ddl()):
+                c.execute(stmt)
+            c.execute("INSERT INTO meta (key, value) VALUES ('notifier_schema', 'e1.v0')")
+            for r in rows:
+                c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
+                          " envelope_digest, processed_at) VALUES (?,?,?,?,?,?,?)", r)
+        return db
+
+    def envelope(self, text, update_id, sent_at=T):
+        return self.signer.envelope(TG_JOSH, text, update_id=update_id, sent_at=sent_at)
+
+    def v0_row(self, msg, status, processed_at=T):
+        digest = ChannelAuth._digest(msg)
+        return ("telegram", msg.update_id, msg.sent_at, status,
+                "human:josh" if status == "pending" else None, digest,
+                processed_at if status == "processed" else None)
+
+    def open_world(self, now=T + 10):
+        w = World.__new__(World)
+        World.__init__(w, self._tmp.name)          # migrates on first construction
+        w.now = now
+        return w
+
+    def schema_version(self):
+        with Database(self.path).read() as c:
+            return c.execute("SELECT value FROM meta WHERE key='notifier_schema'").fetchone()[0]
+
+    def test_v0_database_is_migrated_and_old_processed_row_stays_burned(self):
+        stop = self.envelope("/stop", "old-1")
+        self.make_v0([self.v0_row(stop, "processed")])
+        w = self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v1")
+        with w.db.read() as c:
+            row = c.execute("SELECT status, sent_at, migration_flag FROM inbound_seen"
+                            " WHERE update_id='old-1'").fetchone()
+        self.assertEqual(row[0], "processed")
+        self.assertEqual(row[2], "sent_at_unknown")
+        # Replay of the pre-migration envelope after migration: rejected.
+        w.now = T + 10
+        self.assertEqual(w.router.handle(stop).reason, "replayed")
+        self.assertFalse(w.notifier.kill.is_set())
+        # ... and still rejected once its row is long pruned.
+        w.now = T + 10_000
+        w.router.handle(w.tg_msg("/noop"))
+        self.assertEqual(w.router.handle(stop).reason, "stale_transport")
+
+    def test_old_pending_command_needs_operator_and_never_runs(self):
+        stop = self.envelope("/stop", "old-p")
+        self.make_v0([self.v0_row(stop, "pending")])
+        w = self.open_world()
+        self.assertEqual(w.auth.needs_operator(), [("telegram", "old-p")])
+        res = w.router.handle(stop)
+        self.assertEqual((res.outcome, res.reason), ("ignored", "needs_operator"))
+        self.assertFalse(w.notifier.kill.is_set())
+        self.assertTrue(w.auth.burn_needs_operator("telegram", "old-p"))
+        self.assertEqual(w.auth.needs_operator(), [])
+        self.assertEqual(w.router.handle(stop).reason, "replayed")   # burned, never executed
+        self.assertFalse(w.notifier.kill.is_set())
+
+    def test_high_water_is_seeded_at_migration(self):
+        old = self.envelope("/noop", "old-2", sent_at=T)
+        self.make_v0([self.v0_row(old, "processed", processed_at=T + 50)])
+        w = self.open_world(now=T + 10)
+        hw = w.auth.high_water("telegram")
+        self.assertEqual(hw, {"max_sent_at": T + 50, "max_clock": T + 50})   # max(now=T, T+50)
+        # A pre-migration envelope whose row v0 had already pruned: below the floor.
+        pruned_earlier = self.envelope("/stop", "old-gone", sent_at=T - 400)
+        w.now = T + 60
+        self.assertEqual(w.router.handle(pruned_earlier).reason, "stale_transport")
+
+    def test_interrupted_migration_rolls_back_then_restart_migrates_cleanly(self):
+        from notifier import _schema
+        from runtime import JournalUnavailable
+        stop = self.envelope("/stop", "old-3")
+        self.make_v0([self.v0_row(stop, "processed"), self.v0_row(
+            self.envelope("/ack x", "old-4"), "pending")])
+
+        def crash():
+            raise sqlite3.OperationalError("simulated crash mid-migration")
+        _schema._MIGRATION_FAULT = crash
+        with self.assertRaises(JournalUnavailable):
+            self.open_world()
+        # Nothing half-done: still e1.v0, original table and rows intact.
+        self.assertEqual(self.schema_version(), "e1.v0")
+        with Database(self.path).read() as c:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(inbound_seen)")]
+            n = c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0]
+            tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
+        self.assertNotIn("sent_at", cols)
+        self.assertEqual(n, 2)
+        self.assertNotIn("inbound_seen_v0", tables)
+        _schema._MIGRATION_FAULT = None
+        w = self.open_world()                           # restart: clean migration
+        self.assertEqual(self.schema_version(), "e1.v1")
+        self.assertEqual(w.auth.needs_operator(), [("telegram", "old-4")])
+        self.assertEqual(w.router.handle(stop).reason, "replayed")
+
+    def test_unknown_future_schema_version_is_refused(self):
+        from runtime import JournalUnavailable
+        db = self.make_v0()
+        with db.tx() as c:
+            c.execute("UPDATE meta SET value='e1.v9' WHERE key='notifier_schema'")
+        with self.assertRaises(JournalUnavailable):
+            self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v9")      # untouched
+
+    def test_unrecognised_v0_layout_is_refused(self):
+        from runtime import JournalUnavailable
+        db = self.make_v0()
+        with db.tx() as c:                               # e.g. an older pre-225e7df layout
+            c.execute("DROP TABLE inbound_seen")
+            c.execute("CREATE TABLE inbound_seen (channel TEXT, update_id TEXT, at REAL,"
+                      " PRIMARY KEY (channel, update_id))")
+        with self.assertRaises(JournalUnavailable):
+            self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v0")
+
+    def test_v0_schema_text_is_verbatim_from_225e7df(self):
+        import ast
+        import subprocess
+        try:
+            src = subprocess.run(["git", "-C", str(ROOT), "show", "225e7df:notifier/_schema.py"],
+                                 capture_output=True, text=True, check=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("225e7df not available in this checkout (shallow clone)")
+        tree = ast.parse(src)
+        real = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                    and getattr(n.targets[0], "id", "") == "SCHEMA")
+        self.assertEqual(tuple(real), _v0_ddl())
+
+    def assertRefusedUntouched(self, ddl, why):
+        from runtime import JournalUnavailable
+        stop = self.envelope("/stop", "old-x")
+        self.make_v0(ddl=ddl)
+        with Database(self.path).tx() as c:
+            c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
+                      " envelope_digest, processed_at) VALUES (?,?,?,?,?,?,?)",
+                      self.v0_row(stop, "processed"))
+        with Database(self.path).read() as c:
+            before = sorted(c.execute("SELECT type, name, sql FROM sqlite_master"
+                                      " WHERE substr(name, 1, 7) <> 'sqlite_'").fetchall(), key=str)
+        with self.assertRaises(JournalUnavailable, msg=why):
+            self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v0", why)
+        with Database(self.path).read() as c:
+            after = sorted(c.execute("SELECT type, name, sql FROM sqlite_master"
+                                     " WHERE substr(name, 1, 7) <> 'sqlite_'").fetchall(), key=str)
+            n = c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0]
+        self.assertEqual(after, before, f"{why}: schema changed")   # no partial migration
+        self.assertEqual(n, 1, why)
+
+    def variant(self, table, old, new):
+        ddl, hits = [], 0
+        for stmt in _v0_ddl():
+            if f"TABLE IF NOT EXISTS {table} " in stmt and old in stmt:
+                stmt, hits = stmt.replace(old, new, 1), hits + 1
+            ddl.append(stmt)
+        self.assertEqual(hits, 1, f"variant {table}: {old!r} not found")
+        return tuple(ddl)
+
+    def test_altered_check_constraint_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "('pending','processed')", "('pending','processed','other')"),
+            "CHECK allows a third status")
+
+    def test_dropped_not_null_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "envelope_digest TEXT NOT NULL", "envelope_digest TEXT"),
+            "NOT NULL dropped")
+
+    def test_changed_primary_key_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "PRIMARY KEY (channel, update_id)", "PRIMARY KEY (update_id, channel)"),
+            "primary key changed")
+
+    def test_changed_type_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "at REAL NOT NULL", "at TEXT NOT NULL"), "column type changed")
+
+    def test_extra_index_is_refused(self):
+        self.assertRefusedUntouched(
+            _v0_ddl() + ("CREATE INDEX inbound_seen_extra ON inbound_seen (status)",),
+            "extra index")
+
+    def test_missing_index_is_refused(self):
+        self.assertRefusedUntouched(
+            tuple(st for st in _v0_ddl() if "approval_requests_task" not in st),
+            "missing index")
+
+    def test_extra_trigger_is_refused(self):
+        self.assertRefusedUntouched(_v0_ddl() + (
+            "CREATE TRIGGER inbound_seen_t AFTER INSERT ON inbound_seen BEGIN SELECT 1; END",),
+            "extra trigger")
+
+    def test_same_column_changed_literal_is_refused(self):
+        # Dolores: the CHECK literal 'pending' becomes 'IF NOT EXISTS pending'.
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "('pending','processed')", "('IF NOT EXISTS pending','processed')"),
+            "changed literal inside CHECK")
+
+    def test_whitespace_inside_literal_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "('pending','processed')", "('pending ','processed')"),
+            "changed whitespace inside a literal")
+
+    def test_extra_view_is_refused(self):
+        self.assertRefusedUntouched(
+            _v0_ddl() + ("CREATE VIEW leaked AS SELECT * FROM inbound_seen",), "extra view")
+
+    def test_extra_trigger_on_non_v0_table_referencing_v0_is_refused(self):
+        self.assertRefusedUntouched(_v0_ddl() + (
+            "CREATE TRIGGER outbox_leak AFTER INSERT ON outbox BEGIN"
+            " DELETE FROM inbound_seen; END",), "trigger on outbox touching inbound_seen")
+
+    def test_view_named_like_an_internal_object_is_refused(self):
+        # '_' is a LIKE wildcard: sqliteXleak must not be mistaken for sqlite_*.
+        for name in ("sqliteXleak", "SQLITEXleak", "sqlite"):
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.assertRefusedUntouched(
+                    _v0_ddl() + (f"CREATE VIEW {name} AS SELECT * FROM inbound_seen",),
+                    f"view {name}")
+
+    def test_extra_unrelated_table_is_refused(self):
+        self.assertRefusedUntouched(
+            _v0_ddl() + ("CREATE TABLE stray (x TEXT)",), "unexpected table")
+
+    def test_fresh_database_starts_at_v1_and_reopen_is_idempotent(self):
+        w = self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v1")
+        self.assertEqual(w.router.handle(w.tg_msg("/stop")).outcome, "stopped")
+        self.open_world()                                # second start: no migration, no error
+        self.assertEqual(self.schema_version(), "e1.v1")
+
+
+# ============================================================ refusal is atomic (Dolores, #28/#29 @ 0d8395b)
+
+class AtomicRefusal(unittest.TestCase):
+    """A refused database is left byte-identical: nothing at all is written."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "potter.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def c2_only(self, **meta):
+        db = Database(self.path)                       # C2 only: no C3 outbox, no E1
+        with db.tx() as c:
+            for k, v in meta.items():
+                c.execute("INSERT INTO meta (key, value) VALUES (?,?)", (k, v))
+        return db
+
+    def snapshot(self):
+        c = sqlite3.connect(self.path)
+        try:
+            schema = c.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"
+                               " ORDER BY type, name").fetchall()
+            meta = c.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+            return schema, meta
+        finally:
+            c.close()
+
+    def assertRefusedByteIdentical(self, db, why):
+        from notifier import _schema, KillFlag
+        from runtime import JournalUnavailable
+        before = self.snapshot()
+        refusals = [
+            ("ensure", lambda: _schema.ensure(db)),
+            ("ChannelAuth", lambda: ChannelAuth(db=db, transport_keys=TRANSPORT_KEYS,
+                                                inbound_bindings={}, outbound_addresses={})),
+            ("KillFlag", lambda: KillFlag(db)),
+        ]
+        # Notifier: auth from a separate, valid database; only `db` is under test.
+        ok_db = Database(Path(self._tmp.name) / "other.db")
+        ok_auth = ChannelAuth(db=ok_db, transport_keys=TRANSPORT_KEYS, inbound_bindings={},
+                              outbound_addresses={JOSH: {"telegram": "a", "email": "b"}})
+        refusals.append(("Notifier", lambda: Notifier(
+            db, channels={"telegram": FakeChannel("telegram"), "email": FakeChannel("email")},
+            auth=ok_auth)))
+        for name, make in refusals:
+            with self.subTest(path=name):
+                with self.assertRaises(JournalUnavailable, msg=f"{why} via {name}"):
+                    make()
+                self.assertEqual(self.snapshot(), before, f"{why} via {name}: database mutated")
+
+    def test_future_version_on_c2_only_db_is_refused_byte_identical(self):
+        db = self.c2_only(notifier_schema="e1.v9")
+        self.assertRefusedByteIdentical(db, "future notifier schema")
+        tables = {r[1] for r in self.snapshot()[0]}
+        self.assertNotIn("outbox", tables)
+
+    def test_v0_mismatch_on_c2_only_db_is_refused_byte_identical(self):
+        from notifier import _schema
+        db = self.c2_only(notifier_schema="e1.v0")
+        with db.tx() as c:                                    # v0 tables, but no C3 outbox
+            for stmt in _schema.V0_SCHEMA:
+                c.execute(stmt)
+        self.assertRefusedByteIdentical(db, "e1.v0 catalog mismatch (no outbox)")
+
+    def test_foreign_outbox_schema_is_refused_byte_identical(self):
+        db = self.c2_only(outbox_schema="c3.v9")
+        self.assertRefusedByteIdentical(db, "unsupported C3 outbox schema")
+
+    def test_accepted_fresh_c2_only_db_is_set_up_in_one_step(self):
+        from notifier import _schema
+        db = self.c2_only()
+        _schema.ensure(db)
+        schema, meta = self.snapshot()
+        self.assertIn("outbox", {r[1] for r in schema})
+        self.assertIn(("notifier_schema", "e1.v1"), meta)
+        self.assertIn(("outbox_schema", "c3.v0"), meta)
+        before = self.snapshot()
+        _schema.ensure(db)                                    # idempotent
+        self.assertEqual(self.snapshot(), before)
 
 
 # ============================================================ long work (item 5)
