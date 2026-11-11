@@ -11,14 +11,22 @@ Transport authentication (message-bound, integrity- and replay-protected):
   hand-built ``InboundMessage('telegram', josh_id, '/stop')`` is ignored, and
   so is a genuine update whose text or reply target was changed.
 * Replay without loss: each authentic ``(channel, update_id)`` is recorded
-  durably in ``inbound_seen`` as ``pending`` with its verified command, and
-  only within ``max_skew_s`` of its signed time. The command's effect marks
-  it ``processed`` in the same transaction (``complete``). Redelivery of a
-  ``processed`` update is ignored (``replayed``); redelivery of a ``pending``
-  one - the process crashed after authenticating but before the effect
-  committed - is authenticated again so the command runs once. Two
-  concurrent deliveries of a pending update race on ``complete``'s
+  durably in ``inbound_seen`` as ``pending`` with a sha256 digest of the
+  exact signed envelope (payload + MAC; never the body). The command's
+  effect marks it ``processed`` in the same transaction (``complete``).
+  - Never seen before: must be within ``max_skew_s`` of its signed time.
+  - ``processed``: ignored (``replayed``).
+  - ``pending`` (crashed after authenticating, before the effect committed):
+    the recovery path. The redelivered envelope must match the stored digest
+    byte for byte; freshness is NOT reapplied (the outage may be long), but
+    authorization (binding, allowlist, enabled, DKIM/session) is rechecked.
+    A different envelope under the same update id is ``replayed``.
+  Two concurrent deliveries of a pending update race on ``complete``'s
   compare-and-set; the loser's effect rolls back.
+* Retention: vouchers (which hold the verified text for command binding) are
+  released after dispatch and capped at ``MAX_MINTED``; journal rows keep
+  only the digest, and processed rows are pruned once a replay of them would
+  be rejected as stale anyway (``2 * max_skew_s`` + margin).
 * No key for a channel -> nothing on that channel is ever authenticated.
 
 Principal checks (after the transport check):
@@ -67,6 +75,8 @@ from .channels import EMAIL, POTTER_HOME, TELEGRAM, InboundMessage
 
 DEFAULT_ALLOWLIST = frozenset({JOSH, CHRISTIE})   # Christie present but disabled (C5)
 DEFAULT_MAX_SKEW_S = 300.0
+MAX_MINTED = 1024            # live vouchers kept in memory (oldest evicted)
+PRUNE_MARGIN_S = 60.0
 
 Verifier = Callable[[InboundMessage], bool]
 
@@ -159,8 +169,8 @@ class ChannelAuth:
 
     # ------------------------------------------------------------------ transport
     def _transport_ok(self, msg: InboundMessage) -> str | None:
-        """None if the envelope is authentic and fresh; else a reason.
-        (Replay is decided against ``inbound_seen`` in ``authenticate``.)"""
+        """None if the envelope's MAC verifies; else a reason. Freshness and
+        replay are decided against ``inbound_seen`` in ``authenticate``."""
         key = self._keys.get(msg.channel)
         if key is None:
             return "unknown_channel"
@@ -175,9 +185,17 @@ class ChannelAuth:
             return "unauthenticated_transport"
         if not isinstance(msg.update_id, str) or not msg.update_id:
             return "unauthenticated_transport"
-        if not isinstance(msg.sent_at, (int, float)) or abs(self._clock() - msg.sent_at) > self._skew:
-            return "stale_transport"
+        if not isinstance(msg.sent_at, (int, float)):
+            return "unauthenticated_transport"
         return None
+
+    def _fresh(self, msg: InboundMessage) -> bool:
+        return abs(self._clock() - msg.sent_at) <= self._skew
+
+    @staticmethod
+    def _digest(msg: InboundMessage) -> str:
+        return hashlib.sha256(transport_payload(msg) + b"|" + msg.transport_mac.encode()
+                              ).hexdigest()
 
     def _principal(self, msg: InboundMessage) -> tuple[str | None, str]:
         """(principal, "ok") or (None, reason) for an authentic envelope."""
@@ -208,36 +226,60 @@ class ChannelAuth:
         bad = self._transport_ok(msg)
         if bad:
             return AuthResult(None, bad)
-        principal, reason = self._principal(msg)
+        digest = self._digest(msg)
+        principal, reason = self._principal(msg)       # always (re)checked
         now = self._clock()
-        text = msg.text or ""
         with self.db.tx() as c:
-            row = c.execute("SELECT status, command, reply_to FROM inbound_seen"
+            self._prune(c, now)
+            row = c.execute("SELECT status, envelope_digest FROM inbound_seen"
                             " WHERE channel=? AND update_id=?",
                             (msg.channel, msg.update_id)).fetchone()
             if row is not None:
-                status, command, reply_to = row
-                if status == "processed" or command != text or reply_to != msg.reply_to:
+                status, stored = row
+                if status == "processed" or not hmac.compare_digest(stored, digest):
                     return AuthResult(None, "replayed")
-                # pending: crashed before the effect committed -> resume below
-            elif principal is None:
-                # Authentic but not obeyed: record as done so it is never retried.
-                c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
-                          " command, reply_to, processed_at) VALUES (?,?,?,'processed',NULL,?,?,?)",
-                          (msg.channel, msg.update_id, now, text, msg.reply_to, now))
+                # pending + identical envelope: recovery path (no freshness check).
+                if principal is None:
+                    # Authorization no longer holds: close it, never execute.
+                    c.execute("UPDATE inbound_seen SET status='processed', processed_at=?"
+                              " WHERE channel=? AND update_id=?",
+                              (now, msg.channel, msg.update_id))
             else:
-                c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
-                          " command, reply_to) VALUES (?,?,?,'pending',?,?,?)",
-                          (msg.channel, msg.update_id, now, principal, text, msg.reply_to))
+                if not self._fresh(msg):
+                    return AuthResult(None, "stale_transport")      # nothing recorded
+                if principal is None:
+                    # Authentic but not obeyed: record as done so it is never retried.
+                    c.execute("INSERT INTO inbound_seen (channel, update_id, at, status,"
+                              " principal, envelope_digest, processed_at)"
+                              " VALUES (?,?,?,'processed',NULL,?,?)",
+                              (msg.channel, msg.update_id, now, digest, now))
+                else:
+                    c.execute("INSERT INTO inbound_seen (channel, update_id, at, status,"
+                              " principal, envelope_digest) VALUES (?,?,?,'pending',?,?)",
+                              (msg.channel, msg.update_id, now, principal, digest))
         if principal is None:
             return AuthResult(None, reason)
         serial = next(self._serials)
         token = secrets.token_hex(32)
-        sender = AuthenticatedSender(principal, msg.channel, serial, token, text,
+        sender = AuthenticatedSender(principal, msg.channel, serial, token, msg.text or "",
                                      msg.reply_to, msg.update_id)
         with self._lock:
             self._minted[token] = (sender, self._claims(sender))
+            while len(self._minted) > MAX_MINTED:
+                self._minted.pop(next(iter(self._minted)))
         return AuthResult(sender, "ok")
+
+    def _prune(self, c: sqlite3.Connection, now: float) -> None:
+        """Drop processed rows old enough that any replay is already stale.
+        Pending rows are never pruned (they must stay resumable)."""
+        c.execute("DELETE FROM inbound_seen WHERE status='processed' AND processed_at < ?",
+                  (now - 2 * self._skew - PRUNE_MARGIN_S,))
+
+    def release(self, sender: object) -> None:
+        """Forget a voucher (and the text it carries) once dispatch is over."""
+        if type(sender) is AuthenticatedSender:
+            with self._lock:
+                self._minted.pop(sender._token, None)
 
     def complete(self, c: sqlite3.Connection, sender: AuthenticatedSender) -> bool:
         """Mark the voucher's update ``processed`` inside the caller's effect
