@@ -69,16 +69,28 @@ async def _bounded(backend: Backend, query: str, timeout: float):
             raw = task.result()
             values = []
             iterator = iter(raw)
-            while True:
-                if time.monotonic() - start >= timeout:
-                    return 'deadline', (), time.monotonic() - start
+            try:
+                while True:
+                    if time.monotonic() - start >= timeout:
+                        return 'deadline', (), time.monotonic() - start
+                    try:
+                        value = next(iterator)
+                    except StopIteration:
+                        break
+                    if len(values) >= MAX_ASYNC_RESULTS:
+                        return 'unavailable', (), time.monotonic() - start
+                    values.append(value)
+            finally:
+                # A cancelled/over-limit iterator may own a cursor or generator
+                # resource. Cleanup is best-effort and must not replace the
+                # retrieval result. Caller cancellation at an await remains
+                # outside this synchronous block and is propagated above.
                 try:
-                    value = next(iterator)
-                except StopIteration:
-                    break
-                if len(values) >= MAX_ASYNC_RESULTS:
-                    return 'unavailable', (), time.monotonic() - start
-                values.append(value)
+                    close = getattr(iterator, 'close', None)
+                    if callable(close):
+                        close()
+                except (Exception, asyncio.CancelledError):
+                    pass
             items = tuple(values)
             if any(not isinstance(item, Evidence) or type(item.item_id) is not str
                    or not item.item_id or type(item.text) is not str for item in items):
