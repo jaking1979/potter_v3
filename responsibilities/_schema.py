@@ -8,9 +8,9 @@
                                 primary key forbids a second one.
 * ``responsibility_progress`` - per task: when its first T16 state was
                                 reported (the long-work clock, so the 30 s ack
-                                survives a restart) and the ticks handed to
-                                E1's ``LongWork``. E1 keeps its own message
-                                progress in the outbox.
+                                survives a restart). ``history`` is unused
+                                (kept for layout compatibility): what was told
+                                lives only in E1's durable outbox.
 
 ``meta.responsibilities_schema`` pins the layout; any other value fails closed.
 """

@@ -510,6 +510,7 @@ class ResponsibilityRunner:
                 # The waiting action can no longer be rebuilt as approved.
             pa = self._issuer.get(aid) if aid else None
             if pa is not None and pa.status == "pending" and now < pa.expires_at:
+                self._report(d, tid, WAITING_APPROVAL)   # the 30 s ack may now be due
                 continue
             if pa is not None and pa.status == "approved":
                 t = self.tasks.approval_resolved(tid, True)
@@ -557,10 +558,11 @@ class ResponsibilityRunner:
         outcome = outcome or task.state
         receipt = receipt_link(task.id)
         try:
-            if self._acked(task.id):
-                lw = self._long_work(d, task.id)
-                if lw is not None:
-                    lw.finish(receipt, self._now(), outcome=outcome)
+            lw = self._long_work(d, task.id)
+            # Long work = ran 30 s or more since its first report. Decided from
+            # the persisted start time, not from whether an ack was recorded.
+            if lw is not None and self._now() - lw[1] >= LONG_WORK_ACK_S:
+                lw[0].finish(receipt, self._now(), outcome=outcome)
             handle = self._handles[d.id]
             with self.db.tx() as c:
                 if outcome == DONE and text:
@@ -612,38 +614,51 @@ class ResponsibilityRunner:
 
     # ---------------------------------------------------------------- long work (E1)
     def _long_work(self, d: Responsibility, task_id: str):
-        """A fresh E1 LongWork for the task. E1 reads its own progress (ack,
-        update numbering, last state told) back from the outbox on every tick,
-        so nothing is replayed here."""
+        """(fresh E1 LongWork for the task, its start time), or None if the run
+        never reported. E1 reads its own progress (ack, update numbering, last
+        state told) back from its durable outbox on every tick."""
         with self.db.read() as c:
             row = _schema.load_progress(c, task_id)
-        return None if row is None else self._handles[d.id].long_work(task_id, row[0])
-
-    def _acked(self, task_id: str) -> bool:
-        with self.db.read() as c:
-            row = _schema.load_progress(c, task_id)
-        return bool(row) and any(at - row[0] >= LONG_WORK_ACK_S for _, at in row[1])
+        return None if row is None else (self._handles[d.id].long_work(task_id, row[0]), row[0])
 
     def _report(self, d: Responsibility, task_id: str, state: str) -> None:
-        """Hand a T16 state to E1's LongWork. The first report pins the run's
-        start time, and every tick is logged here, so the ack timing survives a
-        restart. E1 makes repeated ticks idempotent."""
+        """Hand a T16 state to E1's LongWork. E2 stores only the run's start
+        time (the 30 s clock, so it survives a restart). Whether an ack or an
+        update is still owed is decided by E1 from its durable outbox, never
+        from local history: every report ticks E1, and E1 makes a repeated
+        tick a no-op. A crash between pinning the start and E1's enqueue is
+        therefore simply retried by the next report."""
         if self._handles[d.id].silent or self.kill.is_set():
             return
         now = self._now()
         with self.db.tx() as c:
             row = _schema.load_progress(c, task_id)
-            started, history = row if row else (now, [])
-            last = history[-1][0] if history else None
-            acked = any(at - started >= LONG_WORK_ACK_S for _, at in history)
-            if state == last and (acked or now - started < LONG_WORK_ACK_S):
-                return
-            history.append([state, now])
-            _schema.save_progress(c, task_id, started, history)
+            if row is None:
+                _schema.save_progress(c, task_id, now, [])
+                started = now
+            else:
+                started = row[0]
         try:
             self._handles[d.id].long_work(task_id, started).tick(state, now)
         except NotifierError:
             pass    # Stopped, or the work already has its final message
+
+    def report_progress(self) -> int:
+        """Periodic long-work reporter (the C8 loop calls it on a cadence,
+        like ``poll_approvals``): ticks every running or waiting task of these
+        responsibilities, so the 30 s ack is sent even while a single long step
+        or a pending approval produces no state change. Safe from any process:
+        a tick only enqueues, idempotently. Returns the number of tasks ticked."""
+        with self.db.read() as c:
+            rows = c.execute("SELECT id, kind, state FROM tasks WHERE state IN (?,?)"
+                             " ORDER BY created_at, id", (RUNNING, WAITING_APPROVAL)).fetchall()
+        n = 0
+        for tid, kind, state in rows:
+            d = self._defs.get(kind)
+            if d is not None:
+                self._report(d, tid, state)
+                n += 1
+        return n
 
     # ================================================================ escalation / watchdog
     def _escalation_note(self, subject: str, ident: str) -> tuple[str, str] | None:

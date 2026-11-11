@@ -16,6 +16,7 @@
 
 Offline only: fake channels, a fake provider in a local SQLite file, test keys.
 """
+import json
 import os
 import signal
 import subprocess
@@ -813,6 +814,123 @@ class LongWork(Base):
                                      f"{base}:state:3", f"{base}:state:4", f"{base}:final"])
         self.assertEqual([w2.body(f"{base}:state:{n}")["state"] for n in (2, 3, 4)],
                          ["queued", "running", "done"])
+
+
+class LongWorkTruthIsTheOutbox(Base):
+    """Dolores @467b2b9: _report committed local history before E1's tick, so
+    a crash in between left history saying 'acked' while the outbox had no
+    ack (and a state update could be skipped); and a task waiting on a
+    pending approval was never ticked again, so the 30 s ack never came.
+    Now E1's durable outbox is the only record of what was told."""
+
+    def work_rows(self, w, task_id, job):
+        prefix = f"work:{job}:{task_id}:"
+        with w.db.read() as c:
+            return [(r[0][len(prefix):], json.loads(r[1]))
+                    for r in c.execute("SELECT notification_id, body FROM outbox WHERE"
+                                       " channel='telegram' AND notification_id LIKE ?"
+                                       " ORDER BY created_at, rowid", (prefix + "%",))]
+
+    def crash_first_tick_at_or_after(self, w, seconds, started):
+        from unittest import mock
+        from notifier.service import LongWork
+
+        class Crash(BaseException):
+            pass
+
+        real = LongWork.tick
+        state = {"armed": True}
+
+        def tick(lw, st, now):
+            if state["armed"] and now - started >= seconds:
+                state["armed"] = False
+                raise Crash()                 # after E2 pinned the start, before E1 enqueued
+            return real(lw, st, now)
+
+        return Crash, mock.patch.object(LongWork, "tick", tick)
+
+    def test_crash_between_pin_and_e1_tick_still_acks_once_and_in_order(self):
+        w = self.world()
+        w.ext.hooks["log"] = ("after", lambda eff: setattr(w, "now", w.now + 31))
+        w.runner.on_event("bill.due", {"id": "lw-1", "amount": 5})
+        Crash, patch = self.crash_first_tick_at_or_after(w, 30, rw.T0)
+        with patch, self.assertRaises(Crash):
+            w.runner.run_once()               # dies at the first >=30 s tick (no ack yet)
+        task = w.runner.on_event("bill.due", {"id": "lw-1", "amount": 5})[0][0]
+        self.assertEqual(self.work_rows(w, task.id, "bill.watch"), [])
+        w2 = rw.World(self.tmp, worker="w-restarted")
+        w2.now = w.now + 10_000               # dead worker's lease has expired
+        r = w2.runner.run_pending()[-1]
+        self.assertEqual(r.outcome, "waiting_approval")
+        rows = self.work_rows(w2, task.id, "bill.watch")
+        self.assertEqual([k for k, _ in rows], ["ack", "state:1"])          # ack recovered
+        self.assertEqual(rows[1][1]["state"], "waiting_approval")
+        w2.say(f"/approve {r.detail}")
+        w2.runner.poll_approvals()
+        w2.runner.run_pending()
+        kinds = [k for k, _ in self.work_rows(w2, task.id, "bill.watch")]
+        self.assertEqual(kinds.count("ack"), 1)
+        self.assertEqual(kinds[0], "ack")
+        self.assertEqual(kinds[-1], "final")
+        self.assertEqual([b["state"] for k, b in self.work_rows(w2, task.id, "bill.watch")
+                          if k.startswith("state:")],
+                         ["waiting_approval", "queued", "running", "done"])
+
+    def test_crash_before_a_state_update_is_recovered_by_the_next_report(self):
+        w = self.world()
+        w.ext.hooks["log"] = ("after", lambda eff: setattr(w, "now", w.now + 31))
+        w.runner.on_event("bill.due", {"id": "lw-2", "amount": 5})
+        from unittest import mock
+        from notifier.service import LongWork
+
+        class Crash(BaseException):
+            pass
+
+        real = LongWork.tick
+
+        def tick(lw, st, now):
+            if st == WAITING_APPROVAL:
+                raise Crash()                 # the waiting update is lost in the crash
+            return real(lw, st, now)
+
+        with mock.patch.object(LongWork, "tick", tick), self.assertRaises(Crash):
+            w.runner.run_once()
+        task = w.runner.on_event("bill.due", {"id": "lw-2", "amount": 5})[0][0]
+        self.assertEqual([k for k, _ in self.work_rows(w, task.id, "bill.watch")], ["ack"])
+        w2 = rw.World(self.tmp, worker="w2")
+        w2.now = w.now + 5
+        w2.runner.poll_approvals()            # issues the lost approval request
+        w2.runner.poll_approvals()            # pending: ticks waiting -> update sent
+        rows = self.work_rows(w2, task.id, "bill.watch")
+        self.assertEqual([k for k, _ in rows], ["ack", "state:1"])
+        self.assertEqual(rows[1][1]["state"], "waiting_approval")
+
+    def test_pending_approval_past_30s_gets_exactly_one_ack_from_polls(self):
+        w = self.world()
+        w.runner.on_event("bill.due", {"id": "lw-3", "amount": 5})
+        r = w.runner.run_once()               # parks immediately, before 30 s
+        self.assertEqual(r.outcome, "waiting_approval")
+        self.assertEqual(self.work_rows(w, r.task_id, "bill.watch"), [])
+        w.now += 31
+        for _ in range(3):
+            self.assertEqual(w.runner.poll_approvals(), [])
+        self.assertEqual([k for k, _ in self.work_rows(w, r.task_id, "bill.watch")], ["ack"])
+
+    def test_report_progress_acks_during_one_long_step(self):
+        w = self.world(definitions=[rw.batch(n=1)])
+
+        def long_step(eff):
+            w.now += 45
+            self.assertEqual(w.runner.report_progress(), 1)   # periodic reporter mid-step
+
+        w.ext.hooks["s1"] = ("before", long_step)
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "done")
+        kinds = [k for k, _ in self.work_rows(w, r.task_id, "notes.batch")]
+        self.assertEqual(kinds[0], "ack")
+        self.assertEqual(kinds.count("ack"), 1)
+        self.assertEqual(kinds[-1], "final")
 
 
 class Structure(Base):
