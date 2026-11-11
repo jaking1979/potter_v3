@@ -1,5 +1,5 @@
 import unittest
-from wilson_interval import wilson_95
+from evaluation.a4a.wilson_interval import wilson_95
 
 
 class WilsonIntervalTests(unittest.TestCase):
