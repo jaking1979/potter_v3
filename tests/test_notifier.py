@@ -17,6 +17,7 @@ Offline only: every channel is a FakeChannel; keys are test constants.
 import contextlib
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import textwrap
@@ -920,7 +921,8 @@ class StopSendRace(Base):
 
     def test_unreturned_row_is_always_reported_never_aged_out(self):
         with self.w.db.tx() as c:
-            c.execute("INSERT INTO notifier_sending VALUES ('ghost:telegram', 'dead', ?)",
+            c.execute("INSERT INTO notifier_sending (message_id, dispatch, owner, since, status)"
+                      " VALUES ('ghost:telegram', 1, 'dead', ?, 'dispatching')",
                       (self.w.now - 10,))
         quick = self.w.make_notifier(stop_wait_s=0.05)
         # Bounded wait expires on a live-looking row: returned as unconfirmed, not all-clear.
@@ -1264,6 +1266,334 @@ class StopBoundaryAfterFinalRecheck(Base):
         self.resume.set()
         worker.join(10)
         self.assertEqual(self.w.tg.delivered_notifications().count("job:digest:d1"), 1)
+
+
+# ============================================================ Dolores review @ f14e564
+
+class _Reopen(Base):
+    def reopen(self, **auth_kw):
+        w2 = World(self._tmp.name)
+        w2.now, w2.live = self.w.now, self.w.live
+        if auth_kw:
+            w2.auth = ChannelAuth(db=w2.db, transport_keys=TRANSPORT_KEYS, clock=lambda: w2.now,
+                                  outbound_addresses={JOSH: {"telegram": "chat-1001",
+                                                             "email": MAIL_JOSH}}, **auth_kw)
+            w2.router = CommandRouter(auth=w2.auth, notifier=w2.notifier, issuer=w2.issuer,
+                                      live_action=lambda aid, tid: w2.live.get(tid),
+                                      clock=lambda: w2.now)
+        return w2
+
+    def pending_count(self):
+        with self.w.db.read() as c:
+            return c.execute("SELECT COUNT(*) FROM inbound_seen WHERE status='pending'"
+                             ).fetchone()[0]
+
+
+class FailureLeavesCommandPending(_Reopen):
+    """Finding 1: only a known, completed outcome marks an update processed."""
+
+    def test_signing_failure_inside_decide_then_redelivery_approves_once(self):
+        tid = self.w.waiting_task()
+        action = mail_action(tid)
+        aid = self.w.request(action)
+        real_key = self.w.issuer._key
+
+        class FlakyKey:
+            key_id = real_key.key_id
+            calls = 0
+
+            def sign(self, payload):
+                FlakyKey.calls += 1
+                if FlakyKey.calls == 1:
+                    raise OSError("HSM unavailable")
+                return real_key.sign(payload)
+        self.w.issuer._key = FlakyKey()
+        msg = self.w.tg_msg(f"/approve {aid}")
+        with self.assertRaises(OSError):
+            self.w.router.handle(msg)
+        self.assertEqual(self.pending_count(), 1)                 # not marked processed
+        self.assertEqual(self.w.issuer.get(aid).status, "pending")  # tx rolled back
+        res = self.w.router.handle(msg)                           # adapter redelivers
+        self.assertEqual(res.outcome, "approved")
+        self.assertEqual(self.w.c1(action, res.detail).outcome, ALLOW)
+        self.assertEqual(self.w.router.handle(msg).reason, "replayed")
+
+    def test_trace_failure_inside_decide_then_restart_redelivery_approves_once(self):
+        tid = self.w.waiting_task()
+        aid = self.w.request(mail_action(tid))
+        self.w.issuer._sink = lambda line: (_ for _ in ()).throw(OSError("sink down"))
+        msg = self.w.tg_msg(f"/approve {aid}")
+        with self.assertRaises(OSError):
+            self.w.router.handle(msg)
+        w2 = self.reopen()
+        self.assertEqual(w2.router.handle(msg).outcome, "approved")
+        with w2.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM approval_requests WHERE"
+                                       " status='approved'").fetchone()[0], 1)
+
+    def test_failure_inside_stop_transaction_then_redelivery_stops_once(self):
+        real = self.w.notifier._sweep_tx
+        calls = []
+
+        def flaky_sweep(c, now):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("disk hiccup")
+            return real(c, now)
+        self.w.notifier._sweep_tx = flaky_sweep
+        msg = self.w.tg_msg("/stop")
+        with self.assertRaises(RuntimeError):
+            self.w.router.handle(msg)
+        self.assertFalse(self.w.notifier.kill.is_set())           # rolled back
+        self.assertEqual(self.pending_count(), 1)
+        self.assertEqual(self.w.router.handle(msg).outcome, "stopped")
+        self.assertEqual(self.w.router.handle(msg).reason, "replayed")
+        self.w.notifier.run()
+        self.assertEqual([m.body["kind"] for m in self.w.tg.delivered], ["stop_ack"])
+
+    def test_failure_after_commit_is_not_reapplied(self):
+        tid = self.w.waiting_task()
+        aid = self.w.request(mail_action(tid))
+        real = self.w.issuer.decide
+
+        def decide_then_fail(*a, **kw):
+            real(*a, **kw)
+            raise RuntimeError("reply path failed after commit")
+        self.w.issuer.decide = decide_then_fail
+        msg = self.w.tg_msg(f"/approve {aid}")
+        with self.assertRaises(RuntimeError):
+            self.w.router.handle(msg)
+        self.assertEqual(self.pending_count(), 0)                 # marked in the effect tx
+        with self.w.db.read() as c:
+            nonce = c.execute("SELECT nonce FROM approval_requests").fetchone()[0]
+        self.assertEqual(self.reopen().router.handle(msg).reason, "replayed")
+        with self.w.db.read() as c:
+            self.assertEqual(c.execute("SELECT nonce FROM approval_requests").fetchone()[0], nonce)
+
+    def test_ack_failure_leaves_pending_and_redelivery_acks(self):
+        self.w.job_notify("digest", "d1", "x")
+        real_ack = self.w.notifier.outbox.ack
+        calls = []
+
+        def flaky(mid, now=None):
+            calls.append(mid)
+            if len(calls) == 1:
+                raise RuntimeError("busy")
+            return real_ack(mid, now=now)
+        self.w.notifier.outbox.ack = flaky
+        msg = self.w.tg_msg("/ack job:digest:d1")
+        with self.assertRaises(RuntimeError):
+            self.w.router.handle(msg)
+        self.assertEqual(self.pending_count(), 1)
+        self.assertEqual(self.w.router.handle(msg).outcome, "acked")
+        self.assertEqual(self.w.notifier.outbox.get("job:digest:d1:telegram").status, "acked")
+
+
+class PendingRecoveryPath(_Reopen):
+    """Finding 2: pending commands survive long outages; nothing else gets in."""
+
+    def test_restart_after_freshness_window_resumes_pending_command(self):
+        msg = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)         # journaled pending ... crash
+        self.w.now += 3600                                        # outage far beyond 300 s
+        w2 = self.reopen()
+        self.assertEqual(w2.router.handle(msg).outcome, "stopped")
+        self.assertTrue(w2.notifier.kill.is_set())
+
+    def test_altered_envelope_for_pending_update_is_refused(self):
+        msg = self.w.tg_msg("/ack job:digest:d1")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)         # pending
+        self.w.now += 3600
+        w2 = self.reopen()
+        # Same update id, validly signed but different content: not the journaled envelope.
+        swapped = w2.signers["telegram"].envelope(TG_JOSH, "/stop", update_id=msg.update_id,
+                                                  sent_at=msg.sent_at)
+        res = w2.router.handle(swapped)
+        self.assertEqual((res.outcome, res.reason), ("ignored", "replayed"))
+        self.assertFalse(w2.notifier.kill.is_set())
+        from dataclasses import replace
+        self.assertEqual(w2.router.handle(replace(msg, text="/stop")).reason,
+                         "unauthenticated_transport")
+
+    def test_stale_never_seen_update_is_refused_and_not_recorded(self):
+        msg = self.w.tg_msg("/stop")
+        self.w.now += 301
+        self.assertEqual(self.w.router.handle(msg).reason, "stale_transport")
+        with self.w.db.read() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0], 0)
+        self.assertFalse(self.w.notifier.kill.is_set())
+
+    def test_recovery_rechecks_authorization(self):
+        msg = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(msg).ok)         # pending ... crash
+        w2 = self.reopen(inbound_bindings={"telegram": {}})        # Josh's binding revoked
+        self.assertEqual(w2.router.handle(msg).reason, "unknown_sender")
+        self.assertFalse(w2.notifier.kill.is_set())
+        self.assertEqual(self.pending_count(), 0)                 # closed, never executed
+
+
+class RetentionBounds(_Reopen):
+    def test_journal_keeps_digest_only_and_vouchers_are_released(self):
+        self.w.job_notify("digest", "d1", "x")
+        self.w.router.handle(self.w.tg_msg("/ack job:digest:d1"))
+        with self.w.db.read() as c:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(inbound_seen)")]
+            blob = json.dumps(c.execute("SELECT * FROM inbound_seen").fetchall())
+        self.assertNotIn("command", cols)
+        self.assertNotIn("reply_to", cols)
+        self.assertNotIn("/ack", blob)
+        self.assertNotIn("job:digest:d1", blob)
+        self.assertEqual(self.w.auth._minted, {})                  # released after dispatch
+
+    def test_voucher_map_is_capped(self):
+        from notifier import auth as auth_mod
+        for _ in range(auth_mod.MAX_MINTED + 50):
+            self.w.auth.authenticate(self.w.tg_msg("/noop"))
+        self.assertLessEqual(len(self.w.auth._minted), auth_mod.MAX_MINTED)
+
+    def test_old_processed_rows_are_pruned_pending_rows_kept(self):
+        done = self.w.tg_msg("/noop")
+        self.w.router.handle(done)                                 # processed
+        pending = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(pending).ok)     # pending
+        self.w.now += 2 * 300 + 61
+        self.w.router.handle(self.w.tg_msg("/noop"))               # triggers prune
+        with self.w.db.read() as c:
+            ids = {r[0]: r[1] for r in c.execute("SELECT update_id, status FROM inbound_seen")}
+        self.assertNotIn(done.update_id, ids)
+        self.assertEqual(ids[pending.update_id], "pending")
+        # The pruned envelope cannot come back: it is stale now.
+        self.assertEqual(self.w.router.handle(done).reason, "stale_transport")
+
+
+class DurableInFlightRecord(_Reopen):
+    """T19: the in-flight record is durable and only resolution removes it."""
+
+    def rows(self, db=None):
+        with (db or self.w.db).read() as c:
+            return c.execute("SELECT message_id, dispatch, status FROM notifier_sending"
+                             " ORDER BY message_id, dispatch").fetchall()
+
+    def stop(self, w=None):
+        w = w or self.w
+        return w.router.handle(w.tg_msg("/stop")).detail
+
+    def test_crash_before_dispatch_leaves_no_record_and_no_send(self):
+        def crash(msg):
+            raise Crash()
+        self.w.notifier._hook_after_gate = crash
+        self.w.job_notify("digest", "d1", "x")
+        with self.assertRaises(Crash):
+            self.w.notifier.run()
+        self.assertEqual(self.rows(), [])                           # never dispatched
+        self.assertEqual(self.w.tg.calls, 0)
+        self.assertTrue(self.stop().all_clear)
+
+    def test_crash_after_dispatch_is_reported_unknown_across_restart_and_age(self):
+        self.w.tg.crash_after_delivery = Crash()
+        self.w.job_notify("digest", "d1", "x")
+        with self.assertRaises(Crash):
+            self.w.notifier.run()
+        self.assertEqual(self.rows(), [("job:digest:d1:telegram", 1, "unknown")])
+        self.w.now += 3600                                         # leases long expired
+        w2 = self.reopen()
+        w2.notifier.run()                                          # reconcile: still unknown
+        self.assertEqual(w2.notifier.outbox.get("job:digest:d1:telegram").status,
+                         "abandoned_unknown")
+        report = self.stop(w2)
+        self.assertEqual(report.unknown_outcome, ("job:digest:d1:telegram",))
+        self.assertIn("job:digest:d1:telegram", report.unconfirmed_in_flight)
+        self.assertFalse(report.all_clear)
+        self.assertEqual(self.rows(w2.db), [("job:digest:d1:telegram", 1, "unknown")])
+
+    def test_dead_process_dispatching_record_never_ages_out(self):
+        self.w.job_notify("digest", "d1", "x")
+        with self.w.db.tx() as c:                                  # killed -9 mid-dispatch
+            c.execute("INSERT INTO notifier_sending (message_id, dispatch, owner, since,"
+                      " status) VALUES ('job:digest:d1:telegram', 1, 'dead', ?, 'dispatching')",
+                      (self.w.now,))
+        for hours in (1, 24, 24 * 30):
+            self.w.now = T + hours * 3600
+            report = self.reopen().router.handle(self.w.tg_msg("/stop")).detail
+            self.assertEqual(report.unconfirmed_in_flight, ("job:digest:d1:telegram",))
+            self.assertEqual(report.expired_in_flight, ("job:digest:d1:telegram",))
+            self.assertFalse(report.all_clear)
+
+    def test_provider_timeout_is_unknown_until_reconciled_delivered(self):
+        self.w.tg.ambiguous_after_delivery = True
+        self.w.job_notify("digest", "d1", "x")
+        self.w.notifier.run()                                      # timeout -> unknown, routine abandoned
+        self.w.tg.ambiguous_after_delivery = False
+        self.assertEqual(self.rows(), [("job:digest:d1:telegram", 1, "unknown")])
+        self.assertEqual(self.stop().unknown_outcome, ("job:digest:d1:telegram",))
+        # Provider later confirms delivery (e.g. Josh acks): the record resolves.
+        self.w.notifier.outbox.ack("job:digest:d1:telegram")
+        self.w.notifier.run()
+        self.assertEqual(self.rows(), [])
+
+    def test_retry_and_duplicate_send_are_recorded_per_dispatch(self):
+        self.w.tg.ambiguous_after_delivery = True
+        seen = []
+        self.w.tg.on_send = lambda m: seen.append(self.rows())
+        self.w.job_notify("monitor", "fire", "alarm", urgency="urgent")
+        self.w.notifier.run()                                      # dispatch 1 unknown, 2 resent
+        self.assertEqual(self.w.tg.delivered_notifications(), ["job:monitor:fire"] * 2)
+        self.assertEqual(seen[1], [("job:monitor:fire:telegram", 1, "unknown"),
+                                   ("job:monitor:fire:telegram", 2, "dispatching")])
+        self.assertEqual(self.rows(), [("job:monitor:fire:telegram", 1, "unknown"),
+                                       ("job:monitor:fire:telegram", 2, "unknown")])
+        self.assertEqual(self.stop().unknown_outcome, ("job:monitor:fire:telegram",))
+
+    def test_reconciled_success_clears_record(self):
+        self.w.tg.crash_after_delivery = Crash()
+        self.w.job_notify("digest", "d1", "x")
+        with self.assertRaises(Crash):
+            self.w.notifier.run()
+        self.w.now += 60
+        w2 = self.reopen()
+        w2.tg.reconcile_verdict = "succeeded"
+        w2.notifier.run()
+        self.assertEqual(w2.notifier.outbox.get("job:digest:d1:telegram").status, "sent")
+        self.assertEqual(self.rows(w2.db), [])
+        self.assertTrue(self.stop(w2).all_clear)
+
+    def test_concurrent_stop_and_dispatch_never_reports_all_clear_falsely(self):
+        import threading
+        for trial in range(15):
+            with self.subTest(trial=trial):
+                self.tearDown()
+                self.setUp()
+                for i in range(6):
+                    self.w.job_notify("digest", f"b{i}", f"{i}")
+                done = threading.Event()
+                late = []                                       # sends after stop() returned
+                started = threading.Event()
+
+                def on_send(m):
+                    started.set()
+                    if done.is_set() and not m.notification_id.startswith("stop:"):
+                        late.append(m.message_id)
+                self.w.tg.on_send = on_send
+                worker = threading.Thread(target=self.w.notifier.run)
+                worker.start()
+                self.assertTrue(started.wait(10))
+                report = self.stop()
+                done.set()
+                worker.join(10)
+                # Any send that landed after stop() returned was reported unconfirmed.
+                self.assertTrue(set(late) <= set(report.unconfirmed_in_flight),
+                                (late, report))
+                if late:
+                    self.assertFalse(report.all_clear)
+                self.assertEqual(self.rows(), [])
+
+    def test_unreadable_in_flight_state_is_never_all_clear(self):
+        def broken():
+            raise sqlite3.OperationalError("disk I/O error")
+        self.w.notifier._await_in_flight = broken
+        report = self.stop()
+        self.assertTrue(report.state_unknown)
+        self.assertFalse(report.all_clear)
 
 
 # ============================================================ long work (item 5)

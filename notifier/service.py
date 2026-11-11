@@ -38,14 +38,18 @@ the caller's transaction, through the C3 outbox. Nothing else holds a channel.
   dispatch timeout and that the kill flag is clear; otherwise it removes its
   row and aborts.
 
-  The contract (honest: Telegram/email cannot be fenced at the provider):
-  no send starts its final recheck after ``stop()`` commits; a sender
-  already past its final recheck may still deliver once; ``stop()`` returns
-  every such sender as unconfirmed (and expired if aged). ``stop()`` waits
-  (up to ``stop_wait_s``) for unexpired rows, then returns EVERY row still
-  present in ``StopReport.unconfirmed_in_flight`` - age never removes one;
-  rows past the dispatch timeout are also listed in ``expired_in_flight``.
-  An empty ``unconfirmed_in_flight`` is the only all-clear.
+  T19 item 6 ("nothing follows") is UNMET for non-fenceable channels
+  (Telegram, email): this is an open gap, not a contract change. What holds:
+  each (message, dispatch) has a durable in-flight record (``gated`` ->
+  ``dispatching`` in the final check, serialized with the committed kill
+  flag; removed on a known outcome, kept as ``unknown`` otherwise, removed
+  later only when the outbox resolves the message - never by age or lease).
+  No send starts its final check after ``stop()`` commits; a sender past its
+  final check may still deliver once and is reported unconfirmed (expired if
+  aged, ``unknown_outcome`` if its result is unknown). ``stop()`` waits (up
+  to ``stop_wait_s``) for live dispatches, then returns EVERY record in
+  ``StopReport.unconfirmed_in_flight``; unreadable state -> ``state_unknown``.
+  ``all_clear`` (no records, readable state) is the only all-clear.
 * Long work: ``LongWork`` sends one acknowledgement after 30 s, an update only
   when the state changes, and a final message with the receipt link.
 
@@ -133,10 +137,12 @@ class StopReport:
     reply_notification_id: str
     unconfirmed_in_flight: tuple[str, ...] = ()   # every unreturned send, never filtered by age
     expired_in_flight: tuple[str, ...] = ()       # subset past dispatch timeout (still unconfirmed)
+    unknown_outcome: tuple[str, ...] = ()         # subset whose provider outcome is unknown
+    state_unknown: bool = False                   # in-flight state could not be read
 
     @property
     def all_clear(self) -> bool:
-        return not self.unconfirmed_in_flight
+        return not self.unconfirmed_in_flight and not self.state_unknown
 
 
 class Notifier:
@@ -227,6 +233,7 @@ class Notifier:
         report = RunReport()
         self._run_now = now
         try:
+            self._settle_in_flight_records()
             for _ in range(max_messages):
                 self._housekeeping(report)
                 self._claimed = False
@@ -237,6 +244,7 @@ class Notifier:
                 if not (report.merge(r) or self._claimed):
                     break
             self._housekeeping(report)
+            self._settle_in_flight_records()
         finally:
             self._run_now = None
         self._trace_sends(report, self._now(now))
@@ -249,35 +257,52 @@ class Notifier:
         return got
 
     def _send(self, msg: QueuedMessage) -> Any:
+        """Durable in-flight protocol (see module doc and README, T19):
+
+        gate tx     kill check + record (message, dispatch) as ``gated``
+        final tx    record still ours, unexpired, kill clear -> ``dispatching``
+        send        channel.send
+        outcome     success / definite failure -> record removed;
+                    anything else (timeout, ambiguous error, crash) -> kept as
+                    ``unknown`` until the outbox resolves the message.
+        A crash that kills the process keeps whatever the record says."""
         self._claimed = True
         if self._hook_before_gate is not None:
             self._hook_before_gate(msg)
         channel = self._channels.get(msg.channel)
         if channel is None:
             raise SendFailed("no such channel")
-        # The gate: kill check + in-flight record, atomically (see module doc).
+        key = (msg.message_id, msg.dispatches)
         with self.db.tx() as c:
             if msg.body.get("kind") != "stop_ack" and self.kill.is_set(c):
                 raise SendFailed("stopped")      # row stays suppressed by the sweep
-            c.execute("INSERT OR REPLACE INTO notifier_sending (message_id, owner, since)"
-                      " VALUES (?,?,?)", (msg.message_id,
-                                          f"{self._owner}:{os.getpid()}:{threading.get_ident()}",
-                                          self._now()))
+            c.execute("INSERT OR REPLACE INTO notifier_sending (message_id, dispatch, owner,"
+                      " since, status) VALUES (?,?,?,?,'gated')",
+                      (*key, f"{self._owner}:{os.getpid()}:{threading.get_ident()}",
+                       self._now()))
         mine = self._inflight()
         mine.add(msg.message_id)
         is_primary = msg.channel == self._primary
+        dispatched, known = False, False
         try:
             if self._hook_after_gate is not None:
                 self._hook_after_gate(msg)
-            self._recheck(msg)                   # last word before the channel call
+            self._recheck(msg, key)              # final check; flips to 'dispatching'
+            dispatched = True
             if self._hook_after_recheck is not None:
                 self._hook_after_recheck(msg)
             try:
                 result = channel.send(msg)
-            except BaseException:
+            except SendFailed:
+                known = True                     # definitely not delivered
                 if is_primary:
                     self._record_health(ok=False)
                 raise
+            except BaseException:
+                if is_primary:
+                    self._record_health(ok=False)
+                raise                            # outcome unknown: record kept
+            known = True
             if is_primary:
                 self._record_health(ok=True)
             return result
@@ -285,24 +310,43 @@ class Notifier:
             mine.discard(msg.message_id)
             try:
                 with self.db.tx() as c:
-                    c.execute("DELETE FROM notifier_sending WHERE message_id=?",
-                              (msg.message_id,))
+                    if not dispatched or known:
+                        c.execute("DELETE FROM notifier_sending WHERE message_id=? AND"
+                                  " dispatch=?", key)
+                    else:
+                        c.execute("UPDATE notifier_sending SET status='unknown' WHERE"
+                                  " message_id=? AND dispatch=?", key)
             except Exception:
-                pass   # a leftover row only delays stop() until it ages out
+                pass   # the record stays as it was: reported conservatively
 
-    def _recheck(self, msg: QueuedMessage) -> None:
-        """Abort unless this send's gate row is still ours, unexpired, and the
-        kill flag is clear (stop_ack exempt from the flag). The finally-block
-        in ``_send`` removes the row on abort."""
+    def _recheck(self, msg: QueuedMessage, key: tuple[str, int]) -> None:
+        """The final check, serialized with the kill flag in one BEGIN
+        IMMEDIATE transaction: abort unless the record is still ours and
+        ``gated``, unexpired, and the kill flag is clear (stop_ack exempt);
+        otherwise flip it to ``dispatching`` and commit before the call."""
         with self.db.tx() as c:
-            row = c.execute("SELECT since FROM notifier_sending WHERE message_id=?",
-                            (msg.message_id,)).fetchone()
-            if row is None:
+            row = c.execute("SELECT since, status FROM notifier_sending WHERE message_id=?"
+                            " AND dispatch=?", key).fetchone()
+            if row is None or row[1] != "gated":
                 raise SendFailed("aborted: gate record missing")
             if self._now() >= row[0] + self._dispatch_timeout:
                 raise SendFailed("aborted: gate expired")
             if msg.body.get("kind") != "stop_ack" and self.kill.is_set(c):
                 raise SendFailed("aborted: stopped after gate")
+            c.execute("UPDATE notifier_sending SET status='dispatching', dispatched_at=?"
+                      " WHERE message_id=? AND dispatch=?", (self._now(), *key))
+
+    def _settle_in_flight_records(self) -> None:
+        """Remove in-flight records only once the outbox has resolved their
+        message (delivered, acked, or proven undelivered), and only if the
+        record is not a live dispatch (unknown, or older than the dispatch
+        timeout). Age alone never removes a record."""
+        now = self._now()
+        with self.db.tx() as c:
+            c.execute("DELETE FROM notifier_sending WHERE (status='unknown' OR since < ?)"
+                      " AND message_id IN (SELECT message_id FROM outbox WHERE"
+                      " status IN ('sent','acked','failed') OR sent_at IS NOT NULL)",
+                      (now - self._dispatch_timeout,))
 
     def _reconcile(self, msg: QueuedMessage) -> str:
         self._claimed = True
@@ -431,33 +475,39 @@ class Notifier:
             self.enqueue(c, notification_id=reply, kind="stop_ack", text=text, urgency=URGENT,
                          channel=channel, now=now,
                          extra={"cancelled_notifications": nids, "cancelled_approvals": appr})
-        unconfirmed, expired = self._await_in_flight()
+        try:
+            unconfirmed, expired, unknown = self._await_in_flight()
+            state_unknown = False
+        except Exception:
+            # Can't read in-flight state: never an all-clear.
+            unconfirmed, expired, unknown, state_unknown = [], [], [], True
         return StopReport(tuple(msgs), tuple(nids), tuple(appr), not first, reply,
-                          tuple(unconfirmed), tuple(expired))
+                          tuple(unconfirmed), tuple(expired), tuple(unknown), state_unknown)
 
-    def _await_in_flight(self) -> tuple[list[str], list[str]]:
-        """Wait (bounded by ``stop_wait_s``) for unexpired sends past the gate
-        to return, then report EVERY row still present - age never removes an
-        entry from the report. Expired rows are not waited for (a sender that
-        has not yet reached its final recheck will abort there), but they stay
-        in the report: one already past its final recheck may still deliver
-        once. The caller's own in-flight send (``/stop``
-        handled from inside a send on this thread) is excluded.
+    def _await_in_flight(self) -> tuple[list[str], list[str], list[str]]:
+        """Wait (bounded by ``stop_wait_s``) for live, unexpired dispatches
+        (``gated`` / ``dispatching``) to resolve, then report EVERY record
+        still present - age, an expired lease or a dead process never removes
+        one. The caller's own in-flight send (``/stop`` handled from inside a
+        send on this thread) is excluded.
 
-        Returns (unconfirmed, expired). When the wait expires the unconfirmed
-        set is returned as-is; it is never an all-clear."""
+        Returns (unconfirmed, expired, unknown_outcome), message ids. When
+        the wait expires the set is returned as it stands; never an all-clear."""
         deadline = time.monotonic() + self._stop_wait
         mine = self._inflight()
         while True:
             now = self._now()
             with self.db.read() as c:
-                rows = c.execute("SELECT message_id, since FROM notifier_sending"
-                                 " ORDER BY message_id").fetchall()
-            rows = [(m, since) for m, since in rows if m not in mine]
-            expired = [m for m, since in rows if now >= since + self._dispatch_timeout]
-            waiting = [m for m, since in rows if now < since + self._dispatch_timeout]
+                rows = c.execute("SELECT message_id, since, status FROM notifier_sending"
+                                 " ORDER BY message_id, dispatch").fetchall()
+            rows = [r for r in rows if r[0] not in mine]
+            live = [r for r in rows if r[2] in ("gated", "dispatching")]
+            expired = [m for m, since, _ in live if now >= since + self._dispatch_timeout]
+            waiting = [m for m, since, _ in live if now < since + self._dispatch_timeout]
             if not waiting or time.monotonic() >= deadline:
-                return [m for m, _ in rows], expired
+                uniq = lambda xs: sorted(set(xs))       # noqa: E731
+                return (uniq(m for m, _, _ in rows), uniq(expired),
+                        uniq(m for m, _, st in rows if st == "unknown"))
             self._sleep(0.005)
 
     def _sweep(self, now: float) -> list[str]:

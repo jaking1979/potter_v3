@@ -53,14 +53,18 @@ class CommandRouter:
             return RouteResult("ignored", res.reason)
         sender = res.sender
         try:
-            return self._dispatch(msg, sender, now)
+            result = self._dispatch(msg, sender, now)
         except AlreadyProcessed:
             return RouteResult("ignored", "replayed")
         finally:
-            # Outcomes without their own effect transaction (refusals, unknown
-            # commands) and the idempotent ack are marked processed here; for
-            # /stop and approval decisions this is a no-op (already marked).
-            self._auth.finish(sender)
+            self._auth.release(sender)
+        # Reached only on a known, completed outcome. /stop and approval
+        # decisions already marked the update processed in their effect
+        # transaction (no-op here); refusals, unknown commands and the
+        # idempotent ack are marked now. An unexpected exception skips this,
+        # so the update stays pending and redelivery runs it (once).
+        self._auth.finish(sender)
+        return result
 
     def _dispatch(self, msg: InboundMessage, sender, now: float) -> RouteResult:
         words = (msg.text or "").strip().split()

@@ -6,10 +6,15 @@
                           issuance in C2's database so each request is
                           answered at most once (single use), and stores the
                           exact canonical BoundAction it was raised for.
-* ``notifier_sending``  - sends past the kill gate and not yet returned
-                          (the /stop in-flight boundary, see service.py).
+* ``notifier_sending``  - durable in-flight record per (message, dispatch):
+                          ``gated`` -> ``dispatching`` (flipped atomically with
+                          the final kill check) -> removed only when the
+                          outcome is known; an unknown outcome stays as
+                          ``unknown`` until the outbox resolves the message.
+                          Never removed because of age or an expired lease.
 * ``inbound_seen``      - (channel, update_id) of every authentic adapter
-                          update, with its verified command and a status:
+                          update, with a sha256 digest of the exact signed
+                          envelope (never its body) and a status:
                           ``pending`` until the command's effect commits
                           (marked ``processed`` in the SAME transaction),
                           so a crash between authentication and effect is
@@ -59,9 +64,13 @@ SCHEMA = (
     # stop() (which sets the flag under the same write lock) sees every send
     # that got past the gate and waits for it before returning.
     """CREATE TABLE IF NOT EXISTS notifier_sending (
-        message_id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        dispatch INTEGER NOT NULL,
         owner TEXT NOT NULL,
-        since REAL NOT NULL)""",
+        since REAL NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('gated','dispatching','unknown')),
+        dispatched_at REAL,
+        PRIMARY KEY (message_id, dispatch))""",
     # Transport replay protection: each adapter update is accepted once.
     """CREATE TABLE IF NOT EXISTS inbound_seen (
         channel TEXT NOT NULL,
@@ -69,8 +78,7 @@ SCHEMA = (
         at REAL NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('pending','processed')),
         principal TEXT,
-        command TEXT NOT NULL,
-        reply_to TEXT,
+        envelope_digest TEXT NOT NULL,
         processed_at REAL,
         PRIMARY KEY (channel, update_id))""",
     """CREATE TABLE IF NOT EXISTS inbound_log (
