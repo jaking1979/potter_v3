@@ -64,6 +64,13 @@ _SCHEMA = (
         ref TEXT NOT NULL,
         event_id TEXT NOT NULL,
         PRIMARY KEY (ref, event_id))""",
+    # The sent_at E3 signed into its E1 envelope for one platform message
+    # (keyed by sha256 of the handoff key; no body, no sender ref). Kept until
+    # E1's row is settled so every retry re-presents the identical envelope.
+    """CREATE TABLE IF NOT EXISTS transport_handoff (
+        hkey TEXT PRIMARY KEY,
+        sent_at REAL NOT NULL,
+        created_at INTEGER NOT NULL)""",
 )
 
 
@@ -174,6 +181,46 @@ class IngressStore:
             tx._c.executemany("INSERT OR REPLACE INTO attachment_staged VALUES (?,?,?)",
                               [(stage_id, r, now) for r in refs])
 
+    # ---- E1 handoff --------------------------------------------------------
+
+    def handoff_sent_at(self, hkey: str, sent_at: float, now: int) -> float:
+        """The recorded sent_at for this handoff, recording ``sent_at`` first
+        if there is none (committed before E1 is called)."""
+        with self.transaction() as tx:
+            tx._c.execute("INSERT OR IGNORE INTO transport_handoff VALUES (?,?,?)",
+                          (hkey, float(sent_at), now))
+            return tx._c.execute("SELECT sent_at FROM transport_handoff WHERE hkey=?",
+                                 (hkey,)).fetchone()[0]
+
+    def handoff_refresh(self, hkey: str, sent_at: float) -> float:
+        with self.transaction() as tx:
+            tx._c.execute("UPDATE transport_handoff SET sent_at=? WHERE hkey=?",
+                          (float(sent_at), hkey))
+        return float(sent_at)
+
+    def handoff_drop(self, hkey: str) -> None:
+        with self.transaction() as tx:
+            tx._c.execute("DELETE FROM transport_handoff WHERE hkey=?", (hkey,))
+
+    def handoffs(self) -> list[tuple]:
+        with self._conn() as c:
+            return c.execute("SELECT hkey, sent_at FROM transport_handoff").fetchall()
+
+    # ---- attachment GC -----------------------------------------------------
+
+    def mark_orphans(self, store_refs, now: int) -> list[str]:
+        """Phase 2 of GC: blobs present in the store that E3 neither
+        references nor has a marker for (a late ``put`` that landed after its
+        stage was collected, or one followed by a crash) get an ``orphan:``
+        marker now, so phase 1 reclaims them after the grace period."""
+        with self.transaction() as tx:
+            known = {r[0] for r in tx._c.execute(
+                "SELECT ref FROM attachment_refs UNION SELECT ref FROM attachment_staged")}
+            orphans = [r for r in store_refs if r not in known]
+            tx._c.executemany("INSERT OR REPLACE INTO attachment_staged VALUES (?,?,?)",
+                              [(f"orphan:{r}", r, now) for r in orphans])
+            return orphans
+
     def collect_garbage(self, older_than: int, delete) -> list[str]:
         """Delete blobs whose every staged/released marker is older than
         ``older_than`` and that no committed event references. Runs under
@@ -217,6 +264,15 @@ class _Tx:
         self._c.executemany("INSERT OR IGNORE INTO attachment_refs VALUES (?,?)",
                             [(r, event_id) for r in refs])
 
+    def stage_intact(self, stage_id: str, refs: list[str]) -> bool:
+        """True iff every marker this ingest staged is still there. GC
+        deletes the markers it collects in the same transaction as the blob,
+        so a missing marker means the blob may be gone: the ingest must not
+        commit a reference to it."""
+        have = {r[0] for r in self._c.execute(
+            "SELECT ref FROM attachment_staged WHERE stage_id=?", (stage_id,))}
+        return set(refs) <= have
+
     def unstage(self, stage_id: str) -> None:
         self._c.execute("DELETE FROM attachment_staged WHERE stage_id=?", (stage_id,))
 
@@ -250,12 +306,18 @@ class AttachmentStore(Protocol):
     * ``put(data)`` stores the bytes and returns ``attachment_ref(sha256(data))``
       (idempotent; E3 refuses any other return value). Must not interpret them.
     * ``delete(ref)`` removes the blob; idempotent (a missing blob is fine).
+    * ``exists(ref)`` and ``refs()`` (every stored ref) let E3 verify a blob
+      before committing a reference to it and find orphans.
 
     It is not transactional with E3's database: E3 owns the lifecycle
     (stage -> put -> commit refs; ``collect_garbage`` for anything orphaned)."""
     def put(self, data: bytes) -> str: ...
 
     def delete(self, ref: str) -> None: ...
+
+    def exists(self, ref: str) -> bool: ...
+
+    def refs(self) -> list[str]: ...
 
 
 class InMemoryAttachmentStore:
@@ -270,3 +332,9 @@ class InMemoryAttachmentStore:
 
     def delete(self, ref: str) -> None:
         self.blobs.pop(ref, None)
+
+    def exists(self, ref: str) -> bool:
+        return ref in self.blobs
+
+    def refs(self) -> list[str]:
+        return list(self.blobs)

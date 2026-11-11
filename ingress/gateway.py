@@ -48,7 +48,7 @@ from email import policy as email_policy
 from email.parser import BytesParser
 from typing import Callable, Mapping
 
-from notifier.auth import DEFAULT_MAX_SKEW_S, ChannelAuth, TransportSigner
+from notifier.auth import ChannelAuth, TransportSigner
 
 from .content import IngressLimits, injection_flags, is_forward_subject, split_body
 from .events import (EMAIL, EXTERNAL_SENDER, FORWARDED_CONTENT, PRINCIPAL_DIRECT, TELEGRAM,
@@ -65,7 +65,7 @@ REASONS = frozenset({
     "duplicate", "duplicate_pending", "expired", "replay_conflict", "transport_unverified", "webhook_unverified",
     "malformed", "missing_message_id", "oversized_raw", "oversized_body",
     "oversized_attachment", "too_many_attachments", "bot_sender", "sender_not_allowlisted",
-    "trace_error", "ingress_error",
+    "trace_error", "ingress_error", "attachment_reclaimed",
     # trust reasons (why an accepted event is untrusted; "ok" when principal_direct)
     "ok", "multiple_from", "header_defect", "display_name_spoof", "reply_to_mismatch",
     "sender_mismatch", "dkim_missing", "dkim_failed", "dkim_unaligned", "spf_failed",
@@ -137,6 +137,10 @@ class IngressResult:
     trust_reason: str | None = None  # accepted events only: "ok" or why untrusted
 
 
+class _AttachmentLost(Exception):
+    """A staged attachment was collected before the ingest could commit."""
+
+
 class _Reject(Exception):
     def __init__(self, reason: str, *, record: bool):
         super().__init__(reason)
@@ -171,8 +175,6 @@ class IngressGateway:
     def __init__(self, *, store: IngressStore, attachments: AttachmentStore,
                  channel_auth: ChannelAuth, clock: Callable[[], int],
                  transport_signers: Mapping[str, TransportSigner] | None = None,
-                 transport_max_skew_s: float = DEFAULT_MAX_SKEW_S,
-                 transport_replay_horizon_s: float | None = None,
                  attachment_grace_s: int = 3600,
                  telegram_transport: TransportVerifier | None = None,
                  email_verifier: EmailVerifier | None = None,
@@ -183,19 +185,9 @@ class IngressGateway:
         self._store = store
         self._attachments = attachments
         self._auth = channel_auth
-        # Replay-record retention, bound to the transport contract: an E1
-        # envelope is accepted only while |now - sent_at| <= max_skew, and its
-        # inbound_seen row is written at authentication time, so any envelope
-        # for a row older than 2*max_skew is already stale. Pruning E3-owned
-        # rows past that horizon (plus margin) can never reopen replay. It
-        # MUST be configured with the same max_skew as the ChannelAuth.
-        if transport_max_skew_s <= 0:
-            raise ValueError("transport_max_skew_s must be positive")
-        horizon = (2 * transport_max_skew_s + 60 if transport_replay_horizon_s is None
-                   else transport_replay_horizon_s)
-        if horizon < 2 * transport_max_skew_s:
-            raise ValueError("replay horizon must be >= 2 * transport max skew")
-        self._replay_horizon = float(horizon)
+        # Replay-record retention is E1's (225e7df prunes its own processed
+        # rows with its own max_skew and never prunes pending ones). E3 never
+        # deletes from E1's table, so no E3 setting can reopen replay.
         if attachment_grace_s < 0:
             raise ValueError("attachment_grace_s must be >= 0")
         self._grace = int(attachment_grace_s)
@@ -273,21 +265,10 @@ class IngressGateway:
         released by ``expire_pending``: only those staged/released longer than
         ``grace_s`` ago and referenced by no committed event."""
         grace = self._grace if grace_s is None else grace_s
-        return self._store.collect_garbage(self._clock() - grace, self._attachments.delete)
-
-    def prune_transport_records(self) -> int:
-        """Bounded retention for the E1 ``inbound_seen`` rows E3 creates
-        (``update_id`` prefix ``e3:``): delete those authenticated more than
-        the replay horizon ago. Replay stays closed: any envelope for such a
-        row fails E1's freshness check, and a platform re-delivery is answered
-        by E3's own dedupe (which settles a fresh row, then finishes it).
-        Never touches rows that E1's own router or other adapters created.
-        Interim: E1 has no prune API yet; this should move to one."""
-        cutoff = self._clock() - self._replay_horizon
-        with self._auth.db.tx() as c:
-            cur = c.execute("DELETE FROM inbound_seen WHERE update_id LIKE 'e3:%' AND at < ?",
-                            (cutoff,))
-            return cur.rowcount
+        now = self._clock()
+        collected = self._store.collect_garbage(now - grace, self._attachments.delete)
+        self._store.mark_orphans(self._attachments.refs(), now)
+        return collected
 
     @staticmethod
     def _restore(raw: str | None, digest: str | None) -> InboundEvent | None:
@@ -481,20 +462,37 @@ class IngressGateway:
         * The voucher is checked and then retired (``consume``) before this
           returns, on every path: nothing stays in ``ChannelAuth._minted``.
         * ``update_id`` is deterministic per platform message
-          (``e3:<key digest>``), so retries never add rows. A rolled-back
-          attempt leaves the row ``pending`` and E1 resumes it on retry (E1
-          f14e564); ``_finalize`` marks it ``processed`` (``finish``) once
-          E3's decision commits."""
+          (``e3:<key digest>``), so retries never add rows.
+        * E1 (225e7df) resumes a ``pending`` row only for the byte-identical
+          envelope, and ``sent_at`` is inside the MAC. So E3 durably records
+          the ``sent_at`` it used for this message BEFORE presenting it
+          (``transport_handoff``), and every retry or re-delivery re-presents
+          the identical envelope. Only if E1 answers ``stale_transport`` -
+          which it does only when it holds NO row for the update - is a
+          fresh ``sent_at`` taken (a first presentation, never a resumption).
+        * The stored ``sent_at`` is dropped once E1's row is known settled
+          (``finish`` after commit, or E1 refused it as already processed)."""
         signer = self._signers.get(channel)
         if signer is None:
             return None, None, "unvouched_sender"
         bound = bind_text(text)
-        env = signer.envelope(sender_ref, bound, update_id=f"e3:{sha256(key.encode())[:32]}",
-                              sent_at=float(self._clock()), raw_ref=raw_ref)
+        hkey = sha256(key.encode())
+        update_id = f"e3:{hkey[:32]}"
+        sent_at = self._store.handoff_sent_at(hkey, float(self._clock()), self._clock())
+        env = signer.envelope(sender_ref, bound, update_id=update_id, sent_at=sent_at,
+                              raw_ref=raw_ref)
         auth = self._auth.authenticate(env)
+        if getattr(auth, "reason", None) == "stale_transport":
+            sent_at = self._store.handoff_refresh(hkey, float(self._clock()))
+            env = signer.envelope(sender_ref, bound, update_id=update_id, sent_at=sent_at,
+                                  raw_ref=raw_ref)
+            auth = self._auth.authenticate(env)
         sender = getattr(auth, "sender", None)
+        if sender is None and getattr(auth, "reason", None) != "stale_transport":
+            self._store.handoff_drop(hkey)    # E1 holds a settled (processed) row
+        sender = (sender, hkey) if sender is not None else None
         try:
-            principal = self._vouched_principal(auth, channel, text)
+            principal = self._vouched_principal(auth, channel, text)  # checks before retire
             reason = getattr(auth, "reason", None)
             if principal is not None:
                 reason = "ok"
@@ -504,7 +502,7 @@ class IngressGateway:
         finally:
             if sender is not None:
                 try:
-                    self._auth.consume(sender)
+                    self._auth.consume(sender[0])
                 except Exception:
                     pass
 
@@ -536,13 +534,21 @@ class IngressGateway:
             return None
 
     def _release(self, voucher: object) -> None:
-        """Mark E1's (digest-only) replay row processed once E3 has committed."""
+        """Mark E1's (digest-only) replay row processed once E3 has committed,
+        then drop the stored ``sent_at``. If ``finish`` fails the row stays
+        pending and the stored ``sent_at`` is kept, so a re-delivery
+        re-presents the identical envelope and settles it."""
         if voucher is None:
             return
+        sender, hkey = voucher
         try:
-            self._auth.finish(voucher)
+            self._auth.finish(sender)
         except Exception:
-            pass   # stays pending; E3 dedupe answers any redelivery first
+            return
+        try:
+            self._store.handoff_drop(hkey)
+        except Exception:
+            pass
 
     @staticmethod
     def _email_parts(msg) -> tuple[str, list[RawAttachment]]:
@@ -685,7 +691,7 @@ class IngressGateway:
             except Exception:
                 return IngressResult(False, "ingress_error")
         result = self._decide(d, now, reject=reject, stage_id=stage_id)
-        if result.reason not in ("trace_error", "ingress_error"):
+        if result.reason not in ("trace_error", "ingress_error", "attachment_reclaimed"):
             self._release(d.voucher)     # committed: E1 row -> processed
         return result
 
@@ -707,6 +713,14 @@ class IngressGateway:
         try:
             with self._store.transaction() as tx:
                 if stage_id is not None:
+                    # Stage ownership, checked under the same write lock GC
+                    # needs: if GC collected our markers (a paused or slow
+                    # writer), or a blob is missing, refuse - retryable, and
+                    # nothing is recorded - rather than commit a dangling ref.
+                    refs = [attachment_ref(sha256(a.data)) for a in d.attachments]
+                    if not tx.stage_intact(stage_id, refs) or not all(
+                            self._attachments.exists(r) for r in refs):
+                        raise _AttachmentLost()
                     tx.unstage(stage_id)      # committed with whatever is decided below
                 prior = tx.get(key_digest)
                 if prior is not None:
@@ -742,6 +756,8 @@ class IngressGateway:
                 trace(True, d.trust_reason, trust)
                 return IngressResult(True, "accepted", event_id=event_id, event=event,
                                      trust_reason=d.trust_reason)
+        except _AttachmentLost:
+            return IngressResult(False, "attachment_reclaimed")
         except Exception:
             # Rolled back (trace sink or store failure): nothing recorded, so a
             # re-delivery is processed afresh. Fail closed.

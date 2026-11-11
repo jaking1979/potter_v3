@@ -1000,7 +1000,8 @@ class VoucherLifecycle(Fixture):
     def e1_rows(self):
         import sqlite3
         with sqlite3.connect(self.e1db) as c:
-            return c.execute("SELECT update_id, status, command FROM inbound_seen").fetchall()
+            return c.execute("SELECT update_id, status, envelope_digest FROM inbound_seen"
+                             ).fetchall()
 
     def all_db_text(self):
         import sqlite3
@@ -1042,8 +1043,8 @@ class VoucherLifecycle(Fixture):
         a = self.gw.ingest_telegram(self.tg(text=self.SECRET)).event
         self.pass_dkim("<v3@potter.test>")
         b = self.gw.ingest_email(make_email(mid="<v3@potter.test>", body=self.SECRET)).event
-        ((_, _, cmd), *_rest) = self.e1_rows()
-        self.assertTrue(cmd.startswith("e3-sha256:"))
+        ((_, _, env_digest), *_rest) = self.e1_rows()
+        self.assertRegex(env_digest, r"^[0-9a-f]{64}$")   # E1 keeps a digest only
         self.gw.ack(a.event_id)
         self.gateway(channel_auth=self.spy, clock=lambda: T + 7200).expire_pending(60)
         self.assertEqual(self.gw.pending(), [])
@@ -1072,24 +1073,32 @@ class VoucherLifecycle(Fixture):
 
 
 class ReplayRecordRetention(Fixture):
-    """Dolores review on 02a9a1f: E1 inbound_seen rows created by E3 need a
-    finite retention bound to the transport contract, and a crash after E3's
-    commit but before E1 finish() must not leave a row pending forever."""
+    """E1 inbound_seen rows created by E3. Retention is E1's own (225e7df:
+    processed rows pruned after 2*max_skew+margin by E1, pending never); E3
+    never deletes from E1's table. E3 makes every retry present the
+    byte-identical envelope so E1's pending-recovery path can settle it."""
 
     SKEW = 300.0
+    HORIZON = 2 * SKEW + 61
 
     def setUp(self):
         super().setUp()
         self.now = [T]
         envs = self.envs = []
+        settled = self.settled = []
 
         class Capture(ChannelAuth):
             def authenticate(self, msg):
                 envs.append(msg)
                 return super().authenticate(msg)
+
+            def complete(self, c, sender):
+                ok = super().complete(c, sender)
+                settled.append(ok)
+                return ok
         self.auth = self.make_auth(cls=Capture, clock=lambda: float(self.now[0]),
                                    max_skew_s=self.SKEW)
-        self.gw = self.gateway(clock=lambda: self.now[0], transport_max_skew_s=self.SKEW)
+        self.gw = self.gateway(clock=lambda: self.now[0])
         self.e1db = str(Path(self.tmp.name) / "e1.db")
 
     def rows(self):
@@ -1102,78 +1111,128 @@ class ReplayRecordRetention(Fixture):
         with sqlite3.connect(self.db) as c:
             return c.execute("SELECT COUNT(*) FROM ingress_inbox").fetchone()[0]
 
-    def test_84_normal_completion_marks_processed(self):
+    def crashed_gw(self):
+        gw = self.gateway(clock=lambda: self.now[0])
+        gw._release = lambda voucher: None          # dies after E3 commit, before finish()
+        return gw
+
+    def trigger_e1_prune(self):
+        """E1 prunes inside authenticate(); any authentic envelope triggers it."""
+        env = TransportSigner("telegram", TG_KEY).envelope(
+            str(TG_STRANGER), "x", update_id=f"probe-{self.now[0]}", sent_at=float(self.now[0]))
+        self.auth.authenticate(env)
+
+    def test_84_normal_completion_settles_once(self):
         self.assertTrue(self.gw.ingest_telegram(self.tg()).event.trusted)
         self.assertEqual([st for _, st in self.rows()], ["processed"])
+        self.assertEqual(self.settled, [True])
+        self.assertEqual(IngressStore(self.db).handoffs(), [])        # sent_at dropped
 
-    def test_85_crash_after_commit_before_finish_is_settled_on_redelivery(self):
-        crashed = self.gateway(clock=lambda: self.now[0], transport_max_skew_s=self.SKEW)
-        crashed._release = lambda voucher: None          # dies before E1 finish()
-        first = crashed.ingest_telegram(self.tg())
+    def test_85_crash_before_finish_settled_exactly_once_on_redelivery(self):
+        first = self.crashed_gw().ingest_telegram(self.tg())
         self.assertTrue(first.accepted)
         self.assertEqual([st for _, st in self.rows()], ["pending"])
-        again = self.gw.ingest_telegram(self.tg())        # platform re-delivery
+        self.assertEqual(len(IngressStore(self.db).handoffs()), 1)    # sent_at kept
+        self.now[0] += 3600                                           # long outage
+        again = self.gw.ingest_telegram(self.tg())                    # platform re-delivery
         self.assertTrue(again.duplicate)
-        self.assertEqual(again.event, first.event)        # same event, not a second one
+        self.assertEqual(again.event, first.event)                    # no second event
         self.assertEqual(self.inbox_count(), 1)
+        self.assertEqual((self.envs[0].sent_at, self.envs[0].transport_mac),
+                         (self.envs[1].sent_at, self.envs[1].transport_mac))  # identical
         self.assertEqual([st for _, st in self.rows()], ["processed"])
-        self.assertEqual(self.auth._minted, {})
-        third = self.gw.ingest_telegram(self.tg())        # idempotent from here on
-        self.assertEqual([st for _, st in self.rows()], ["processed"])
-        self.assertTrue(third.duplicate)
-
-    def test_86_prune_past_horizon_keeps_old_envelope_rejected(self):
+        self.assertEqual(self.settled, [True])                        # exactly once
         self.gw.ingest_telegram(self.tg())
-        old_env = self.envs[0]
-        self.now[0] = T + int(2 * self.SKEW)               # inside the horizon
-        self.assertEqual(self.gw.prune_transport_records(), 0)
-        self.now[0] = T + int(2 * self.SKEW) + 61          # past it
-        self.assertEqual(self.gw.prune_transport_records(), 1)
-        self.assertEqual(self.rows(), [])
-        replay = self.auth.authenticate(old_env)          # captured envelope replayed
-        self.assertFalse(replay.ok)
-        self.assertEqual(replay.reason, "stale_transport")
-        self.assertEqual(self.rows(), [])
-        again = self.gw.ingest_telegram(self.tg())        # platform re-delivery
-        self.assertTrue(again.duplicate)                  # E3 dedupe still answers
+        self.assertEqual(self.settled, [True])
+        self.assertEqual(self.auth._minted, {})
+
+    def test_86_e1_prune_never_removes_a_pending_row_recovery_can_settle(self):
+        self.crashed_gw().ingest_telegram(self.tg())
+        self.now[0] += int(10 * self.HORIZON)
+        self.trigger_e1_prune()                                       # E1 prunes processed only
+        self.assertIn("pending", [st for _, st in self.rows()])
+        self.assertTrue(self.gw.ingest_telegram(self.tg()).duplicate)
+        self.assertEqual([st for u, st in self.rows() if u.startswith("e3:")], ["processed"])
+        self.assertEqual(self.settled, [True])
+
+    def test_87_replay_after_e1_prune_is_stale_and_never_reaches_recovery(self):
+        self.gw.ingest_telegram(self.tg())
+        captured = self.envs[0]
+        self.now[0] += int(self.HORIZON)
+        self.trigger_e1_prune()
+        self.assertEqual([u for u, _ in self.rows() if u.startswith("e3:")], [])  # pruned
+        replay = self.auth.authenticate(captured)
+        self.assertEqual((replay.ok, replay.reason), (False, "stale_transport"))
+        self.assertEqual([u for u, _ in self.rows() if u.startswith("e3:")], [])  # not recorded
+        self.assertEqual(self.settled, [True])                        # no recovery ran
+        again = self.gw.ingest_telegram(self.tg())                    # platform re-delivery
+        self.assertTrue(again.duplicate)                              # E3 dedupe answers
         self.assertEqual(self.inbox_count(), 1)
 
-    def test_87_repeated_deliveries_keep_rows_bounded(self):
+    def test_88_skew_mismatch_cannot_reopen_replay(self):
+        # Dolores 01:37Z: E3 used a caller-supplied skew to prune E1 rows. E3 no
+        # longer deletes from E1's table at all, so a ChannelAuth with a large
+        # max_skew keeps its own horizon.
+        self.auth = self.make_auth(cls=type(self.auth), clock=lambda: float(self.now[0]),
+                                   max_skew_s=10_000)
+        self.gw = self.gateway(clock=lambda: self.now[0])
+        self.gw.ingest_telegram(self.tg())
+        captured = self.envs[-1]
+        self.now[0] += 661
+        self.trigger_e1_prune()
+        self.assertFalse(hasattr(self.gw, "prune_transport_records"))
+        replay = self.auth.authenticate(captured)
+        self.assertEqual((replay.ok, replay.reason), (False, "replayed"))
+
+    def test_89_repeated_deliveries_keep_rows_bounded(self):
         for i in range(10):
             self.now[0] = T + i * 1000
             self.gw.ingest_telegram(self.tg())
-            self.gw.prune_transport_records()
-            self.assertLessEqual(len(self.rows()), 1)
-        for m in range(1, 6):                              # several messages
-            self.gw.ingest_telegram(self.tg(msg_id=100 + m, ref=f"r{m}"))
-        self.assertLessEqual(len(self.rows()), 6)
-        self.now[0] += 10_000
-        self.gw.prune_transport_records()
-        self.assertEqual(self.rows(), [])
+            self.trigger_e1_prune()
+            self.assertLessEqual(len([u for u, _ in self.rows() if u.startswith("e3:")]), 1)
+        self.assertLessEqual(len(IngressStore(self.db).handoffs()), 1)
+        self.assertEqual(self.inbox_count(), 1)
 
-    def test_88_prune_never_touches_non_e3_rows(self):
-        env = TransportSigner("telegram", TG_KEY).envelope(
-            str(TG_JOSH), "/ack 1", update_id="tg-router-1", sent_at=float(self.now[0]))
-        self.assertTrue(self.auth.authenticate(env).ok)
-        self.gw.ingest_telegram(self.tg())
-        self.now[0] += 10_000
-        self.assertEqual(self.gw.prune_transport_records(), 1)
-        self.assertEqual([u for u, _ in self.rows()], ["tg-router-1"])
-
-    def test_89_horizon_must_cover_the_transport_window(self):
-        with self.assertRaises(ValueError):
-            self.gateway(transport_max_skew_s=300, transport_replay_horizon_s=500)
-        with self.assertRaises(ValueError):
-            self.gateway(transport_max_skew_s=0)
-
-    def test_90_email_crash_before_finish_settled(self):
+    def test_90_email_crash_before_finish_settled_exactly_once(self):
         self.pass_dkim("<s1@potter.test>")
-        crashed = self.gateway(clock=lambda: self.now[0], transport_max_skew_s=self.SKEW)
-        crashed._release = lambda voucher: None
-        self.assertTrue(crashed.ingest_email(make_email(mid="<s1@potter.test>")).event.trusted)
+        self.assertTrue(self.crashed_gw().ingest_email(
+            make_email(mid="<s1@potter.test>")).event.trusted)
         self.assertEqual([st for _, st in self.rows()], ["pending"])
+        self.now[0] += 3600
         self.assertTrue(self.gw.ingest_email(make_email(mid="<s1@potter.test>")).duplicate)
         self.assertEqual([st for _, st in self.rows()], ["processed"])
+        self.assertEqual(self.settled, [True])
+
+    def test_97_rollback_then_late_retry_resumes_with_identical_envelope(self):
+        def broken(line):
+            raise OSError("down")
+        self.assertEqual(self.gateway(clock=lambda: self.now[0], trace_sink=broken)
+                         .ingest_telegram(self.tg()).reason, "trace_error")
+        self.now[0] += 3600                       # retry long after the freshness window
+        retry = self.gw.ingest_telegram(self.tg())
+        self.assertTrue(retry.accepted and retry.event.trusted)
+        self.assertEqual(self.settled, [True])
+        self.assertEqual(self.envs[0].transport_mac, self.envs[1].transport_mac)
+
+    def test_98_never_presented_handoff_refreshes_sent_at(self):
+        # Crash after recording sent_at but before E1 saw the envelope: E1 has no
+        # row, so the stale envelope is refused and E3 re-signs a fresh one.
+        IngressStore(self.db).handoff_sent_at(
+            __import__("hashlib").sha256(f"telegram|{TG_JOSH}|1".encode()).hexdigest(),
+            float(T), T)
+        self.now[0] += 3600
+        res = self.gw.ingest_telegram(self.tg())
+        self.assertTrue(res.accepted and res.event.trusted)
+        self.assertEqual([e.sent_at for e in self.envs], [float(T), float(T + 3600)])
+
+    def test_99_clock_moves_back_after_acceptance(self):
+        first = self.gw.ingest_telegram(self.tg())
+        self.now[0] -= 5000
+        again = self.gw.ingest_telegram(self.tg())
+        self.assertTrue(again.duplicate)
+        self.assertEqual(again.event_id, first.event_id)
+        self.assertEqual(self.inbox_count(), 1)
+        self.assertEqual(self.settled, [True])
 
 
 class AttachmentLifecycle(Fixture):
@@ -1252,6 +1311,81 @@ class AttachmentLifecycle(Fixture):
                 return "s3://bucket/random-key"
         res = self.gateway(attachments=Bad()).ingest_telegram(self.tg_att())
         self.assertEqual((res.accepted, res.reason), (False, "ingress_error"))
+
+
+class AttachmentStageOwnership(Fixture):
+    """Dolores review on 382360b: a paused writer whose stage was collected must
+    never commit a reference to a blob that GC deleted."""
+
+    BYTES = b"synthetic attachment for the GC race"
+
+    def tg_att(self, msg_id=1, ref="d1"):
+        return self.tg(msg_id=msg_id, ref=ref,
+                       attachments=(RawAttachment(self.BYTES, "application/pdf", "a.pdf"),))
+
+    def paused_store(self, *, gc_before_store: bool):
+        outer = self
+
+        class Paused(InMemoryAttachmentStore):
+            armed = True
+
+            def put(self, data):
+                if not self.armed:
+                    return super().put(data)
+                self.armed = False                   # pause only the first writer
+                gc = outer.gateway(clock=lambda: T + 7200, attachments=self)
+                if gc_before_store:
+                    gc.gc_attachments()              # GC runs while writer is paused
+                    return super().put(data)         # late put lands afterwards
+                ref = super().put(data)
+                gc.gc_attachments()                  # GC runs before put returns
+                return ref
+        return Paused()
+
+    def test_100_paused_writer_after_store_is_refused_not_dangling(self):
+        store = self.paused_store(gc_before_store=False)
+        res = self.gateway(attachments=store).ingest_telegram(self.tg_att())
+        self.assertEqual((res.accepted, res.reason), (False, "attachment_reclaimed"))
+        self.assertEqual(IngressStore(self.db).attachment_state()[1], [])   # no refs
+        self.assertEqual(IngressStore(self.db).log(), [])                  # nothing recorded
+        retry = self.gateway(attachments=store).ingest_telegram(self.tg_att())
+        self.assertTrue(retry.accepted)                                    # retryable
+        self.assertTrue(store.exists(retry.event.attachments[0].ref))
+
+    def test_101_late_put_after_collection_is_swept_as_orphan(self):
+        store = self.paused_store(gc_before_store=True)
+        res = self.gateway(attachments=store).ingest_telegram(self.tg_att())
+        self.assertEqual(res.reason, "attachment_reclaimed")
+        self.assertEqual(len(store.blobs), 1)                  # late bytes landed, unowned
+        sweep = self.gateway(clock=lambda: T + 8000, attachments=store)
+        self.assertEqual(sweep.gc_attachments(), [])          # phase 2 marks it orphan
+        self.assertEqual(len(IngressStore(self.db).attachment_state()[0]), 1)
+        self.assertEqual(len(self.gateway(clock=lambda: T + 8000 + 3601,
+                                          attachments=store).gc_attachments()), 1)
+        self.assertEqual(store.blobs, {})
+
+    def test_102_crash_after_stage_and_put_is_reclaimed(self):
+        from ingress.store import attachment_ref
+        from ingress.events import sha256 as h
+        ref = attachment_ref(h(self.BYTES))
+        IngressStore(self.db).stage_attachments("ingest:crashed", [ref], T)
+        self.attachments.put(self.BYTES)                      # then the process died
+        self.assertEqual(self.gw.gc_attachments(), [])        # within grace
+        self.assertEqual(self.gateway(clock=lambda: T + 3601).gc_attachments(), [ref])
+        self.assertEqual(self.attachments.blobs, {})
+
+    def test_103_orphan_sweep_never_touches_committed_or_inflight_blobs(self):
+        ok = self.gw.ingest_telegram(self.tg_att())
+        committed = ok.event.attachments[0].ref
+        from ingress.store import attachment_ref
+        from ingress.events import sha256 as h
+        inflight = attachment_ref(h(b"in flight"))
+        IngressStore(self.db).stage_attachments("ingest:live", [inflight], T + 9000)
+        self.attachments.put(b"in flight")
+        for t in (T + 9000, T + 20000):
+            self.gateway(clock=lambda t=t: t).gc_attachments(grace_s=3600 * 10)
+        self.assertIn(committed, self.attachments.blobs)
+        self.assertIn(inflight, self.attachments.blobs)
 
 
 class Structure(unittest.TestCase):
