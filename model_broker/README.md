@@ -20,3 +20,21 @@ This is **not a production budget gate**: no trusted task/candidate identity, au
 Claude's period-format review correction: requests and all existing ledger rows now require a canonical lowercase hyphenated UUID task ID, an exact valid ISO calendar date `YYYY-MM-DD`, and a month equal to the date's `YYYY-MM`. Alternate spellings, impossible dates and inconsistent months refuse work. Legacy migration and normal reopening fail closed on noncanonical stored rows; the prototype does not rename, merge, erase or release those reservations. This is a compatibility break for synthetic stores using arbitrary task IDs; they require separate reconciliation, not automatic reset.
 
 This validates spelling, not provenance. A caller can still invent another canonical task ID or valid date and receive a separate bucket. No trusted identity or clock is implemented; neither can callers be trusted to select the correct budget period. A delayed reservation dispatched across a period boundary also needs a policy and trustworthy runtime time binding. Until these are integrated and tested, this is not a hard budget ceiling and must not be used as a production gate. Full-ledger validation remains O(n).
+
+
+## Offline dispatch-date boundary experiment
+
+`dispatch_once` now requires an explicit canonical `dispatch_day`, checked
+inside the ledger write transaction against the original reservation day.
+Any day change (and thus month change) refuses dispatch and retains the full
+reservation; retries and reopen do not release or move it. This is a breaking
+interface change. Stale reservations have no automatic rebooking or release.
+
+The date is caller-supplied and is not trusted. The database admission can
+commit before midnight and a real provider call can occur after midnight;
+this seam cannot prevent that race or establish billing periods, clock
+rollback/restart behavior, network effect timing, multi-host consistency,
+provider-reported usage, or hard spending ceilings. It cannot be used as
+a real dispatch authorization. The integration needs a trusted period
+authority and a provider-call protocol with a defined boundary, durable
+uncertainty and reconciliation; independent approval remains required.

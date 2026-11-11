@@ -27,6 +27,53 @@ class BrokerTests(unittest.TestCase):
         self.caps = Caps(50, 20, 30, 60)
         self.b = Broker.bootstrap(self.path, self.caps)
 
+    def test_rollover_refuses_stale_without_releasing_after_restart(self):
+        b = Broker(self.path, Caps(100, 1000, 100, 1000))
+        b.reserve(req('old', day='2026-11-30', month='2026-11'),
+                  [candidate(expected=100, worst=100)])
+        b.reserve(req('new', day='2026-12-01', month='2026-12'),
+                  [candidate(expected=100, worst=100)])
+        b.dispatch_once('new', dispatch_day='2026-12-01')
+        for current in ('2026-12-01', '2026-12-01'):
+            with self.assertRaisesRegex(Refused, 'reservation_period_changed'):
+                Broker(self.path, Caps(100,1000,100,1000)).dispatch_once('old', dispatch_day=current)
+        self.assertEqual(b.status('old')[-1], 'reserved')
+        self.assertEqual(b.entries('old'), (('reservation',100,'operation'),))
+        with self.assertRaisesRegex(Refused, 'duplicate_call_id'):
+            b.reserve(req('old', day='2026-12-01', month='2026-12'),
+                      [candidate(expected=100, worst=100)])
+        self.assertEqual(b.entries('new'), (('reservation',100,'operation'),))
+
+    def test_same_month_rollover_and_invalid_dates_fail_closed(self):
+        self.b.reserve(req(), [candidate()])
+        for day in ('2026-11-07', '2026-11-05'):
+            with self.assertRaisesRegex(Refused, 'reservation_period_changed'):
+                self.b.dispatch_once('c1', dispatch_day=day)
+        for day in ('20261106', '2026-02-30', '', None):
+            with self.assertRaisesRegex(Refused, 'invalid_dispatch_day'):
+                self.b.dispatch_once('c1', dispatch_day=day)
+        self.assertEqual(self.b.status('c1')[-1], 'reserved')
+        self.assertEqual(len(self.b.entries('c1')), 1)
+
+    def test_concurrent_rollover_attempts_never_dispatch_or_release(self):
+        self.b.reserve(req(), [candidate()])
+        barrier, results = threading.Barrier(4), []
+        def attempt():
+            b = Broker(self.path, self.caps)
+            barrier.wait()
+            try:
+                b.dispatch_once('c1', dispatch_day='2026-11-07')
+                results.append('dispatched')
+            except Refused as exc:
+                results.append(str(exc))
+        threads = [threading.Thread(target=attempt) for _ in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=10)
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(results, ['reservation_period_changed'] * 4)
+        self.assertEqual(self.b.status('c1')[-1], 'reserved')
+        self.assertEqual(self.b.entries('c1'), (('reservation',10,'operation'),))
+
     def test_budget_bucket_variants_cannot_bypass_ceilings(self):
         task = "12345678-1234-4234-8234-123456789abc"
         strict = Broker(self.path, Caps(100, 100, 100, 100))
@@ -77,23 +124,23 @@ class BrokerTests(unittest.TestCase):
 
     def test_reservation_survives_restart_and_unknown_cost(self):
         self.b.reserve(req(), [candidate()])
-        self.b.dispatch_once("c1")
+        self.b.dispatch_once("c1", dispatch_day='2026-11-06')
         b2 = Broker(self.path, self.caps)
         with self.assertRaises(Refused): b2.settle("c1", None)
-        with self.assertRaises(Refused): b2.dispatch_once("c1")
+        with self.assertRaises(Refused): b2.dispatch_once("c1", dispatch_day='2026-11-06')
         b2.reserve(req("c2"), [candidate()])
         with self.assertRaisesRegex(Refused, "budget_ceiling"):
             b2.reserve(req("c3"), [candidate(worst=1, expected=1)])
         self.assertEqual(b2.status("c1")[-1], "dispatched")
 
     def test_settle_frees_unused_reservation_and_prevents_replay(self):
-        self.b.reserve(req(), [candidate()]); self.b.dispatch_once("c1"); self.b.settle("c1", 3)
+        self.b.reserve(req(), [candidate()]); self.b.dispatch_once("c1", dispatch_day='2026-11-06'); self.b.settle("c1", 3)
         self.b.reserve(req("c2"), [candidate(worst=17)])
         with self.assertRaises(Refused): self.b.settle("c1", 3)
         with self.assertRaises(Refused): self.b.reserve(req(), [candidate()])
 
     def test_overrun_blocks_subsequent_calls(self):
-        self.b.reserve(req(), [candidate()]); self.b.dispatch_once("c1")
+        self.b.reserve(req(), [candidate()]); self.b.dispatch_once("c1", dispatch_day='2026-11-06')
         with self.assertRaisesRegex(Refused, "cost_variance"): self.b.settle("c1", 11)
         with self.assertRaisesRegex(Refused, "unresolved_cost_variance"):
             self.b.reserve(req("c2"), [candidate()])
@@ -120,7 +167,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_settlement_appends_only_unused_difference_and_survives_restart(self):
         self.b.reserve(req(), [candidate()])
-        self.b.dispatch_once('c1')
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
         self.b.settle('c1', 3)
         reopened = Broker(self.path, self.caps)
         self.assertEqual(reopened.entries('c1'),
@@ -132,7 +179,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_concurrent_settlements_release_once(self):
         self.b.reserve(req(), [candidate()])
-        self.b.dispatch_once('c1')
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
         barrier, outcomes = threading.Barrier(2), []
         def settle():
             b = Broker(self.path, self.caps)
@@ -151,7 +198,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_failed_settlement_transaction_keeps_full_reservation(self):
         self.b.reserve(req(), [candidate()])
-        self.b.dispatch_once('c1')
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
         with sqlite3.connect(self.path) as db:
             db.execute("""CREATE TRIGGER injected_failure BEFORE UPDATE ON broker_calls
                         BEGIN SELECT RAISE(ABORT,'injected_failure'); END""")
@@ -162,7 +209,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_process_crash_before_commit_preserves_reservation(self):
         self.b.reserve(req(), [candidate()])
-        self.b.dispatch_once('c1')
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
         code = '''import os,sqlite3,sys
 db=sqlite3.connect(sys.argv[1],isolation_level=None)
 db.execute('BEGIN IMMEDIATE')
@@ -185,7 +232,7 @@ os._exit(0)
 
     def test_overrun_entry_persists_and_blocks_after_restart(self):
         self.b.reserve(req(), [candidate()])
-        self.b.dispatch_once('c1')
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
         with self.assertRaisesRegex(Refused, 'cost_variance'):
             self.b.settle('c1', 12)
         reopened = Broker(self.path, self.caps)
@@ -203,7 +250,7 @@ os._exit(0)
 
     def test_inconsistent_call_row_does_not_free_budget(self):
         self.b.reserve(req(), [candidate()])
-        self.b.dispatch_once('c1')
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
         with sqlite3.connect(self.path) as db:
             db.execute("UPDATE broker_calls SET state='settled',actual=0")
         with self.assertRaisesRegex(LedgerUnavailable, 'ledger_inconsistent'):
@@ -235,7 +282,7 @@ os._exit(0)
         Broker(path, self.caps)
         self.assertEqual(len(b.entries('old')), 2)
         with self.assertRaisesRegex(Refused, 'not_reserved'):
-            b.dispatch_once('unknown')
+            b.dispatch_once('unknown', dispatch_day='2026-11-06')
 
     def test_invalid_legacy_snapshot_refused_without_partial_migration(self):
         path = Path(self.tmp.name) / 'invalid.sqlite'
@@ -292,12 +339,12 @@ else:
     def test_overrun_blocks_already_reserved_dispatch_after_restart(self):
         self.b.reserve(req(), [candidate()])
         self.b.reserve(req('c2'), [candidate()])
-        self.b.dispatch_once('c1')
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
         with self.assertRaisesRegex(Refused, 'cost_variance'):
             self.b.settle('c1', 11)
         reopened = Broker(self.path, self.caps)
         with self.assertRaisesRegex(Refused, 'unresolved_cost_variance'):
-            reopened.dispatch_once('c2')
+            reopened.dispatch_once('c2', dispatch_day='2026-11-06')
         self.assertEqual(reopened.status('c2')[-1], 'reserved')
         self.assertEqual(reopened.entries('c2'), (('reservation', 10, 'operation'),))
 
@@ -307,16 +354,16 @@ else:
                     Caps(99,99,9,99), Caps(99,99,99,9)):
             reopened = Broker(self.path, cap)
             with self.assertRaisesRegex(Refused, 'budget_ceiling'):
-                reopened.dispatch_once('c1')
+                reopened.dispatch_once('c1', dispatch_day='2026-11-06')
             self.assertEqual(reopened.status('c1')[-1], 'reserved')
-        self.b.dispatch_once('c1')
+        self.b.dispatch_once('c1', dispatch_day='2026-11-06')
 
     def test_dispatch_once_process_race_has_single_winner(self):
         self.b.reserve(req(), [candidate()])
         code = '''import sys
 from model_broker.broker import Broker,Caps,Refused
 try:
-    Broker(sys.argv[1], Caps(50,20,30,60)).dispatch_once('c1')
+    Broker(sys.argv[1], Caps(50,20,30,60)).dispatch_once('c1', dispatch_day='2026-11-06')
 except Refused:
     print('refused')
 else:
@@ -332,4 +379,5 @@ else:
 
 
 if __name__ == "__main__": unittest.main()
+
 

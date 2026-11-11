@@ -267,8 +267,13 @@ class Broker:
             db.commit()
             return c
 
-    def dispatch_once(self, call_id: str):
-        """Record the point after which a charge may exist; do not retry blindly."""
+    def dispatch_once(self, call_id: str, *, dispatch_day: str):
+        """Offline admission using a caller-supplied date; NOT a trusted clock.
+
+        A stale reservation cannot be dispatched in a new day or month. It
+        remains fully reserved, including across restarts. This check does not
+        guard a real provider invocation after this transaction commits.
+        """
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             self._validate_ledger(db)
@@ -278,6 +283,13 @@ class Broker:
                              (call_id,)).fetchone()
             if row is None or row[4] != 'reserved':
                 raise Refused('not_reserved')
+            # Compare the canonical supplied day while holding the write
+            # transaction. No stale reservation is migrated or released.
+            if not _canonical_buckets(row[0], dispatch_day,
+                                      dispatch_day[:7] if type(dispatch_day) is str else None):
+                raise Refused('invalid_dispatch_day')
+            if dispatch_day != row[1]:
+                raise Refused('reservation_period_changed')
             # A reservation is not irrevocable dispatch permission. Another
             # call can overrun or configured caps can tighten before dispatch.
             for column, value, cap in zip(('task_id', 'day', 'month'), row[:3],
@@ -315,4 +327,5 @@ class Broker:
             db.execute('BEGIN')
             self._validate_ledger(db)
             return db.execute("SELECT model,provider,worst,actual,state FROM broker_calls WHERE call_id=?", (call_id,)).fetchone()
+
 
