@@ -1,6 +1,6 @@
 import copy
 import unittest
-from case_agreement import count_case_agreement, affected_case_summary
+from evaluation.a4a.case_agreement import count_case_agreement, affected_case_summary
 
 
 def record(case, responsibility=False):

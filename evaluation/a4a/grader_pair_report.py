@@ -4,7 +4,7 @@ The caller must independently lock the plan, establish blinding, alignment,
 provenance, and no-effects isolation. This function proves none of those.
 Applicability and L17 wording remain unresolved; this is not a ratified rule.
 """
-from case_agreement import count_case_agreement
+from evaluation.a4a.case_agreement import count_case_agreement
 from evaluation.a4a.applicability_report import summarize_applicability
 
 

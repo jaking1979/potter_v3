@@ -4,7 +4,7 @@ Inputs must already be aligned by a separately protected, verified mapping. This
 helper cannot establish blinding, mapping provenance, case independence or the
 integrity of what a grader saw; it does not calculate pass/fail thresholds.
 """
-from blind_grading import validate_grades
+from evaluation.a4a.blind_grading import validate_grades
 
 
 def count_case_agreement(first, second, expected_cases):

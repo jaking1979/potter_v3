@@ -1,8 +1,8 @@
 import copy
 import unittest
 
-from grader_pair_report import summarize_grader_pairs
-from test_case_agreement import record
+from evaluation.a4a.grader_pair_report import summarize_grader_pairs
+from evaluation.a4a.test_case_agreement import record
 
 
 class GraderPairBridgeTest(unittest.TestCase):
