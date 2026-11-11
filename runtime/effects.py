@@ -24,7 +24,14 @@ dispatched under a trusted ``ConnectorContract`` whose identity AND
 source artifact) still match an entry in the
 ``trusted_idempotent`` registry fixed at construction (default: none). A
 contract rotated across a restart, or a row with no digest, is not trusted.
-No caller-supplied flag or attribute can grant this. ``"succeeded"`` resolves it without
+No caller-supplied flag or attribute can grant this.
+
+Each dispatch claim binds a signed request deadline (claim time + the
+provider-enforced lifetime L) minted by the journal's DispatchDeadlineSigner
+in the SAME transaction as the eligibility check and the kill switch; the
+adapter only receives the ticket. Window trust requires every attempt's
+acceptance envelope [earliest claim, latest signed deadline] to fit the
+provider's retention. ``now=`` is accepted only from a trusted test clock. ``"succeeded"`` resolves it without
 re-execution; ``"still_unknown"`` (or anything unrecognised, or an unfenced
 ``"failed"``) refuses the retry and leaves it unresolved.
 
@@ -62,6 +69,8 @@ RECONCILE_VERDICTS = (SUCCEEDED, FAILED, STILL_UNKNOWN)
 DEFAULT_DISPATCH_TIMEOUT_S = 300.0
 DEFAULT_RETENTION_MARGIN_S = 60.0
 BASIS_DEFINITE, BASIS_FENCE, BASIS_WINDOW = "definite", "fence", "window"
+TRUSTED_CLOCK_ONLY = ("now= is reserved for a trusted test clock; runtime callers use the"
+                      " journal's own clock")
 WINDOW_LAPSED = ("trusted idempotency window no longer covers a re-dispatch;"
                  " the earlier dispatch may still land: back to unknown")
 NOT_APPLIED_UNFENCED = ("reconcile reports not applied, but the earlier dispatch may still land;"
@@ -154,6 +163,49 @@ def _require_loaded_matches_source(code: Any, source: bytes, adapter: Any) -> No
         f"loaded adapter {adapter_name(adapter)!r} differs from its source file")
 
 
+class DeadlineTicketInvalid(ValueError):
+    """A dispatch ticket's signature or fields do not verify."""
+
+
+class DispatchDeadlineSigner:
+    """Mints the signed request deadline bound to each dispatch claim.
+
+    The key belongs to the journal and to the provider-side verifier, never to
+    adapters: an adapter receives only the finished ticket on the Effect, so it
+    cannot mint a later deadline. A trusted provider must reject any request
+    whose ticket fails to verify or whose deadline has passed (e.g. a signed
+    request expiry, a pre-signed URL). HMAC here is a reference model; a real
+    deployment would use a provider-supported signed-expiry mechanism."""
+
+    def __init__(self, key: bytes, key_id: str = "c2-deadline"):
+        if not (isinstance(key, bytes) and len(key) >= 16):
+            raise ValueError("deadline signing key must be >= 16 bytes")
+        if not (isinstance(key_id, str) and key_id):
+            raise ValueError("key_id required")
+        self._key, self.key_id = key, key_id
+
+    def _mac(self, body: dict) -> str:
+        msg = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
+
+    def sign(self, idempotency_key: str, dispatch_no: int, deadline: float) -> str:
+        body = {"key": idempotency_key, "n": dispatch_no, "deadline": float(deadline),
+                "kid": self.key_id}
+        return json.dumps({**body, "sig": self._mac(body)}, sort_keys=True, separators=(",", ":"))
+
+    def verify(self, ticket: str) -> dict:
+        try:
+            d = json.loads(ticket)
+            body = {k: d[k] for k in ("key", "n", "deadline", "kid")}
+            sig = d["sig"]
+        except (TypeError, ValueError, KeyError) as exc:
+            raise DeadlineTicketInvalid(f"malformed dispatch ticket: {exc!r}") from exc
+        if body["kid"] != self.key_id or not isinstance(sig, str) \
+                or not hmac.compare_digest(self._mac(body), sig):
+            raise DeadlineTicketInvalid("dispatch ticket signature does not verify")
+        return body
+
+
 @dataclass(frozen=True)
 class IdempotencyScope:
     """The provider-side namespace in which an idempotency key is deduplicated.
@@ -167,10 +219,11 @@ class IdempotencyScope:
     dedupe_version: str      # provider's dedupe contract version
     retention_window_s: int  # how long the provider remembers a key
     config_hash: str         # sha256 of the adapter's dedupe-relevant config
-    # Max age of a request the provider will still ACCEPT, enforced by the
-    # provider itself (e.g. a signed request expiry), measured from dispatch.
-    # None = the provider enforces no such bound: a late request can land at
-    # any time, so a finite retention can never exclude a duplicate.
+    # Lifetime L of the signed deadline the journal binds to each dispatch
+    # claim (deadline = claim time + L). Declaring it asserts the provider
+    # verifies that deadline and rejects any request after it. None = the
+    # provider enforces no deadline: a late request can land at any time, so
+    # a finite retention can never exclude a duplicate.
     enforced_request_lifetime_s: int | None = None
 
     def __post_init__(self):
@@ -193,18 +246,17 @@ class IdempotencyScope:
                 self.dedupe_version, self.retention_window_s, self.config_hash,
                 self.enforced_request_lifetime_s]
 
-    def covers_retry(self, first_dispatched_at: float | None, retry_at: float,
-                     margin_s: float) -> bool:
-        """True only if every attempt, the original included, is provably
-        inside one still-valid dedupe window. Any attempt is accepted at most
-        L after it was sent, and the earliest may already have been applied at
-        first_dispatched_at. So the provider must remember the key for
-        L + (retry_at - first_dispatched_at) + margin. No enforced lifetime, or
-        no journaled first dispatch, means it cannot be proven."""
-        L = self.enforced_request_lifetime_s
-        if L is None or first_dispatched_at is None:
+    def covers_envelope(self, earliest_claim: float | None, latest_deadline: float | None,
+                        margin_s: float) -> bool:
+        """True only if every attempt's acceptance envelope lies inside one
+        dedupe window. No attempt can be applied before the earliest claim, or
+        after the latest signed deadline, so the provider must remember the key
+        for (latest_deadline - earliest_claim) + margin. Without an enforced
+        deadline, or with either bound unknown, it cannot be proven."""
+        if self.enforced_request_lifetime_s is None or earliest_claim is None \
+                or latest_deadline is None:
             return False
-        return self.retention_window_s >= L + (retry_at - first_dispatched_at) + margin_s
+        return self.retention_window_s >= (latest_deadline - earliest_claim) + margin_s
 
 
 def current_idempotency_scope(adapter: Any) -> IdempotencyScope:
@@ -341,6 +393,10 @@ class EffectInFlight(EffectError):
     """Another dispatcher holds this effect right now."""
 
 
+class EffectKilled(EffectError):
+    """The kill switch refused this dispatch; nothing was sent."""
+
+
 class EffectConflict(EffectError):
     """This task step is already bound to a different action, or a dispatch
     does not match the connector the effect is bound to."""
@@ -368,6 +424,13 @@ class Effect:
     # (trusted idempotency window, which expires, so it is re-checked at every
     # dispatch claim). NULL on a FAILED row is treated like "window".
     failed_basis: str | None = None
+    # Signed deadline bound to the CURRENT dispatch claim, and its ticket: the
+    # adapter must send the ticket; the provider rejects it after the deadline.
+    dispatch_deadline: float | None = None
+    dispatch_ticket: str | None = None
+    max_dispatch_deadline: float | None = None   # latest deadline ever minted
+    last_claim_at: float | None = None           # latest claim time (rollback check)
+    unbounded_dispatch: int = 0                  # 1 if any claim had no enforced deadline
 
     def intent(self) -> EffectIntent:
         return EffectIntent(self.effect_id, self.task_id, self.action_hash,
@@ -380,7 +443,8 @@ class Effect:
 
 _COLS = ("idempotency_key, task_id, effect_id, action_hash, action_canonical, approval_id,"
          " status, dispatches, in_flight_owner, in_flight_until, result, last_error, connector,"
-         " connector_digest, first_dispatched_at, failed_basis")
+         " connector_digest, first_dispatched_at, failed_basis, dispatch_deadline, dispatch_ticket,"
+         " max_dispatch_deadline, last_claim_at, unbounded_dispatch")
 
 
 def _effect(row: tuple) -> Effect:
@@ -409,8 +473,16 @@ class EffectJournal:
                  dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
                  fence: Callable[[Effect], bool] | None = None,
                  trusted_idempotent: TrustedIdempotentRegistry | None = None,
-                 retention_margin_s: float = DEFAULT_RETENTION_MARGIN_S):
+                 retention_margin_s: float = DEFAULT_RETENTION_MARGIN_S,
+                 deadline_signer: DispatchDeadlineSigner | None = None,
+                 kill_switch: Callable[[Effect], bool] | None = None,
+                 trusted_test_clock: bool = False):
         self.db = as_database(db)
+        if deadline_signer is not None and not isinstance(deadline_signer, DispatchDeadlineSigner):
+            raise TypeError("deadline_signer must be a DispatchDeadlineSigner")
+        self._signer = deadline_signer   # None: no deadline can be bound, so no window trust
+        self._kill = kill_switch         # E2 seam: True (or any non-False) = do not dispatch
+        self._trusted_test_clock = trusted_test_clock is True
         if not (isinstance(retention_margin_s, (int, float)) and retention_margin_s >= 0):
             raise ValueError("retention_margin_s must be >= 0")
         self._margin = float(retention_margin_s)   # clock skew / processing slack
@@ -425,6 +497,23 @@ class EffectJournal:
 
     def _now(self, now: float | None) -> float:
         return self._clock() if now is None else now
+
+    def _entry_now(self, now: float | None) -> float | None:
+        """Explicit times are a test affordance; at runtime only the journal's
+        own clock is used, so a caller cannot pin a stale time."""
+        if now is not None and not self._trusted_test_clock:
+            raise ValueError(TRUSTED_CLOCK_ONLY)
+        return now
+
+    def _killed(self, eff: Effect) -> bool:
+        """Fail closed: anything but an explicit False from the kill switch, an
+        exception included, stops the dispatch."""
+        if self._kill is None:
+            return False
+        try:
+            return self._kill(eff) is not False
+        except Exception:
+            return True
 
     # -- recording ---------------------------------------------------------
     def record_intent(self, task_id: str, effect_id: str, action: BoundAction,
@@ -476,7 +565,7 @@ class EffectJournal:
         ``succeeded`` is always accepted. ``failed`` is accepted only when a late
         landing of the earlier dispatch is excluded (see ``execute``); otherwise
         the effect stays ``unknown`` for authoritative reconciliation."""
-        now = self._now(now)
+        now = self._now(self._entry_now(now))
         eff = self._require(key)
         if eff.status != UNKNOWN:
             return eff
@@ -542,9 +631,29 @@ class EffectJournal:
             return None
         if not self._scope_unchanged(contract):
             return None
-        if contract.idempotency_scope.covers_retry(eff.first_dispatched_at, now, self._margin):
+        if self._window_covers(eff, contract, now):
             return BASIS_WINDOW
         return None
+
+    def _window_covers(self, eff: Effect, contract: ConnectorContract, now: float) -> bool:
+        """Would a dispatch claimed at ``now`` keep EVERY attempt's acceptance
+        envelope inside one dedupe window? The retry's own deadline would be
+        now + L; earlier attempts are bounded by their recorded signed
+        deadlines. Refused when no deadline can be bound (no signer, no
+        enforced lifetime), when any earlier claim had no deadline or its
+        bounds are missing (migrated rows), or when the clock reads earlier
+        than a recorded claim (rollback)."""
+        L = contract.idempotency_scope.enforced_request_lifetime_s
+        if L is None or self._signer is None or eff.unbounded_dispatch:
+            return False
+        if eff.dispatches > 0 and (eff.first_dispatched_at is None
+                                   or eff.max_dispatch_deadline is None):
+            return False
+        if eff.last_claim_at is not None and now < eff.last_claim_at:
+            return False
+        earliest = now if eff.first_dispatched_at is None else min(eff.first_dispatched_at, now)
+        latest = now + L if eff.max_dispatch_deadline is None else max(eff.max_dispatch_deadline, now + L)
+        return contract.idempotency_scope.covers_envelope(earliest, latest, self._margin)
 
     @staticmethod
     def _scope_unchanged(contract: ConnectorContract) -> bool:
@@ -598,8 +707,8 @@ class EffectJournal:
             raise ValueError("owner required")
         if not (isinstance(connector, str) and connector):
             raise ValueError("connector identity required")
-        explicit_now = now
-        now = self._now(now)
+        explicit_now = self._entry_now(now)
+        now = self._now(explicit_now)
         eff = self._require(key)
         if eff.status == SUCCEEDED:
             return eff
@@ -626,33 +735,61 @@ class EffectJournal:
         eff.action()  # integrity check BEFORE anything is dispatched
         lapsed = False
         with self.db.tx() as c:
-            # Time of the claim itself, not of entry or of a (possibly slow)
-            # reconcile: a window-based FAILED is only as good as right now.
+            # ONE transaction, under the journal write lock: read the clock,
+            # re-check kill switch and eligibility, mint the signed deadline
+            # and claim. The time read here is the time the deadline is bound
+            # to, so a stall before this point (lock wait, slow reconcile) is
+            # measured, and a stall after it is bounded by the deadline itself.
             now = self._now(explicit_now)
-            eff = load_effect(c, key)
-            if eff.status == FAILED and eff.failed_basis not in (BASIS_DEFINITE, BASIS_FENCE) \
-                    and self._exclusion_basis(eff, now) is None:
+            prior = load_effect(c, key)
+            if prior is None or prior.status not in (PENDING, FAILED) \
+                    or prior.connector not in (None, connector):
+                raise EffectInFlight(f"effect {key} was claimed by another dispatcher")
+            if self._killed(prior):
+                raise EffectKilled(f"kill switch refused dispatch of {key}")
+            if prior.status == FAILED and prior.failed_basis not in (BASIS_DEFINITE, BASIS_FENCE) \
+                    and self._exclusion_basis(prior, now) is None:
                 c.execute("UPDATE effects SET status=?, failed_basis=NULL, last_error=?, updated_at=?"
                           " WHERE idempotency_key=? AND status=? AND dispatches=?",
-                          (UNKNOWN, WINDOW_LAPSED, now, key, FAILED, eff.dispatches))
+                          (UNKNOWN, WINDOW_LAPSED, now, key, FAILED, prior.dispatches))
                 lapsed = True
+            else:
+                L = contract.idempotency_scope.enforced_request_lifetime_s if contract else None
+                if L is not None and self._signer is not None:
+                    deadline = now + L
+                    ticket = self._signer.sign(key, prior.dispatches + 1, deadline)
+                    unbounded = 0
+                else:
+                    deadline = ticket = None
+                    unbounded = 1
+                c.execute("UPDATE effects SET status=?, dispatches=dispatches+1,"
+                          " in_flight_owner=?, in_flight_until=?, updated_at=?, failed_basis=NULL,"
+                          " first_dispatched_at=MIN(COALESCE(first_dispatched_at, ?), ?),"
+                          " last_claim_at=MAX(COALESCE(last_claim_at, ?), ?),"
+                          " dispatch_deadline=?, dispatch_ticket=?,"
+                          " max_dispatch_deadline=CASE WHEN ? IS NULL THEN max_dispatch_deadline"
+                          " ELSE MAX(COALESCE(max_dispatch_deadline, ?), ?) END,"
+                          " unbounded_dispatch=MAX(unbounded_dispatch, ?),"
+                          " connector_digest=CASE WHEN connector IS NULL THEN ?"
+                          " ELSE connector_digest END,"
+                          " connector=COALESCE(connector, ?)"
+                          " WHERE idempotency_key=? AND status=? AND dispatches=?",
+                          (UNKNOWN, owner, now + self._dispatch_timeout, now, now, now, now, now,
+                           deadline, ticket, deadline, deadline, deadline, unbounded, digest,
+                           connector, key, prior.status, prior.dispatches))
+                eff = load_effect(c, key)
         if lapsed:
             raise EffectOutcomeUnknown(f"effect {key}: {WINDOW_LAPSED}")
-        with self.db.tx() as c:
-            cur = c.execute("UPDATE effects SET status=?, dispatches=dispatches+1,"
-                            " in_flight_owner=?, in_flight_until=?, updated_at=?, failed_basis=NULL,"
-                            " first_dispatched_at=COALESCE(first_dispatched_at, ?),"
-                            " connector_digest=CASE WHEN connector IS NULL THEN ?"
-                            " ELSE connector_digest END,"
-                            " connector=COALESCE(connector, ?)"
-                            " WHERE idempotency_key=? AND status IN (?,?) AND dispatches=?"
-                            " AND (connector IS NULL OR connector=?)"
-                            " AND failed_basis IS ?",
-                            (UNKNOWN, owner, now + self._dispatch_timeout, now, now, digest, connector,
-                             key, PENDING, FAILED, eff.dispatches, connector, eff.failed_basis))
-            if cur.rowcount != 1:
-                raise EffectInFlight(f"effect {key} was claimed by another dispatcher")
-            eff = load_effect(c, key)
+        if self._killed(eff):
+            # Killed after the claim but before anything was sent: undo the
+            # claim (its deadline stays recorded, which is only conservative).
+            with self.db.tx() as c:
+                c.execute("UPDATE effects SET status=?, failed_basis=?, in_flight_owner=NULL,"
+                          " in_flight_until=NULL, dispatch_ticket=NULL, last_error=?, updated_at=?"
+                          " WHERE idempotency_key=? AND dispatches=? AND in_flight_owner=?",
+                          (prior.status, prior.failed_basis, "killed before send", now, key,
+                           eff.dispatches, owner))
+            raise EffectKilled(f"kill switch refused dispatch of {key} before send")
         # From here until an outcome is committed, the journal says "unknown".
         try:
             result = perform(eff)
