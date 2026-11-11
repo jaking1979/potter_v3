@@ -87,3 +87,25 @@ and status only, rather than retaining queried fact keys. Empty results use a
 canonical fallback and are never marked as index hits. ID and status metadata
 may still persist in memory, and neither this change nor a local forget can
 recall caller-held objects or prove erasure of external copies.
+
+### Local snapshot stamps (synthetic only)
+
+Schema v2 on this candidate is newly bootstrapped only; v1 is refused and no
+migration is implemented. `snapshot_with_stamp(keys)` returns advisory
+`Retrieval` objects (active, provisional and excluded identifiers) and a
+`(store_epoch, generation)` tuple from the same local read transaction.
+Bootstrap chooses a random UUID4 epoch; stage, promote, undo and forget each
+increment the generation atomically with the local mutation. Idempotent retries
+and rolled-back mutations do not increment it. `is_current_stamp(stamp)` checks
+the supplied tuple against this same local database at the moment of the call.
+Generation overflow and malformed metadata fail closed.
+
+A stamp is a local invalidation hint, not a capability, authenticated source,
+release fence or delivery proof. A check followed by a send has a race; snapshots
+already detached from the store still exist. The epoch is inside the same SQLite
+file: clones or old backups preserve it and can make stale stamps look current.
+No restore procedure, independent anti-rollback anchor, external tombstone replay,
+queue cancellation, provider coordination or in-flight reconciliation is
+implemented. Do not use this for real data, runtime integration, or a T15/T27
+forget guarantee until those dependencies and the D3/D4/C3 contract are agreed
+and tested. Incrementing on all local mutations is conservative, not per-fact.

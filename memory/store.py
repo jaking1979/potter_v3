@@ -56,7 +56,7 @@ _COLUMNS = {
     'item': ('id','key','value','origin','status','sensitivity','confidence','source_ref','version','supersedes','contradicts'),
     'request': ('request_id','payload','item_id'),
     'audit': ('seq','op','item_id','version'),
-    'metadata': ('schema','environment'),
+    'metadata': ('schema','environment','epoch','generation'),
 }
 _SCHEMA = """
 BEGIN IMMEDIATE;
@@ -68,9 +68,9 @@ CREATE TABLE item (id TEXT PRIMARY KEY, key TEXT NOT NULL,
 CREATE UNIQUE INDEX one_active_key ON item(key) WHERE status='active';
 CREATE TABLE request (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL, item_id TEXT NOT NULL);
 CREATE TABLE audit (seq INTEGER PRIMARY KEY, op TEXT NOT NULL, item_id TEXT NOT NULL, version INTEGER NOT NULL);
-CREATE TABLE metadata (schema TEXT NOT NULL, environment TEXT NOT NULL);
-INSERT INTO metadata VALUES ('potter.memory.offline/v1','synthetic');
-PRAGMA user_version=1;
+CREATE TABLE metadata (schema TEXT NOT NULL, environment TEXT NOT NULL, epoch TEXT NOT NULL, generation INTEGER NOT NULL);
+INSERT INTO metadata VALUES ('potter.memory.offline/v2','synthetic','{epoch}',0);
+PRAGMA user_version=2;
 COMMIT;
 """
 
@@ -124,7 +124,7 @@ class MemoryStore:
             self._db.execute('PRAGMA secure_delete=ON')
             if create:
                 # Exclusive bootstrap owns an empty file, never a migration.
-                self._db.executescript(_SCHEMA)
+                self._db.executescript(_SCHEMA.replace('{epoch}', str(uuid.uuid4())))
             with self._transaction(write=False):
                 if self._db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                     raise Invalid('store integrity')
@@ -140,14 +140,22 @@ class MemoryStore:
                 self._closed = True
 
     def _check_schema(self):
-        if self._db.execute('PRAGMA user_version').fetchone()[0] != 1:
+        if self._db.execute('PRAGMA user_version').fetchone()[0] != 2:
             raise Invalid('unknown store version')
         tables = {r[0] for r in self._db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if tables != {'item', 'request', 'audit', 'metadata'}:
             raise Invalid('unknown store tables')
-        meta = self._db.execute('SELECT schema,environment FROM metadata').fetchall()
-        if [tuple(r) for r in meta] != [('potter.memory.offline/v1', 'synthetic')]:
+        meta = self._db.execute('SELECT schema,environment,epoch,generation FROM metadata').fetchall()
+        if len(meta) != 1:
+            raise Invalid('unknown store metadata')
+        schema, environment, epoch, generation = tuple(meta[0])
+        try:
+            epoch_valid = isinstance(epoch, str) and str(uuid.UUID(epoch)) == epoch and uuid.UUID(epoch).version == 4
+        except (ValueError, AttributeError):
+            epoch_valid = False
+        if (schema != 'potter.memory.offline/v2' or environment != 'synthetic'
+                or not epoch_valid or type(generation) is not int or not 0 <= generation <= 9223372036854775807):
             raise Invalid('unknown store metadata')
         for table, columns in _COLUMNS.items():
             actual = tuple(row[1] for row in self._db.execute('PRAGMA table_info(' + table + ')'))
@@ -226,6 +234,7 @@ class MemoryStore:
                               confidence, source_ref, 1, None, contradicts))
             self._db.execute('INSERT INTO request VALUES (?,?,?)', (request_id, packed, ident))
             self._audit('stage', ident, 1)
+            self._bump_generation()
             return self._get(ident)
 
     @staticmethod
@@ -292,6 +301,7 @@ class MemoryStore:
             self._db.execute("UPDATE item SET status='active',version=version+1,supersedes=? WHERE id=?",
                              (active['id'] if active else None, ident))
             self._audit('promote', ident, item.version + 1)
+            self._bump_generation()
             return self._get(ident)
 
     def undo(self, ident: str, expected_version: int, proof: object) -> Item:
@@ -308,6 +318,7 @@ class MemoryStore:
             self._db.execute("UPDATE item SET status='active',version=version+1 WHERE id=?", (prior.id,))
             self._audit('undo', ident, item.version + 1)
             self._audit('restore', prior.id, prior.version + 1)
+            self._bump_generation()
             return self._get(prior.id)
 
     def forget(self, ident: str, expected_version: int, proof: object) -> None:
@@ -329,6 +340,7 @@ class MemoryStore:
             self._db.execute("UPDATE item SET status='forgotten', key='', value='', source_ref='', version=version+1 WHERE key=? AND status!='forgotten'", (item.key,))
             for row in rows:
                 self._audit('forget', row['id'], row['version'] + 1)
+            self._bump_generation()
 
     def _retrieve(self, key, consequential):
         rows = self._db.execute("SELECT * FROM item WHERE key=? AND status IN ('active','staged') ORDER BY rowid", (key,)).fetchall()
@@ -368,6 +380,44 @@ class MemoryStore:
             raise Invalid('duplicate keys')
         with self._transaction(write=False):
             return {key: self._retrieve(key, False) for key in keys}
+
+    def _bump_generation(self):
+        # Called only while the same write transaction owns the content change.
+        row = self._db.execute('SELECT generation FROM metadata').fetchone()
+        if row[0] >= 9223372036854775807:
+            raise Invalid('generation exhausted')
+        self._db.execute('UPDATE metadata SET generation=generation+1')
+
+    def snapshot_with_stamp(self, keys):
+        """Offline snapshot and local invalidation hint from the same read view.
+
+        Detached content, not an authorization or a publication fence. The
+        epoch is only a per-bootstrap identifier; restoring or cloning a file
+        may reuse it. No protected external anti-rollback authority exists.
+        """
+        if type(keys) not in (list, tuple) or len(keys) > 1000:
+            raise Invalid('bounded explicit keys required')
+        keys = tuple(keys)
+        for key in keys:
+            self._text(key, 'key')
+        if len(set(keys)) != len(keys):
+            raise Invalid('duplicate keys')
+        with self._transaction(write=False):
+            stamp = tuple(self._db.execute('SELECT epoch,generation FROM metadata').fetchone())
+            return {key: self._retrieve(key, False) for key in keys}, stamp
+
+    def is_current_stamp(self, stamp):
+        """Compare a local stamp now; says nothing about later use or delivery."""
+        if (type(stamp) is not tuple or len(stamp) != 2 or not isinstance(stamp[0], str)
+                or type(stamp[1]) is not int or not 0 <= stamp[1] <= 9223372036854775807):
+            raise Invalid('invalid stamp')
+        try:
+            if str(uuid.UUID(stamp[0])) != stamp[0] or uuid.UUID(stamp[0]).version != 4:
+                raise Invalid('invalid stamp')
+        except (ValueError, AttributeError):
+            raise Invalid('invalid stamp')
+        with self._transaction(write=False):
+            return stamp == tuple(self._db.execute('SELECT epoch,generation FROM metadata').fetchone())
 
     def _get(self, ident: str) -> Item:
         row = self._db.execute('SELECT * FROM item WHERE id=?', (ident,)).fetchone()
