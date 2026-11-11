@@ -12,7 +12,7 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
 | `channels.py` | The `Channel` interface (`send`, `reconcile`, `probe`), `InboundMessage` and `FakeChannel`. |
 | `lint.py` | Structural check: no direct channel use and no reach-through into notifier internals outside `notifier/`. Run it with `python3 -m notifier.lint .`. |
 | `traces.py` | Emits C6 `DecisionTrace` records for issue, decide and send. The records are redaction-safe. |
-| `_schema.py` | The `notifier_state`, `approval_requests` and `inbound_log` tables, pinned by `meta.notifier_schema=e1.v0`. |
+| `_schema.py` | E1's tables, pinned by `meta.notifier_schema=e1.v1`. `ensure()` migrates an `e1.v0` database inside one `BEGIN IMMEDIATE` transaction (see Schema migration below). It refuses an unknown or future version, or an `e1.v0` layout it doesn't recognise, before routing any traffic. |
 
 ## T19 PASS 2 mapping
 
@@ -26,6 +26,20 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
      - **Known outcomes only.** The router marks a refusal, an unknown command or the idempotent ack `processed` only after that outcome completes. If anything raises first (a signing key, the trace sink, the database), the transaction rolls back and the update stays `pending`. A failure *after* the effect commits leaves it `processed`, so the effect is never reapplied.
      - **Recovery path.** Redelivery of a `pending` update resumes it, even after an outage longer than the 300 s freshness window. The redelivered envelope must match the stored digest byte for byte, and authorization is rechecked: binding, allowlist, enabled status, DKIM or session. A different envelope under the same update ID is refused as `replayed`. An update never seen before must still be fresh (`stale_transport` otherwise), and nothing is recorded for it.
      - Redelivery of a `processed` update is ignored as `replayed`. If two deliveries race, one wins the compare-and-set and the other's effect rolls back.
+   - **Clock rollback fails closed.** Each transport keeps a durable high-water mark in the shared DB (`notifier_state['hw:<channel>']`). It holds the highest accepted signed `sent_at` and the highest clock reading seen; both only move forward.
+     - If the clock reads more than 5 s behind the highest clock of *any* transport, every command is refused as `clock_regression`. Refusal continues until an operator calls `ChannelAuth.reconcile_clock()`, which lowers only the clock mark, never the `sent_at` mark.
+     - A never-seen envelope must be fresh against the clock *and* have `sent_at ≥ max_sent_at − 300 s`. So an envelope whose row was pruned can't be accepted again, whatever the wall clock says.
+     - Pruning removes processed rows with `sent_at < max_sent_at − (2 × 300 s + 60 s)`, never by wall time.
+     - E3 reads `max_skew_s`, `prune_horizon_s`, `clock_tolerance_s` and `high_water(channel)` as read-only values.
+     - Tests:
+       - Dolores's jump-forward-then-roll-back;
+       - a restart from the DB between the jump and the rollback;
+       - a rollback seen on another transport;
+       - operator reconcile;
+       - restoring a DB copy taken after acceptance (`replayed`) and after the jump (`clock_regression`);
+       - a small step back within tolerance;
+       - unchanged forward operation.
+     - **Limit:** restoring a DB copy taken *before* an envelope was first accepted is indistinguishable from first delivery, while the clock is still within 300 s of that envelope. Detecting it needs an external monotonic anchor, such as a signed counter held outside the DB.
    - **Retention.** Vouchers, which carry the verified text for command binding, are released after dispatch and capped at 1024 in memory. Journal rows keep only the digest. Processed rows are pruned after `2 × 300 s + 60 s`, once any replay of them would be rejected as stale anyway. Pending rows are never pruned.
    - A voucher can drive only the command it was minted for. `stop()` needs `/stop`, `ack(nid)` needs `/ack nid`, and `decide(id, approve)` needs `/approve id`. A voucher for `/ack` therefore cannot stop or approve.
    - A boundary test wires a fake Telegram webhook adapter to the router. The adapter checks the webhook secret and signs the envelope. A forged webhook never reaches the router.
@@ -80,6 +94,16 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
    - A `probe()` every `probe_interval_s` (60 s) ends the outage.
    - `watchdog()` reports C3 `stale_backlog` older than 30 min and raises one urgent alert per 30-minute bucket; a later change in the same bucket keeps the first alert.
    - While stopped, outage handling still runs for the `/stop` confirmation only, so it falls back to email if Telegram is down.
+
+## Schema migration (`e1.v0` → `e1.v1`)
+
+- **Trigger.** `e1.v0` is the layout as of `225e7df`, detected column for column. `inbound_seen` gained a required `sent_at` column. The migration runs in `_schema.ensure()`, which every E1 constructor calls, inside **one** `BEGIN IMMEDIATE` transaction.
+- **Failure.** A crash or error rolls everything back. The database stays `e1.v0` with its rows intact, and the next start migrates it cleanly. Startup fails closed with `JournalUnavailable`, so no traffic is routed.
+- **Old processed rows** stay as burned replay records. Their `sent_at` is set to the migration time, which becomes their floor, and they are flagged `migration_flag='sent_at_unknown'`. No envelope time is invented, and they can never become replayable.
+- **Old pending commands (decision: not auto-recovered).** They become `needs_operator`, have no effect, and are listed by `ChannelAuth.needs_operator()`. A redelivery is ignored as `needs_operator`. An operator can only burn one with `burn_needs_operator(channel, update_id)`; it is never executed. I chose this over refusing the migration until they're drained, because a refusal would block `/stop` on the upgraded system.
+- **High-water seed.** The mark is seeded from max(now, latest `processed_at`) under `hw:__migration__`, which applies to every transport's floor and clock check. A pre-migration envelope whose row v0 had already pruned is therefore below the floor (`stale_transport`).
+- **Refused.** An unknown or future version (for example `e1.v9`), and an `e1.v0` database whose tables don't match the `225e7df` layout (for example an earlier unreleased layout). In both cases nothing is changed.
+- **Fidelity check.** The test fixture's `e1.v0` DDL was checked against a database created by the real `225e7df` code: columns, types, NOT NULL, keys, indexes and CHECKs all match. That real database migrates and authenticates normally.
 
 ## Known gaps / decisions for review
 
