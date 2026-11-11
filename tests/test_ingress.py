@@ -38,6 +38,9 @@ from policy import (ALLOW, DENY, TRUSTED_SOURCES, Caller, Capability,  # noqa: E
 from policy._contracts import approval as c0  # noqa: E402
 
 T = 1_800_000_000
+# Leak sentinel: '~' and uppercase Q/Z/X never occur in a UUID, a lowercase hex
+# digest or an ISO timestamp, so a substring match can only be a real leak.
+SENTINEL = "Q~ZX~vault~sentinel~QZX"
 TG_KEY, MAIL_KEY = b"t" * 32, b"m" * 32   # test-only transport keys (E1 c8c8422)
 TASK_ID = "00000000-0000-4000-8000-000000000001"  # canonical UUID (C1 8c6bf28)
 TG_JOSH, TG_CHRISTIE, TG_STRANGER = 1001, 3003, 2002
@@ -477,7 +480,7 @@ class DedupeAndReplay(Fixture):
 
 class TracingAndRedaction(Fixture):
     def test_38_one_trace_per_decision_without_content(self):
-        secret_text = "the vault code is 4242 and my token sk-test-abc"
+        secret_text = f"the vault code is {SENTINEL} and my token sk-test-{SENTINEL}"
         self.gw.ingest_telegram(self.tg(text=secret_text))
         self.gw.ingest_telegram(self.tg(text=secret_text))           # duplicate
         self.gw.ingest_telegram(self.tg(user=TG_STRANGER, msg_id=7, ref="d7"))
@@ -486,8 +489,31 @@ class TracingAndRedaction(Fixture):
         outcomes = [json.loads(t)["potter.outcome"] for t in self.traces]
         self.assertEqual(outcomes, ["accepted", "blocked", "blocked", "blocked"])
         blob = "".join(self.traces) + repr(IngressStore(self.db).log())
-        for leak in ("4242", "sk-test", str(TG_JOSH), str(TG_STRANGER), "milk"):
-            self.assertNotIn(leak, blob)
+        self.assertNotIn(SENTINEL, blob)                 # no message text anywhere
+        # Field-specific: every trace value is a fixed enum, a UUID, a sha256 hex
+        # digest or a timestamp, so no sender reference or text can be present.
+        uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+        shapes = {"schema": {"potter.trace.decision/v0"}, "potter.component": {"task"},
+                  "potter.outcome": {"accepted", "blocked"},
+                  "potter.environment": {"synthetic"}}
+        for line in self.traces:
+            rec = json.loads(line)
+            self.assertEqual(set(rec), {"schema", "task.id", "trace.id", "potter.component",
+                                        "potter.outcome", "potter.decision.digest",
+                                        "potter.environment", "time", "potter.subject.id"})
+            for k, allowed in shapes.items():
+                self.assertIn(rec[k], allowed)
+            for k in ("task.id", "trace.id", "potter.subject.id"):
+                self.assertRegex(rec[k], uuid_re)
+            self.assertRegex(rec["potter.decision.digest"], r"^[0-9a-f]{64}$")
+            self.assertRegex(rec["time"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        for channel, event_id, decision, reason, trust, received_at in IngressStore(self.db).log():
+            self.assertEqual(channel, "telegram")
+            self.assertRegex(event_id, uuid_re)
+            self.assertIn(decision, ("accepted", "rejected"))
+            self.assertIn(reason, REASONS)
+            self.assertIn(trust, ("principal_direct", "untrusted", "none"))
+            self.assertIsInstance(received_at, int)
 
     def test_39_trace_failure_fails_closed_and_records_nothing(self):
         def broken(line):
@@ -982,7 +1008,7 @@ class VoucherLifecycle(Fixture):
     """Dolores review on e2c36bb: E1 vouchers and replay rows minted by ingress
     must have a bounded lifetime and never retain message text."""
 
-    SECRET = "vault code 4242 for the lockbox"
+    SECRET = f"vault code {SENTINEL} for the lockbox"
 
     def setUp(self):
         super().setUp()
@@ -1048,7 +1074,7 @@ class VoucherLifecycle(Fixture):
         self.gw.ack(a.event_id)
         self.gateway(channel_auth=self.spy, clock=lambda: T + 7200).expire_pending(60)
         self.assertEqual(self.gw.pending(), [])
-        self.assertNotIn("4242", self.all_db_text())
+        self.assertNotIn(SENTINEL, self.all_db_text())
         self.assert_no_live_vouchers()
         self.assertIsNotNone(b)
 
@@ -1064,7 +1090,7 @@ class VoucherLifecycle(Fixture):
         self.assertEqual([st for _, st, _ in self.e1_rows()], ["processed"])
         self.assert_no_live_vouchers()
         self.gw.ack(retry.event.event_id)        # the E3 inbox held it only until ack
-        self.assertNotIn("4242", self.all_db_text())
+        self.assertNotIn(SENTINEL, self.all_db_text())
 
     def test_83_e3_voucher_is_not_an_e1_command(self):
         self.gw.ingest_telegram(self.tg(text="/stop"))
