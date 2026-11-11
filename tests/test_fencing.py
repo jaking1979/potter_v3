@@ -997,6 +997,128 @@ class ContractBindsImplementationAndScope(_Tmp):
             self.ext.__class__ = StubConnector
         fenced(self.ext)
 
+    def _rebuilt_with_globals(self, func, **overrides):
+        """The GENUINE code object, re-bound to globals that swap one name."""
+        import types as _t
+        import runtime.fencing as fencing_mod
+        g = dict(vars(fencing_mod))
+        g.update(overrides)
+        return _t.FunctionType(func.__code__, g, func.__name__, func.__defaults__,
+                               func.__closure__)
+
+    def test_boundary_has_no_decorator_closure_left(self):
+        for name in ("boundary", "_tx"):
+            f = vars(EpochAuthority)[name]
+            self.assertIsNone(f.__closure__, name)
+            self.assertFalse(hasattr(f, "__wrapped__"), name)
+
+    def test_boundary_rebuilt_with_swapped_globals_loses_trust(self):
+        """The executed-code variant of the closure-cell attack: genuine
+        boundary code, but its globals resolve _BoundaryTx to a lock-free fake
+        that yields a stale committed epoch."""
+        from runtime.fencing import Epoch
+
+        class FakeBoundary:
+            def __init__(self, authority):
+                self.authority = authority
+
+            def __enter__(self):
+                self.c = self.authority._connect()          # no BEGIN IMMEDIATE
+                return self.c, Epoch(1, "node-a")           # the stale leader's epoch
+
+            def __exit__(self, *exc):
+                self.c.close()
+                return False
+
+        @contextlib.contextmanager
+        def swapped():
+            real = vars(EpochAuthority)["boundary"]
+            EpochAuthority.boundary = self._rebuilt_with_globals(real, _BoundaryTx=FakeBoundary)
+            try:
+                yield
+            finally:
+                EpochAuthority.boundary = real
+        self._late_stale_write_scenario(swapped)
+
+    def test_tx_rebuilt_with_swapped_globals_loses_trust(self):
+        class NoLockTx:
+            def __init__(self, authority):
+                self.authority = authority
+
+            def __enter__(self):
+                self.c = self.authority._connect()          # autocommit, no write lock
+                return self.c
+
+            def __exit__(self, *exc):
+                self.c.close()
+                return False
+
+        @contextlib.contextmanager
+        def swapped():
+            real = vars(EpochAuthority)["_tx"]
+            EpochAuthority._tx = self._rebuilt_with_globals(real, _AuthorityTx=NoLockTx)
+            try:
+                yield
+            finally:
+                EpochAuthority._tx = real
+        self._late_stale_write_scenario(swapped, stale_write_lands=False)
+
+    def test_closure_cell_swaps_are_detected(self):
+        import runtime.fencing as fencing_mod
+        # 1. the orchestrator's exact pattern, on a contextmanager wrapper
+        @contextlib.contextmanager
+        def reviewed():
+            yield "genuine"
+
+        def evil():
+            yield "fake"
+        self.assertIs(fencing_mod._unwrap_reviewed(reviewed, "reviewed"), reviewed.__wrapped__)
+        reviewed.__closure__[0].cell_contents = evil
+        with self.assertRaisesRegex(BoundaryVerificationError, "other than __wrapped__"):
+            fencing_mod._unwrap_reviewed(reviewed, "reviewed")
+        # 2. a source method's __class__ cell, and 3. a generated method's cell
+        from runtime.fencing import FencingToken, NodeNotActive
+        targets = [NodeNotActive.__init__, FencingToken.__setattr__]
+        for f in targets:
+            i = f.__code__.co_freevars.index("__class__" if "__class__" in f.__code__.co_freevars
+                                              else "cls")
+            cell = f.__closure__[i]
+            real = cell.cell_contents
+            cell.cell_contents = ValueError
+            try:
+                with self.assertRaises(BoundaryVerificationError, msg=f.__qualname__):
+                    fenced(self.ext)
+            finally:
+                cell.cell_contents = real
+        fenced(self.ext)
+
+    def test_defaults_mutations_are_detected(self):
+        import runtime.fencing as fencing_mod
+        from runtime.fencing import FencedBoundaryContract as FBC, FencingToken
+        cases = [
+            (StubConnector.__init__, "__kwdefaults__", {"identity": "evil.gateway"}),
+            (Node.require_active, "__defaults__", (FencingToken("x", 99),)),
+            (FencedEffects.execute, "__kwdefaults__", {"now": 0.0}),
+            (FBC.__init__, "__defaults__", ("a weaker guarantee",)),
+        ]
+        for f, attr, value in cases:
+            real = getattr(f, attr)
+            setattr(f, attr, value)
+            try:
+                with self.assertRaises(BoundaryVerificationError, msg=f"{f.__qualname__}.{attr}"):
+                    fenced(self.ext)
+            finally:
+                setattr(f, attr, real)
+        kw = fencing_mod.EpochAuthority.__init__.__kwdefaults__   # in-place mutation
+        real_clock = kw["clock"]
+        kw["clock"] = lambda: 0.0
+        try:
+            with self.assertRaises(BoundaryVerificationError):
+                fenced(self.ext)
+        finally:
+            kw["clock"] = real_clock
+        fenced(self.ext)
+
     def test_instance_callables_and_collaborator_tampering_lose_trust(self):
         cases = []
 

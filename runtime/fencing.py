@@ -147,6 +147,68 @@ def owner_epoch(owner: str | None) -> int:
     return int(m.group(1)) if m else 0
 
 
+class _AuthorityTx:
+    """``BEGIN IMMEDIATE`` on the authority DB. A plain class rather than a
+    ``contextmanager`` generator, so the code that runs is exactly the code
+    the boundary verifier checks (no decorator closure in between)."""
+
+    def __init__(self, authority: "EpochAuthority"):
+        self._authority = authority
+        self._conn: sqlite3.Connection | None = None
+
+    def __enter__(self) -> sqlite3.Connection:
+        c = self._authority._connect()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            c.close()
+            raise
+        self._conn = c
+        return c
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        c, self._conn = self._conn, None
+        try:
+            c.execute("COMMIT" if exc_type is None else "ROLLBACK")
+        finally:
+            c.close()
+        return False
+
+
+class _BoundaryTx:
+    """The authority's boundary transaction: ``_AuthorityTx`` plus the
+    committed epoch read inside it; sqlite errors surface as
+    ``AuthorityUnavailable``."""
+
+    def __init__(self, authority: "EpochAuthority"):
+        self._tx = _AuthorityTx(authority)
+
+    def __enter__(self) -> tuple[sqlite3.Connection, "Epoch"]:
+        try:
+            c = self._tx.__enter__()
+        except sqlite3.Error as exc:
+            raise AuthorityUnavailable(f"epoch authority boundary failed: {exc}") from exc
+        try:
+            row = c.execute("SELECT epoch, holder FROM authority WHERE id = 1").fetchone()
+            if row is None:
+                raise AuthorityUnavailable("epoch authority has no row")
+            return c, Epoch(int(row[0]), row[1])
+        except BaseException as exc:
+            self._tx.__exit__(type(exc), exc, exc.__traceback__)
+            if isinstance(exc, sqlite3.Error):
+                raise AuthorityUnavailable(f"epoch authority boundary failed: {exc}") from exc
+            raise
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            self._tx.__exit__(exc_type, exc, tb)
+        except sqlite3.Error as err:
+            raise AuthorityUnavailable(f"epoch authority boundary failed: {err}") from err
+        if exc_type is not None and issubclass(exc_type, sqlite3.Error):
+            raise AuthorityUnavailable(f"epoch authority boundary failed: {exc}") from exc
+        return False
+
+
 class EpochAuthority:
     """Monotonic epoch with compare-and-set promotion, in one SQLite file."""
 
@@ -175,36 +237,19 @@ class EpochAuthority:
         c.execute("PRAGMA synchronous=FULL")
         return c
 
-    @contextlib.contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
-        c = self._connect()
-        try:
-            c.execute("BEGIN IMMEDIATE")
-            try:
-                yield c
-            except BaseException:
-                c.execute("ROLLBACK")
-                raise
-            c.execute("COMMIT")
-        finally:
-            c.close()
+    def _tx(self) -> "_AuthorityTx":
+        """One ``BEGIN IMMEDIATE`` write transaction (committed only if the
+        block completes)."""
+        return _AuthorityTx(self)
 
-    @contextlib.contextmanager
-    def boundary(self) -> Iterator[tuple[sqlite3.Connection, Epoch]]:
+    def boundary(self) -> "_BoundaryTx":
         """One ``BEGIN IMMEDIATE`` transaction on the authority DB, with the
         committed epoch read inside it. :meth:`promote` takes the same write
         lock, so whatever runs in this block linearizes with promotion: no
         promotion can commit between the epoch read and the block's commit.
         The external boundary (:class:`StubConnector`) keeps its state in this
-        DB and checks + applies here."""
-        try:
-            with self._tx() as c:
-                row = c.execute("SELECT epoch, holder FROM authority WHERE id = 1").fetchone()
-                if row is None:
-                    raise AuthorityUnavailable("epoch authority has no row")
-                yield c, Epoch(int(row[0]), row[1])
-        except sqlite3.Error as exc:
-            raise AuthorityUnavailable(f"epoch authority boundary failed: {exc}") from exc
+        DB and checks + applies here. Yields ``(connection, Epoch)``."""
+        return _BoundaryTx(self)
 
     def current(self) -> Epoch:
         try:
@@ -659,6 +704,173 @@ def _verify_manifest(mod: types.ModuleType, modname: str, source: bytes) -> None
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             _verify_class_manifest(live.get(node.name), node, mod, trusted)
+    _verify_function_objects(mod, tree, trusted)
+
+
+# ----- function objects: what actually runs is code + globals + closure + defaults
+
+def _first_line(node: ast.AST) -> int:
+    return min([node.lineno, *[d.lineno for d in getattr(node, "decorator_list", [])]])
+
+
+def _expected_defaults(node: ast.FunctionDef, mod: types.ModuleType,
+                       scope: dict[str, Any]) -> tuple[tuple, dict]:
+    try:
+        pos = tuple(_static_value(d, mod, scope) for d in node.args.defaults)
+        kw = {a.arg: _static_value(d, mod, scope)
+              for a, d in zip(node.args.kwonlyargs, node.args.kw_defaults) if d is not None}
+    except _Unverifiable as exc:
+        raise BoundaryVerificationError(f"default of {node.name} cannot be verified: {exc}") from exc
+    return pos, kw
+
+
+def _same_defaults(f: Any, pos: tuple, kw: dict) -> bool:
+    live_pos = f.__defaults__ or ()
+    live_kw = f.__kwdefaults__ or {}
+    return (len(live_pos) == len(pos) and all(_same_value(a, b) for a, b in zip(live_pos, pos))
+            and set(live_kw) == set(kw) and all(_same_value(live_kw[k], kw[k]) for k in kw))
+
+
+def _cell_values(f: Any, what: str) -> list[tuple[str, Any]]:
+    cells = f.__closure__ or ()
+    if len(cells) != len(f.__code__.co_freevars):
+        raise BoundaryVerificationError(f"{what}: closure does not match its code")
+    out = []
+    for name, cell in zip(f.__code__.co_freevars, cells):
+        try:
+            out.append((name, cell.cell_contents))
+        except ValueError:
+            raise BoundaryVerificationError(f"{what}: empty closure cell {name!r}") from None
+    return out
+
+
+def _check_source_function(f: Any, node: ast.FunctionDef, cls: type | None,
+                           mod: types.ModuleType, scope: dict[str, Any], what: str) -> None:
+    """A source-defined function: globals are the module's, the only closure
+    cell is the ``__class__`` cell holding the owning class, and the defaults
+    equal the source's default expressions."""
+    if f.__globals__ is not vars(mod):
+        raise BoundaryVerificationError(f"{what}: globals are not the module's")
+    for name, value in _cell_values(f, what):
+        if not (name == "__class__" and cls is not None and value is cls):
+            raise BoundaryVerificationError(f"{what}: unexpected closure cell {name!r}")
+    if not _same_defaults(f, *_expected_defaults(node, mod, scope)):
+        raise BoundaryVerificationError(f"{what}: defaults differ from the reviewed source")
+
+
+def _unwrap_reviewed(f: Any, what: str) -> Any:
+    """contextlib.contextmanager wrappers run the function in their single
+    ``func`` closure cell, NOT ``__wrapped__``: that cell must hold exactly the
+    wrapped (and separately verified) function."""
+    inner = getattr(f, "__wrapped__", None)
+    if inner is None:
+        return f
+    if f.__code__ != _CONTEXTMANAGER_HELPER or f.__globals__ is not vars(contextlib) \
+            or f.__defaults__ or f.__kwdefaults__:
+        raise BoundaryVerificationError(f"{what}: wrapped by an unreviewed decorator")
+    cells = _cell_values(f, what)
+    if len(cells) != 1 or cells[0][0] != "func" or cells[0][1] is not inner:
+        raise BoundaryVerificationError(f"{what}: the wrapper runs something other than __wrapped__")
+    return inner
+
+
+def _generated_globals_ok(f: Any, mod: types.ModuleType) -> bool:
+    origin = f.__code__.co_filename
+    if origin == "<string>":
+        return f.__globals__ is vars(mod)
+    for m in (dataclasses, reprlib, typing):
+        if os.path.realpath(origin) == os.path.realpath(m.__file__):
+            return f.__globals__ is vars(m)
+    return False
+
+
+def _generated_cell_ok(name: str, value: Any, cls: type) -> bool:
+    if name in ("__class__", "cls"):
+        return value is cls
+    if name == "__dataclass_builtins_object__":
+        return value is builtins.object
+    if name == "FrozenInstanceError":
+        return value is dataclasses.FrozenInstanceError
+    if name == "fillvalue":
+        return type(value) is str and value == "..."
+    if name == "repr_running":
+        return type(value) is set
+    return False
+
+
+def _check_generated(f: Any, cls: type, name: str, mod: types.ModuleType,
+                     class_defaults: list[Any], what: str) -> None:
+    """A method the class machinery generated: expected globals for its origin,
+    only the known cells (with their expected values), and no defaults except
+    a dataclass ``__init__``'s, which must be the class's source defaults."""
+    if not _generated_globals_ok(f, mod):
+        raise BoundaryVerificationError(f"{what}: generated method has unexpected globals")
+    for cell, value in _cell_values(f, what):
+        if cell == "user_function":
+            if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<string>"):
+                raise BoundaryVerificationError(f"{what}: unexpected repr target")
+            _check_generated(value, cls, name, mod, [], what + " [inner]")
+        elif not _generated_cell_ok(cell, value, cls):
+            raise BoundaryVerificationError(f"{what}: unexpected closure cell {cell!r}")
+    values = list(f.__defaults__ or ()) + list((f.__kwdefaults__ or {}).values())
+    if name == "__init__" and dataclasses.is_dataclass(cls):
+        sentinel = getattr(dataclasses, "_HAS_DEFAULT_FACTORY", None)
+        for v in values:
+            if not (v is sentinel or any(_same_value(v, d) for d in class_defaults)):
+                raise BoundaryVerificationError(f"{what}: generated default differs from the source")
+    elif values:
+        raise BoundaryVerificationError(f"{what}: generated method has unexpected defaults")
+
+
+def _verify_function_objects(mod: types.ModuleType, tree: ast.Module,
+                             trusted: dict[str, Any]) -> None:
+    live = vars(mod)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            f = live.get(node.name)
+            if not isinstance(f, types.FunctionType):
+                raise BoundaryVerificationError(f"function {node.name} is missing")
+            f = _unwrap_reviewed(f, node.name)
+            _check_source_function(f, node, None, mod, trusted, node.name)
+        elif isinstance(node, ast.ClassDef):
+            cls = live.get(node.name)
+            scope = dict(trusted)                 # class-body scope for method defaults
+            class_defaults: list[Any] = []
+            for b in node.body:
+                if isinstance(b, (ast.Assign, ast.AnnAssign)) and b.value is not None:
+                    try:
+                        val = _static_value(b.value, mod, scope)
+                    except _Unverifiable:
+                        continue
+                    class_defaults.append(val)
+                    targets = b.targets if isinstance(b, ast.Assign) else [b.target]
+                    for t in targets:
+                        if isinstance(t, ast.Name):
+                            scope[t.id] = val
+            defined = set()
+            for b in node.body:
+                if not isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                defined.add(b.name)
+                v = vars(cls).get(b.name)
+                parts = ([v] if isinstance(v, types.FunctionType)
+                         else [v.__func__] if isinstance(v, (staticmethod, classmethod))
+                         else [x for x in (v.fget, v.fset, v.fdel) if x is not None]
+                         if isinstance(v, property) else [])
+                what = f"{node.name}.{b.name}"
+                matched = False
+                for part in parts:
+                    part = _unwrap_reviewed(part, what)
+                    if part.__code__.co_firstlineno == _first_line(b):
+                        _check_source_function(part, b, cls, mod, scope, what)
+                        matched = True
+                if not matched:
+                    raise BoundaryVerificationError(f"{what}: reviewed definition not found")
+            for key, v in vars(cls).items():
+                if key in defined:
+                    continue
+                if isinstance(v, types.FunctionType):
+                    _check_generated(v, cls, key, mod, class_defaults, f"{node.name}.{key}")
 
 
 def _verify_class_manifest(cls: Any, node: ast.ClassDef, mod: types.ModuleType,
