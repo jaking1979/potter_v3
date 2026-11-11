@@ -7,7 +7,7 @@ The agreed preparation protocol is not a ratified acceptance rule.
 from .wilson import wilson_95
 
 
-def summarize(planned_ids, classifications):
+def _summarize_dimension(planned_ids, classifications):
     """Use every planned case once; affected means missing/duplicate/unalignable.
 
     More than 10% affected cases prevents calculation of a score. The caller
