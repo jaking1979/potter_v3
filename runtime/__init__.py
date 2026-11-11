@@ -4,10 +4,18 @@ nothing here performs a real external effect; callers inject perform/reconcile."
 from .approval_ledger import JournalApprovalLedger
 from .db import Database, JournalUnavailable
 from .effects import (EFFECT_NAMESPACE, FAILED as EFFECT_FAILED, PENDING, STILL_UNKNOWN,
-                      SUCCEEDED, UNKNOWN, Effect, ConnectorContract, EffectConflict, EffectError, EffectFailed,
-                      EffectInFlight, EffectJournal, EffectOutcomeUnknown, TrustedIdempotentRegistry,
-                      adapter_name,
-                      idempotency_key)
+                      SUCCEEDED, UNKNOWN, ConnectorContract, Effect, EffectConflict, EffectError,
+                      EffectFailed, EffectInFlight, EffectJournal, EffectOutcomeUnknown,
+                      TrustedIdempotentRegistry, adapter_name, idempotency_key)
+from .fencing import (ACTIVE, FENCED, NODE_STATES, PAUSED, AuthorityUnavailable, Epoch,
+                      BoundaryVerificationError, EpochAuthority, FencedBoundaryContract,
+                      FencedBoundaryRegistry, FencingScope, authority_scope_id,
+                      boundary_artifact_digest, current_fencing_scope,
+                      verify_boundary_implementation,
+                      FencedEffects, FencingError, FencingToken,
+                      FileCopyReplicator, Node, NodeNotActive, Observation, PromotionConflict,
+                      Replicator, StaleEpoch, StaleEpochRefused, StubConnector,
+                      UnresolvedEffects, owner_epoch)
 from .outbox import (ABANDONED_UNKNOWN, ACKED, OUTBOX_NAMESPACE, ROUTINE, SENT, SUPPRESSED,
                      URGENT, Outbox, OutboxConflict, OutboxError, OutboxMessage, QueuedMessage,
                      RelayReport, SendFailed, outbox_idempotency_key)
