@@ -97,13 +97,13 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
 
 ## Schema migration (`e1.v0` → `e1.v1`)
 
-- **Trigger.** `e1.v0` is the layout as of `225e7df`, detected column for column. `inbound_seen` gained a required `sent_at` column. The migration runs in `_schema.ensure()`, which every E1 constructor calls, inside **one** `BEGIN IMMEDIATE` transaction.
+- **Trigger.** `e1.v0` is the exact schema as of `225e7df`. That text is stored verbatim as `_schema.V0_SCHEMA`, and a test checks it against `git show 225e7df` when the commit is available. Before migrating, every table, index, trigger and view on the five `e1.v0` tables is compared with the catalog `V0_SCHEMA` produces, as normalized `sqlite_master` SQL with autoindexes included. So types, NOT NULL, primary keys, CHECK constraints and indexes must all match. `inbound_seen` gained a required `sent_at` column. The migration runs in `_schema.ensure()`, which every E1 constructor calls, inside **one** `BEGIN IMMEDIATE` transaction.
 - **Failure.** A crash or error rolls everything back. The database stays `e1.v0` with its rows intact, and the next start migrates it cleanly. Startup fails closed with `JournalUnavailable`, so no traffic is routed.
 - **Old processed rows** stay as burned replay records. Their `sent_at` is set to the migration time, which becomes their floor, and they are flagged `migration_flag='sent_at_unknown'`. No envelope time is invented, and they can never become replayable.
 - **Old pending commands (decision: not auto-recovered).** They become `needs_operator`, have no effect, and are listed by `ChannelAuth.needs_operator()`. A redelivery is ignored as `needs_operator`. An operator can only burn one with `burn_needs_operator(channel, update_id)`; it is never executed. I chose this over refusing the migration until they're drained, because a refusal would block `/stop` on the upgraded system.
 - **High-water seed.** The mark is seeded from max(now, latest `processed_at`) under `hw:__migration__`, which applies to every transport's floor and clock check. A pre-migration envelope whose row v0 had already pruned is therefore below the floor (`stale_transport`).
-- **Refused.** An unknown or future version (for example `e1.v9`), and an `e1.v0` database whose tables don't match the `225e7df` layout (for example an earlier unreleased layout). In both cases nothing is changed.
-- **Fidelity check.** The test fixture's `e1.v0` DDL was checked against a database created by the real `225e7df` code: columns, types, NOT NULL, keys, indexes and CHECKs all match. That real database migrates and authenticates normally.
+- **Refused.** An unknown or future version (for example `e1.v9`), and any `e1.v0` schema that differs from `V0_SCHEMA`. That includes an altered CHECK, a dropped NOT NULL, a changed primary key, a changed type, an extra or missing index, or an extra trigger. In every case nothing is changed: the version, the schema text and the rows are all untouched, which the tests verify.
+- **Fidelity.** The test fixture is generated from `V0_SCHEMA` itself, so it can't drift. A database created by the real `225e7df` code was also checked: it matches and migrates normally.
 
 ## Known gaps / decisions for review
 

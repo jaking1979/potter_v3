@@ -1752,27 +1752,11 @@ class ClockRollback(_Reopen):
 
 # ============================================================ schema migration e1.v0 -> e1.v1 (Dolores @ c23ecd9)
 
-V0_DDL = (   # exact e1.v0 notifier tables as of 225e7df
-    """CREATE TABLE notifier_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)""",
-    """CREATE TABLE approval_requests (approval_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
-        action_hash TEXT NOT NULL, action_canonical TEXT NOT NULL, capability TEXT NOT NULL,
-        screenshot_ref TEXT, notification_id TEXT NOT NULL, requested_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL, status TEXT NOT NULL CHECK (status IN
-        ('pending','approved','denied','expired','voided','cancelled')), nonce TEXT UNIQUE,
-        decided_at INTEGER, decided_channel TEXT, status_reason TEXT, record TEXT)""",
-    "CREATE INDEX approval_requests_task ON approval_requests (task_id, status)",
-    """CREATE TABLE notifier_sending (message_id TEXT NOT NULL, dispatch INTEGER NOT NULL,
-        owner TEXT NOT NULL, since REAL NOT NULL, status TEXT NOT NULL CHECK (status IN
-        ('gated','dispatching','unknown')), dispatched_at REAL,
-        PRIMARY KEY (message_id, dispatch))""",
-    """CREATE TABLE inbound_seen (channel TEXT NOT NULL, update_id TEXT NOT NULL,
-        at REAL NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending','processed')),
-        principal TEXT, envelope_digest TEXT NOT NULL, processed_at REAL,
-        PRIMARY KEY (channel, update_id))""",
-    """CREATE TABLE inbound_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL,
-        channel TEXT NOT NULL, sender_ref TEXT NOT NULL, outcome TEXT NOT NULL,
-        reason TEXT NOT NULL)""",
-)
+def _v0_ddl():
+    """The e1.v0 fixture is generated from the accepted schema text itself
+    (``_schema.V0_SCHEMA``, verbatim from 225e7df), so it cannot drift."""
+    from notifier import _schema
+    return tuple(_schema.V0_SCHEMA)
 
 
 class SchemaMigration(unittest.TestCase):
@@ -1786,13 +1770,13 @@ class SchemaMigration(unittest.TestCase):
         _schema._MIGRATION_FAULT = None
         self._tmp.cleanup()
 
-    def make_v0(self, rows=()):
+    def make_v0(self, rows=(), ddl=None):
         """A database as 225e7df left it: C2/C3 tables, e1.v0 notifier tables, rows."""
         from runtime import Outbox
         db = Database(self.path)
         Outbox(db)
         with db.tx() as c:
-            for stmt in V0_DDL:
+            for stmt in (ddl if ddl is not None else _v0_ddl()):
                 c.execute(stmt)
             c.execute("INSERT INTO meta (key, value) VALUES ('notifier_schema', 'e1.v0')")
             for r in rows:
@@ -1908,6 +1892,83 @@ class SchemaMigration(unittest.TestCase):
         with self.assertRaises(JournalUnavailable):
             self.open_world()
         self.assertEqual(self.schema_version(), "e1.v0")
+
+    def test_v0_schema_text_is_verbatim_from_225e7df(self):
+        import ast
+        import subprocess
+        try:
+            src = subprocess.run(["git", "-C", str(ROOT), "show", "225e7df:notifier/_schema.py"],
+                                 capture_output=True, text=True, check=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("225e7df not available in this checkout (shallow clone)")
+        tree = ast.parse(src)
+        real = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                    and getattr(n.targets[0], "id", "") == "SCHEMA")
+        self.assertEqual(tuple(real), _v0_ddl())
+
+    def assertRefusedUntouched(self, ddl, why):
+        from runtime import JournalUnavailable
+        stop = self.envelope("/stop", "old-x")
+        self.make_v0(ddl=ddl)
+        with Database(self.path).tx() as c:
+            c.execute("INSERT INTO inbound_seen (channel, update_id, at, status, principal,"
+                      " envelope_digest, processed_at) VALUES (?,?,?,?,?,?,?)",
+                      self.v0_row(stop, "processed"))
+        with Database(self.path).read() as c:
+            before = sorted(c.execute("SELECT type, name, sql FROM sqlite_master"
+                                      " WHERE name NOT LIKE 'sqlite_%'").fetchall(), key=str)
+        with self.assertRaises(JournalUnavailable, msg=why):
+            self.open_world()
+        self.assertEqual(self.schema_version(), "e1.v0", why)
+        with Database(self.path).read() as c:
+            after = sorted(c.execute("SELECT type, name, sql FROM sqlite_master"
+                                     " WHERE name NOT LIKE 'sqlite_%'").fetchall(), key=str)
+            n = c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0]
+        self.assertEqual(after, before, f"{why}: schema changed")   # no partial migration
+        self.assertEqual(n, 1, why)
+
+    def variant(self, table, old, new):
+        ddl, hits = [], 0
+        for stmt in _v0_ddl():
+            if f"TABLE IF NOT EXISTS {table} " in stmt and old in stmt:
+                stmt, hits = stmt.replace(old, new, 1), hits + 1
+            ddl.append(stmt)
+        self.assertEqual(hits, 1, f"variant {table}: {old!r} not found")
+        return tuple(ddl)
+
+    def test_altered_check_constraint_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "('pending','processed')", "('pending','processed','other')"),
+            "CHECK allows a third status")
+
+    def test_dropped_not_null_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "envelope_digest TEXT NOT NULL", "envelope_digest TEXT"),
+            "NOT NULL dropped")
+
+    def test_changed_primary_key_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "PRIMARY KEY (channel, update_id)", "PRIMARY KEY (update_id, channel)"),
+            "primary key changed")
+
+    def test_changed_type_is_refused(self):
+        self.assertRefusedUntouched(self.variant(
+            "inbound_seen", "at REAL NOT NULL", "at TEXT NOT NULL"), "column type changed")
+
+    def test_extra_index_is_refused(self):
+        self.assertRefusedUntouched(
+            _v0_ddl() + ("CREATE INDEX inbound_seen_extra ON inbound_seen (status)",),
+            "extra index")
+
+    def test_missing_index_is_refused(self):
+        self.assertRefusedUntouched(
+            tuple(st for st in _v0_ddl() if "approval_requests_task" not in st),
+            "missing index")
+
+    def test_extra_trigger_is_refused(self):
+        self.assertRefusedUntouched(_v0_ddl() + (
+            "CREATE TRIGGER inbound_seen_t AFTER INSERT ON inbound_seen BEGIN SELECT 1; END",),
+            "extra trigger")
 
     def test_fresh_database_starts_at_v1_and_reopen_is_idempotent(self):
         w = self.open_world()
