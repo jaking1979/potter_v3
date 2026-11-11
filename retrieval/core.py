@@ -65,7 +65,8 @@ async def _bounded(backend: Backend, query: str, timeout: float):
         try:
             raw = task.result()
             items = tuple(raw)
-            if any(not isinstance(item, Evidence) or not item.item_id for item in items):
+            if any(not isinstance(item, Evidence) or type(item.item_id) is not str
+                   or not item.item_id or type(item.text) is not str for item in items):
                 raise ValueError('invalid evidence')
             if time.monotonic() - start >= timeout:
                 return 'deadline', (), time.monotonic() - start

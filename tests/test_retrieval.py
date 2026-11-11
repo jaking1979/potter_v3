@@ -6,6 +6,17 @@ from retrieval.core import Evidence, FakeBackend, benchmark, retrieve_turn
 
 
 class RetrievalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_evidence_fields_are_unavailable(self):
+        for item in (Evidence(['unhashable'], 'text'), Evidence(1, 'text'),
+                     Evidence('id', None), Evidence('id', {'body': 'object'})):
+            with self.subTest(item=item):
+                result = await retrieve_turn(FakeBackend([item]), 'q', consequential=True)
+                self.assertEqual((result.status, result.items, result.blocked),
+                                 ('unavailable', (), True))
+                scored = await benchmark(FakeBackend([item]), 'q', ['id'])
+                self.assertEqual((scored.status, scored.top_ids, scored.hit),
+                                 ('unavailable', (), False))
+
     async def test_blocking_backend_cannot_return_late_turn_or_benchmark(self):
         class Blocking:
             async def search(self, query):
