@@ -80,13 +80,14 @@ def render(view):
          '<a href="#main">Skip to status</a><main id="main"><h1>Potter Home</h1>',
          '<p>Offline read-only preview. Approval and recovery actions are unavailable here. ',
          'Use the established authenticated channel for decisions.</p>',
-         '<p>This view does not prove that a service or host is reachable.</p>']
+         '<p>This view does not prove that a service or host is reachable.</p>',
+         '<p>Snapshot generated at '+escape(clean['generated_at'])+'. This page does not update automatically; refresh to check current status.</p>']
     for name,s in clean['sections'].items():
         out.append('<section aria-labelledby="'+name+'"><h2 id="'+name+'">'+name.title()+'</h2>')
         if s['availability']=='unavailable':
             out.append('<p>Unavailable. State age unknown. Other available sections remain readable. No action is enabled.</p>')
         else:
-            label='Stale' if s['stale'] else 'Snapshot within five minutes'
+            label='Stale at generation' if s['stale'] else 'Within five minutes at generation'
             out.append('<p>'+label+'. Snapshot age: '+str(s['age_s'])+' seconds.</p>')
             if not s['items']: out.append('<p>No items in this snapshot.</p>')
             else:
