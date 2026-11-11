@@ -13,7 +13,7 @@ results · long-work state · escalations · watchdog ─▶ E1 JobHandle (enque
 | --- | --- |
 | `definitions.py` | `Responsibility(id, trigger, delivery, steps, cadence_s, …)`. The trigger is `Schedule(every_s)` or `Event(topic, key fields)`. Delivery is `"josh"` or `"silent"`. Each `Step` names a C1 capability, its bound action (static, or a deterministic builder over the payload and earlier results) and a connector identity. |
 | `runner.py` | `ResponsibilityRunner`: `tick`, `on_event`, `run_once` / `run_pending`, `poll_approvals`, `live_action` (for E1's `CommandRouter`), `watchdog` and `recover`. |
-| `_schema.py` | `responsibility_state` holds the schedule watermarks. `responsibility_progress` holds the long-work start time and the ticks sent. The layout is pinned by `meta.responsibilities_schema=e2.v1` (`e2.v0` upgrades in place). |
+| `_schema.py` | `responsibility_state` holds the schedule watermarks. `responsibility_progress` holds the long-work start time and the ticks sent. `responsibility_approvals` claims the one E1 approval request per (task, action hash). The layout is pinned by `meta.responsibilities_schema=e2.v1` (`e2.v0` upgrades in place). |
 
 ## How each requirement is met
 
