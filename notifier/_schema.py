@@ -130,7 +130,10 @@ def _catalog(c: sqlite3.Connection) -> set:
     tables, indexes, triggers and views, whatever table they hang off, with
     their exact stored SQL (no normalization)."""
     return {tuple(r) for r in c.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+        # Exact prefix test: in LIKE, '_' is a wildcard (and LIKE ignores case),
+        # so "NOT LIKE 'sqlite_%'" would hide e.g. a view named sqliteXleak.
+        "SELECT type, name, tbl_name, sql FROM sqlite_master"
+        " WHERE substr(name, 1, 7) <> 'sqlite_'")}
 
 
 def _expected_v0_catalog() -> set:

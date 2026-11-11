@@ -1916,13 +1916,13 @@ class SchemaMigration(unittest.TestCase):
                       self.v0_row(stop, "processed"))
         with Database(self.path).read() as c:
             before = sorted(c.execute("SELECT type, name, sql FROM sqlite_master"
-                                      " WHERE name NOT LIKE 'sqlite_%'").fetchall(), key=str)
+                                      " WHERE substr(name, 1, 7) <> 'sqlite_'").fetchall(), key=str)
         with self.assertRaises(JournalUnavailable, msg=why):
             self.open_world()
         self.assertEqual(self.schema_version(), "e1.v0", why)
         with Database(self.path).read() as c:
             after = sorted(c.execute("SELECT type, name, sql FROM sqlite_master"
-                                     " WHERE name NOT LIKE 'sqlite_%'").fetchall(), key=str)
+                                     " WHERE substr(name, 1, 7) <> 'sqlite_'").fetchall(), key=str)
             n = c.execute("SELECT COUNT(*) FROM inbound_seen").fetchone()[0]
         self.assertEqual(after, before, f"{why}: schema changed")   # no partial migration
         self.assertEqual(n, 1, why)
@@ -1989,6 +1989,16 @@ class SchemaMigration(unittest.TestCase):
         self.assertRefusedUntouched(_v0_ddl() + (
             "CREATE TRIGGER outbox_leak AFTER INSERT ON outbox BEGIN"
             " DELETE FROM inbound_seen; END",), "trigger on outbox touching inbound_seen")
+
+    def test_view_named_like_an_internal_object_is_refused(self):
+        # '_' is a LIKE wildcard: sqliteXleak must not be mistaken for sqlite_*.
+        for name in ("sqliteXleak", "SQLITEXleak", "sqlite"):
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.assertRefusedUntouched(
+                    _v0_ddl() + (f"CREATE VIEW {name} AS SELECT * FROM inbound_seen",),
+                    f"view {name}")
 
     def test_extra_unrelated_table_is_refused(self):
         self.assertRefusedUntouched(
