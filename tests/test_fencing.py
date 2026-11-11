@@ -871,6 +871,132 @@ class ContractBindsImplementationAndScope(_Tmp):
             del self.ext.apply
         self.assertEqual(self.ext.count(), 0)
 
+    def test_getattribute_descriptor_takeover_loses_trust(self):
+        """Dolores's bypass at 344ca26: a NON-callable descriptor installed as
+        StubConnector.__getattribute__ resolves self.apply to a token-ignoring
+        callable while perform, apply and the file are untouched."""
+        class D:
+            def __get__(self, obj, owner=None):
+                def lookup(name):
+                    if name == "apply":
+                        return lambda key, token: _token_ignoring_apply(obj, key, token)
+                    return object.__getattribute__(obj, name)
+                return lookup
+
+        @contextlib.contextmanager
+        def descriptor_installed():
+            self.assertFalse(callable(D()))
+            StubConnector.__getattribute__ = D()
+            try:
+                yield
+            finally:
+                del StubConnector.__getattribute__
+        with descriptor_installed():                    # the bypass is real
+            probe = StubConnector(self.auth)
+            self.assertIsNot(type(probe).__dict__.get("apply"), None)
+            self.assertNotEqual(getattr(probe.apply, "__name__", ""), "apply")
+        self._late_stale_write_scenario(descriptor_installed)
+
+    def test_late_writes_after_verification_lose_trust(self):
+        import runtime.fencing as fencing_mod
+        reg = fenced(self.ext)
+        a = Node("node-a", self.auth, self.p.a, boundaries=reg)
+        a.promote()
+        a.unpause(self.ext.reconcile)
+        contract = reg[self.ext.identity]
+        self.assertIsNone(a._contract_problem(contract))
+
+        class FakeEvent:
+            def wait(self, timeout=None):
+                return True
+        writes = [
+            ("class attribute", lambda: setattr(StubConnector, "extra", 1),
+             lambda: delattr(StubConnector, "extra")),
+            ("module value", lambda: setattr(fencing_mod, "_GATE_TYPES",
+                                             fencing_mod._GATE_TYPES + (FakeEvent,)),
+             None),
+            ("snapshotted value", lambda: setattr(fencing_mod, "_CONTEXTMANAGER_HELPER",
+                                                  (lambda: 0).__code__), None),
+            ("module attribute", lambda: setattr(fencing_mod, "_helper", 1),
+             lambda: delattr(fencing_mod, "_helper")),
+        ]
+        for label, do, undo in writes:
+            name = {"module value": "_GATE_TYPES",
+                    "snapshotted value": "_CONTEXTMANAGER_HELPER"}.get(label)
+            saved = getattr(fencing_mod, name) if name else None
+            do()
+            try:
+                self.assertIsNotNone(a._contract_problem(contract), label)
+                eff = a.journal.record_intent(TASK, f"late-{label}", action())
+                with self.assertRaises(EffectConflict, msg=label):
+                    FencedEffects(a).execute(eff.idempotency_key, self.ext.perform,
+                                             self.ext.reconcile, connector=self.ext.identity)
+            finally:
+                if undo:
+                    undo()
+                else:
+                    setattr(fencing_mod, name, saved)
+        self.assertIsNone(a._contract_problem(contract))       # genuine again
+        self.assertEqual(self.ext.count(), 0)
+
+    def test_base_swap_loses_trust(self):
+        from runtime.fencing import StaleEpoch, StaleEpochRefused
+
+        class EvilStale(StaleEpoch):
+            pass
+        original = StaleEpochRefused.__bases__
+        StaleEpochRefused.__bases__ = (EvilStale,)
+        try:
+            with self.assertRaisesRegex(BoundaryVerificationError, "bases were swapped"):
+                fenced(self.ext)
+        finally:
+            StaleEpochRefused.__bases__ = original
+        fenced(self.ext)
+
+    def test_metaclass_swap_loses_trust(self):
+        import runtime.fencing as fencing_mod
+
+        class Meta(type):
+            pass
+        real = fencing_mod.StubConnector
+        ns = {k: v for k, v in vars(real).items() if k not in ("__dict__", "__weakref__")}
+        swapped = Meta("StubConnector", real.__bases__, ns)
+        swapped.__module__, swapped.__qualname__ = real.__module__, real.__qualname__
+        fencing_mod.StubConnector = swapped
+        try:
+            ext2 = swapped(self.auth)
+            with self.assertRaisesRegex(BoundaryVerificationError, "metaclass was swapped"):
+                FencedBoundaryRegistry([ext2.contract(STUB_ARTIFACT)])
+        finally:
+            fencing_mod.StubConnector = real
+        fenced(self.ext)
+
+    def test_lookup_affecting_class_attributes_and_class_reassignment_lose_trust(self):
+        def getattr_hook(self, name):
+            return None
+        hooks = {"__getattr__": getattr_hook, "__slots__": ("x",),
+                 "__init_subclass__": classmethod(lambda cls: None),
+                 "__set_name__": lambda self, owner, name: None}
+        # (__new__ is rejected by name too, but setting then deleting it on a live
+        # class leaves CPython's tp_new slot changed, so it is not probed in place.)
+        for name, value in hooks.items():
+            setattr(StubConnector, name, value)
+            try:
+                with self.assertRaises(BoundaryVerificationError, msg=name):
+                    fenced(self.ext)
+            finally:
+                delattr(StubConnector, name)
+
+        class Sub(StubConnector):
+            pass
+        self.ext.__class__ = Sub                           # instance __class__ reassignment
+        try:
+            with self.assertRaises(BoundaryVerificationError):
+                fenced(self.ext)
+        finally:
+            self.ext.__class__ = StubConnector
+        fenced(self.ext)
+
     def test_instance_callables_and_collaborator_tampering_lose_trust(self):
         cases = []
 

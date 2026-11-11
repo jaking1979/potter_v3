@@ -45,6 +45,9 @@ for that window. Staging-only (T22); nothing here performs a real effect.
 """
 from __future__ import annotations
 
+import abc
+import ast
+import builtins
 import contextlib
 import dataclasses
 import multiprocessing.synchronize
@@ -485,6 +488,265 @@ def _verify_module(modname: str | None, adapter: Any) -> None:
         if isinstance(v, types.FunctionType) and v.__module__ == modname \
                 and "<" not in v.__qualname__ and name not in funcs:
             raise BoundaryVerificationError(f"unreviewed function {name} added to the module")
+    _verify_manifest(mod, modname, source)
+
+
+# ----- manifest: nothing in the module or its classes beyond what the source binds
+
+_MODULE_MACHINERY = frozenset({"__name__", "__doc__", "__package__", "__loader__", "__spec__",
+                               "__file__", "__cached__", "__builtins__", "__annotations__",
+                               "__annotate__", "__conditional_annotations__"})
+_CLASS_MACHINERY = frozenset({"__module__", "__qualname__", "__doc__", "__dict__", "__weakref__",
+                              "__firstlineno__", "__static_attributes__", "__annotations__",
+                              "__annotate__", "__annotate_func__", "__annotations_cache__",
+                              "__type_params__", "__orig_bases__", "__parameters__"})
+_DATACLASS_MACHINERY = frozenset({"__dataclass_fields__", "__dataclass_params__", "__match_args__"})
+_ABC_MACHINERY = frozenset({"_abc_impl", "__abstractmethods__"})
+_PROTOCOL_MACHINERY = frozenset({"_is_protocol", "_is_runtime_protocol", "__protocol_attrs__",
+                                 "__non_callable_proto_members__",
+                                 "__callable_proto_members_only__"})
+# Names that change attribute lookup / construction / identity: never accepted
+# unless the reviewed class body itself defines them (then they are verified).
+_LOOKUP_SENSITIVE = frozenset({"__getattribute__", "__getattr__", "__setattr__", "__delattr__",
+                               "__get__", "__set__", "__delete__", "__set_name__",
+                               "__init_subclass__", "__class_getitem__", "__slots__", "__new__",
+                               "__call__", "__instancecheck__", "__subclasscheck__",
+                               "__mro_entries__", "__prepare__", "__class__", "__dir__"})
+
+
+class _Unverifiable(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _Unpacked:
+    """Element ``index`` of a tuple-unpacking assignment."""
+    node: ast.Assign
+    index: int
+
+
+def _assigned_value(src: Any, mod: types.ModuleType, trusted: dict[str, Any]) -> Any:
+    if isinstance(src, _Unpacked):
+        seq = _static_value(src.node.value, mod, trusted)
+        if not isinstance(seq, (tuple, list)):
+            raise _Unverifiable("unpacking a non-sequence")
+        return seq[src.index]
+    return _static_value(src.value, mod, trusted)
+
+
+def _bound_names(body: list[ast.stmt]) -> tuple[dict[str, ast.AST], dict[str, ast.AST]]:
+    """(names bound by def/class/assign in ``body`` -> defining node,
+        names bound by import -> import node)"""
+    defs: dict[str, ast.AST] = {}
+    imports: dict[str, ast.AST] = {}
+    for n in body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defs[n.name] = n
+        elif isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    defs[t.id] = n
+                elif isinstance(t, (ast.Tuple, ast.List)):
+                    for i, e in enumerate(t.elts):     # a, b = x, y  ->  element i
+                        if isinstance(e, ast.Name):
+                            defs[e.id] = _Unpacked(n, i)
+        elif isinstance(n, ast.AnnAssign) and n.value is not None and isinstance(n.target, ast.Name):
+            defs[n.target.id] = n
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                imports[a.asname or a.name.split(".")[0]] = n
+    return defs, imports
+
+
+def _import_target(node: ast.AST, alias: ast.alias, mod: types.ModuleType) -> Any:
+    if isinstance(node, ast.Import):
+        if alias.asname:
+            return sys.modules[alias.name]
+        return sys.modules[alias.name.split(".")[0]]
+    base = node.module or ""
+    if node.level:
+        pkg = (mod.__package__ or "").split(".")
+        pkg = pkg[: len(pkg) - (node.level - 1)] if node.level > 1 else pkg
+        base = ".".join([*pkg, base] if base else pkg)
+    src = sys.modules[base]
+    return vars(src)[alias.name] if alias.name in vars(src) else sys.modules[f"{base}.{alias.name}"]
+
+
+def _static_value(node: ast.AST, mod: types.ModuleType, trusted: dict[str, Any]) -> Any:
+    """Evaluate a module-level expression made only of literals, verified
+    names, attribute access on verified modules, tuples/lists/sets, and
+    ``frozenset(<static>)`` / ``re.compile(<literal>)``. Anything else is
+    _Unverifiable."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        items = [_static_value(e, mod, trusted) for e in node.elts]
+        return tuple(items) if isinstance(node, ast.Tuple) else (
+            items if isinstance(node, ast.List) else set(items))
+    if isinstance(node, ast.Name):
+        if node.id in trusted:
+            return trusted[node.id]
+        if node.id not in vars(mod) and node.id in vars(builtins):
+            return vars(builtins)[node.id]        # unshadowed builtin
+        raise _Unverifiable(node.id)
+    if isinstance(node, ast.Attribute):
+        base = _static_value(node.value, mod, trusted)
+        if isinstance(base, types.ModuleType) and node.attr in vars(base):
+            return vars(base)[node.attr]
+        raise _Unverifiable(ast.unparse(node))
+    if isinstance(node, ast.Call) and not node.keywords:
+        f = node.func
+        if isinstance(f, ast.Name) and f.id == "frozenset" and "frozenset" not in vars(mod) \
+                and len(node.args) == 1:
+            return frozenset(_static_value(node.args[0], mod, trusted))
+        if isinstance(f, ast.Attribute) and f.attr == "compile" and isinstance(f.value, ast.Name) \
+                and trusted.get(f.value.id) is sys.modules.get("re") \
+                and all(isinstance(a, ast.Constant) for a in node.args):
+            return re.compile(*[a.value for a in node.args])
+    raise _Unverifiable(ast.unparse(node))
+
+
+def _same_value(live: Any, expected: Any) -> bool:
+    if isinstance(expected, (type, types.ModuleType, types.FunctionType, types.CodeType)):
+        return live is expected
+    if isinstance(expected, re.Pattern):
+        return type(live) is re.Pattern and (live.pattern, live.flags) == (expected.pattern, expected.flags)
+    if isinstance(expected, (tuple, list)):
+        return type(live) is type(expected) and len(live) == len(expected) and all(
+            _same_value(a, b) for a, b in zip(live, expected))
+    if isinstance(expected, (set, frozenset)):
+        if type(live) is not type(expected) or len(live) != len(expected):
+            return False
+        if all(isinstance(x, (type, types.ModuleType)) for x in expected):
+            return {id(x) for x in live} == {id(x) for x in expected}
+        return live == expected
+    return type(live) is type(expected) and live == expected
+
+
+def _verify_manifest(mod: types.ModuleType, modname: str, source: bytes) -> None:
+    tree = ast.parse(source)
+    defs, imports = _bound_names(tree.body)
+    live = vars(mod)
+    unknown = set(live) - set(defs) - set(imports) - _MODULE_MACHINERY
+    if unknown:
+        raise BoundaryVerificationError(f"unreviewed module attribute(s) {sorted(unknown)}")
+    b = live.get("__builtins__")
+    if b is not builtins and b is not vars(builtins):
+        raise BoundaryVerificationError("module __builtins__ was replaced")
+    trusted: dict[str, Any] = {}
+    for name, node in imports.items():
+        alias = next(a for a in node.names if (a.asname or a.name.split(".")[0]) == name)
+        try:
+            expected = _import_target(node, alias, mod)
+        except (KeyError, ValueError) as exc:
+            raise BoundaryVerificationError(f"import binding {name!r} cannot be resolved") from exc
+        if live.get(name) is not expected:
+            raise BoundaryVerificationError(f"import binding {name!r} was rebound")
+        trusted[name] = expected
+    for name, node in defs.items():
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            trusted[name] = live.get(name)       # verified structurally elsewhere
+    for name, node in defs.items():              # module-level assigned values
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, _Unpacked)):
+            continue
+        try:
+            expected = _assigned_value(node, mod, trusted)
+        except _Unverifiable:
+            continue                             # snapshotted at registry build instead
+        if name not in live or not _same_value(live[name], expected):
+            raise BoundaryVerificationError(f"module value {name!r} differs from the reviewed source")
+        trusted[name] = live[name]
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            _verify_class_manifest(live.get(node.name), node, mod, trusted)
+
+
+def _verify_class_manifest(cls: Any, node: ast.ClassDef, mod: types.ModuleType,
+                           trusted: dict[str, Any]) -> None:
+    name = node.name
+    if not isinstance(cls, type):
+        raise BoundaryVerificationError(f"class {name} is missing")
+    # 1. type identity: bases, metaclass, MRO
+    if node.keywords:
+        raise BoundaryVerificationError(f"class {name} uses class keywords: unverifiable")
+    try:
+        bases = types.resolve_bases(tuple(_static_value(b, mod, trusted)
+                                          for b in node.bases)) or (object,)
+    except _Unverifiable as exc:
+        raise BoundaryVerificationError(f"class {name} has unverifiable bases") from exc
+    if len(cls.__bases__) != len(bases) or any(a is not b for a, b in zip(cls.__bases__, bases)):
+        raise BoundaryVerificationError(f"class {name} bases were swapped")
+    meta = type
+    for b in bases:
+        if issubclass(type(b), meta):
+            meta = type(b)
+    if type(cls) is not meta:
+        raise BoundaryVerificationError(f"class {name} metaclass was swapped")
+    if cls.__mro__ != tuple(type.mro(cls)):
+        raise BoundaryVerificationError(f"class {name} has a non-standard MRO")
+    # 2. manifest of the class namespace
+    defs, _ = _bound_names(node.body)
+    allowed = set(defs) | _CLASS_MACHINERY
+    if dataclasses.is_dataclass(cls):
+        allowed |= _DATACLASS_MACHINERY | _DATACLASS_GENERATED
+    if isinstance(cls, abc.ABCMeta):
+        allowed |= _ABC_MACHINERY
+    if getattr(cls, "_is_protocol", False):
+        allowed |= _PROTOCOL_MACHINERY | _PROTOCOL_GENERATED
+    for key, v in vars(cls).items():
+        if key not in allowed:
+            raise BoundaryVerificationError(f"unreviewed class attribute {name}.{key}")
+        if key in _LOOKUP_SENSITIVE and key not in defs and not (
+                dataclasses.is_dataclass(cls) and key in _DATACLASS_GENERATED
+                and isinstance(v, types.FunctionType)):
+            raise BoundaryVerificationError(f"lookup-affecting attribute {name}.{key}")
+        if isinstance(v, (types.FunctionType, staticmethod, classmethod, property)):
+            continue                              # verified structurally by check_class
+        if isinstance(v, type) and v.__qualname__ == f"{name}.{key}":
+            continue                              # nested class, verified by check_class
+        if key in ("__dict__", "__weakref__"):
+            if type(v).__name__ != "getset_descriptor" or v.__objclass__ is not cls:
+                raise BoundaryVerificationError(f"{name}.{key} is not the class's own descriptor")
+            continue
+        if key == "__hash__" and v is None:
+            continue
+        if callable(v) or hasattr(type(v), "__get__") or hasattr(type(v), "__set__"):
+            raise BoundaryVerificationError(f"class attribute {name}.{key} is a callable or descriptor")
+        src = defs.get(key)
+        if isinstance(src, (ast.Assign, ast.AnnAssign, _Unpacked)):
+            try:
+                expected = _assigned_value(src, mod, trusted)
+            except _Unverifiable:
+                continue
+            if not _same_value(v, expected):
+                raise BoundaryVerificationError(f"class value {name}.{key} differs from the reviewed source")
+
+
+def unverifiable_module_values(adapter: Any) -> dict[str, Any]:
+    """Module-level values the static check cannot evaluate (verifier
+    internals such as the contextmanager helper's code). The registry
+    snapshots their identity at build; later rebinding is caught live."""
+    out: dict[str, Any] = {}
+    owner = getattr(adapter, "__self__", None)
+    func = getattr(adapter, "__func__", adapter)
+    names = {getattr(func, "__module__", None)}
+    if owner is not None:
+        names.add((owner if isinstance(owner, type) else type(owner)).__module__)
+    for modname in sorted(n for n in names if n):
+        mod = sys.modules.get(modname)
+        if mod is None:
+            continue
+        with open(os.path.realpath(mod.__file__), "rb") as f:
+            tree = ast.parse(f.read())
+        defs, imports = _bound_names(tree.body)
+        trusted = {k: vars(mod).get(k) for k in [*imports, *defs]}
+        for name, node in defs.items():
+            if isinstance(node, (ast.Assign, ast.AnnAssign, _Unpacked)):
+                try:
+                    _assigned_value(node, mod, trusted)
+                except _Unverifiable:
+                    out[f"{modname}.{name}"] = vars(mod).get(name)
+    return out
 
 
 @dataclass(frozen=True)
@@ -603,6 +865,7 @@ class FencedBoundaryRegistry(Mapping):
 
     def __init__(self, contracts: Iterable[FencedBoundaryContract] = ()):
         entries: dict[str, FencedBoundaryContract] = {}
+        baselines: dict[str, Mapping[str, Any]] = {}
         for k in contracts:
             if not isinstance(k, FencedBoundaryContract):
                 raise TypeError("registry entries must be FencedBoundaryContract")
@@ -610,7 +873,18 @@ class FencedBoundaryRegistry(Mapping):
                 raise ValueError(f"duplicate boundary identity {k.identity!r}")
             k.verify_live()
             entries[k.identity] = k
+            baselines[k.identity] = MappingProxyType(unverifiable_module_values(k.adapter))
         self._entries = MappingProxyType(entries)
+        self._baselines = MappingProxyType(baselines)
+
+    def baseline_holds(self, identity: str) -> bool:
+        """The module values the static check cannot evaluate are still the very
+        objects they were when this registry was built (late rebinding)."""
+        base = self._baselines.get(identity)
+        if base is None:
+            return False
+        now = unverifiable_module_values(self._entries[identity].adapter)
+        return set(now) == set(base) and all(now[k] is base[k] for k in base)
 
     def __getitem__(self, identity: str) -> FencedBoundaryContract:
         return self._entries[identity]
@@ -622,7 +896,7 @@ class FencedBoundaryRegistry(Mapping):
         return len(self._entries)
 
     def __setattr__(self, name, value):
-        if name != "_entries" or "_entries" in self.__dict__:
+        if name not in ("_entries", "_baselines") or name in self.__dict__:
             raise AttributeError("FencedBoundaryRegistry is frozen")
         object.__setattr__(self, name, value)
 
@@ -876,6 +1150,9 @@ class Node:
             return str(exc)
         if contract.fencing_scope.authority != authority_scope_id(self.authority):
             return "scope names a different epoch authority"
+        if self.boundaries.get(contract.identity) is not contract \
+                or not self.boundaries.baseline_holds(contract.identity):
+            return "module values changed since the registry was verified"
         return None
 
     def _boundary_proven(self, effect: Effect) -> bool:
