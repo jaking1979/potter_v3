@@ -66,7 +66,7 @@ REASONS = frozenset({
     "malformed", "missing_message_id", "oversized_raw", "oversized_body",
     "oversized_attachment", "too_many_attachments", "bot_sender", "sender_not_allowlisted",
     "trace_error", "ingress_error", "attachment_reclaimed", "clock_regression",
-    "needs_operator",
+    "needs_operator", "transport_conflict",
     # trust reasons (why an accepted event is untrusted; "ok" when principal_direct)
     "ok", "multiple_from", "header_defect", "display_name_spoof", "reply_to_mismatch",
     "sender_mismatch", "dkim_missing", "dkim_failed", "dkim_unaligned", "spf_failed",
@@ -172,16 +172,28 @@ class _Draft:
 # it) nor an accepted untrusted event: unrecorded, retryable rejections.
 # ``stale_transport`` is included: it is returned only after E3 has already
 # re-signed once with a fresh sent_at, i.e. E3's and E1's clocks disagree.
-E1_RETRYABLE = frozenset({"clock_regression", "needs_operator", "stale_transport"})
+# ``transport_conflict``: E1 refused the envelope as ``replayed`` on a first
+# (non-settle) handoff - either a different update under the same key is
+# pending in E1 (e.g. an altered retry after an E3 rollback) or E1 has a
+# processed row E3 never committed. Never recorded, so it cannot pre-empt the
+# genuine update's retry, and never accepted.
+E1_RETRYABLE = frozenset({"clock_regression", "needs_operator", "stale_transport",
+                          "transport_conflict"})
 # E1 refusals after which E1 holds a settled (processed) row for the update.
 _E1_SETTLED = frozenset({"replayed", "unknown_sender", "not_allowlisted",
                          "principal_disabled", "dkim_unverified", "session_unverified"})
 
 
-def bind_text(text: str) -> str:
-    """What the E1 envelope carries for ``text``: a SHA-256 commitment, so the
-    MAC binds the exact message while E1 never stores or holds the body."""
-    return "e3-sha256:" + sha256(text.encode("utf-8", "surrogatepass"))
+def bind_update(text: str, content_digest: str) -> str:
+    """What the E1 envelope carries: a SHA-256 commitment to the message text
+    AND the update's full content digest - every trust- and event-relevant
+    transport field (Telegram: chat, chat type, sender, bot / forwarded /
+    via-bot flags, text, attachment bytes, media types and filenames; email:
+    the raw message bytes, so all headers and attachments). The MAC therefore
+    binds the exact update, so E1's pending recovery can only resume an
+    identical update, never one whose provenance or attachments changed;
+    and E1 never stores or holds the body."""
+    return "e3-sha256:" + sha256(canon([text, content_digest]))
 
 
 class IngressGateway:
@@ -323,7 +335,7 @@ class IngressGateway:
         digest = sha256(canon({
             "chat": u.chat_id, "chat_type": u.chat_type, "from": u.from_user_id,
             "bot": u.from_is_bot, "fwd": u.forwarded, "via": u.via_bot, "text": u.text,
-            "att": [sha256(a.data) for a in u.attachments]}))
+            "att": [[sha256(a.data), a.media_type, a.filename] for a in u.attachments]}))
         draft = _Draft(TELEGRAM, key, f"{u.chat_id}:{u.message_id}", digest, None, (),
                        u.attachments, "ok")
         self._check_sizes(u.text, u.attachments, draft)
@@ -331,19 +343,24 @@ class IngressGateway:
             raise _Reject("malformed", record=False)
         if u.from_is_bot:
             raise _Reject("bot_sender", record=True).with_draft(draft)
-        if self._store.seen_content(sha256(key.encode())) == digest:
+        seen = self._store.seen_content(sha256(key.encode()))
+        if seen is not None and seen != digest:
+            return draft      # E3 already committed a different update here: replay_conflict
+        if seen == digest:
             # Re-delivery of a decision E3 already committed: answer from E3's
             # dedupe, but first settle E1's record for this message. If the
             # process died after E3 committed and before E1 finish(), the row
             # is still pending; re-signing the same deterministic envelope
             # lets E1 resume it and we finish it now. If it is already
             # processed, E1 answers "replayed" and nothing changes.
-            _, voucher, _ = self._authenticate(TELEGRAM, str(u.from_user_id), u.text, key,
-                                               raw_ref=u.delivery_ref)
+            _, voucher, _ = self._authenticate(TELEGRAM, str(u.from_user_id),
+                                               bind_update(u.text, digest), key,
+                                               raw_ref=u.delivery_ref, settle=True)
             self._release(voucher)
             return draft
         principal, draft.voucher, reason = self._authenticate(
-            TELEGRAM, str(u.from_user_id), u.text, key, raw_ref=u.delivery_ref)
+            TELEGRAM, str(u.from_user_id), bind_update(u.text, digest), key,
+            raw_ref=u.delivery_ref)
         if reason in E1_RETRYABLE:
             raise _Reject(reason, record=False)
         if principal is None:
@@ -388,15 +405,20 @@ class IngressGateway:
         # Dedupe namespace: "verified:" only for a fully authenticated sender,
         # so an unauthenticated sender can never squat or pre-empt that key.
         verified_key = f"email|verified:{sha256(self._from_addr(msg).encode())}|{mid}"
-        if self._store.seen_content(sha256(verified_key.encode())) == sha256(raw):
+        seen = self._store.seen_content(sha256(verified_key.encode()))
+        if seen is not None and seen != sha256(raw):
+            # E3 already committed a different message under this verified key.
+            return _Draft(EMAIL, verified_key, mid, sha256(raw), None, (), (), "ok")
+        if seen == sha256(raw):
             addr = self._from_addr(msg)       # settle E1's record (see _telegram)
-            _, voucher, _ = self._authenticate(EMAIL, addr, f"{subject}\n{text}",
+            _, voucher, _ = self._authenticate(EMAIL, addr,
+                                               bind_update(f"{subject}\n{text}", sha256(raw)),
                                                f"email|{sha256(addr.encode())}|{mid}",
-                                               raw_ref=mid)
+                                               raw_ref=mid, settle=True)
             self._release(voucher)
             return _Draft(EMAIL, verified_key, mid, sha256(raw), None, (), (), "ok")
-        trust, addr, principal, voucher = self._email_trust(msg, raw, mid,
-                                                            f"{subject}\n{text}")
+        trust, addr, principal, voucher = self._email_trust(
+            msg, raw, mid, bind_update(f"{subject}\n{text}", sha256(raw)))
         if trust in E1_RETRYABLE:
             raise _Reject(trust, record=False)
         own = PRINCIPAL_DIRECT if trust == "ok" else EXTERNAL_SENDER
@@ -466,13 +488,15 @@ class IngressGateway:
             return reason, addr, None, voucher
         return "ok", addr, principal, voucher
 
-    def _authenticate(self, channel: str, sender_ref: str, text: str, key: str, *,
-                      raw_ref: str | None) -> tuple[str | None, object, str]:
+    def _authenticate(self, channel: str, sender_ref: str, bound: str, key: str, *,
+                      raw_ref: str | None, settle: bool = False
+                      ) -> tuple[str | None, object, str]:
         """Hand the platform-verified update to E1 as a signed envelope and
         return ``(principal or None, voucher or None, reason)``. Bounded lifetime:
 
-        * The envelope carries ``bind_text(text)`` (a SHA-256 commitment to the
-          exact text), not the text: the MAC still binds this exact message,
+        * The envelope carries ``bound`` = ``bind_update(text, content_digest)``
+          (a SHA-256 commitment to the text and the whole update), not the
+          text: the MAC binds this exact update,
           but neither E1's in-memory voucher nor its durable ``inbound_seen``
           row ever holds the body. ``e3-sha256:`` is not an E1 command word,
           so an E3 voucher cannot drive ``/stop`` / ``/ack`` / ``/approve``.
@@ -492,7 +516,6 @@ class IngressGateway:
         signer = self._signers.get(channel)
         if signer is None:
             return None, None, "unvouched_sender"
-        bound = bind_text(text)
         hkey = sha256(key.encode())
         update_id = f"e3:{hkey[:32]}"
         sent_at = self._store.handoff_sent_at(hkey, float(self._clock()), self._clock())
@@ -505,14 +528,21 @@ class IngressGateway:
                                   raw_ref=raw_ref)
             auth = self._auth.authenticate(env)
         sender = getattr(auth, "sender", None)
-        if sender is None and getattr(auth, "reason", None) in _E1_SETTLED:
+        e1_reason = getattr(auth, "reason", None)
+        # "replayed" means settled only on a settle (already E3-committed,
+        # identical-content) handoff; on a first handoff it can be a pending
+        # row for a DIFFERENT update: keep the stored sent_at so the genuine
+        # update can still resume, and refuse this one as a conflict.
+        if sender is None and e1_reason in _E1_SETTLED and (settle or e1_reason != "replayed"):
             self._store.handoff_drop(hkey)    # E1 holds a settled (processed) row
         sender = (sender, hkey) if sender is not None else None
         try:
-            principal = self._vouched_principal(auth, channel, text)  # checks before retire
-            reason = getattr(auth, "reason", None)
+            principal = self._vouched_principal(auth, channel, bound)  # checks before retire
+            reason = e1_reason
             if principal is not None:
                 reason = "ok"
+            elif reason == "replayed" and not settle:
+                reason = "transport_conflict"
             elif reason not in REASONS or reason == "ok":
                 reason = "unvouched_sender"
             return principal, sender, reason
@@ -533,10 +563,10 @@ class IngressGateway:
             pass
         return ""
 
-    def _vouched_principal(self, auth: object, channel: str, text: str) -> str | None:
+    def _vouched_principal(self, auth: object, channel: str, bound: str) -> str | None:
         """The principal only if E1 ``ChannelAuth`` itself minted this exact
         voucher for this channel and this exact message (its text must be
-        ``bind_text(text)``). A hand-constructed or copied
+        ``bound``, i.e. ``bind_update(text, content_digest)``). A copied or
         ``AuthenticatedSender`` never yields ``principal_direct``."""
         try:
             sender = getattr(auth, "sender", None)
@@ -544,7 +574,7 @@ class IngressGateway:
                 return None
             if sender.channel != channel or not isinstance(sender.principal, str):
                 return None
-            if sender.text != bind_text(text):
+            if sender.text != bound:
                 return None
             return sender.principal or None
         except Exception:

@@ -32,7 +32,7 @@ from ingress import (ATTACHMENT, EXTERNAL_SENDER, FORWARDED_CONTENT, PRINCIPAL_D
 from ingress.gateway import REASONS  # noqa: E402
 from notifier import ChannelAuth, lint  # noqa: E402
 from notifier.auth import TransportSigner  # noqa: E402
-from ingress.gateway import bind_text  # noqa: E402
+from ingress.gateway import bind_update  # noqa: E402
 from policy import (ALLOW, DENY, TRUSTED_SOURCES, Caller, Capability,  # noqa: E402
                     CapabilityRegistry, PolicyEngine, PolicyRequest, RiskClass)
 from policy._contracts import approval as c0  # noqa: E402
@@ -614,14 +614,15 @@ class HandBuiltVoucherRefused(Fixture):
 
     def test_47_voucher_relabelled_to_other_channel_refused(self):
         self.pass_dkim("<m1@potter.test>")
+        bound = bind_update("add note", "0" * 64)
         env = TransportSigner("email", MAIL_KEY).envelope(
-            JOSH_MAIL, bind_text("add note"), update_id="t47", sent_at=float(T), raw_ref="<m1@potter.test>")
+            JOSH_MAIL, bound, update_id="t47", sent_at=float(T), raw_ref="<m1@potter.test>")
         minted = self.auth.authenticate(env)
         self.assertTrue(minted.ok)
         relabelled = dataclasses.replace(minted.sender, channel="telegram")
         self.assertFalse(self.auth.vouches(relabelled))
-        self.assertIsNone(self.gw._vouched_principal(minted, "telegram", "add note"))
-        self.assertEqual(self.gw._vouched_principal(minted, "email", "add note"), JOSH)
+        self.assertIsNone(self.gw._vouched_principal(minted, "telegram", bound))
+        self.assertEqual(self.gw._vouched_principal(minted, "email", bound), JOSH)
 
 
 class QuoteBoundariesFailClosed(Fixture):
@@ -874,22 +875,29 @@ class MessageBoundTransport(Fixture):
         ev = gw.ingest_telegram(self.tg(text="/note add milk")).event
         self.assertTrue(ev.trusted)
         (env,) = self.seen
-        self.assertEqual((env.channel, env.sender_ref, env.text),
-                         ("telegram", str(TG_JOSH), bind_text("/note add milk")))
-        self.assertNotIn("milk", env.text)           # commitment, not the body
+        self.assertEqual((env.channel, env.sender_ref), ("telegram", str(TG_JOSH)))
+        self.assertRegex(env.text, r"^e3-sha256:[0-9a-f]{64}$")   # commitment, not the body
+        self.assertNotIn("milk", env.text)
         self.assertTrue(env.transport_mac)
         self.assertTrue(env.update_id.startswith("e3:"))
         self.pass_dkim("<m1@potter.test>")
-        gw.ingest_email(make_email(subject="add note", body="add milk to the list"))
-        self.assertEqual(self.seen[1].text, bind_text("add note\nadd milk to the list\n"))
+        raw = make_email(subject="add note", body="add milk to the list")
+        gw.ingest_email(raw)
+        from ingress.events import sha256 as h
+        self.assertEqual(self.seen[1].text,
+                         bind_update("add note\nadd milk to the list\n", h(raw)))
 
     def test_70_voucher_for_other_text_refused(self):
+        bound = bind_update("/ack 1", "0" * 64)
         env = TransportSigner("telegram", TG_KEY).envelope(
-            str(TG_JOSH), bind_text("/ack 1"), update_id="t70", sent_at=float(T))
+            str(TG_JOSH), bound, update_id="t70", sent_at=float(T))
         minted = self.auth.authenticate(env)
         self.assertTrue(minted.ok)
-        self.assertIsNone(self.gw._vouched_principal(minted, "telegram", "/pay mallory"))
-        self.assertEqual(self.gw._vouched_principal(minted, "telegram", "/ack 1"), JOSH)
+        self.assertIsNone(self.gw._vouched_principal(
+            minted, "telegram", bind_update("/pay mallory", "0" * 64)))
+        self.assertIsNone(self.gw._vouched_principal(
+            minted, "telegram", bind_update("/ack 1", "1" * 64)))      # same text, other update
+        self.assertEqual(self.gw._vouched_principal(minted, "telegram", bound), JOSH)
 
     def test_71_stale_envelope_refused(self):
         gw = self.gateway(channel_auth=self.make_auth(clock=lambda: float(T + 3600)))
@@ -1507,6 +1515,80 @@ class E1WatermarkRefusals(Fixture):
         self.assertEqual((replay.ok, replay.reason), (False, "stale_transport"))
         self.e1_now[0] = float(T)                                       # rewind wall clock
         self.assertEqual(first_env_auth.authenticate(old).reason, "clock_regression")
+
+
+class PendingRecoveryBindsWholeUpdate(Fixture):
+    """Dolores review at 8b017eb: E1 pending recovery bound only the text, so
+    after an E3 rollback an update with the same id/sender/text but changed
+    provenance (forwarded / via-bot / chat type), attachments or email headers
+    reproduced the identical envelope and was accepted. The envelope now
+    commits to the whole update; a conflicting retry is refused, unrecorded,
+    and the genuine update can still resume."""
+
+    def roll_back(self, ingest):
+        def broken(line):
+            raise OSError("trace sink down")
+        res = ingest(self.gateway(trace_sink=broken))
+        self.assertEqual(res.reason, "trace_error")        # E1 row left pending
+
+    def assert_conflict_then_genuine_resumes(self, genuine, altered, ingest):
+        self.roll_back(lambda gw: ingest(gw, genuine))
+        before = IngressStore(self.db).log()
+        res = ingest(self.gw, altered)
+        self.assertEqual((res.accepted, res.reason, res.event),
+                         (False, "transport_conflict", None))
+        self.assertEqual(IngressStore(self.db).log(), before)  # nothing recorded
+        ok = ingest(self.gw, genuine)                      # genuine retry still resumes
+        self.assertTrue(ok.accepted)
+        return ok.event
+
+    def tg_ingest(self, gw, u):
+        return gw.ingest_telegram(u)
+
+    def test_109_forwarded_flag_changed_after_rollback(self):
+        # Dolores's probe: forwarded "transfer money" rolled back, then the same
+        # id/sender/text with forwarded=False must NOT become principal_direct.
+        ev = self.assert_conflict_then_genuine_resumes(
+            self.tg(text="transfer money", forwarded=True),
+            self.tg(text="transfer money", forwarded=False), self.tg_ingest)
+        self.assertEqual(ev.provenance, (FORWARDED_CONTENT,))
+
+    def test_110_via_bot_and_chat_type_changed_after_rollback(self):
+        self.assert_conflict_then_genuine_resumes(
+            self.tg(via_bot=True), self.tg(via_bot=False), self.tg_ingest)
+        self.assert_conflict_then_genuine_resumes(
+            self.tg(msg_id=2, ref="d2", chat=-7, chat_type="group"),
+            self.tg(msg_id=2, ref="d2", chat=-7, chat_type="private"), self.tg_ingest)
+
+    def test_111_attachment_bytes_or_metadata_changed_after_rollback(self):
+        a = RawAttachment(b"invoice", "application/pdf", "a.pdf")
+        for i, b in enumerate((RawAttachment(b"invoice-2", "application/pdf", "a.pdf"),
+                               RawAttachment(b"invoice", "text/plain", "a.pdf"),
+                               RawAttachment(b"invoice", "application/pdf", "b.pdf"),
+                               None)):
+            altered = (b,) if b is not None else ()
+            self.assert_conflict_then_genuine_resumes(
+                self.tg(msg_id=10 + i, ref=f"a{i}", attachments=(a,)),
+                self.tg(msg_id=10 + i, ref=f"a{i}", attachments=altered), self.tg_ingest)
+
+    def test_112_email_headers_or_attachments_changed_after_rollback(self):
+        self.pass_dkim("<e1@potter.test>")
+        genuine = make_email(mid="<e1@potter.test>", subject="Fwd: invoice", body="pay it")
+        altered = make_email(mid="<e1@potter.test>", subject="pay it", body="pay it")
+        ev = self.assert_conflict_then_genuine_resumes(
+            genuine, altered, lambda gw, raw: gw.ingest_email(raw))
+        self.assertNotIn(PRINCIPAL_DIRECT, [s.provenance for s in ev.segments
+                                            if "pay it" in s.text])
+        self.pass_dkim("<e2@potter.test>")
+        g2 = make_email(mid="<e2@potter.test>",
+                        attachments=[(b"approve", "text", "plain", "a.txt")])
+        a2 = make_email(mid="<e2@potter.test>")
+        self.assert_conflict_then_genuine_resumes(g2, a2, lambda gw, raw: gw.ingest_email(raw))
+
+    def test_113_identical_retry_after_rollback_still_resumes(self):
+        self.roll_back(lambda gw: gw.ingest_telegram(self.tg()))
+        res = self.gw.ingest_telegram(self.tg())
+        self.assertTrue(res.accepted and res.event.trusted)
 
 
 class Structure(unittest.TestCase):
