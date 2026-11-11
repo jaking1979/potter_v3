@@ -44,7 +44,8 @@ def _drain(task: asyncio.Task) -> None:
 
 
 async def _bounded(backend: Backend, query: str, timeout: float):
-    from retrieval.isolated import SyntheticProcessBackend, bounded_search
+    from retrieval.isolated import (SyntheticProcessBackend, bounded_search,
+                                    MAX_ID_CHARS, MAX_TEXT_CHARS)
     if isinstance(backend, SyntheticProcessBackend):
         return await bounded_search(backend, query, timeout)
     start = time.monotonic()
@@ -93,7 +94,9 @@ async def _bounded(backend: Backend, query: str, timeout: float):
                     pass
             items = tuple(values)
             if any(not isinstance(item, Evidence) or type(item.item_id) is not str
-                   or not item.item_id or type(item.text) is not str for item in items):
+                   or not 0 < len(item.item_id) <= MAX_ID_CHARS
+                   or type(item.text) is not str or len(item.text) > MAX_TEXT_CHARS
+                   for item in items):
                 raise ValueError('invalid evidence')
             if time.monotonic() - start >= timeout:
                 return 'deadline', (), time.monotonic() - start
