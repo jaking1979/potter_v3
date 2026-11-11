@@ -1,7 +1,7 @@
 """Synthetic cross-helper comparison, not a grading or acceptance gate."""
 import unittest
-from wilson import wilson_95 as fixed
-from wilson_interval import wilson_95 as legacy
+from evaluation.a4a.wilson import wilson_95 as fixed
+from evaluation.a4a.wilson_interval import wilson_95 as legacy
 
 class CrossHelperAgreement(unittest.TestCase):
     def test_positive_counts_agree_to_reporting_precision(self):
@@ -14,5 +14,10 @@ class CrossHelperAgreement(unittest.TestCase):
         self.assertIsNone(fixed(0, 0))
         with self.assertRaises(ValueError):
             legacy(0, 0)
+
+    def test_exact_endpoints(self):
+        for n in (1, 7, 20, 27, 100, 1000):
+            self.assertEqual(legacy(0, n)[0], 0.0)
+            self.assertEqual(legacy(n, n)[1], 1.0)
 
 if __name__ == '__main__': unittest.main()
