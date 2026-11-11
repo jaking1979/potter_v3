@@ -23,6 +23,8 @@ class LedgerUnavailable(Refused):
     """Unknown schema or inconsistent local accounting: no budget is released."""
 
 
+_MAX_I64 = (1 << 63) - 1  # SQLite INTEGER is signed 64-bit
+
 _COLUMNS = ('call_id', 'task_id', 'task_class', 'privacy_class', 'day', 'month',
             'model', 'provider', 'expected', 'worst', 'actual', 'state')
 
@@ -93,8 +95,8 @@ class Broker:
 
     @staticmethod
     def _validate_caps(caps):
-        if type(caps) is not Caps or any(type(x) is not int or x < 0 for x in vars(caps).values()):
-            raise ValueError("caps must be nonnegative integer microdollars")
+        if type(caps) is not Caps or any(type(x) is not int or not 0 <= x <= _MAX_I64 for x in vars(caps).values()):
+            raise ValueError("caps must be SQLite-range nonnegative integer microdollars")
 
     def __init__(self, path: str | Path, caps: Caps):
         """Open existing state; missing or empty files are never bootstrapped."""
@@ -231,7 +233,7 @@ class Broker:
             if (c.approved is True and c.available is True and req.task_class in c.validated_tasks
                 and req.privacy_class in c.privacy_classes and c.model and c.provider
                 and type(c.expected_usd_micros) is int and type(c.worst_usd_micros) is int
-                and 0 <= c.expected_usd_micros <= c.worst_usd_micros):
+                and 0 <= c.expected_usd_micros <= c.worst_usd_micros <= _MAX_I64):
                 eligible.append(c)
         eligible.sort(key=lambda x: (x.expected_usd_micros, x.worst_usd_micros, x.model, x.provider))
         if not eligible:
@@ -307,7 +309,7 @@ class Broker:
             db.commit()
 
     def settle(self, call_id: str, actual_usd_micros: int):
-        if type(actual_usd_micros) is not int or actual_usd_micros < 0:
+        if type(actual_usd_micros) is not int or not 0 <= actual_usd_micros <= _MAX_I64:
             raise Refused("unknown_or_invalid_cost")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
