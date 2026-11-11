@@ -1,5 +1,5 @@
 import unittest
-from evaluation.a4a.synthetic_validity import summarize
+from evaluation.a4a.synthetic_validity import _summarize_dimension
 
 
 class SyntheticValidityTests(unittest.TestCase):
@@ -10,7 +10,7 @@ class SyntheticValidityTests(unittest.TestCase):
     def test_affected_are_unique_disagreements_in_fixed_denominator(self):
         self.cases[self.ids[0]] = 'missing'
         self.cases[self.ids[1]] = 'unalignable'
-        r = summarize(self.ids, self.cases)
+        r = _summarize_dimension(self.ids, self.cases)
         self.assertEqual((r['status'], r['agreements'], r['planned_cases']),
                          ('descriptive_only', 18, 20))
         self.assertEqual(len(r['affected']), 2)
@@ -19,7 +19,7 @@ class SyntheticValidityTests(unittest.TestCase):
     def test_over_ten_percent_is_not_scored(self):
         for case in self.ids[:3]:
             self.cases[case] = 'duplicate'
-        r = summarize(self.ids, self.cases)
+        r = _summarize_dimension(self.ids, self.cases)
         self.assertEqual(r['status'], 'invalid_rerun')
         self.assertNotIn('agreements', r)
         self.assertNotIn('interval_95', r)
@@ -31,15 +31,15 @@ class SyntheticValidityTests(unittest.TestCase):
                            (self.ids, {**self.cases, 'extra': 'agree'}),
                            (self.ids, {**self.cases, self.ids[0]: 'unknown'})):
             with self.assertRaises(ValueError):
-                summarize(ids, cases)
+                _summarize_dimension(ids, cases)
 
     def test_exact_ten_percent_for_odd_planned_count(self):
         ids = self.ids + ['case-20']
         cases = {x: 'agree' for x in ids}
         cases[ids[0]] = cases[ids[1]] = 'missing'
-        self.assertEqual(summarize(ids, cases)['status'], 'descriptive_only')
+        self.assertEqual(_summarize_dimension(ids, cases)['status'], 'descriptive_only')
         cases[ids[2]] = 'missing'
-        self.assertEqual(summarize(ids, cases)['status'], 'invalid_rerun')
+        self.assertEqual(_summarize_dimension(ids, cases)['status'], 'invalid_rerun')
 
 
 if __name__ == '__main__':
