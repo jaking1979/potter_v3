@@ -27,6 +27,15 @@ class ExerciseCommitmentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_exercise(plan, self.fixtures, self.digest)
 
+    def test_changed_rule_version_refuses_existing_digest(self):
+        from unittest.mock import patch
+        import evaluation.a4a.exercise_commitment as mod
+        other = dict(mod._RULES, version='synthetic-grader-pair/v2')
+        with patch.object(mod, '_RULES', other):
+            self.assertNotEqual(exercise_digest(self.plan, self.fixtures), self.digest)
+            with self.assertRaises(ValueError):
+                verify_exercise(self.plan, self.fixtures, self.digest)
+
     def test_invalid_inputs_refused(self):
         for plan, data, digest in ((self.plan, self.fixtures, 'x'*64),
                                    (self.plan, None, self.digest),
