@@ -1724,6 +1724,110 @@ class NonFiniteLeases(_TmpDB):
         self.assertEqual(self.store.claim("w2", LEASE, now=T + 41).lease_owner, "w2")
 
 
+class LeaseClockUnderLock(_TmpDB):
+    """Trusted time is sampled after the write lock is held (Dolores review
+    of 0564323): a lease operation that waits on the lock past its lease's
+    expiry is refused, and the reclaim at that time succeeds."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = [T]
+        self.timed = TaskStore(self.db, clock=lambda: self.t[0], escalate_after=10)
+
+    def _blocked(self, op, advance_to):
+        """Run ``op`` while another connection holds the write lock; the clock
+        advances to ``advance_to`` before the lock is released."""
+        locked, release = threading.Event(), threading.Event()
+
+        def holder():
+            c = sqlite3.connect(self.db, timeout=30, isolation_level=None)
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                locked.set()
+                release.wait(30)
+                self.t[0] = advance_to
+                c.execute("COMMIT")
+            finally:
+                c.close()
+        th = threading.Thread(target=holder)
+        th.start()
+        self.assertTrue(locked.wait(30))
+        threading.Timer(0.2, release.set).start()
+        try:
+            return op()
+        finally:
+            th.join(30)
+
+    def test_lease_ops_waiting_on_the_lock_past_expiry_are_refused(self):
+        ops = {"heartbeat": lambda tid: self.timed.heartbeat(tid, "w", LEASE),
+               "checkpoint": lambda tid: self.timed.checkpoint(tid, "w", {"i": 1}),
+               "complete": lambda tid: self.timed.complete(tid, "w"),
+               "fail": lambda tid: self.timed.fail(tid, "w", "boom"),
+               "wait_for_approval": lambda tid: self.timed.wait_for_approval(tid, "w")}
+        for i, (name, op) in enumerate(ops.items()):
+            with self.subTest(op=name):
+                base = T + i * 1000
+                self.t[0] = base
+                task, _ = self.timed.submit(f"lock:{name}", "x")
+                self.assertEqual(self.timed.claim("w", LEASE).id, task.id)   # lease to base+30
+                self.t[0] = base + 20                      # the worker calls in time...
+                with self.assertRaises(LeaseLost):         # ...but gets the lock at base+40
+                    self._blocked(lambda: op(task.id), advance_to=base + 40)
+                again = self.timed.claim("w2", LEASE)      # the reclaim at base+40 succeeds
+                self.assertEqual((again.id, again.lease_owner), (task.id, "w2"))
+                self.assertEqual(again.lease_expires_at, base + 40 + LEASE)
+                self.timed.complete(task.id, "w2")
+
+    def test_lock_wait_within_the_lease_still_succeeds(self):
+        task, _ = self.timed.submit("lock:ok", "x")
+        self.timed.claim("w", LEASE)
+        self.t[0] = T + 5
+        out = self._blocked(lambda: self.timed.heartbeat(task.id, "w", LEASE), advance_to=T + 20)
+        self.assertEqual(out.lease_expires_at, T + 20 + LEASE)       # extended from lock time
+
+    def test_claim_samples_after_the_lock(self):
+        task, _ = self.timed.submit("lock:claim", "x")
+        self.timed.claim("w", LEASE)
+        self.t[0] = T + 20                                 # still leased when B starts...
+        got = self._blocked(lambda: self.timed.claim("w2", LEASE), advance_to=T + 40)
+        self.assertEqual((got.id, got.lease_owner), (task.id, "w2"))  # ...expired once it holds the lock
+
+    def test_clock_rollback_refused_for_lease_holder(self):
+        task, _ = self.store.submit("rollback", "x", now=T)
+        self.store.claim("w", LEASE, now=T)
+        self.store.heartbeat(task.id, "w", LEASE, now=T + 10)       # last write at T+10, lease to T+40
+        for name, op in (("heartbeat", lambda: self.store.heartbeat(task.id, "w", LEASE, now=T + 5)),
+                         ("checkpoint", lambda: self.store.checkpoint(task.id, "w", {}, now=T + 9)),
+                         ("complete", lambda: self.store.complete(task.id, "w", now=T + 1))):
+            with self.subTest(op=name), self.assertRaisesRegex(LeaseLost, "rollback"):
+                op()
+        t = TaskStore(self.db).get(task.id)                # restart: nothing changed
+        self.assertEqual((t.state, t.lease_expires_at, t.updated_at), (RUNNING, T + 40, T + 10))
+        self.assertEqual(self.store.complete(task.id, "w", now=T + 11).state, DONE)   # forward clock ok
+
+
+class JobUpperLimits(_TmpDB):
+    def test_finite_over_limit_rows_flagged_after_restart(self):
+        from runtime.tasks import MAX_CADENCE_S, MAX_TOLERANCE
+        for name in ("huge-cadence", "huge-tolerance", "bounded", "stale"):
+            self.store.register_job(name, 60, now=T)
+        with _sql(self.db) as c:                           # finite rows above the limits
+            c.execute("UPDATE jobs SET cadence_s=1e20, tolerance=1 WHERE name='huge-cadence'")
+            c.execute("UPDATE jobs SET tolerance=2000 WHERE name='huge-tolerance'")
+            c.execute("UPDATE jobs SET cadence_s=?, tolerance=? WHERE name='bounded'",
+                      (MAX_CADENCE_S, MAX_TOLERANCE))      # exactly at the limits: valid
+        out = {j.name: j.fault for j in TaskStore(self.db).stale_jobs(T + 100)}   # restart
+        self.assertEqual(out, {"huge-cadence": "cadence_s/tolerance out of range",
+                               "huge-tolerance": "cadence_s/tolerance out of range",
+                               "stale": None})             # bounded is valid and not stale
+        with self.assertRaises(ValueError):                # registration enforces the same limits
+            self.store.register_job("x", 1e20, now=T)
+        with self.assertRaises(ValueError):
+            self.store.register_job("x", 60, tolerance=2000, now=T)
+        self.assertEqual(self.store.register_job("x", MAX_CADENCE_S, tolerance=MAX_TOLERANCE,
+                                                 now=T).cadence_s, MAX_CADENCE_S)
+
+
 class NonFiniteDeadlines(_EffectFixture):
     def _raw_ticket(self, body):
         """A ticket MAC'd exactly as the old signer did (NaN/Infinity allowed)."""

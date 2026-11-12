@@ -21,11 +21,11 @@ queued ──claim──▶ running ──complete──▶ done
                                        (a denied or expired approval counts toward job escalation)
 ```
 
-Each worker mutation checks, inside its write transaction, that the worker still holds a live lease. If it doesn't, the call raises `LeaseLost`.
+Each worker mutation checks, inside its write transaction, that the worker still holds a live lease. If it doesn't, the call raises `LeaseLost`. Every `TaskStore` write samples trusted time *after* `BEGIN IMMEDIATE` holds the lock; the `now=` test value is applied there too. Waiting on the lock is therefore measured: a heartbeat that gets the lock after its lease expired is refused, and the reclaim at that time succeeds. A lease holder whose clock reads earlier than the task's last write (rollback) also gets `LeaseLost`.
 
 **Non-finite inputs.**
 - **Leases.** `claim` and `heartbeat` reject a `lease_s` that is NaN, ±inf, ≤ 0, or > `MAX_LEASE_S` (1 day), before any write. A persisted lease that isn't a finite time within `MAX_LEASE_S` of now is treated as **expired**: the task can be reclaimed, the reclaim counts as a failure, and the holder gets `LeaseLost`. This covers +inf written before validation and NaN, which SQLite stores as NULL.
-- **Jobs.** `register_job` rejects a cadence or tolerance that is non-finite, out of range, or whose product overflows, on both create and update. An invalid update leaves the row unchanged.
+- **Jobs.** `register_job` rejects a cadence or tolerance that is non-finite, out of range, or whose product overflows, on both create and update. `stale_jobs` applies the same upper limits to persisted rows, so a finite but over-limit row is flagged too. An invalid update leaves the row unchanged.
 - **Watchdog.** `stale_jobs` reports a persisted row it can't evaluate as `Job.fault` and still evaluates every other job. If its clock is not finite, it reports every job with a fault.
 - **Clock.** Task-store and journal writes refuse a clock reading that is not finite.
 

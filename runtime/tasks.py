@@ -96,6 +96,7 @@ class Task:
     lease_expires_at: float | None
     checkpoint: Any
     last_error: str | None
+    updated_at: float | None = None   # journal time of the last write (rollback check)
 
 
 @dataclass(frozen=True)
@@ -123,10 +124,12 @@ def _job_fault(j: Job) -> str | None:
             continue
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
             return f"{name} is not finite: {v!r}"
-    if j.cadence_s <= 0 or j.tolerance < 1:
-        return "cadence_s/tolerance out of range"
     if not math.isfinite(j.cadence_s * j.tolerance):
         return "cadence_s x tolerance overflows"
+    # The same limits registration enforces: a finite but over-limit row
+    # (e.g. written before validation, or edited) is not silently trusted.
+    if not (0 < j.cadence_s <= MAX_CADENCE_S) or not (1 <= j.tolerance <= MAX_TOLERANCE):
+        return "cadence_s/tolerance out of range"
     return None
 
 
@@ -140,7 +143,7 @@ class Escalation:
 
 
 _TCOLS = ("id, trigger_key, kind, job, payload, state, attempts, consecutive_failures,"
-          " lease_owner, lease_expires_at, checkpoint, last_error")
+          " lease_owner, lease_expires_at, checkpoint, last_error, updated_at")
 _JCOLS = "name, cadence_s, tolerance, registered_at, last_success_at, consecutive_failures, escalated_at"
 
 
@@ -204,8 +207,8 @@ class TaskStore:
             raise ValueError("tolerance must be >= 1")
         if not math.isfinite(cadence_s * tolerance):
             raise ValueError("cadence_s x tolerance overflows")
-        now = self._now(now)
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             c.execute("INSERT INTO jobs (name, cadence_s, tolerance, registered_at) VALUES (?,?,?,?)"
                       " ON CONFLICT(name) DO UPDATE SET cadence_s=excluded.cadence_s,"
                       " tolerance=excluded.tolerance", (name, cadence_s, tolerance, now))
@@ -251,9 +254,9 @@ class TaskStore:
         (task, created). Payloads are JSON and must never contain secrets."""
         if not trigger_key or not kind:
             raise ValueError("trigger_key and kind required")
-        now = self._now(now)
         tid = task_id_for(trigger_key)
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             cur = c.execute("INSERT OR IGNORE INTO tasks (id, trigger_key, kind, job, payload, state,"
                             " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
                             (tid, trigger_key, kind, job, _dump(payload), QUEUED, now, now))
@@ -270,10 +273,10 @@ class TaskStore:
         if not worker_id:
             raise ValueError("worker_id required")
         lease_s = self._lease(lease_s)
-        now = self._now(now)
         fired: list[Escalation] = []
         claimed = None
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             while claimed is None:
                 row = c.execute(
                     "SELECT id, state FROM tasks WHERE state=? OR (state=? AND (lease_expires_at IS NULL"
@@ -303,6 +306,10 @@ class TaskStore:
         exp = t.lease_expires_at
         live = (isinstance(exp, (int, float)) and math.isfinite(exp)
                 and now < exp <= now + MAX_LEASE_S)
+        if t.updated_at is not None and now < t.updated_at:
+            # The clock reads earlier than this task's last write: a rolled-back
+            # clock could make an expired lease look live, so refuse.
+            raise LeaseLost(f"clock rollback: {now} is before {task_id}'s last update {t.updated_at}")
         if t.state != RUNNING or t.lease_owner != worker_id or not live:
             raise LeaseLost(f"{worker_id} does not hold a live lease on {task_id} (state {t.state})")
         return t
@@ -310,8 +317,8 @@ class TaskStore:
     def heartbeat(self, task_id: str, worker_id: str, lease_s: float, *,
                   now: float | None = None) -> Task:
         lease_s = self._lease(lease_s)        # validated before any write
-        now = self._now(now)
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             self._owned(c, task_id, worker_id, now)
             c.execute("UPDATE tasks SET lease_expires_at=?, updated_at=? WHERE id=?",
                       (now + lease_s, now, task_id))
@@ -320,16 +327,16 @@ class TaskStore:
     def checkpoint(self, task_id: str, worker_id: str, data: Any, *,
                    now: float | None = None) -> Task:
         """Persist progress so a resumed worker continues from here."""
-        now = self._now(now)
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             self._owned(c, task_id, worker_id, now)
             c.execute("UPDATE tasks SET checkpoint=?, updated_at=? WHERE id=?",
                       (_dump(data), now, task_id))
             return _load(c, task_id)
 
     def wait_for_approval(self, task_id: str, worker_id: str, *, now: float | None = None) -> Task:
-        now = self._now(now)
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             self._owned(c, task_id, worker_id, now)
             return self._move(c, task_id, RUNNING, WAITING_APPROVAL, now)
 
@@ -338,9 +345,9 @@ class TaskStore:
         """Approved -> back to queued to resume; denied/expired -> failed. A
         denied or expired approval ends the run, so it counts toward the job's
         consecutive failed runs (and job escalation) like any terminal failure."""
-        now = self._now(now)
         fired: list[Escalation] = []
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             t = _load(c, task_id)
             if t is None:
                 raise KeyError(task_id)
@@ -356,8 +363,8 @@ class TaskStore:
         return out
 
     def complete(self, task_id: str, worker_id: str, *, now: float | None = None) -> Task:
-        now = self._now(now)
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             t = self._owned(c, task_id, worker_id, now)
             out = self._move(c, task_id, RUNNING, DONE, now)
             c.execute("UPDATE tasks SET consecutive_failures=0 WHERE id=?", (task_id,))
@@ -371,9 +378,9 @@ class TaskStore:
         """Record a failed attempt. Retryable -> queued again, until
         ``escalate_after`` consecutive failures -> escalated. Not retryable ->
         failed."""
-        now = self._now(now)
         fired: list[Escalation] = []
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
             t = self._owned(c, task_id, worker_id, now)
             self._record_failure(c, t, error, retryable=retryable, now=now, fired=fired)
             out = _load(c, task_id)
