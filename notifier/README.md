@@ -40,6 +40,16 @@ E1 is the only notifier and the only approval issuer. It builds on C0 (`contract
        - a small step back within tolerance;
        - unchanged forward operation.
      - **Limit:** restoring a DB copy taken *before* an envelope was first accepted is indistinguishable from first delivery, while the clock is still within 300 s of that envelope. Detecting it needs an external monotonic anchor, such as a signed counter held outside the DB.
+   - **Refusal reasons (a contract E3 depends on).** For an update ID that is already journaled:
+     - `replayed` means the update was processed: it is done and will never run again, so stop redelivering it.
+     - `pending_conflict` means a *different* envelope arrived under an update ID that is still pending. It is not the journaled command and is never executed; the original envelope can still resume.
+     - `needs_operator` means a migrated pending command, which is never resumed.
+
+     The input-validation refusals cover non-finite values. Each fails closed with no writes, and none raises:
+     - `invalid_sent_at`: a NaN, ±inf, bool or non-numeric signed `sent_at`, rejected before the MAC check, the freshness arithmetic or any transaction, for new and pending envelopes alike.
+     - `clock_invalid`: a clock reading that is NaN, ±inf, bool or non-numeric, or a clock that raises. The reading is checked before authentication, any watermark update, marking a command processed (an invalid reading rolls the command's effect back, so it stays pending), operator reconcile or repair, and the migration seed.
+     - `watermark_corrupt`: a stored high-water value that is not finite. This persists across instances until an operator runs `ChannelAuth.repair_watermark()`, which replaces only the non-finite fields with the current finite clock and never lowers a finite one. `reconcile_clock()` is not a repair path.
+   - **`max_skew_s` bounds.** Construction rejects any value that isn't a finite number in (0, 3600] s; bool, NaN and ±inf are rejected. Watermarks are written with `allow_nan=False`.
    - **Retention.** Vouchers, which carry the verified text for command binding, are released after dispatch and capped at 1024 in memory. Journal rows keep only the digest. Processed rows are pruned after `2 × 300 s + 60 s`, once any replay of them would be rejected as stale anyway. Pending rows are never pruned.
    - A voucher can drive only the command it was minted for. `stop()` needs `/stop`, `ack(nid)` needs `/ack nid`, and `decide(id, approve)` needs `/approve id`. A voucher for `/ack` therefore cannot stop or approve.
    - A boundary test wires a fake Telegram webhook adapter to the router. The adapter checks the webhook secret and signs the envelope. A forged webhook never reaches the router.
