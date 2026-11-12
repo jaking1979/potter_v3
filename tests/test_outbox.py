@@ -51,6 +51,8 @@ class Channel:
             c.execute("CREATE TABLE IF NOT EXISTS calls (seq INTEGER PRIMARY KEY AUTOINCREMENT,"
                       " message_id TEXT NOT NULL, key TEXT NOT NULL, pid INTEGER NOT NULL)")
             c.execute("CREATE TABLE IF NOT EXISTS delivered (key TEXT NOT NULL)")
+            c.execute("CREATE TABLE IF NOT EXISTS fences (key TEXT PRIMARY KEY,"
+                      " upto INTEGER NOT NULL)")
 
     def log_call(self, msg):
         with _sql(self.path) as c:
@@ -58,8 +60,19 @@ class Channel:
                       (msg.message_id, msg.idempotency_key, os.getpid()))
 
     def deliver(self, msg):
+        """Provider side: a dispatch at or below the key's fence is refused."""
         with _sql(self.path) as c:
+            row = c.execute("SELECT upto FROM fences WHERE key=?", (msg.idempotency_key,)).fetchone()
+            if row and msg.dispatches <= row[0]:
+                raise SendFailed(f"fenced: dispatch {msg.dispatches} <= {row[0]}")
             c.execute("INSERT INTO delivered VALUES (?)", (msg.idempotency_key,))
+
+    def fence(self, msg):
+        """Enforceable provider fence: refuse every dispatch so far of this key."""
+        with _sql(self.path) as c:
+            c.execute("INSERT INTO fences VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET"
+                      " upto = max(upto, excluded.upto)", (msg.idempotency_key, msg.dispatches))
+        return True
 
     def send(self, msg):
         self.log_call(msg)
@@ -175,8 +188,9 @@ class CrashBoundaries(_Tmp):
         p.join(30)
         self.assertNotEqual(p.exitcode, 0)
 
-    def _restart_relay(self, reconcile=Channel.blind):
-        ob = Outbox(Database(self.db), dispatch_timeout_s=TIMEOUT)   # fresh objects = restart
+    def _restart_relay(self, reconcile=Channel.blind, fence=None):
+        ob = Outbox(Database(self.db), dispatch_timeout_s=TIMEOUT,   # fresh objects = restart
+                    fence=fence)
         return ob, ob.relay(self.ch.send, reconcile, owner="relay-2", now=AFTER_TIMEOUT)
 
     def test_crash_before_commit_leaves_no_message_and_no_send(self):
@@ -252,16 +266,40 @@ class CrashBoundaries(_Tmp):
         self.assertEqual(len(self.ch.calls()), 2)
         self.assertEqual(ob.get(self.MID).status, ABANDONED_UNKNOWN)
 
-    def test_honest_reconcile_gives_exactly_one_delivery_at_every_boundary(self):
+    def test_unfenced_not_delivered_verdict_never_authorizes_redispatch(self):
+        """An honest read-back that says "not delivered yet" is not enough after a
+        restart: without a fence the earlier sender might still land it."""
+        key = outbox_idempotency_key(self.MID)
+        for urgency, status, deliveries, calls in ((ROUTINE, ABANDONED_UNKNOWN, 0, 1),
+                                                   (URGENT, SENT, 1, 2)):   # T19 single resend
+            with self.subTest(urgency=urgency):
+                self.setUp()
+                self._crash("during_send", urgency)
+                ob, _ = self._restart_relay(self.ch.reconcile)
+                m = ob.get(self.MID)
+                self.assertEqual((m.status, self.ch.delivered(key), len(self.ch.calls())),
+                                 (status, deliveries, calls))
+                self.assertEqual(m.definite_failures, 0)
+
+    def test_honest_reconcile_after_delivery_resolves_without_resend(self):
+        for urgency in (ROUTINE, URGENT):
+            with self.subTest(urgency=urgency):
+                self.setUp()
+                self._crash("after_send", urgency)
+                ob, _ = self._restart_relay(self.ch.reconcile)
+                m = ob.get(self.MID)
+                self.assertEqual((m.status, m.blind_resends, len(self.ch.calls())), (SENT, 0, 1))
+
+    def test_fenced_restart_gives_exactly_one_delivery_at_every_boundary(self):
         for boundary in ("after_commit", "during_send", "after_send"):
             for urgency in (ROUTINE, URGENT):
                 with self.subTest(boundary=boundary, urgency=urgency):
                     self.setUp()
                     self._crash(boundary, urgency)
-                    ob, _ = self._restart_relay(self.ch.reconcile)
-                    self.assertEqual(ob.get(self.MID).status, SENT)
+                    ob, _ = self._restart_relay(self.ch.reconcile, fence=self.ch.fence)
+                    m = ob.get(self.MID)
+                    self.assertEqual((m.status, m.blind_resends), (SENT, 0))
                     self.assertEqual(self.ch.delivered(outbox_idempotency_key(self.MID)), 1)
-                    self.assertEqual(ob.get(self.MID).blind_resends, 0)
 
 
 # -- enqueue semantics ---------------------------------------------------------
@@ -500,3 +538,135 @@ class AckAndWatchdog(_Tmp):
             c.execute("UPDATE outbox SET status='unknown' WHERE message_id='c-new'")
         self.assertEqual([m.message_id for m in self.ob.stale_backlog(now=T + 3501)],
                          ["b-old", "c-new"])
+
+
+# -- claim deadlines under lock contention, paused senders, fences -----------------
+import threading  # noqa: E402
+
+
+class _Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class LeaseSafety(_Tmp):
+    def test_claim_under_lock_contention_is_not_born_expired(self):
+        """Dolores's probe: relay A waits on the write lock while the clock
+        passes its timeout; its claim must not commit already expired, so a
+        second relay cannot claim and resend it first."""
+        clock = _Clock(T)
+        a = Outbox(self.database, clock=clock, dispatch_timeout_s=10)
+        b = Outbox(self.database, clock=clock, dispatch_timeout_s=10)
+        self.enqueue(msg("u1", URGENT))
+        in_send, release_send = threading.Event(), threading.Event()
+        self.addCleanup(release_send.set)        # never leave the sender parked
+        seen = {}
+
+        def slow_send(m):
+            self.ch.log_call(m)
+            seen["until"], seen["clock"] = a.get("u1").in_flight_until, clock()
+            in_send.set()
+            release_send.wait(30)
+            self.ch.deliver(m)
+
+        holder = sqlite3.connect(self.db, timeout=30, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")                  # hold the write lock
+        t = threading.Thread(target=lambda: seen.setdefault(
+            "a", a.relay(slow_send, Channel.blind, owner="relay-A")))
+        t.start()
+        time.sleep(0.5)                                    # A is queued on the lock
+        clock.t = T + 100                                  # ...while time passes its timeout
+        holder.execute("COMMIT")
+        holder.close()
+        self.assertTrue(in_send.wait(30))
+        self.assertGreater(seen["until"], seen["clock"])   # A's claim is live, not born expired
+        rb = b.relay(self.ch.send, Channel.blind, owner="relay-B")
+        self.assertEqual(rb, RelayReport())                # B finds nothing it may claim
+        release_send.set()
+        t.join(30)
+        self.assertEqual(seen["a"].sent, ["u1"])
+        self.assertEqual(self.ch.calls("u1"), [outbox_idempotency_key("u1")])
+        m = a.get("u1")
+        self.assertEqual((m.status, m.dispatches, m.blind_resends), (SENT, 1, 0))
+
+    def _paused_sender(self, urgency, fence):
+        """Relay A claims and starts sending, then stalls past its lease. Relay B
+        reconciles (honestly: "not delivered yet"). Then A wakes up and delivers."""
+        clock = _Clock(T)
+        a = Outbox(self.database, clock=clock, dispatch_timeout_s=10)
+        b = Outbox(self.database, clock=clock, dispatch_timeout_s=10, fence=fence)
+        self.enqueue(msg("m1", urgency))
+        out = {}
+
+        def paused_send(m):
+            self.ch.log_call(m)
+            clock.t = T + 60                       # A stalls far past its 10 s lease
+            out["b"] = b.relay(self.ch.send, self.ch.reconcile, owner="relay-B")
+            try:
+                self.ch.deliver(m)                 # ...then A's request lands late
+                out["late"] = "delivered"
+            except SendFailed:
+                out["late"] = "refused"
+                raise
+        a.relay(paused_send, Channel.blind, owner="relay-A")
+        return a.get("m1"), out
+
+    def test_paused_sender_routine_unfenced_is_not_redispatched(self):
+        m, out = self._paused_sender(ROUTINE, fence=None)
+        self.assertEqual(out["b"].abandoned_unknown, ["m1"])
+        self.assertEqual(out["late"], "delivered")
+        self.assertEqual(len(self.ch.calls("m1")), 1)
+        self.assertEqual(self.ch.delivered(), 1)           # exactly one, despite B
+        self.assertEqual((m.status, m.dispatches), (ABANDONED_UNKNOWN, 1))
+
+    def test_paused_sender_urgent_unfenced_keeps_t19_cap(self):
+        m, out = self._paused_sender(URGENT, fence=None)
+        self.assertEqual(out["b"].resent_unknown, ["m1"])
+        self.assertEqual(len(self.ch.calls("m1")), 2)       # never more than one resend
+        self.assertLessEqual(self.ch.delivered(), 2)
+        self.assertEqual((m.status, m.dispatches, m.blind_resends, m.definite_failures),
+                         (SENT, 2, 1, 0))
+
+    def test_paused_sender_with_provider_fence_delivers_exactly_once(self):
+        for urgency in (ROUTINE, URGENT):
+            with self.subTest(urgency=urgency):
+                self.setUp()
+                m, out = self._paused_sender(urgency, fence=self.ch.fence)
+                self.assertEqual(out["b"].sent, ["m1"])          # fenced redispatch, same key
+                self.assertEqual(out["late"], "refused")         # provider refuses A
+                self.assertEqual(self.ch.delivered(), 1)
+                self.assertEqual(set(self.ch.calls("m1")), {outbox_idempotency_key("m1")})
+                self.assertEqual((m.status, m.dispatches, m.blind_resends), (SENT, 2, 0))
+
+    def test_fence_errors_or_non_true_answers_refuse(self):
+        for i, fence in enumerate((lambda m: 1 / 0, lambda m: "yes", lambda m: None)):
+            with self.subTest(i=i):
+                self.setUp()
+                m, out = self._paused_sender(ROUTINE, fence=fence)
+                self.assertEqual(out["b"].abandoned_unknown, ["m1"])
+                self.assertEqual(len(self.ch.calls()), 1)
+
+    def test_clock_regression_cannot_write_an_expired_deadline(self):
+        ahead, behind = _Clock(T + 100), _Clock(T)
+        a = Outbox(self.database, clock=ahead, dispatch_timeout_s=10)
+        self.enqueue(msg("m1", URGENT))
+        self.enqueue(msg("m2", URGENT))
+        a.relay(self.ch.send, Channel.blind, owner="relay-A", limit=1)    # m1 at T+100
+        # Restart with a clock that stepped back 100 s; it claims m2 and stalls.
+        r = Outbox(Database(self.db), clock=behind, dispatch_timeout_s=10)
+        seen = {}
+
+        def stalled(m):
+            self.ch.log_call(m)
+            seen["until"] = r.get("m2").in_flight_until
+            seen["c"] = Outbox(self.database, clock=_Clock(T + 105), dispatch_timeout_s=10) \
+                .relay(self.ch.send, Channel.blind, owner="relay-C")
+            self.ch.deliver(m)
+        r.relay(stalled, Channel.blind, owner="relay-R")
+        self.assertEqual(seen["until"], T + 110)          # not T + 10
+        self.assertEqual(seen["c"], RelayReport())         # C at T+105 sees a live claim
+        self.assertEqual(len(self.ch.calls("m2")), 1)
+        self.assertEqual(r.get("m2").dispatches, 1)

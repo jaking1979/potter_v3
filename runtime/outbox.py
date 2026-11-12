@@ -31,6 +31,24 @@ Unknown outcomes (T19 PASS 2 item 1) are first given to ``reconcile(message)``:
     (``blind_resends`` 0 -> 1, enforced by a CHECK constraint). Any
     non-success outcome after that resend -> ``abandoned_unknown``.
 
+Re-dispatch after an unknown outcome needs a fence. A lease cannot preempt a
+paused sender: a stalled process, or a request that timed out locally, can
+still deliver after its claim expired. So a reconcile verdict of ``"failed"``
+("not delivered yet") authorizes a re-dispatch ONLY if the injected ``fence``
+(the C4 / provider-side seam, mirroring C2 ``EffectJournal(fence=...)``)
+confirms every earlier dispatch is fenced off at the channel. With no fence,
+or if it errors or returns anything but ``True``, the verdict is treated as
+``still_unknown``: routine is not resent, urgent gets only its single T19
+resend. An expired claim alone never authorizes anything but a reconcile.
+
+Claim deadlines are computed INSIDE the write transaction, after BEGIN
+IMMEDIATE has the lock, so waiting on the lock cannot commit a claim that is
+already expired. Inside that transaction the time used is
+``max(clock(), outbox_clock_hwm)``, a high-water mark kept in ``meta``. A
+relay whose clock stepped backwards therefore cannot write a deadline that
+other relays already consider past. A clock that jumps forward only freezes
+recovery until real time catches up; it never shortens a live lease.
+
 This is the one deliberate departure from T10's "never blind retry": T19
 accepts a possible duplicate for urgent notifications in exchange for not
 silently losing one, and caps it at one duplicate.
@@ -204,7 +222,8 @@ class Outbox:
     def __init__(self, db: Database | str | Path, *, clock: Callable[[], float] = time.time,
                  dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
                  max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-                 backoff_s: float = DEFAULT_BACKOFF_S):
+                 backoff_s: float = DEFAULT_BACKOFF_S,
+                 fence: Callable[[QueuedMessage], bool] | None = None):
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         self.db = as_database(db)
@@ -212,12 +231,14 @@ class Outbox:
         self._dispatch_timeout = dispatch_timeout_s
         self._max_attempts = max_attempts
         self._backoff = backoff_s
+        self._fence = fence   # C4/provider seam; None = refuse unfenced re-dispatch
         try:
             with self.db.tx() as c:
                 for stmt in OUTBOX_SCHEMA:
                     c.execute(stmt)
                 c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('outbox_schema', ?)",
                           (OUTBOX_SCHEMA_VERSION,))
+                c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('outbox_clock_hwm', '0')")
                 got = c.execute("SELECT value FROM meta WHERE key='outbox_schema'").fetchone()[0]
                 if got != OUTBOX_SCHEMA_VERSION:
                     raise JournalUnavailable(
@@ -227,6 +248,28 @@ class Outbox:
 
     def _now(self, now: float | None) -> float:
         return self._clock() if now is None else now
+
+    @staticmethod
+    def _tx_now(c: sqlite3.Connection, clock: Callable[[], float]) -> float:
+        """Time for a relay transition. Call ONLY inside ``db.tx()``: the clock
+        is read after the write lock is held, and never below the shared
+        high-water mark, so no deadline is written that is already past."""
+        t = float(clock())
+        hwm = float(c.execute("SELECT value FROM meta WHERE key='outbox_clock_hwm'").fetchone()[0])
+        if t > hwm:
+            c.execute("UPDATE meta SET value=? WHERE key='outbox_clock_hwm'", (repr(t),))
+            return t
+        return hwm
+
+    def _fenced(self, msg: QueuedMessage) -> bool:
+        """True only if the fence confirms every earlier dispatch of ``msg`` can
+        no longer deliver. Default (no fence), an error or a non-True answer: refuse."""
+        if self._fence is None:
+            return False
+        try:
+            return self._fence(msg) is True
+        except Exception:
+            return False
 
     # -- enqueue (inside the caller's business transaction) -----------------
     def enqueue(self, tx: sqlite3.Connection, message: OutboxMessage, *,
@@ -322,7 +365,7 @@ class Outbox:
         report = RelayReport()
         handled = 0
         while limit is None or handled < limit:
-            claim = self._claim(owner, clock())
+            claim = self._claim(owner, clock)
             if claim is None:
                 break
             kind, msg = claim
@@ -335,9 +378,10 @@ class Outbox:
                 self._resolve_unknown(msg, send, reconcile, owner, clock, report)
         return report
 
-    def _claim(self, owner: str, now: float) -> tuple[str, QueuedMessage] | None:
-        until = now + self._dispatch_timeout
+    def _claim(self, owner: str, clock: Callable[[], float]) -> tuple[str, QueuedMessage] | None:
         with self.db.tx() as c:
+            now = self._tx_now(c, clock)          # sampled after BEGIN IMMEDIATE has the lock
+            until = now + self._dispatch_timeout
             # 1. Unknown outcomes nobody holds (released, or dispatcher died).
             row = c.execute(f"SELECT {_COLS} FROM outbox WHERE status=? AND"
                             " (in_flight_owner IS NULL OR in_flight_until <= ?)"
@@ -375,14 +419,14 @@ class Outbox:
         try:
             result = send(msg)
         except SendFailed as exc:
-            self._definite_failure(msg, owner, clock(), f"send failed: {exc!r}", report)
+            self._definite_failure(msg, owner, clock, f"send failed: {exc!r}", report)
             return
         except Exception as exc:
             # Ambiguous: stays "unknown" under our claim; resolve it right away.
-            if self._update(msg, owner, "last_error=?", (f"ambiguous: {exc!r}",), clock()):
+            if self._update(msg, owner, "last_error=?", (f"ambiguous: {exc!r}",), clock):
                 self._resolve_unknown(msg, send, reconcile, owner, clock, report)
             return
-        if self._settle_sent(msg, owner, result, clock()):
+        if self._settle_sent(msg, owner, result, clock):
             report.sent.append(msg.message_id)
 
     def _resolve_unknown(self, msg: QueuedMessage, send, reconcile, owner: str, clock,
@@ -396,46 +440,58 @@ class Outbox:
         if verdict not in (VERDICT_SUCCEEDED, VERDICT_FAILED, STILL_UNKNOWN):
             verdict, note = STILL_UNKNOWN, f"unrecognised reconcile verdict {verdict!r}"
         if verdict == VERDICT_SUCCEEDED:
-            if self._settle_sent(msg, owner, {"reconciled": True}, clock()):
+            if self._settle_sent(msg, owner, {"reconciled": True}, clock):
                 report.sent.append(msg.message_id)
             return
         if verdict == VERDICT_FAILED:
-            # A crash, not the channel, stopped it: retry now (still counts to max_attempts).
-            self._definite_failure(msg, owner, clock(), "reconciled: not delivered", report,
-                                   retry_now=True)
-            return
+            if self._fenced(msg):
+                # Proven not delivered AND no earlier dispatch can still land:
+                # retry now with the same key (counts towards max_attempts).
+                self._definite_failure(msg, owner, clock, "reconciled: not delivered, fenced",
+                                       report, retry_now=True)
+                return
+            # "Not delivered yet" is not "will never be delivered": a paused or
+            # timed-out earlier sender may still land it. No fence -> unknown.
+            verdict, note = STILL_UNKNOWN, "reconciled not delivered, but unfenced"
         reason = note or "outcome unknown"
         if msg.urgency == URGENT and msg.blind_resends == 0:
             # T19: urgent -> exactly one resend, same idempotency key.
             if self._update(msg, owner, "dispatches=dispatches+1, blind_resends=1,"
                             " in_flight_until=?, last_error=?",
-                            (clock() + self._dispatch_timeout, reason), clock()):
+                            lambda now: (now + self._dispatch_timeout, reason), clock):
                 report.resent_unknown.append(msg.message_id)
                 resent = self.get(msg.message_id)
                 try:
                     result = send(resent)
                 except Exception as exc:
-                    self._abandon(resent, owner, clock(), f"after one resend: {exc!r}", report)
+                    self._abandon(resent, owner, clock, f"after one resend: {exc!r}", report)
                     return
-                if self._settle_sent(resent, owner, result, clock()):
+                if self._settle_sent(resent, owner, result, clock):
                     report.sent.append(msg.message_id)
             return
         why = reason if msg.urgency == ROUTINE else f"{reason} after one resend"
-        self._abandon(msg, owner, clock(), why, report)
+        self._abandon(msg, owner, clock, why, report)
 
     # -- transitions (each conditioned on the claim still being ours) --------
-    def _update(self, msg: QueuedMessage, owner: str, assignments: str, args: tuple,
-                now: float) -> bool:
+    def _update(self, msg: QueuedMessage, owner: str, assignments: str,
+                args: "tuple | Callable[[float], tuple]", clock: Callable[[], float]) -> bool:
+        """``args`` may be a function of the in-transaction time, for values
+        (deadlines, retry times) that must not be computed before the lock."""
         with self.db.tx() as c:
+            now = self._tx_now(c, clock)
+            if callable(args):
+                args = args(now)
             cur = c.execute(f"UPDATE outbox SET {assignments}, updated_at=?"
                             " WHERE message_id=? AND status=? AND dispatches=?"
                             " AND in_flight_owner=?",
                             (*args, now, msg.message_id, UNKNOWN, msg.dispatches, owner))
             return cur.rowcount == 1
 
-    def _settle_sent(self, msg: QueuedMessage, owner: str, result: Any, now: float) -> bool:
+    def _settle_sent(self, msg: QueuedMessage, owner: str, result: Any,
+                     clock: Callable[[], float]) -> bool:
         blob = json.dumps(result, sort_keys=True) if result is not None else None
         with self.db.tx() as c:
+            now = self._tx_now(c, clock)
             cur = c.execute("UPDATE outbox SET status=?, result=?, sent_at=?, last_error=NULL,"
                             " in_flight_owner=NULL, in_flight_until=NULL, updated_at=?"
                             " WHERE message_id=? AND status=? AND dispatches=?"
@@ -450,22 +506,23 @@ class Outbox:
                       (blob, now, now, msg.message_id, msg.dispatches, owner))
             return False
 
-    def _definite_failure(self, msg: QueuedMessage, owner: str, now: float, error: str,
-                          report: RelayReport, retry_now: bool = False) -> None:
+    def _definite_failure(self, msg: QueuedMessage, owner: str, clock: Callable[[], float],
+                          error: str, report: RelayReport, retry_now: bool = False) -> None:
         if msg.blind_resends:
             # The first dispatch's outcome is still unknown: never send a third time.
-            self._abandon(msg, owner, now, f"{error} after one resend", report)
+            self._abandon(msg, owner, clock, f"{error} after one resend", report)
             return
         failures = msg.definite_failures + 1
         final = failures >= self._max_attempts
-        retry_at = now if retry_now else now + self._backoff * (2 ** (failures - 1))
+        delay = 0.0 if retry_now else self._backoff * (2 ** (failures - 1))
         if self._update(msg, owner, "status=?, definite_failures=?, next_attempt_at=?,"
                         " last_error=?, in_flight_owner=NULL, in_flight_until=NULL",
-                        (FAILED if final else PENDING, failures, retry_at, error), now):
+                        lambda now: (FAILED if final else PENDING, failures, now + delay, error),
+                        clock):
             (report.failed if final else report.retry_scheduled).append(msg.message_id)
 
-    def _abandon(self, msg: QueuedMessage, owner: str, now: float, error: str,
+    def _abandon(self, msg: QueuedMessage, owner: str, clock: Callable[[], float], error: str,
                  report: RelayReport) -> None:
         if self._update(msg, owner, "status=?, last_error=?, in_flight_owner=NULL,"
-                        " in_flight_until=NULL", (ABANDONED_UNKNOWN, error), now):
+                        " in_flight_until=NULL", (ABANDONED_UNKNOWN, error), clock):
             report.abandoned_unknown.append(msg.message_id)
