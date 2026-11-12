@@ -50,8 +50,12 @@ class StampTests(unittest.TestCase):
     def test_failed_write_rolls_generation_back(self):
         item = self.stage('r1', 'one')
         _, stamp = self.b.snapshot_with_stamp(['k'])
-        self.a._db.execute("CREATE TRIGGER fail_audit BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT,'injected'); END")
-        with self.assertRaises(Exception): self.a.promote(item.id, item.version, object())
+        import sqlite3
+        self.a._db.set_authorizer(lambda op, arg1, arg2, db, src: sqlite3.SQLITE_DENY if op == sqlite3.SQLITE_INSERT and arg1 == 'audit' else sqlite3.SQLITE_OK)
+        try:
+            with self.assertRaises(sqlite3.DatabaseError): self.a.promote(item.id, item.version, object())
+        finally:
+            self.a._db.set_authorizer(None)
         self.assertTrue(self.b.is_current_stamp(stamp))
         snap, _ = self.b.snapshot_with_stamp(['k'])
         self.assertEqual(snap['k'].provisional[0].value, 'one')

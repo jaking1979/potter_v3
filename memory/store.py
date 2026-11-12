@@ -146,6 +146,10 @@ class MemoryStore:
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if tables != {'item', 'request', 'audit', 'metadata'}:
             raise Invalid('unknown store tables')
+        # This synthetic schema does not define triggers or views. A trigger
+        # could copy a fact during forget despite the expected table names.
+        if self._db.execute("SELECT 1 FROM sqlite_master WHERE type IN ('trigger','view') LIMIT 1").fetchone():
+            raise Invalid('unknown store objects')
         meta = self._db.execute('SELECT schema,environment,epoch,generation FROM metadata').fetchall()
         if len(meta) != 1:
             raise Invalid('unknown store metadata')
