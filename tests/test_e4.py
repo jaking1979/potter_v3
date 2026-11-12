@@ -76,5 +76,18 @@ class Tests(unittest.TestCase):
     def test_forged_projection_revalidated(self):
         v=project(fixture(),now=NOW);v['sections']['tasks']['items'][0]['status']='<script>CANARY_SECRET</script>'
         self.assertNotIn('CANARY_SECRET',render(v))
+    def test_forged_section_is_unavailable_without_hiding_other_sections(self):
+        for invalid in (None, [], 'CANARY_SECRET', 42):
+            v=project(fixture(),now=NOW);v['sections']['tasks']=invalid
+            html=render(v)
+            self.assertNotIn('CANARY_SECRET',html)
+            self.assertIn('Unavailable. State age unknown.',html)
+            self.assertIn('Approvals status',html)
+    def test_forged_sections_container_fails_closed(self):
+        for invalid in (None, [], 'CANARY_SECRET', 42):
+            v=project(fixture(),now=NOW);v['sections']=invalid
+            html=render(v)
+            self.assertEqual(html.count('Unavailable. State age unknown.'),6)
+            self.assertNotIn('CANARY_SECRET',html)
 if __name__=='__main__':unittest.main()
 
