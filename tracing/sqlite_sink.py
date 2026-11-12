@@ -114,8 +114,11 @@ class SqliteTraceSink:
         return c
 
     def _verify(self, c):
-        rows = c.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
-        if dict(rows) != _DDL:
+        rows = c.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").fetchall()
+        expected = [('table', 'events', 'events', _DDL['events']),
+                    ('table', 'metadata', 'metadata', _DDL['metadata']),
+                    ('index', 'sqlite_autoindex_events_1', 'events', None)]
+        if rows != expected:
             raise TraceStoreRefused('existing store schema mismatch')
         meta = c.execute('SELECT version, environment FROM metadata').fetchall()
         if meta != [(VERSION, self.environment)]:
