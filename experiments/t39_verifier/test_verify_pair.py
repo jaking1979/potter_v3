@@ -115,6 +115,30 @@ class VerificationTests(unittest.TestCase):
             admit_merge(commit=self.expected['commit'], tree=self.expected['tree'], load_receipt=lambda _: replay,
                         verify=verifier, registry=registry, issuer='ci', now=stamp)
 
+    def test_signed_noncanonical_or_malformed_claims_fail_closed(self):
+        valid = json.loads(self.payloads[0])
+        cases = [
+            json.dumps(valid, sort_keys=True).encode(),  # signed whitespace
+            json.dumps(dict(reversed(list(valid.items()))), separators=(',', ':')).encode(),
+            self.payloads[0][:-1] + b',"role":"author"}',  # duplicate key
+            self.payload('author', 'e' * 64, unexpected='field'),
+            json.dumps({k: v for k, v in valid.items() if k != 'evidence'}, sort_keys=True, separators=(',', ':')).encode(),
+            self.payload('author', 'e' * 64, expires_at=True),
+            self.payloads[0] + b'\xff',
+        ]
+        for index, payload in enumerate(cases):
+            with self.subTest(index=index):
+                self.payloads[0] = payload
+                self.sigs[0] = self.sign(payload, 'dolores', f'bad-{index}')
+                with self.assertRaises(ValueError): self.verify()
+
+    def test_invalid_signer_keys_fail_closed(self):
+        author = self.keys['dolores']
+        for bad in ('ssh-rsa AAAA', author + ' trailing-comment', author + '=',
+                    author.replace('ssh-ed25519', 'ssh-ed448'), 'ssh-ed25519 AAAA'):
+            with self.subTest(key=bad), self.assertRaises(ValueError):
+                self.verify(agent_keys={'dolores': bad, 'claude': self.keys['claude']})
+
 
 if __name__ == '__main__':
     unittest.main()
