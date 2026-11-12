@@ -14,12 +14,14 @@ class BenchmarkInputTests(unittest.IsolatedAsyncioTestCase):
                 yield str(len(consumed))
         with self.assertRaises(ValueError):
             await benchmark(FakeBackend(), 'q', unbounded())
-        self.assertEqual(len(consumed), 4)
+        self.assertEqual(len(consumed), 0)
 
     async def test_invalid_values_refused_and_valid_set_scores(self):
-        for values in (None, [['unhashable']], ['a', 'a'], ['']):
+        for values in (None, 'ab', b'ab', [['unhashable']], ['a', 'a'], ['']):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 await benchmark(FakeBackend(), 'q', values)
         result = await benchmark(FakeBackend([Evidence('a', 'text')]), 'q', ['a'])
+        self.assertTrue(result.hit)
+        result = await benchmark(FakeBackend([Evidence('a', 'text')]), 'q', ('a',))
         self.assertTrue(result.hit)
 
