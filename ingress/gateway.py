@@ -66,7 +66,7 @@ REASONS = frozenset({
     "malformed", "missing_message_id", "oversized_raw", "oversized_body",
     "oversized_attachment", "too_many_attachments", "bot_sender", "sender_not_allowlisted",
     "trace_error", "ingress_error", "attachment_reclaimed", "clock_regression",
-    "needs_operator", "transport_conflict",
+    "needs_operator", "transport_conflict", "pending_conflict", "needs_reconciliation",
     # trust reasons (why an accepted event is untrusted; "ok" when principal_direct)
     "ok", "multiple_from", "header_defect", "display_name_spoof", "reply_to_mismatch",
     "sender_mismatch", "dkim_missing", "dkim_failed", "dkim_unaligned", "spf_failed",
@@ -172,13 +172,20 @@ class _Draft:
 # it) nor an accepted untrusted event: unrecorded, retryable rejections.
 # ``stale_transport`` is included: it is returned only after E3 has already
 # re-signed once with a fresh sent_at, i.e. E3's and E1's clocks disagree.
-# ``transport_conflict``: E1 refused the envelope as ``replayed`` on a first
-# (non-settle) handoff - either a different update under the same key is
-# pending in E1 (e.g. an altered retry after an E3 rollback) or E1 has a
-# processed row E3 never committed. Never recorded, so it cannot pre-empt the
-# genuine update's retry, and never accepted.
+# ``transport_conflict``: E1 answered ``pending_conflict`` (E1 f37086f) - a
+# DIFFERENT update is pending under this key (e.g. an altered retry after an
+# E3 rollback). Never recorded, so it cannot pre-empt the genuine update,
+# whose identical envelope still resumes the pending row; never accepted.
 E1_RETRYABLE = frozenset({"clock_regression", "needs_operator", "stale_transport",
                           "transport_conflict"})
+# ``needs_reconciliation``: on a FIRST handoff (E3 has no committed decision
+# for this key) E1 answered ``replayed`` - it holds a PROCESSED row E3 never
+# committed (E3 store lost or restored, or an E1 row written by another path).
+# Nothing can resume it, so retrying would loop forever. It is a durable,
+# explicit safe failure: recorded (re-deliveries are then plain duplicates),
+# never accepted, no event, no effect; listed by needs_reconciliation() for an
+# operator.
+NEEDS_RECONCILIATION = "needs_reconciliation"
 # E1 refusals after which E1 holds a settled (processed) row for the update.
 _E1_SETTLED = frozenset({"replayed", "unknown_sender", "not_allowlisted",
                          "principal_disabled", "dkim_unverified", "session_unverified"})
@@ -285,6 +292,13 @@ class IngressGateway:
                 pass
         return ids
 
+    def needs_reconciliation(self) -> list[tuple[str, str]]:
+        """(channel, event_id) of deliveries refused as ``needs_reconciliation``:
+        E1 holds a processed record E3 never committed. For an operator; E3
+        never accepts or retries them."""
+        return [(ch, ev) for ch, ev, _dec, reason, _t, _r in self._store.log()
+                if reason == NEEDS_RECONCILIATION]
+
     def gc_attachments(self, grace_s: int | None = None) -> list[str]:
         """Reclaim blobs left by rolled-back or crashed ingests and blobs
         released by ``expire_pending``: only those staged/released longer than
@@ -363,6 +377,8 @@ class IngressGateway:
             raw_ref=u.delivery_ref)
         if reason in E1_RETRYABLE:
             raise _Reject(reason, record=False)
+        if reason == NEEDS_RECONCILIATION:
+            raise _Reject(NEEDS_RECONCILIATION, record=True).with_draft(draft)
         if principal is None:
             # A stranger DMing the bot does not drive the runner (E1: ignored + logged).
             raise _Reject("sender_not_allowlisted", record=True).with_draft(draft)
@@ -421,6 +437,10 @@ class IngressGateway:
             msg, raw, mid, bind_update(f"{subject}\n{text}", sha256(raw)))
         if trust in E1_RETRYABLE:
             raise _Reject(trust, record=False)
+        if trust == NEEDS_RECONCILIATION:
+            # Recorded under the verified key, so re-deliveries are duplicates.
+            raise _Reject(NEEDS_RECONCILIATION, record=True).with_draft(
+                _Draft(EMAIL, verified_key, mid, sha256(raw), None, (), (), trust))
         own = PRINCIPAL_DIRECT if trust == "ok" else EXTERNAL_SENDER
         key = (verified_key if own == PRINCIPAL_DIRECT
                else f"email|untrusted:{sha256(addr.encode())}|{mid}")
@@ -529,11 +549,10 @@ class IngressGateway:
             auth = self._auth.authenticate(env)
         sender = getattr(auth, "sender", None)
         e1_reason = getattr(auth, "reason", None)
-        # "replayed" means settled only on a settle (already E3-committed,
-        # identical-content) handoff; on a first handoff it can be a pending
-        # row for a DIFFERENT update: keep the stored sent_at so the genuine
-        # update can still resume, and refuse this one as a conflict.
-        if sender is None and e1_reason in _E1_SETTLED and (settle or e1_reason != "replayed"):
+        # E1 f37086f: "replayed" = processed (settled), "pending_conflict" = a
+        # different update is pending. Keep the stored sent_at on a conflict so
+        # the genuine update can still resume; drop it once E1 has settled.
+        if sender is None and e1_reason in _E1_SETTLED:
             self._store.handoff_drop(hkey)    # E1 holds a settled (processed) row
         sender = (sender, hkey) if sender is not None else None
         try:
@@ -541,8 +560,10 @@ class IngressGateway:
             reason = e1_reason
             if principal is not None:
                 reason = "ok"
-            elif reason == "replayed" and not settle:
+            elif reason == "pending_conflict":
                 reason = "transport_conflict"
+            elif reason == "replayed" and not settle:
+                reason = NEEDS_RECONCILIATION
             elif reason not in REASONS or reason == "ok":
                 reason = "unvouched_sender"
             return principal, sender, reason

@@ -1210,9 +1210,9 @@ class ReplayRecordRetention(Fixture):
     def test_88_skew_mismatch_cannot_reopen_replay(self):
         # Dolores 01:37Z: E3 used a caller-supplied skew to prune E1 rows. E3 no
         # longer deletes from E1's table at all, so a ChannelAuth with a large
-        # max_skew keeps its own horizon.
+        # max_skew (up to E1's 3600 s limit) keeps its own horizon.
         self.auth = self.make_auth(cls=type(self.auth), clock=lambda: float(self.now[0]),
-                                   max_skew_s=10_000)
+                                   max_skew_s=3600)       # E1's maximum
         self.gw = self.gateway(clock=lambda: self.now[0])
         self.gw.ingest_telegram(self.tg())
         captured = self.envs[-1]
@@ -1589,6 +1589,71 @@ class PendingRecoveryBindsWholeUpdate(Fixture):
         self.roll_back(lambda gw: gw.ingest_telegram(self.tg()))
         res = self.gw.ingest_telegram(self.tg())
         self.assertTrue(res.accepted and res.event.trusted)
+
+
+class E1RecoveryStatesAreDistinct(Fixture):
+    """Dolores at dbb4b4e: E1 answered ``replayed`` both for a pending row with a
+    different envelope and for any processed row, so E3 looped forever on a
+    processed row it never committed. With E1 f37086f the states are distinct:
+    ``pending_conflict`` -> unrecorded, retryable ``transport_conflict``; a
+    first-handoff ``replayed`` -> recorded ``needs_reconciliation`` (never
+    accepted, no event, no retry loop)."""
+
+    def setUp(self):
+        super().setUp()
+        self.reasons = []
+        reasons = self.reasons
+
+        class Spy(ChannelAuth):
+            def authenticate(self, msg):
+                r = super().authenticate(msg)
+                reasons.append(r.reason)
+                return r
+        self.auth = self.make_auth(cls=Spy)
+        self.gw = self.gateway()
+
+    def lost_store_gateway(self):
+        """E3 with a fresh, empty store against the SAME E1 database."""
+        return self.gateway(store=IngressStore(str(Path(self.tmp.name) / "lost.db")))
+
+    def test_114_processed_row_e3_never_committed_needs_reconciliation(self):
+        self.assertTrue(self.gw.ingest_telegram(self.tg()).accepted)     # E1 row processed
+        lost = self.lost_store_gateway()
+        res = lost.ingest_telegram(self.tg())
+        self.assertEqual(self.reasons[-1], "replayed")
+        self.assertEqual((res.accepted, res.reason, res.event),
+                         (False, "needs_reconciliation", None))
+        self.assertEqual(lost.pending(), [])                              # no event
+        self.assertEqual(len(lost.needs_reconciliation()), 1)            # for an operator
+        self.assertEqual(IngressStore(str(Path(self.tmp.name) / "lost.db")).handoffs(), [])
+        for _ in range(5):                                                 # no retry loop
+            again = lost.ingest_telegram(self.tg())
+            self.assertEqual((again.accepted, again.duplicate, again.event), (False, True, None))
+        self.assertEqual(len(lost.needs_reconciliation()), 1)
+
+    def test_115_email_processed_row_e3_never_committed(self):
+        self.pass_dkim("<r9@potter.test>")
+        self.assertTrue(self.gw.ingest_email(make_email(mid="<r9@potter.test>")).accepted)
+        lost = self.lost_store_gateway()
+        res = lost.ingest_email(make_email(mid="<r9@potter.test>"))
+        self.assertEqual((res.accepted, res.reason, res.event),
+                         (False, "needs_reconciliation", None))
+        self.assertTrue(lost.ingest_email(make_email(mid="<r9@potter.test>")).duplicate)
+        self.assertEqual(lost.pending(), [])
+
+    def test_116_pending_conflict_is_retryable_and_genuine_resumes(self):
+        def broken(line):
+            raise OSError("down")
+        self.gateway(trace_sink=broken).ingest_telegram(self.tg(text="pay", forwarded=True))
+        res = self.gw.ingest_telegram(self.tg(text="pay", forwarded=False))
+        self.assertEqual(self.reasons[-1], "pending_conflict")
+        self.assertEqual((res.accepted, res.reason, res.event), (False, "transport_conflict", None))
+        self.assertEqual(IngressStore(self.db).log(), [])                 # not recorded
+        self.assertEqual(len(IngressStore(self.db).handoffs()), 1)        # sent_at kept
+        self.assertEqual(self.gw.needs_reconciliation(), [])
+        ok = self.gw.ingest_telegram(self.tg(text="pay", forwarded=True))
+        self.assertTrue(ok.accepted)
+        self.assertEqual(ok.event.provenance, (FORWARDED_CONTENT,))       # genuine, untrusted
 
 
 class Structure(unittest.TestCase):

@@ -50,7 +50,11 @@ The handoff has a bounded lifetime and holds no text:
   - **Email:** the raw message bytes, so all headers and attachments.
 
   The MAC therefore binds the exact update, but E1's in-memory voucher and its durable `inbound_seen` row only ever hold the digest. `e3-sha256:` is not an E1 command word, so an E3 voucher can't drive `/stop`, `/ack` or `/approve` (`test_83`).
-- **Conflicting retries refused.** E1's pending recovery can only resume an *identical* update. A different update reusing a rolled-back update's ID, sender and text (different flags, chat type, attachments or headers) is refused with `transport_conflict`: not accepted and not recorded. So it can't pre-empt the genuine update, which still resumes (`test_109`–`test_113`). A conflict with an update E3 has already *committed* is E3's own `replay_conflict`.
+- **Conflicting retries refused.** E1's pending recovery can only resume an *identical* update. A different update reusing a rolled-back update's ID, sender and text (different flags, chat type, attachments or headers) is answered by E1 (`f37086f`) as `pending_conflict`. E3 refuses it as `transport_conflict`: not accepted and not recorded, and the stored `sent_at` is kept. So it can't pre-empt the genuine update, which still resumes (`test_109`–`test_113`, `test_116`). A conflict with an update E3 has already *committed* is E3's own `replay_conflict`.
+- **Processed in E1 but never committed by E3.** On a first handoff, E1 can answer `replayed`, meaning it holds a *processed* record that E3 never committed. Typical causes: E3's store was lost or restored, or the row came from another path. This is a durable, explicit safe failure, `needs_reconciliation`:
+  - **Recorded:** later re-deliveries are plain duplicates, so there is no retry loop.
+  - **Never accepted:** no event and no effect.
+  - **Listed for an operator** by `gateway.needs_reconciliation()` (`test_114`, `test_115`).
 - **Limit:** E3 relies on the adapter or provider delivering each message ID immutably. This interface can detect a changed update, but not prevent a provider from issuing one.
 - **Vouchers are retired immediately.** Each voucher is checked, then retired with `consume()` on every path (accepted, untrusted, rejected or exception), so nothing stays in `ChannelAuth`'s minted table (`test_79`, `test_82`).
 - **One replay row per platform message.** `update_id` is `e3:<key digest>`, so retries add no rows (`test_80`, `test_89`). Once E3's decision commits, `finish()` marks it `processed`.
