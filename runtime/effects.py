@@ -47,6 +47,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 import os
 import sqlite3
 import time
@@ -185,25 +186,64 @@ class DispatchDeadlineSigner:
         self._key, self.key_id = key, key_id
 
     def _mac(self, body: dict) -> str:
-        msg = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        msg = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
         return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
 
+    @staticmethod
+    def _check_fields(key: Any, n: Any, deadline: Any, kid: Any) -> None:
+        if not (isinstance(key, str) and key):
+            raise DeadlineTicketInvalid("ticket key must be a non-empty string")
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise DeadlineTicketInvalid("ticket dispatch number must be an int >= 1")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+                or not math.isfinite(deadline):
+            raise DeadlineTicketInvalid(f"ticket deadline must be a finite number, got {deadline!r}")
+        if not (isinstance(kid, str) and kid):
+            raise DeadlineTicketInvalid("ticket key id must be a non-empty string")
+
     def sign(self, idempotency_key: str, dispatch_no: int, deadline: float) -> str:
+        """Mint a ticket. A non-finite deadline (NaN, +/-inf) or a malformed
+        field is refused: such a deadline could never expire."""
+        try:
+            self._check_fields(idempotency_key, dispatch_no, deadline, self.key_id)
+        except DeadlineTicketInvalid as exc:
+            raise ValueError(str(exc)) from None
         body = {"key": idempotency_key, "n": dispatch_no, "deadline": float(deadline),
                 "kid": self.key_id}
-        return json.dumps({**body, "sig": self._mac(body)}, sort_keys=True, separators=(",", ":"))
+        return json.dumps({**body, "sig": self._mac(body)}, sort_keys=True, separators=(",", ":"),
+                          allow_nan=False)
 
     def verify(self, ticket: str) -> dict:
+        """Authenticate a ticket and return its fields. Rejects NaN/Infinity
+        tokens, wrong field types and non-finite deadlines even if the MAC
+        matches (e.g. a ticket minted before these checks existed)."""
+        def _no_constants(tok):
+            raise ValueError(f"non-finite JSON constant {tok}")
         try:
-            d = json.loads(ticket)
+            d = json.loads(ticket, parse_constant=_no_constants)
+            if not isinstance(d, dict):
+                raise ValueError("ticket is not an object")
             body = {k: d[k] for k in ("key", "n", "deadline", "kid")}
             sig = d["sig"]
         except (TypeError, ValueError, KeyError) as exc:
             raise DeadlineTicketInvalid(f"malformed dispatch ticket: {exc!r}") from exc
+        self._check_fields(body["key"], body["n"], body["deadline"], body["kid"])
         if body["kid"] != self.key_id or not isinstance(sig, str) \
                 or not hmac.compare_digest(self._mac(body), sig):
             raise DeadlineTicketInvalid("dispatch ticket signature does not verify")
         return body
+
+    def admits(self, ticket: Any, idempotency_key: str, at: Any) -> bool:
+        """Reference provider-side acceptance check, fail closed: the ticket
+        must verify, be for this key, and ``at`` (the provider's own clock)
+        must be a finite time no later than the deadline."""
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+            return False
+        try:
+            body = self.verify(ticket)
+        except DeadlineTicketInvalid:
+            return False
+        return body["key"] == idempotency_key and at <= body["deadline"]
 
 
 @dataclass(frozen=True)
@@ -496,7 +536,12 @@ class EffectJournal:
         self._dispatch_timeout = dispatch_timeout_s
 
     def _now(self, now: float | None) -> float:
-        return self._clock() if now is None else now
+        """A clock reading used for journal writes, deadlines and window checks.
+        Non-finite readings are refused before anything is written."""
+        t = self._clock() if now is None else now
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t):
+            raise ValueError(f"clock reading is not a finite number: {t!r}")
+        return float(t)
 
     def _entry_now(self, now: float | None) -> float | None:
         """Explicit times are a test affordance; at runtime only the journal's
@@ -651,6 +696,9 @@ class EffectJournal:
             return False
         if eff.last_claim_at is not None and now < eff.last_claim_at:
             return False
+        for v in (eff.first_dispatched_at, eff.max_dispatch_deadline, eff.last_claim_at):
+            if v is not None and not math.isfinite(v):     # persisted garbage: never trusted
+                return False
         earliest = now if eff.first_dispatched_at is None else min(eff.first_dispatched_at, now)
         latest = now + L if eff.max_dispatch_deadline is None else max(eff.max_dispatch_deadline, now + L)
         return contract.idempotency_scope.covers_envelope(earliest, latest, self._margin)

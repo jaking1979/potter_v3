@@ -9,7 +9,9 @@ connector that deduplicates on the idempotency key and counts applications.
 import contextlib
 import functools
 import json
+import math
 import hashlib
+import hmac
 import importlib.util
 import itertools
 import multiprocessing
@@ -1023,15 +1025,15 @@ class WindowedProvider:
     def deliver(self, key, ticket, at):
         """A request carrying ``ticket`` reaches the provider at ``at``."""
         outcome = None
-        if self.enforces:
-            try:
-                body = self.verifier.verify(ticket)
-                if body["key"] != key:
+        if self.enforces and not self.verifier.admits(ticket, key, at):   # fail closed
+            if not (isinstance(at, (int, float)) and math.isfinite(at)):
+                outcome = "rejected-bad-clock"
+            else:
+                try:
+                    body = self.verifier.verify(ticket)
+                    outcome = "rejected-bad-ticket" if body["key"] != key else "rejected-expired"
+                except DeadlineTicketInvalid:
                     outcome = "rejected-bad-ticket"
-                elif at > body["deadline"]:
-                    outcome = "rejected-expired"
-            except DeadlineTicketInvalid:
-                outcome = "rejected-bad-ticket"
         with _sql(self.path) as c:
             if outcome is None:
                 row = c.execute("SELECT at, n FROM applied WHERE key=?", (key,)).fetchone()
@@ -1603,6 +1605,222 @@ class KillSwitch(_EffectFixture):
         out = self.journal.execute(self.key, self.ext.perform, self.ext.reconcile, owner="A",
                                    connector=CONN, now=T + 1)
         self.assertEqual((out.status, self.ext.count()), ("succeeded", 1))
+
+
+# -- non-finite inputs (Dolores review of 0185f96) -----------------------------
+NONFINITE = (float("nan"), float("inf"), float("-inf"))
+
+
+class NonFiniteJobs(_TmpDB):
+    def test_register_rejects_non_finite_and_out_of_range(self):
+        bad = [*NONFINITE, 0, -1, True, "60", 1e300]
+        for v in bad:
+            with self.subTest(cadence=v), self.assertRaises(ValueError):
+                self.store.register_job("j", v, now=T)
+            with self.subTest(tolerance=v), self.assertRaises(ValueError):
+                self.store.register_job("j", 60, tolerance=v, now=T)
+        with self.assertRaises(ValueError):
+            self.store.register_job("j", 60, tolerance=0.5, now=T)
+        self.assertIsNone(self.store.job("j"))                     # nothing was written
+
+    def test_invalid_update_leaves_valid_row_unchanged(self):
+        self.store.register_job("j", 60, tolerance=2, now=T)
+        for v in NONFINITE:
+            with self.subTest(v=v):
+                with self.assertRaises(ValueError):
+                    self.store.register_job("j", v, now=T + 1)
+                with self.assertRaises(ValueError):
+                    self.store.register_job("j", 60, tolerance=v, now=T + 1)
+        j = TaskStore(self.db).job("j")                            # after a restart
+        self.assertEqual((j.cadence_s, j.tolerance), (60.0, 2.0))
+        self.assertEqual([x.name for x in TaskStore(self.db).stale_jobs(T + 121)], ["j"])
+
+    def test_persisted_bad_row_is_flagged_and_others_still_evaluated(self):
+        self.store.register_job("fresh", 3600, now=T)
+        self.store.register_job("stale", 60, now=T - 10_000)
+        self.store.register_job("inf-cadence", 60, now=T)
+        self.store.register_job("overflow", 60, now=T)
+        self.store.register_job("inf-tol", 60, now=T)
+        with _sql(self.db) as c:                                   # rows written before validation
+            c.execute("UPDATE jobs SET cadence_s=? WHERE name='inf-cadence'", (float("inf"),))
+            c.execute("UPDATE jobs SET cadence_s=1e308, tolerance=1e10 WHERE name='overflow'")
+            # +inf passes the table's CHECK (tolerance >= 1); -inf and NaN cannot be stored.
+            c.execute("UPDATE jobs SET tolerance=? WHERE name='inf-tol'", (float("inf"),))
+        out = {j.name: j.fault for j in TaskStore(self.db).stale_jobs(T + 100)}   # restart
+        self.assertEqual(set(out), {"stale", "inf-cadence", "overflow", "inf-tol"})
+        self.assertIsNone(out["stale"])                            # a normal stale job, no fault
+        self.assertIn("not finite", out["inf-cadence"])
+        self.assertIn("overflows", out["overflow"])
+        self.assertIn("not finite", out["inf-tol"])
+        self.assertNotIn("fresh", out)
+
+    def test_non_finite_evaluation_clock_flags_every_job(self):
+        self.store.register_job("a", 60, now=T)
+        self.store.register_job("b", 3600, now=T)
+        for t in NONFINITE:
+            with self.subTest(t=t):
+                out = self.store.stale_jobs(t)
+                self.assertEqual([j.name for j in out], ["a", "b"])
+                self.assertTrue(all("clock" in j.fault for j in out))
+                out = TaskStore(self.db, clock=lambda t=t: t).stale_jobs()
+                self.assertEqual(len(out), 2)
+        with self.assertRaises(ValueError):
+            self.store.stale_jobs(T, max_age=float("inf"))
+
+    def test_finite_positive_control(self):
+        self.store.register_job("j", 60, tolerance=1.5, now=T)
+        self.assertEqual(self.store.stale_jobs(T + 90), [])
+        self.assertEqual([j.name for j in self.store.stale_jobs(T + 91)], ["j"])
+
+
+class NonFiniteLeases(_TmpDB):
+    def setUp(self):
+        super().setUp()
+        self.task, _ = self.store.submit("lease", "x", now=T)
+
+    def test_claim_rejects_invalid_lease_before_any_write(self):
+        for v in (*NONFINITE, 0, -5, True, 10 * 86_400):
+            with self.subTest(lease=v), self.assertRaises(ValueError):
+                self.store.claim("w", v, now=T)
+        t = self.store.get(self.task.id)
+        self.assertEqual((t.state, t.attempts, t.lease_owner), (QUEUED, 0, None))
+
+    def test_heartbeat_rejects_invalid_lease_before_any_write(self):
+        self.store.claim("w", LEASE, now=T)
+        for v in (*NONFINITE, 0, 10 * 86_400):
+            with self.subTest(lease=v), self.assertRaises(ValueError):
+                self.store.heartbeat(self.task.id, "w", v, now=T + 1)
+        self.assertEqual(self.store.get(self.task.id).lease_expires_at, T + LEASE)
+
+    def test_invalid_clock_during_claim_writes_nothing(self):
+        for t in NONFINITE:
+            with self.subTest(t=t):
+                with self.assertRaises(ValueError):
+                    TaskStore(self.db, clock=lambda t=t: t).claim("w", LEASE)
+                with self.assertRaises(ValueError):
+                    self.store.claim("w", LEASE, now=t)
+        self.assertEqual(self.store.get(self.task.id).state, QUEUED)
+
+    def test_persisted_non_finite_lease_is_reclaimable_after_restart(self):
+        for stored in (float("inf"), float("nan"), T + 10 * 86_400):  # NaN is stored as NULL
+            with self.subTest(stored=stored):
+                store = TaskStore(self.db, escalate=self.escalations.append, escalate_after=10)
+                t = store.claim("w", LEASE, now=T)
+                self.assertIsNotNone(t)
+                with _sql(self.db) as c:
+                    c.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (stored, t.id))
+                restarted = TaskStore(self.db, escalate_after=10)
+                with self.assertRaises(LeaseLost):                 # the holder cannot keep it
+                    restarted.heartbeat(t.id, "w", LEASE, now=T + 1)
+                again = restarted.claim("w2", LEASE, now=T + 1)    # treated as expired
+                self.assertEqual((again.id, again.lease_owner, again.lease_expires_at),
+                                 (t.id, "w2", T + 1 + LEASE))
+                restarted.fail(t.id, "w2", "reset for next case", now=T + 1)
+
+    def test_finite_positive_control(self):
+        self.store.claim("w", LEASE, now=T)
+        self.store.heartbeat(self.task.id, "w", LEASE, now=T + 10)
+        self.assertIsNone(self.store.claim("w2", LEASE, now=T + 39))
+        self.assertEqual(self.store.claim("w2", LEASE, now=T + 41).lease_owner, "w2")
+
+
+class NonFiniteDeadlines(_EffectFixture):
+    def _raw_ticket(self, body):
+        """A ticket MAC'd exactly as the old signer did (NaN/Infinity allowed)."""
+        msg = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        sig = hmac.new(b"test-only-deadline-signing-key", msg, hashlib.sha256).hexdigest()
+        return json.dumps({**body, "sig": sig}, sort_keys=True, separators=(",", ":"))
+
+    def test_sign_rejects_non_finite_and_malformed(self):
+        for v in NONFINITE:
+            with self.subTest(deadline=v), self.assertRaises(ValueError):
+                TEST_SIGNER.sign("k", 1, v)
+        for args in (("", 1, 1.0), ("k", 0, 1.0), ("k", True, 1.0), ("k", "1", 1.0), ("k", 1, "1.0"),
+                     ("k", 1, True)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                TEST_SIGNER.sign(*args)
+
+    def test_verify_rejects_non_finite_even_with_valid_mac(self):
+        for v in NONFINITE:
+            ticket = self._raw_ticket({"key": "k", "n": 1, "deadline": v, "kid": "test"})
+            with self.subTest(v=v), self.assertRaises(DeadlineTicketInvalid):
+                TEST_SIGNER.verify(ticket)
+            self.assertFalse(TEST_SIGNER.admits(ticket, "k", 0.0))
+
+    def test_overflowing_literal_and_stray_constants_rejected(self):
+        # "1e400" is valid JSON with no NaN/Infinity token, yet parses to inf.
+        good = json.loads(TEST_SIGNER.sign("k", 1, 9.0))
+        overflow = json.dumps({**good, "deadline": 1.0}).replace('"deadline": 1.0', '"deadline": 1e400')
+        with self.assertRaises(DeadlineTicketInvalid):
+            TEST_SIGNER.verify(overflow)
+        self.assertFalse(TEST_SIGNER.admits(overflow, "k", 0.0))
+        # A NaN token anywhere in the ticket, even in an unsigned extra field, is refused.
+        stray = TEST_SIGNER.sign("k", 1, 9.0)[:-1] + ',"x":NaN}'
+        with self.assertRaises(DeadlineTicketInvalid):
+            TEST_SIGNER.verify(stray)
+        self.assertEqual(TEST_SIGNER.verify(TEST_SIGNER.sign("k", 1, 9.0))["deadline"], 9.0)
+
+    def test_verify_checks_field_types(self):
+        for body in ({"key": 7, "n": 1, "deadline": 9.0, "kid": "test"},
+                     {"key": "k", "n": "1", "deadline": 9.0, "kid": "test"},
+                     {"key": "k", "n": True, "deadline": 9.0, "kid": "test"},
+                     {"key": "k", "n": 1, "deadline": "9", "kid": "test"},
+                     {"key": "k", "n": 1, "deadline": 9.0, "kid": 1}):
+            with self.subTest(body=body), self.assertRaises(DeadlineTicketInvalid):
+                TEST_SIGNER.verify(self._raw_ticket(body))
+        with self.assertRaises(DeadlineTicketInvalid):
+            TEST_SIGNER.verify("[1, 2]")
+
+    def test_reference_provider_fails_closed_on_non_finite_clock(self):
+        ticket = TEST_SIGNER.sign(self.key, 1, 1005.0)
+        provider = WindowedProvider(os.path.join(self.tmp.name, "nf.sqlite"), 100)
+        for at in (*NONFINITE, None, "1000"):
+            with self.subTest(at=at):
+                self.assertFalse(TEST_SIGNER.admits(ticket, self.key, at))
+        self.assertEqual(provider.deliver(self.key, ticket, float("nan")), "rejected-bad-clock")
+        self.assertEqual(provider.applications(self.key), [])
+
+    def test_persisted_non_finite_ticket_rejected_after_restart(self):
+        provider = WindowedProvider(os.path.join(self.tmp.name, "pt.sqlite"), 100)
+        bad = self._raw_ticket({"key": self.key, "n": 1, "deadline": float("inf"), "kid": "test"})
+        with _sql(self.db) as c:                                   # a ticket minted before the fix
+            c.execute("UPDATE effects SET dispatch_ticket=? WHERE idempotency_key=?", (bad, self.key))
+        stored = TestJournal(self.db).get(self.key).dispatch_ticket  # restart
+        self.assertEqual(provider.deliver(self.key, stored, 1e12), "rejected-bad-ticket")
+        self.assertEqual(provider.applications(self.key), [])
+
+    def test_invalid_journal_clock_during_claim_writes_nothing(self):
+        for t in NONFINITE:
+            with self.subTest(t=t):
+                j = TestJournal(self.db, clock=lambda t=t: t)
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    j.execute(self.key, self._never, self.ext.reconcile, owner="A", connector=CONN)
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    self.journal.execute(self.key, self._never, self.ext.reconcile, owner="A",
+                                         connector=CONN, now=t)
+        eff = self.journal.get(self.key)
+        self.assertEqual((eff.status, eff.dispatches, eff.dispatch_ticket), ("pending", 0, None))
+
+    def test_persisted_non_finite_bounds_never_window_trusted(self):
+        provider = WindowedProvider(os.path.join(self.tmp.name, "pb.sqlite"), 100)
+        a, j = windowed_journal(self.db, provider, [1000.0], windowed_scope(100, 5))
+        a.stall = True
+        with self.assertRaises(EffectOutcomeUnknown):
+            j.execute(self.key, a.perform, provider.reconcile, owner="A", connector=DEDUPE, now=1000.0)
+        with _sql(self.db) as c:
+            c.execute("UPDATE effects SET max_dispatch_deadline=?", (float("-inf"),))
+        with self.assertRaisesRegex(EffectOutcomeUnknown, "trusted"):
+            j.execute(self.key, a.perform, provider.reconcile, owner="B", connector=DEDUPE, now=1001.0)
+
+    def test_finite_controls_including_a_normally_expired_ticket(self):
+        ticket = TEST_SIGNER.sign(self.key, 1, 1005.0)
+        self.assertEqual(TEST_SIGNER.verify(ticket)["deadline"], 1005.0)
+        self.assertTrue(TEST_SIGNER.admits(ticket, self.key, 1005.0))      # at the deadline
+        self.assertFalse(TEST_SIGNER.admits(ticket, self.key, 1005.001))   # normally expired
+        self.assertFalse(TEST_SIGNER.admits(ticket, "other-key", 1000.0))
+        provider = WindowedProvider(os.path.join(self.tmp.name, "fc.sqlite"), 100)
+        self.assertEqual(provider.deliver(self.key, ticket, 1006.0), "rejected-expired")
+        self.assertEqual(provider.deliver(self.key, ticket, 1004.0), "applied")
 
 
 # -- escalation ---------------------------------------------------------------

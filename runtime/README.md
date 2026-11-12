@@ -23,6 +23,12 @@ queued ──claim──▶ running ──complete──▶ done
 
 Each worker mutation checks, inside its write transaction, that the worker still holds a live lease. If it doesn't, the call raises `LeaseLost`.
 
+**Non-finite inputs.**
+- **Leases.** `claim` and `heartbeat` reject a `lease_s` that is NaN, ±inf, ≤ 0, or > `MAX_LEASE_S` (1 day), before any write. A persisted lease that isn't a finite time within `MAX_LEASE_S` of now is treated as **expired**: the task can be reclaimed, the reclaim counts as a failure, and the holder gets `LeaseLost`. This covers +inf written before validation and NaN, which SQLite stores as NULL.
+- **Jobs.** `register_job` rejects a cadence or tolerance that is non-finite, out of range, or whose product overflows, on both create and update. An invalid update leaves the row unchanged.
+- **Watchdog.** `stale_jobs` reports a persisted row it can't evaluate as `Job.fault` and still evaluates every other job. If its clock is not finite, it reports every job with a fault.
+- **Clock.** Task-store and journal writes refuse a clock reading that is not finite.
+
 ## Effect rules (T10)
 
 1. `record_intent(task, step, BoundAction)` runs **before** execution. Recording the same step and action again returns the same entry. Recording the same step with a different action is refused (`EffectConflict`).
@@ -44,6 +50,8 @@ Each worker mutation checks, inside its write transaction, that the worker still
   - the clock reads earlier than a recorded claim (rollback).
 - **`kill_switch(effect)`.** This is the E2 seam. It is checked inside the claim transaction and again just before send; anything other than `False` refuses, and a pre-send kill reverts the claim.
 - **`now=`.** Accepted only by a journal built with `trusted_test_clock=True`.
+
+**Ticket validation.** `DispatchDeadlineSigner` rejects non-finite deadlines and bad field types at mint and at verify. That includes NaN/Infinity tokens and literals such as `1e400` that parse to infinity, even when the MAC matches. `admits(ticket, key, at)` is the reference provider check, and it fails closed on a non-finite `at`.
 
 **Limits:**
 - HMAC is a reference model for a provider-verified signed expiry. A real connector needs a provider that actually enforces the deadline.

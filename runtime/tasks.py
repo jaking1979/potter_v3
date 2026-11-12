@@ -25,9 +25,11 @@ per escalation. A crash between commit and callback loses the notification
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 import uuid
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -48,6 +50,24 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     DONE: frozenset(), FAILED: frozenset(), ESCALATED: frozenset(),
 }
 ESCALATE_AFTER = 3
+# Bounds on operator-supplied durations. Values outside them (NaN, +/-inf,
+# zero, negative, absurdly large) are rejected before any write.
+MAX_CADENCE_S = 10 * 366 * 86_400.0     # ten years
+MAX_TOLERANCE = 1_000.0
+MAX_LEASE_S = 86_400.0                  # one day; heartbeat to hold longer
+
+
+def _finite_number(name: str, v: Any, *, positive: bool = True, upper: float | None = None) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    v = float(v)
+    if not math.isfinite(v):
+        raise ValueError(f"{name} must be finite, got {v!r}")
+    if positive and v <= 0:
+        raise ValueError(f"{name} must be > 0, got {v!r}")
+    if upper is not None and v > upper:
+        raise ValueError(f"{name} must be <= {upper}, got {v!r}")
+    return v
 
 
 class TaskError(Exception):
@@ -88,8 +108,26 @@ class Job:
     consecutive_failures: int
     escalated_at: float | None
 
+    fault: str | None = None   # set when the row (or the evaluation clock) is not valid
+
     def age(self, now: float) -> float:
         return now - (self.last_success_at if self.last_success_at is not None else self.registered_at)
+
+
+def _job_fault(j: Job) -> str | None:
+    """Why a persisted job row cannot be evaluated (e.g. written before
+    validation existed, or edited directly), or None."""
+    for name, v in (("cadence_s", j.cadence_s), ("tolerance", j.tolerance),
+                    ("registered_at", j.registered_at), ("last_success_at", j.last_success_at)):
+        if v is None and name == "last_success_at":
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            return f"{name} is not finite: {v!r}"
+    if j.cadence_s <= 0 or j.tolerance < 1:
+        return "cadence_s/tolerance out of range"
+    if not math.isfinite(j.cadence_s * j.tolerance):
+        return "cadence_s x tolerance overflows"
+    return None
 
 
 @dataclass(frozen=True)
@@ -144,13 +182,28 @@ class TaskStore:
         self._clock = clock
 
     def _now(self, now: float | None) -> float:
-        return self._clock() if now is None else now
+        """The clock reading for a write. A non-finite reading (from the clock
+        or passed explicitly) is refused before anything is written."""
+        t = self._clock() if now is None else now
+        return _finite_number("clock reading", t, positive=False)
+
+    @staticmethod
+    def _lease(lease_s: Any) -> float:
+        return _finite_number("lease_s", lease_s, upper=MAX_LEASE_S)
 
     # -- jobs --------------------------------------------------------------
     def register_job(self, name: str, cadence_s: float, *, tolerance: float = 1.5,
                      now: float | None = None) -> Job:
         """Declare a scheduled job's cadence. Idempotent; re-registering updates
-        cadence/tolerance but keeps history."""
+        cadence/tolerance but keeps history. Both must be finite, positive and
+        bounded (and their product finite); an invalid update leaves the row
+        unchanged."""
+        cadence_s = _finite_number("cadence_s", cadence_s, upper=MAX_CADENCE_S)
+        tolerance = _finite_number("tolerance", tolerance, upper=MAX_TOLERANCE)
+        if tolerance < 1:
+            raise ValueError("tolerance must be >= 1")
+        if not math.isfinite(cadence_s * tolerance):
+            raise ValueError("cadence_s x tolerance overflows")
         now = self._now(now)
         with self.db.tx() as c:
             c.execute("INSERT INTO jobs (name, cadence_s, tolerance, registered_at) VALUES (?,?,?,?)"
@@ -165,16 +218,29 @@ class TaskStore:
 
     def stale_jobs(self, now: float | None = None, max_age: float | None = None) -> list[Job]:
         """Jobs whose last success (or registration, if never) is older than
-        cadence x tolerance; ``max_age``, if given, caps that threshold."""
-        now = self._now(now)
+        cadence x tolerance; ``max_age``, if given, caps that threshold.
+
+        Fail visible: a job whose persisted row cannot be evaluated (non-finite
+        or out-of-range values) is returned with ``fault`` set, and every other
+        job is still evaluated. If the evaluation clock itself is not finite,
+        no age can be computed, so every job is returned with ``fault`` set."""
+        t = self._clock() if now is None else now
+        clock_ok = (not isinstance(t, bool) and isinstance(t, (int, float)) and math.isfinite(t))
+        if max_age is not None:
+            max_age = _finite_number("max_age", max_age)
         with self.db.read() as c:
             jobs = [Job(*r) for r in c.execute(f"SELECT {_JCOLS} FROM jobs ORDER BY name")]
         out = []
         for j in jobs:
+            fault = None if clock_ok else f"evaluation clock is not finite: {t!r}"
+            fault = fault or _job_fault(j)
+            if fault:
+                out.append(dataclasses.replace(j, fault=fault))
+                continue
             limit = j.cadence_s * j.tolerance
             if max_age is not None:
                 limit = min(limit, max_age)
-            if j.age(now) > limit:
+            if j.age(t) > limit:
                 out.append(j)
         return out
 
@@ -196,17 +262,24 @@ class TaskStore:
     def claim(self, worker_id: str, lease_s: float, *, now: float | None = None) -> Task | None:
         """Lease the oldest runnable task: queued, or running with an expired
         lease (its worker died). Reclaiming counts as a failure, so a task that
-        keeps killing its worker escalates instead of looping forever."""
-        if not worker_id or lease_s <= 0:
-            raise ValueError("worker_id and positive lease_s required")
+        keeps killing its worker escalates instead of looping forever.
+
+        A persisted lease that is not a finite time within MAX_LEASE_S of now
+        (e.g. +inf written before validation existed; NaN is stored as NULL) is
+        treated as EXPIRED: the task is reclaimable rather than stuck forever."""
+        if not worker_id:
+            raise ValueError("worker_id required")
+        lease_s = self._lease(lease_s)
         now = self._now(now)
         fired: list[Escalation] = []
         claimed = None
         with self.db.tx() as c:
             while claimed is None:
                 row = c.execute(
-                    "SELECT id, state FROM tasks WHERE state=? OR (state=? AND lease_expires_at<=?)"
-                    " ORDER BY created_at, id LIMIT 1", (QUEUED, RUNNING, now)).fetchone()
+                    "SELECT id, state FROM tasks WHERE state=? OR (state=? AND (lease_expires_at IS NULL"
+                    " OR lease_expires_at<=? OR lease_expires_at>?))"
+                    " ORDER BY created_at, id LIMIT 1",
+                    (QUEUED, RUNNING, now, now + MAX_LEASE_S)).fetchone()
                 if row is None:
                     break
                 tid, state = row
@@ -227,12 +300,16 @@ class TaskStore:
         t = _load(c, task_id)
         if t is None:
             raise KeyError(task_id)
-        if t.state != RUNNING or t.lease_owner != worker_id or (t.lease_expires_at or 0) <= now:
+        exp = t.lease_expires_at
+        live = (isinstance(exp, (int, float)) and math.isfinite(exp)
+                and now < exp <= now + MAX_LEASE_S)
+        if t.state != RUNNING or t.lease_owner != worker_id or not live:
             raise LeaseLost(f"{worker_id} does not hold a live lease on {task_id} (state {t.state})")
         return t
 
     def heartbeat(self, task_id: str, worker_id: str, lease_s: float, *,
                   now: float | None = None) -> Task:
+        lease_s = self._lease(lease_s)        # validated before any write
         now = self._now(now)
         with self.db.tx() as c:
             self._owned(c, task_id, worker_id, now)
