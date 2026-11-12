@@ -585,32 +585,55 @@ class ResponsibilityRunner:
 
     def _deliver_final(self, task_id: str) -> bool:
         """After the terminal commit: E1 long-work 'done' update and final
-        message (idempotent), then mark the final delivered. False if the kill
-        flag holds it back (the sweep delivers it once the flag clears)."""
+        message, then mark the final delivered, but ONLY on durable proof.
+
+        What is owed is fixed at completion (``finals.created_at``): a final
+        message if the run was long work (30 s or more since its first report),
+        nothing for a short or silent run. The marker is set only when nothing
+        is owed, or when E1's outbox holds this task's ``work:...:final`` row.
+        Any notifier failure (kill flag, a missing recipient address, anything
+        else) leaves the marker pending for the next sweep; ``NotifierError``
+        is never read as "already finished" on its own. A final whose
+        responsibility definition is not loaded stays pending as well.
+        Returns True once the final is (or already was) marked delivered."""
         with self.db.read() as c:
-            row = c.execute("SELECT responsibility, outcome FROM responsibility_finals"
-                            " WHERE task_id=? AND delivered_at IS NULL", (task_id,)).fetchone()
+            row = c.execute("SELECT responsibility, outcome, created_at FROM"
+                            " responsibility_finals WHERE task_id=? AND delivered_at IS NULL",
+                            (task_id,)).fetchone()
         if row is None:
             return True
-        d = self._defs.get(row[0])
-        if d is not None and not self._handles[d.id].silent:
-            if self.kill.is_set():
-                return False
+        name, outcome, completed_at = row
+        d = self._defs.get(name)
+        if d is None:
+            return False                       # never mark what we cannot deliver
+        owed = False
+        if not self._handles[d.id].silent:
             lw = self._long_work(d, task_id)
+            owed = lw is not None and completed_at - lw[1] >= LONG_WORK_ACK_S
             if lw is not None:
-                now = self._now()
-                try:
-                    lw[0].tick(row[1], now)
-                    if now - lw[1] >= LONG_WORK_ACK_S:
-                        lw[0].finish(receipt_link(task_id), now, outcome=row[1])
-                except Stopped:
+                if self.kill.is_set():
                     return False
-                except NotifierError:
-                    pass                  # final already enqueued earlier
+                now = self._now()
+                for send in (lambda: lw[0].tick(outcome, now),
+                             lambda: lw[0].finish(receipt_link(task_id), now, outcome=outcome)
+                             if owed else None):
+                    try:
+                        send()
+                    except NotifierError:     # incl. Stopped; judged below, by the outbox
+                        pass
+        if owed and not self._final_enqueued(d, task_id):
+            return False                       # retried by the next sweep
         with self.db.tx() as c:
-            c.execute("UPDATE responsibility_finals SET delivered_at=? WHERE task_id=?",
-                      (self._now(), task_id))
+            c.execute("UPDATE responsibility_finals SET delivered_at=? WHERE task_id=?"
+                      " AND delivered_at IS NULL", (self._now(), task_id))
         return True
+
+    def _final_enqueued(self, d: Responsibility, task_id: str) -> bool:
+        """Durable proof: E1's outbox holds this task's long-work final.
+        Read-only over C3's table (no E1 API answers this; see README gaps)."""
+        with self.db.read() as c:
+            return c.execute("SELECT 1 FROM outbox WHERE notification_id=? LIMIT 1",
+                             (f"work:{d.id}:{task_id}:final",)).fetchone() is not None
 
     def deliver_pending_finals(self) -> int:
         """Recovery sweep: re-deliver every committed-but-undelivered final."""

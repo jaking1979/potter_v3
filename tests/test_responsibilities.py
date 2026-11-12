@@ -1323,6 +1323,100 @@ class FinalOnlyAfterTerminalCommit(Base):
         self.assertEqual(w.ext.calls("s1"), 1)
 
 
+class FinalMarkedOnlyOnProof(Base):
+    """Dolores @59a2e75 (reproduced via E1's real missing-address path):
+    _deliver_final read every NotifierError as 'already finished' and marked
+    the final delivered with no final in the outbox, so it was lost."""
+
+    def committed_but_undelivered(self):
+        """A long-work notes.batch run whose terminal state is committed and
+        whose final is still owed (the worker died before delivering it)."""
+        w = self.world(definitions=[rw.batch(n=1)])
+        w.ext.hooks["s1"] = ("before", lambda eff: setattr(w, "now", w.now + 31))
+        w.runner.tick()
+
+        class Crash(BaseException):
+            pass
+
+        def boom(*a, **k):
+            raise Crash()
+
+        w.runner._deliver_final = boom
+        with self.assertRaises(Crash):
+            w.runner.run_once()
+        task = w.runner.tasks.by_trigger(f"resp:notes.batch:slot:{int(rw.T0 // 3600)}")
+        self.assertEqual(task.state, DONE)
+        return w, task
+
+    def finals(self, w, task_id):
+        with w.db.read() as c:
+            delivered = c.execute("SELECT delivered_at FROM responsibility_finals WHERE"
+                                  " task_id=?", (task_id,)).fetchone()[0]
+            n = c.execute("SELECT COUNT(*) FROM outbox WHERE channel='telegram' AND"
+                          " notification_id=?", (f"work:notes.batch:{task_id}:final",)
+                          ).fetchone()[0]
+        return delivered is not None, n
+
+    def test_missing_address_keeps_the_final_pending_until_it_is_restored(self):
+        from identity.seed import JOSH
+        w, task = self.committed_but_undelivered()
+        w2 = rw.World(self.tmp, worker="w2", definitions=[rw.batch(n=1)])
+        w2.now = w.now + 5
+        w2.auth._out[JOSH].pop("telegram")          # address lost (config change)
+        self.assertEqual(w2.runner.deliver_pending_finals(), 0)
+        w2.runner.report_progress()
+        w2.runner.watchdog()
+        self.assertEqual(self.finals(w2, task.id), (False, 0))   # pending, nothing faked
+        w3 = rw.World(self.tmp, worker="w3", definitions=[rw.batch(n=1)])  # restart, restored
+        w3.now = w2.now + 5
+        self.assertEqual(w3.runner.deliver_pending_finals(), 1)
+        self.assertEqual(self.finals(w3, task.id), (True, 1))
+        self.assertEqual(w3.runner.deliver_pending_finals(), 0)
+        w3.runner.report_progress()
+        self.assertEqual(self.finals(w3, task.id), (True, 1))     # exactly once
+
+    def test_previously_enqueued_final_is_marked_once(self):
+        w, task = self.committed_but_undelivered()
+        w2 = rw.World(self.tmp, worker="w2", definitions=[rw.batch(n=1)])
+        w2.now = w.now + 5
+        lw = w2.notifier.handle_for(rw.batch(n=1).job_spec).long_work(task.id, rw.T0)
+        lw.finish(receipt_link(task.id), w2.now)     # final landed; marker did not
+        self.assertEqual(self.finals(w2, task.id), (False, 1))
+        self.assertEqual(w2.runner.deliver_pending_finals(), 1)  # 'already finished' + proof
+        self.assertEqual(self.finals(w2, task.id), (True, 1))
+        self.assertEqual(w2.runner.deliver_pending_finals(), 0)
+
+    def test_absent_definition_stays_pending(self):
+        w, task = self.committed_but_undelivered()
+        w2 = rw.World(self.tmp, worker="w2", definitions=[rw.bill_watch()])   # no notes.batch
+        w2.now = w.now + 5
+        self.assertEqual(w2.runner.deliver_pending_finals(), 0)
+        w2.runner.watchdog()
+        self.assertEqual(self.finals(w2, task.id), (False, 0))
+        w3 = rw.World(self.tmp, worker="w3", definitions=[rw.batch(n=1)])
+        w3.now = w2.now + 5
+        self.assertEqual(w3.runner.deliver_pending_finals(), 1)
+        self.assertEqual(self.finals(w3, task.id), (True, 1))
+
+    def test_short_run_owes_no_final_and_is_marked(self):
+        w = self.world(definitions=[rw.batch(n=1)])
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "done")
+        self.assertEqual(self.finals(w, r.task_id), (True, 0))
+
+    def test_kill_keeps_the_final_pending(self):
+        w, task = self.committed_but_undelivered()
+        _set_kill(w)
+        w2 = rw.World(self.tmp, worker="w2", definitions=[rw.batch(n=1)])
+        w2.now = w.now + 5
+        self.assertEqual(w2.runner.deliver_pending_finals(), 0)
+        self.assertEqual(self.finals(w2, task.id), (False, 0))
+        w2.notifier.kill.clear()
+        self.assertEqual(w2.runner.deliver_pending_finals(), 1)
+        self.assertEqual(self.finals(w2, task.id), (True, 1))
+
+
 class Structure(Base):
     def test_runner_passes_the_direct_send_lint(self):
         self.assertEqual(lint.scan(HERE.parent), [])
