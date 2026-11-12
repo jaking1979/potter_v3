@@ -66,9 +66,11 @@ def project(snapshot, *, now):
 def render(view):
     # Re-project: passing a forged view must not introduce arbitrary markup.
     now=timestamp(view['generated_at']); snap={'schema':SCHEMA}
+    sections=view.get('sections')
+    if type(sections) is not dict: sections={}
     for name in SECTIONS:
-        s=view.get('sections',{}).get(name,{})
-        if s.get('availability')=='available':
+        s=sections.get(name)
+        if type(s) is dict and s.get('availability')=='available':
             snap[name]={'observed_at':s.get('observed_at'),'items':s.get('items')}
     clean=project(snap,now=now)
     out=['<!doctype html><html lang="en"><head><meta charset="utf-8">',
