@@ -11,7 +11,17 @@ import re
 from evaluation.a4a.fixture_commitment import fixture_digest
 from evaluation.a4a.plan_binding import plan_digest
 
-_SCHEMA = 'potter.a4a-exercise-commitment/v0'
+_SCHEMA = 'potter.a4a-exercise-commitment/v1'
+# This is an experimental descriptor, not an L17 decision or attestation that
+# code implements the descriptor. Any rules change requires a version bump;
+# protected source/version binding is still required before a real exercise.
+_RULES = {'version': 'synthetic-grader-pair/v1',
+          'dimensions': ['done', 'reexplaining', 'speed', 'trust', 'follow_through'],
+          'follow_through': 'responsibility-only',
+          'affected_cases': 'union-across-planned-dimensions',
+          'invalid_when': 'affected-times-10-greater-than-planned',
+          'classifications': ['agree', 'disagree', 'missing', 'duplicate', 'unalignable'],
+          'result': 'descriptive-only'}
 
 
 def exercise_digest(expected_cases, fixtures):
@@ -21,7 +31,7 @@ def exercise_digest(expected_cases, fixtures):
     plan, data = expected_cases.copy(), fixtures.copy()
     if plan.keys() != data.keys():
         raise ValueError('fixture coverage mismatch')
-    payload = {'schema': _SCHEMA, 'plan': plan_digest(plan),
+    payload = {'schema': _SCHEMA, 'rules': _RULES, 'plan': plan_digest(plan),
                'fixtures': fixture_digest(data)}
     encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'),
                          ensure_ascii=True).encode('ascii')
