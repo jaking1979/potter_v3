@@ -933,6 +933,396 @@ class LongWorkTruthIsTheOutbox(Base):
         self.assertEqual(kinds[-1], "final")
 
 
+def approval_prompts(w):
+    with w.db.read() as c:
+        return c.execute("SELECT COUNT(*) FROM outbox WHERE channel='telegram' AND"
+                         " notification_id LIKE 'approval:%'").fetchone()[0]
+
+
+def approval_rows(w):
+    with w.db.read() as c:
+        return c.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+
+
+def schema_version(tmp):
+    from runtime import Database
+    with Database(Path(tmp) / "potter.db").read() as c:
+        return c.execute("SELECT value FROM meta WHERE key='responsibilities_schema'"
+                         ).fetchone()[0]
+
+
+class UpgradeFromLegacy(Base):
+    """Dolores @e6a7af6 (reproduced): the e2.v0 -> v1 upgrade created an empty
+    claim table, so a legacy waiting task with an E1 request got a SECOND
+    prompt. Databases here are produced by the actual prior E2 code
+    (tests/legacy/), then opened by this code."""
+
+    def legacy(self, scenario, *then, base="e2_467b2b9"):
+        out = subprocess.run([sys.executable, str(HERE / "legacy_fixture.py"), base, scenario,
+                              self.tmp, *then], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        info = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(schema_version(self.tmp), "e2.v1" if then else "e2.v0")
+        return info
+
+    def upgraded(self, **kw):
+        w = rw.World(self.tmp, **kw)
+        self.assertEqual(schema_version(self.tmp), "e2.v2")
+        return w
+
+    def claim(self, w, task_id):
+        with w.db.read() as c:
+            rows = c.execute("SELECT approval_id FROM responsibility_approvals WHERE task_id=?",
+                             (task_id,)).fetchall()
+        return [r[0] for r in rows]
+
+    def test_pending_request_is_claimed_and_never_reprompted(self):
+        info = self.legacy("pending")
+        w = self.upgraded()
+        self.assertEqual(self.claim(w, info["task_id"]), [info["approval_id"]])
+        for _ in range(3):
+            self.assertEqual(w.runner.poll_approvals(), [])
+        self.assertEqual((approval_rows(w), approval_prompts(w)), (1, 1))
+        self.assertEqual(w.say(f"/approve {info['approval_id']}").outcome, "approved")
+        self.assertEqual([r.outcome for r in w.runner.poll_approvals()], [QUEUED])
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(w.ext.calls("pay"), 1)
+        self.assertEqual(approval_prompts(w), 1)
+
+    def test_reproduced_v0_then_v1_path_reconciles_on_v2(self):
+        # Dolores's sequence: v0 data, reopened by e6a7af6 (empty migration).
+        info = self.legacy("pending", "e2_e6a7af6")
+        w = self.upgraded()
+        self.assertEqual(self.claim(w, info["task_id"]), [info["approval_id"]])
+        w.runner.poll_approvals()
+        self.assertEqual((approval_rows(w), approval_prompts(w)), (1, 1))
+
+    def test_approved_waiting_request_resumes_without_a_prompt(self):
+        info = self.legacy("approved")
+        w = self.upgraded()
+        self.assertEqual(self.claim(w, info["task_id"]), [info["approval_id"]])
+        self.assertEqual([r.outcome for r in w.runner.poll_approvals()], [QUEUED])
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual((w.ext.calls("pay"), approval_prompts(w)), (1, 1))
+
+    def test_approved_and_queued_task_resumes_without_a_prompt(self):
+        info = self.legacy("approved_queued")
+        w = self.upgraded()
+        self.assertEqual(self.claim(w, info["task_id"]), [info["approval_id"]])
+        self.assertEqual(w.runner.run_pending()[-1].outcome, "done")
+        self.assertEqual((w.ext.calls("pay"), approval_prompts(w)), (1, 1))
+
+    def test_terminal_request_is_held_for_an_operator(self):
+        info = self.legacy("terminal")
+        w = self.upgraded()
+        self.assertEqual(self.claim(w, info["task_id"]), [])
+        self.assertEqual(w.runner.holds(),
+                         [(info["task_id"], "pay", "legacy request is denied")])
+        self.assertEqual(w.runner.poll_approvals(), [])
+        self.assertEqual(w.runner.run_pending(), [])
+        self.assertEqual((approval_rows(w), approval_prompts(w)), (1, 1))
+        self.assertIn(f"job:potter.ops:hold:{info['task_id']}", w.outbox_ids())
+        w.runner.resolve_hold(info["task_id"], None)            # operator ends the run
+        self.assertEqual(w.runner.tasks.get(info["task_id"]).state, "failed")
+        self.assertEqual((approval_rows(w), w.ext.calls("pay")), (1, 0))
+
+    def test_no_request_means_no_prompt_was_ever_sent_so_one_is_issued(self):
+        # E1 writes a request and its prompt in one transaction: no row means
+        # Josh was never asked. Issuing the first prompt is not a duplicate.
+        info = self.legacy("none")
+        w = self.upgraded()
+        self.assertEqual((approval_rows(w), approval_prompts(w)), (0, 0))
+        self.assertEqual(w.runner.holds(), [])
+        w.runner.poll_approvals()
+        w.runner.poll_approvals()
+        self.assertEqual((approval_rows(w), approval_prompts(w)), (1, 1))
+
+    def test_multiple_legacy_requests_are_held_never_guessed(self):
+        info = self.legacy("multiple")
+        w = self.upgraded()
+        self.assertEqual(self.claim(w, info["task_id"]), [])
+        self.assertEqual(w.runner.holds(),
+                         [(info["task_id"], "pay", "2 legacy requests")])
+        self.assertEqual(w.say(f"/approve {info['approval_id']}").outcome, "approved")
+        self.assertEqual(w.runner.poll_approvals(), [])          # no authority guessed
+        self.assertEqual((approval_rows(w), approval_prompts(w)), (2, 2))
+        w.runner.resolve_hold(info["task_id"], info["approval_id"])   # operator picks
+        self.assertEqual([r.outcome for r in w.runner.poll_approvals()], [QUEUED])
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual((w.ext.calls("pay"), approval_rows(w), approval_prompts(w)), (1, 2, 2))
+
+    def test_resolve_hold_refuses_an_approval_for_another_task(self):
+        info = self.legacy("multiple")
+        w = self.upgraded()
+        with self.assertRaises(ValueError):
+            w.runner.resolve_hold(info["task_id"], "appr-not-this-task")
+        self.assertEqual(len(w.runner.holds()), 1)
+
+    def test_held_queued_task_is_parked_not_run(self):
+        info = self.legacy("multiple_queued")
+        w = self.upgraded()
+        self.assertEqual(w.runner.tasks.get(info["task_id"]).state, QUEUED)
+        r = w.runner.run_once()
+        self.assertEqual((r.outcome, r.detail), ("held", "2 legacy requests"))
+        self.assertEqual(w.runner.tasks.get(info["task_id"]).state, WAITING_APPROVAL)
+        self.assertEqual(w.runner.run_pending(), [])
+        self.assertEqual(w.runner.poll_approvals(), [])
+        self.assertEqual((w.ext.calls("pay"), approval_prompts(w)), (0, 2))
+
+    def test_interrupted_upgrade_leaves_v0_and_no_partial_claims(self):
+        from responsibilities import _schema
+        info = self.legacy("pending")
+        real = _schema._reconcile_legacy
+
+        def dies_midway(c, now):
+            real(c, now)                 # claims written ...
+            raise RuntimeError("power cut during upgrade")   # ... then the process dies
+
+        _schema._reconcile_legacy = dies_midway
+        try:
+            with self.assertRaises(RuntimeError):
+                rw.World(self.tmp)
+        finally:
+            _schema._reconcile_legacy = real
+        self.assertEqual(schema_version(self.tmp), "e2.v0")      # rolled back whole
+        from runtime import Database
+        with Database(Path(self.tmp) / "potter.db").read() as c:
+            have = c.execute("SELECT name FROM sqlite_master WHERE name="
+                             "'responsibility_approvals'").fetchone()
+            claims = c.execute("SELECT COUNT(*) FROM responsibility_approvals").fetchone()[0] \
+                if have else 0
+        self.assertEqual(claims, 0)
+        w = self.upgraded()                                        # retried on restart
+        self.assertEqual(self.claim(w, info["task_id"]), [info["approval_id"]])
+        w.runner.poll_approvals()
+        self.assertEqual(approval_prompts(w), 1)
+
+    def test_restart_after_upgrade_changes_nothing(self):
+        info = self.legacy("multiple")
+        w = self.upgraded()
+        before = (w.runner.holds(), self.claim(w, info["task_id"]))
+        w2 = rw.World(self.tmp, worker="w2")
+        w2.runner.poll_approvals()
+        self.assertEqual((w2.runner.holds(), self.claim(w2, info["task_id"])), before)
+        self.assertEqual(approval_prompts(w2), 2)
+
+    def test_old_code_refuses_the_upgraded_database(self):
+        self.legacy("pending")
+        self.upgraded()
+        out = subprocess.run([sys.executable, "-c",
+                              "import sys; sys.argv=['x']; sys.path.insert(0, sys.argv[0]);"
+                              f"import legacy_fixture as lf; lf.reopen('e2_467b2b9', {self.tmp!r})"],
+                             cwd=str(HERE), capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("JournalUnavailable", out.stderr)
+        self.assertIn("e2.v2", out.stderr)
+
+
+class ScheduleOrdering(Base):
+    """Dolores @e6a7af6 (reproduced): tick() committed the watermark, then
+    submitted the task in a second transaction, so an older tick paused in
+    between could create a stale slot after a newer tick advanced it."""
+
+    def slots(self, w):
+        with w.db.read() as c:
+            return sorted(json.loads(r[0])["slot"] for r in c.execute(
+                "SELECT payload FROM tasks WHERE kind='notes.batch'"))
+
+    def test_older_tick_paused_before_insert_serializes_the_newer_one(self):
+        import threading
+        old, new = self.world(), rw.World(self.tmp, worker="w2")
+        inside, release = threading.Event(), threading.Event()
+        real = old.runner.tasks.submit
+
+        def paused(*a, **k):                  # old has read + moved the watermark
+            inside.set()
+            release.wait(10)
+            return real(*a, **k)
+
+        old.runner.tasks.submit = paused
+        out = {}
+        a = threading.Thread(target=lambda: out.setdefault("old", old.runner.tick(now=rw.T0 + 10)))
+        a.start()
+        self.assertTrue(inside.wait(10))
+        b = threading.Thread(target=lambda: out.setdefault("new",
+                                                           new.runner.tick(now=rw.T0 + 7200)))
+        b.start()
+        b.join(0.5)
+        self.assertTrue(b.is_alive())         # the newer tick waits for the older decision
+        release.set()
+        a.join(10)
+        b.join(10)
+        s0, s2 = int((rw.T0 + 10) // 3600), int((rw.T0 + 7200) // 3600)
+        self.assertEqual(self.slots(old), [s0, s2])
+        self.assertEqual(new.runner.tick(now=rw.T0 + 10), [])    # now stale: dropped
+
+    def test_newer_tick_first_means_the_older_slot_is_never_created(self):
+        old, new = self.world(), rw.World(self.tmp, worker="w2")
+        self.assertEqual(len(new.runner.tick(now=rw.T0 + 7200)), 1)
+        self.assertEqual(old.runner.tick(now=rw.T0 + 10), [])
+        self.assertEqual(self.slots(old), [int((rw.T0 + 7200) // 3600)])
+
+    def test_crash_between_watermark_and_insert_records_neither(self):
+        w = self.world()
+
+        class Crash(BaseException):
+            pass
+
+        def boom(*a, **k):
+            raise Crash()
+
+        real = w.runner.tasks.submit
+        w.runner.tasks.submit = boom
+        with self.assertRaises(Crash):
+            w.runner.tick(now=rw.T0 + 10)
+        w.runner.tasks.submit = real
+        with w.db.read() as c:
+            self.assertIsNone(c.execute("SELECT value FROM responsibility_state WHERE"
+                                        " key='watermark:notes.batch'").fetchone())
+        self.assertEqual(self.slots(w), [])
+        # Recovery: the next tick in the same slot creates it ...
+        self.assertEqual(len(rw.World(self.tmp, worker="w2").runner.tick(now=rw.T0 + 20)), 1)
+        # ... a restart in the same slot creates nothing more.
+        self.assertEqual(rw.World(self.tmp, worker="w3").runner.tick(now=rw.T0 + 30), [])
+        self.assertEqual(self.slots(w), [int((rw.T0 + 10) // 3600)])
+
+    def test_crash_then_next_tick_in_a_later_slot_skips_the_missed_one(self):
+        w = self.world()
+
+        class Crash(BaseException):
+            pass
+
+        def boom(*a, **k):
+            raise Crash()
+
+        w.runner.tasks.submit = boom
+        with self.assertRaises(Crash):
+            w.runner.tick(now=rw.T0 + 10)
+        w2 = rw.World(self.tmp, worker="w2")
+        w2.runner.tick(now=rw.T0 + 7200)
+        self.assertEqual(self.slots(w2), [int((rw.T0 + 7200) // 3600)])   # documented skip
+
+
+class FinalOnlyAfterTerminalCommit(Base):
+    """Dolores @e6a7af6 (reproduced): _finish enqueued the 'done' update and
+    the final receipt before C2's complete() committed, so a crash there left a
+    success announcement for a task C2 still recorded as running."""
+
+    def successes(self, w, task_id):
+        out = []
+        with w.db.read() as c:
+            for nid, body in c.execute("SELECT notification_id, body FROM outbox WHERE"
+                                       " channel='telegram'"):
+                b = json.loads(body)
+                if nid == f"job:notes.batch:{task_id}" or (
+                        nid.startswith(f"work:notes.batch:{task_id}:") and (
+                            b.get("kind") == "work_final" or b.get("state") == "done")):
+                    out.append(nid[len(f"work:notes.batch:{task_id}:"):]
+                               if nid.startswith("work:") else "result")
+        return sorted(out)
+
+    def long_batch(self):
+        w = self.world(definitions=[rw.batch(n=1)])
+        w.ext.hooks["s1"] = ("before", lambda eff: setattr(w, "now", w.now + 31))
+        w.runner.tick()
+        return w
+
+    def test_crash_before_complete_announces_nothing_and_restart_announces_once(self):
+        w = self.long_batch()
+
+        class Crash(BaseException):
+            pass
+
+        def boom(*a, **k):
+            raise Crash()
+
+        w.runner.tasks.complete = boom
+        with self.assertRaises(Crash):
+            w.runner.run_once()
+        task = w.runner.tasks.by_trigger(f"resp:notes.batch:slot:{int(rw.T0 // 3600)}")
+        self.assertEqual(task.state, "running")
+        self.assertEqual(self.successes(w, task.id), [])
+        w.notifier.run()                                       # dispatch before recovery
+        self.assertFalse([n for n in w.tg.delivered_notifications()
+                          if n == f"job:notes.batch:{task.id}"
+                          or n.endswith(":final")])
+        w2 = rw.World(self.tmp, worker="w2", definitions=[rw.batch(n=1)])
+        w2.now = w.now + 10_000
+        self.assertEqual(w2.runner.run_pending()[-1].outcome, "done")
+        kinds = self.successes(w2, task.id)
+        self.assertEqual(kinds.count("result"), 1)
+        self.assertEqual(kinds.count("final"), 1)
+        self.assertEqual(w2.ext.calls("s1"), 1)
+
+    def test_crash_after_commit_before_final_is_recovered_once(self):
+        w = self.long_batch()
+
+        class Crash(BaseException):
+            pass
+
+        def boom(*a, **k):
+            raise Crash()
+
+        w.runner._deliver_final = boom
+        with self.assertRaises(Crash):
+            w.runner.run_once()
+        task = w.runner.tasks.by_trigger(f"resp:notes.batch:slot:{int(rw.T0 // 3600)}")
+        self.assertEqual(task.state, DONE)                        # terminal is committed
+        self.assertEqual(self.successes(w, task.id), ["result"])  # result was in that commit
+        w2 = rw.World(self.tmp, worker="w2", definitions=[rw.batch(n=1)])
+        w2.now = w.now + 5
+        w2.runner.report_progress()                               # recovery sweep
+        w2.runner.watchdog()
+        w2.runner.report_progress()
+        kinds = self.successes(w2, task.id)
+        self.assertEqual(kinds.count("final"), 1)
+        self.assertEqual(kinds.count("result"), 1)
+        self.assertEqual(len([k for k in kinds if k.startswith("state:")]), 1)
+
+    def test_lease_lost_at_complete_announces_nothing(self):
+        w = self.long_batch()
+        real = w.runner.tasks.complete
+
+        def late(*a, **k):
+            w.now += 1000                                        # lease expired meanwhile
+            return real(*a, **k)
+
+        w.runner.tasks.complete = late
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "lease_lost")
+        self.assertEqual(self.successes(w, r.task_id), [])
+        w.runner.tasks.complete = real
+        self.assertEqual(w.runner.run_pending()[-1].outcome, "done")
+        self.assertEqual(self.successes(w, r.task_id).count("result"), 1)
+        self.assertEqual(w.ext.calls("s1"), 1)
+
+    def test_kill_at_the_announcement_rolls_back_completion(self):
+        w = self.long_batch()
+
+        class StoppingHandle:
+            silent = False
+
+            def notify(self, *a, **k):
+                # E1 refuses because another process committed /stop just now.
+                from notifier import Stopped
+                raise Stopped("kill flag set")
+
+            def long_work(self, *a, **k):
+                return w.notifier.handle_for(rw.batch(n=1).job_spec).long_work(*a, **k)
+
+        real = w.runner._handles["notes.batch"]
+        w.runner._handles["notes.batch"] = StoppingHandle()
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "interrupted")
+        task = w.runner.tasks.get(r.task_id)
+        self.assertEqual((task.state, task.consecutive_failures), (QUEUED, 0))
+        self.assertEqual(self.successes(w, r.task_id), [])
+        w.runner._handles["notes.batch"] = real
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(self.successes(w, r.task_id).count("result"), 1)
+        self.assertEqual(w.ext.calls("s1"), 1)
+
+
 class Structure(Base):
     def test_runner_passes_the_direct_send_lint(self):
         self.assertEqual(lint.scan(HERE.parent), [])

@@ -22,7 +22,7 @@ queued ──claim──▶ running ──complete──▶ done
                                        (a denied or expired approval counts toward job escalation)
 ```
 
-`release(task, worker)` moves `running → queued` **without** counting a failure (a pause, e.g. E2's kill-flag interrupt). Each worker mutation checks, inside its write transaction, that the worker still holds a live lease. If it doesn't, the call raises `LeaseLost`.
+`release(task, worker)` moves `running → queued` **without** counting a failure (a pause, e.g. E2's kill-flag interrupt). `submit(..., tx=)` and `complete(..., tx=)` can join the caller's open write transaction, so the insert or terminal state commits together with the caller's own writes (E2: schedule watermark; result announcement). Each worker mutation checks, inside its write transaction, that the worker still holds a live lease. If it doesn't, the call raises `LeaseLost`.
 
 ## Effect rules (T10)
 

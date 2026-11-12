@@ -66,6 +66,7 @@ RECEIPT_PREFIX = "potter://receipts/"
 OUT_DONE, OUT_WAITING, OUT_RETRY, OUT_FAILED = "done", "waiting_approval", "retry", "failed"
 OUT_ESCALATED, OUT_INTERRUPTED, OUT_BLOCKED, OUT_LEASE_LOST = (
     "escalated", "interrupted", "blocked", "lease_lost")
+OUT_HELD = "held"
 
 
 @dataclass(frozen=True)
@@ -124,7 +125,7 @@ class ResponsibilityRunner:
         for name, other in (("journal", journal.db), ("ledger", ledger.db), ("issuer", issuer.db)):
             if other.path != self.db.path:
                 raise ValueError(f"{name} must share the runner's database")
-        _schema.ensure(self.db)
+        _schema.ensure(self.db, now=clock())
         self.kill = KillFlag(self.db)
         self._clock = clock
         self.tasks = TaskStore(self.db, escalate=self._on_escalation, clock=clock)
@@ -150,6 +151,7 @@ class ResponsibilityRunner:
         self._ops = handle_for(JobSpec(ops_job, "josh"))
         for d in self._defs.values():
             self.tasks.register_job(d.id, d.cadence_s, tolerance=d.tolerance)
+        self._alert_holds()
 
     def _now(self) -> float:
         return self._clock()
@@ -167,15 +169,23 @@ class ResponsibilityRunner:
             if not isinstance(d.trigger, Schedule):
                 continue
             slot = d.trigger.slot(now)
+            # ONE write transaction: the watermark check, its update and the
+            # task insert commit together. Concurrent ticks (threads or
+            # processes) serialize on the write lock, so a tick that decided
+            # on an old watermark can never insert after a newer tick moved
+            # it. There is no state between the two steps: a crash before
+            # commit records neither, and the next tick submits its own
+            # current slot (an earlier, missed slot is skipped, per the
+            # late-slot rule).
             with self.db.tx() as c:
                 wm = _schema.get_state(c, f"watermark:{d.id}")
                 if wm is not None and slot < int(wm):
                     continue                      # late tick for a superseded slot
                 _schema.set_state(c, f"watermark:{d.id}", str(slot))
-            task, new = self.tasks.submit(
-                f"resp:{d.id}:slot:{slot}", d.id,
-                {"slot": slot, "scheduled_for": slot * d.trigger.every_s + d.trigger.offset_s},
-                job=d.id, now=now)
+                task, new = self.tasks.submit(
+                    f"resp:{d.id}:slot:{slot}", d.id,
+                    {"slot": slot, "scheduled_for": slot * d.trigger.every_s + d.trigger.offset_s},
+                    job=d.id, now=now, tx=c)
             if new:
                 created.append(task)
         return created
@@ -225,6 +235,9 @@ class ResponsibilityRunner:
                 return RunResult(task.id, None, OUT_LEASE_LOST)
             return RunResult(task.id, None, OUT_FAILED, "unknown_responsibility")
         cp = dict(task.checkpoint or {})
+        hold = self._hold_of(task.id)
+        if hold is not None:
+            return self._park_held(d, task, cp, hold)
         # step id -> hash of the action an approval was requested for. E1 now
         # issues only for a task already waiting_approval, after this worker's
         # lease is gone, so the approval id itself is looked up by (task, hash).
@@ -499,6 +512,8 @@ class ResponsibilityRunner:
             d = self._defs.get(task.kind) if task else None
             if d is None:
                 continue
+            if self._hold_of(tid) is not None:
+                continue                      # operator decides; never prompt again
             cp = task.checkpoint or {}
             h = cp.get("approvals", {}).get(cp.get("waiting", ""))
             aid, status, _ = self._approval_for(tid, h) if h else (None, None, None)
@@ -537,20 +552,132 @@ class ResponsibilityRunner:
 
     # ---------------------------------------------------------------- endings
     def _finish(self, d: Responsibility, task: Task, results: Mapping[str, Any]) -> RunResult:
-        """Messages first, then complete: the enqueue is idempotent, so a crash
-        in between re-runs no effect and re-enqueues nothing new. If the kill
-        flag stops the result message, the task is NOT completed: it is
-        interrupted at ``len(steps)``, so the run resumes after the flag is
-        cleared, re-runs no step, and delivers the result then."""
+        """Success becomes observable only together with the terminal state.
+
+        ONE write transaction holds: the job result message (if the definition
+        has a ``report``), C2's terminal ``complete`` (lease-checked inside it)
+        and a pending ``responsibility_finals`` row. A crash, lease loss or kill
+        flag before that commit leaves none of them, so no success is ever
+        announced for a task C2 does not record as done; the task is rerun (no
+        step repeats) or interrupted. The long-work "done" update and final
+        message, which E1 writes in its own transactions, are sent only AFTER
+        the commit, and the recovery sweep (``deliver_pending_finals``, run by
+        ``report_progress`` and ``watchdog``) re-sends them idempotently if a
+        crash lands between the commit and their delivery."""
         ctx = StepContext(task.payload, MappingProxyType(dict(results)))
         if self.kill.is_set():
             raise _Interrupt()
-        self._report(d, task.id, DONE)
         text = d.report(ctx) if d.report is not None else None
-        if not self._final_messages(d, task, text, outcome=DONE):
-            raise _Interrupt()
-        self.tasks.complete(task.id, self._worker)
+        try:
+            with self.db.tx() as c:
+                if text:
+                    self._handles[d.id].notify(
+                        c, task.id, kind="job_result",
+                        text=f"{text} Receipt: {receipt_link(task.id)}")
+                self.tasks.complete(task.id, self._worker, tx=c)
+                c.execute("INSERT OR IGNORE INTO responsibility_finals (task_id, responsibility,"
+                          " outcome, created_at) VALUES (?,?,?,?)",
+                          (task.id, d.id, DONE, self._now()))
+        except Stopped:
+            raise _Interrupt()          # rolled back: not complete, nothing announced
+        self._deliver_final(task.id)
         return RunResult(task.id, d.id, OUT_DONE)
+
+    def _deliver_final(self, task_id: str) -> bool:
+        """After the terminal commit: E1 long-work 'done' update and final
+        message (idempotent), then mark the final delivered. False if the kill
+        flag holds it back (the sweep delivers it once the flag clears)."""
+        with self.db.read() as c:
+            row = c.execute("SELECT responsibility, outcome FROM responsibility_finals"
+                            " WHERE task_id=? AND delivered_at IS NULL", (task_id,)).fetchone()
+        if row is None:
+            return True
+        d = self._defs.get(row[0])
+        if d is not None and not self._handles[d.id].silent:
+            if self.kill.is_set():
+                return False
+            lw = self._long_work(d, task_id)
+            if lw is not None:
+                now = self._now()
+                try:
+                    lw[0].tick(row[1], now)
+                    if now - lw[1] >= LONG_WORK_ACK_S:
+                        lw[0].finish(receipt_link(task_id), now, outcome=row[1])
+                except Stopped:
+                    return False
+                except NotifierError:
+                    pass                  # final already enqueued earlier
+        with self.db.tx() as c:
+            c.execute("UPDATE responsibility_finals SET delivered_at=? WHERE task_id=?",
+                      (self._now(), task_id))
+        return True
+
+    def deliver_pending_finals(self) -> int:
+        """Recovery sweep: re-deliver every committed-but-undelivered final."""
+        with self.db.read() as c:
+            ids = [r[0] for r in c.execute("SELECT task_id FROM responsibility_finals"
+                                           " WHERE delivered_at IS NULL ORDER BY created_at")]
+        return sum(1 for tid in ids if self._deliver_final(tid))
+
+    # ---------------------------------------------------------------- holds (upgrade)
+    def _hold_of(self, task_id: str):
+        with self.db.read() as c:
+            return c.execute("SELECT step_id, action_ref, reason FROM responsibility_holds"
+                             " WHERE task_id=?", (task_id,)).fetchone()
+
+    def holds(self) -> list[tuple[str, str, str]]:
+        """(task id, step id, reason) of every task awaiting an operator."""
+        with self.db.read() as c:
+            return [tuple(r) for r in c.execute("SELECT task_id, step_id, reason FROM"
+                                                " responsibility_holds ORDER BY created_at")]
+
+    def _park_held(self, d: Responsibility, task: Task, cp: dict, hold) -> RunResult:
+        """A held task that was queued/running is parked in waiting_approval on
+        its held step, without any new prompt, until an operator resolves it."""
+        step_id, _, reason = hold
+        try:
+            self.tasks.checkpoint(task.id, self._worker, {**cp, "waiting": step_id})
+            self.tasks.wait_for_approval(task.id, self._worker)
+        except LeaseLost:
+            return RunResult(task.id, d.id, OUT_LEASE_LOST)
+        self._alert_holds()
+        return RunResult(task.id, d.id, OUT_HELD, reason)
+
+    def _alert_holds(self) -> None:
+        for task_id, step_id, reason in self.holds():
+            task = self.tasks.get(task_id)
+            if task is not None and task.kind in self._defs:
+                self._alert(f"hold:{task_id}",
+                            f"{task.kind}: approval for step {step_id} needs an operator"
+                            f" ({reason}); no new prompt was sent."
+                            f" Receipt: {receipt_link(task_id)}")
+
+    def resolve_hold(self, task_id: str, approval_id: str | None) -> None:
+        """Operator decision for a held task. ``approval_id``: claim that exact
+        E1 request (it must belong to this task and the held action); the run
+        then follows it like any claimed approval. ``None``: end the run
+        (failed) without any approval. Nothing is ever re-issued."""
+        hold = self._hold_of(task_id)
+        if hold is None:
+            raise KeyError(task_id)
+        step_id, ref, _ = hold
+        if approval_id is None:
+            task = self.tasks.get(task_id)
+            if task is not None and task.state == WAITING_APPROVAL:
+                self.tasks.approval_resolved(task_id, False,
+                                             error="held approval rejected by operator")
+            with self.db.tx() as c:
+                c.execute("DELETE FROM responsibility_holds WHERE task_id=?", (task_id,))
+            return
+        with self.db.tx() as c:
+            row = c.execute("SELECT task_id, action_hash FROM approval_requests"
+                            " WHERE approval_id=?", (approval_id,)).fetchone()
+            if row is None or row[0] != task_id or row[1] != ref:
+                raise ValueError("approval does not belong to the held task and action")
+            c.execute("INSERT OR REPLACE INTO responsibility_approvals (task_id, action_hash,"
+                      " approval_id, created_at) VALUES (?,?,?,?)",
+                      (task_id, ref, approval_id, self._now()))
+            c.execute("DELETE FROM responsibility_holds WHERE task_id=?", (task_id,))
 
     def _final_messages(self, d: Responsibility, task: Task, text: str | None, *,
                         outcome: str | None = None) -> bool:
@@ -652,6 +779,7 @@ class ResponsibilityRunner:
         with self.db.read() as c:
             rows = c.execute("SELECT id, kind, state FROM tasks WHERE state IN (?,?)"
                              " ORDER BY created_at, id", (RUNNING, WAITING_APPROVAL)).fetchall()
+        self.deliver_pending_finals()
         n = 0
         for tid, kind, state in rows:
             d = self._defs.get(kind)
@@ -695,6 +823,8 @@ class ResponsibilityRunner:
         re-enqueue of escalations. Returns the stale responsibility ids."""
         now = self._now() if now is None else now
         stale = [j for j in self.tasks.stale_jobs(now=now) if j.name in self._defs]
+        self.deliver_pending_finals()
+        self._alert_holds()
         for j in stale:
             limit = j.cadence_s * j.tolerance
             self._alert(f"watchdog:{j.name}:{int(now // limit)}",

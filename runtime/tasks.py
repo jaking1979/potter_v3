@@ -26,6 +26,7 @@ per escalation. A crash between commit and callback loses the notification
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
@@ -182,14 +183,17 @@ class TaskStore:
 
     # -- submission / claiming --------------------------------------------
     def submit(self, trigger_key: str, kind: str, payload: Any = None, *,
-               job: str | None = None, now: float | None = None) -> tuple[Task, bool]:
+               job: str | None = None, now: float | None = None,
+               tx: sqlite3.Connection | None = None) -> tuple[Task, bool]:
         """Create the task for ``trigger_key`` unless it exists. Returns
-        (task, created). Payloads are JSON and must never contain secrets."""
+        (task, created). Payloads are JSON and must never contain secrets.
+        ``tx``: the caller's open write transaction (``Database.tx()``), so the
+        insert commits or rolls back with the caller's own decision."""
         if not trigger_key or not kind:
             raise ValueError("trigger_key and kind required")
         now = self._now(now)
         tid = task_id_for(trigger_key)
-        with self.db.tx() as c:
+        with self._in(tx) as c:
             cur = c.execute("INSERT OR IGNORE INTO tasks (id, trigger_key, kind, job, payload, state,"
                             " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
                             (tid, trigger_key, kind, job, _dump(payload), QUEUED, now, now))
@@ -291,9 +295,13 @@ class TaskStore:
             self._owned(c, task_id, worker_id, now)
             return self._move(c, task_id, RUNNING, QUEUED, now)
 
-    def complete(self, task_id: str, worker_id: str, *, now: float | None = None) -> Task:
+    def complete(self, task_id: str, worker_id: str, *, now: float | None = None,
+                 tx: sqlite3.Connection | None = None) -> Task:
+        """``tx``: the caller's open write transaction, so the terminal state
+        commits atomically with the caller's own writes (e.g. the outbox row
+        announcing the result). The lease is checked inside it."""
         now = self._now(now)
-        with self.db.tx() as c:
+        with self._in(tx) as c:
             t = self._owned(c, task_id, worker_id, now)
             out = self._move(c, task_id, RUNNING, DONE, now)
             c.execute("UPDATE tasks SET consecutive_failures=0 WHERE id=?", (task_id,))
@@ -324,6 +332,14 @@ class TaskStore:
         return self.get(task_id_for(trigger_key))
 
     # -- internals ---------------------------------------------------------
+    def _in(self, tx: sqlite3.Connection | None):
+        """The caller's open write transaction, or a fresh one of our own."""
+        if tx is None:
+            return self.db.tx()
+        if not isinstance(tx, sqlite3.Connection) or not tx.in_transaction:
+            raise ValueError("tx must be an open write transaction (Database.tx())")
+        return contextlib.nullcontext(tx)
+
     def _move(self, c: sqlite3.Connection, task_id: str, src: str, dst: str, now: float,
               error: str | None = None) -> Task:
         _check(src, dst)
