@@ -72,6 +72,7 @@ import hashlib
 import hmac
 import itertools
 import json
+import math
 import secrets
 import sqlite3
 import threading
@@ -92,6 +93,17 @@ DEFAULT_MAX_SKEW_S = 300.0
 MAX_MINTED = 1024            # live vouchers kept in memory (oldest evicted)
 PRUNE_MARGIN_S = 60.0
 CLOCK_TOLERANCE_S = 5.0      # clock may read this far behind the high-water
+MAX_SKEW_LIMIT_S = 3600.0    # max_skew_s must lie in (0, MAX_SKEW_LIMIT_S]
+
+
+def finite_number(v: object) -> bool:
+    """A real, finite int/float - not bool, not NaN, not +-inf."""
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
+
+
+class WatermarkCorrupt(Exception):
+    """A stored high-water value is not a finite number."""
 
 Verifier = Callable[[InboundMessage], bool]
 
@@ -166,6 +178,8 @@ class ChannelAuth:
         """``transport_keys[channel]`` verifies adapter envelopes;
         ``inbound_bindings[channel][sender_ref] -> principal``;
         ``outbound_addresses[principal][channel] -> address``."""
+        if not finite_number(max_skew_s) or not 0 < max_skew_s <= MAX_SKEW_LIMIT_S:
+            raise ValueError(f"max_skew_s must be a finite number in (0, {MAX_SKEW_LIMIT_S:g}] s")
         self.db = as_database(db)
         _schema.ensure(self.db, clock=clock)
         self._keys = {ch: bytes(k) for ch, k in transport_keys.items()}
@@ -176,7 +190,7 @@ class ChannelAuth:
         self._dir = directory or seed_directory()
         self._allow = frozenset(allowlist)
         self._clock = clock
-        self._skew = max_skew_s
+        self._skew = float(max_skew_s)
         self._serials = itertools.count(1)
         # token -> (the exact minted object, its claims at mint time)
         self._minted: dict[str, tuple[AuthenticatedSender, tuple[str, ...]]] = {}
@@ -189,6 +203,8 @@ class ChannelAuth:
         key = self._keys.get(msg.channel)
         if key is None:
             return "unknown_channel"
+        if not finite_number(msg.sent_at):
+            return "invalid_sent_at"          # NaN / +-inf / bool / non-numeric
         mac = msg.transport_mac
         if not isinstance(mac, str) or not mac:
             return "unauthenticated_transport"
@@ -200,9 +216,15 @@ class ChannelAuth:
             return "unauthenticated_transport"
         if not isinstance(msg.update_id, str) or not msg.update_id:
             return "unauthenticated_transport"
-        if not isinstance(msg.sent_at, (int, float)):
-            return "unauthenticated_transport"
         return None
+
+    def _read_clock(self) -> float | None:
+        """One clock reading, or None if it is not a finite number."""
+        try:
+            now = self._clock()
+        except Exception:
+            return None
+        return float(now) if finite_number(now) else None
 
     def _fresh(self, msg: InboundMessage, now: float, hw: dict) -> bool:
         if abs(now - msg.sent_at) > self._skew:
@@ -229,14 +251,24 @@ class ChannelAuth:
             return dict(self._hw(c, channel))
 
     @staticmethod
-    def _hw(c: sqlite3.Connection, channel: str) -> dict:
-        """The channel's mark, never below the migration seed (if any)."""
+    def _load_hw(raw: str) -> dict:
+        hw = json.loads(raw)
+        for k in ("max_sent_at", "max_clock"):
+            v = hw.get(k)
+            if v is not None and not finite_number(v):
+                raise WatermarkCorrupt(k)
+        return hw
+
+    @classmethod
+    def _hw(cls, c: sqlite3.Connection, channel: str) -> dict:
+        """The channel's mark, never below the migration seed (if any).
+        Raises WatermarkCorrupt for a stored non-finite value."""
         out = {"max_sent_at": None, "max_clock": None}
         for key in (_schema.SEED_KEY, f"hw:{channel}"):
             raw = _schema.get_state(c, key)
             if not raw:
                 continue
-            for k, v in json.loads(raw).items():
+            for k, v in cls._load_hw(raw).items():
                 if k in out and v is not None:
                     out[k] = v if out[k] is None else max(out[k], v)
         return out
@@ -251,15 +283,18 @@ class ChannelAuth:
 
     def burn_needs_operator(self, channel: str, update_id: str) -> bool:
         """Operator act: close a migrated pending command WITHOUT executing it."""
+        now = self._read_clock()
+        if now is None:
+            raise ValueError("clock reading is not a finite number; nothing written")
         with self.db.tx() as c:
             cur = c.execute("UPDATE inbound_seen SET status='processed', processed_at=?"
                             " WHERE channel=? AND update_id=? AND status='needs_operator'",
-                            (self._clock(), channel, update_id))
+                            (now, channel, update_id))
             return cur.rowcount == 1
 
-    @staticmethod
-    def _max_clock(c: sqlite3.Connection) -> float | None:
-        vals = [json.loads(v).get("max_clock") for (v,) in c.execute(
+    @classmethod
+    def _max_clock(cls, c: sqlite3.Connection) -> float | None:
+        vals = [cls._load_hw(v).get("max_clock") for (v,) in c.execute(
             "SELECT value FROM notifier_state WHERE key LIKE 'hw:%'")]
         vals = [v for v in vals if v is not None]
         return max(vals) if vals else None
@@ -271,19 +306,45 @@ class ChannelAuth:
         if sent_at is not None:
             hw["max_sent_at"] = (sent_at if hw["max_sent_at"] is None
                                  else max(hw["max_sent_at"], sent_at))
-        _schema.set_state(c, f"hw:{channel}", json.dumps(hw, sort_keys=True))
+        _schema.set_state(c, f"hw:{channel}", json.dumps(hw, sort_keys=True, allow_nan=False))
 
     def reconcile_clock(self) -> None:
         """Operator act after a clock regression is understood: accept the
         current clock as the new max clock on every transport. The sent_at
-        watermark is NOT lowered, so already-seen envelopes stay rejected."""
-        now = self._clock()
+        watermark is NOT lowered, so already-seen envelopes stay rejected.
+        Refuses (no writes) on a non-finite clock or a corrupt stored mark."""
+        now = self._read_clock()
+        if now is None:
+            raise ValueError("clock reading is not a finite number; nothing written")
         with self.db.tx() as c:
             for (key,) in c.execute("SELECT key FROM notifier_state WHERE key LIKE 'hw:%'"
                                     ).fetchall():
-                hw = json.loads(_schema.get_state(c, key))
+                hw = self._load_hw(_schema.get_state(c, key))   # corrupt -> raise, rollback
                 hw["max_clock"] = now
-                _schema.set_state(c, key, json.dumps(hw, sort_keys=True))
+                _schema.set_state(c, key, json.dumps(hw, sort_keys=True, allow_nan=False))
+
+    def repair_watermark(self) -> list[str]:
+        """Operator act for a stored non-finite high-water value (which makes
+        every command refuse as ``watermark_corrupt``): replace each
+        non-finite field with the current, finite clock reading. Finite
+        fields are kept (never lowered). Returns the repaired keys.
+        Refuses (no writes) if the clock reading itself is not finite."""
+        now = self._read_clock()
+        if now is None:
+            raise ValueError("clock reading is not a finite number; nothing written")
+        fixed = []
+        with self.db.tx() as c:
+            for key, raw in c.execute("SELECT key, value FROM notifier_state"
+                                      " WHERE key LIKE 'hw:%'").fetchall():
+                hw = json.loads(raw)
+                bad = [k for k in ("max_sent_at", "max_clock")
+                       if hw.get(k) is not None and not finite_number(hw.get(k))]
+                if bad:
+                    for k in bad:
+                        hw[k] = now
+                    _schema.set_state(c, key, json.dumps(hw, sort_keys=True, allow_nan=False))
+                    fixed.append(key)
+        return sorted(fixed)
 
     @staticmethod
     def _digest(msg: InboundMessage) -> str:
@@ -319,9 +380,17 @@ class ChannelAuth:
         bad = self._transport_ok(msg)
         if bad:
             return AuthResult(None, bad)
+        now = self._read_clock()
+        if now is None:
+            return AuthResult(None, "clock_invalid")             # fail closed, no writes
         digest = self._digest(msg)
         principal, reason = self._principal(msg)       # always (re)checked
-        now = self._clock()
+        try:
+            return self._authenticate_tx(msg, digest, principal, reason, now)
+        except WatermarkCorrupt:
+            return AuthResult(None, "watermark_corrupt")         # rolled back, no writes
+
+    def _authenticate_tx(self, msg, digest, principal, reason, now) -> AuthResult:
         with self.db.tx() as c:
             max_clock = self._max_clock(c)
             if max_clock is not None and now < max_clock - CLOCK_TOLERANCE_S:
@@ -334,9 +403,15 @@ class ChannelAuth:
                 status, stored = row
                 if status == "needs_operator":
                     return AuthResult(None, "needs_operator")      # migrated: never resumed
-                if status == "processed" or not hmac.compare_digest(stored, digest):
+                if status == "processed":
                     self._advance(c, msg.channel, clock=now, sent_at=None)
-                    return AuthResult(None, "replayed")
+                    return AuthResult(None, "replayed")             # done: never again
+                if not hmac.compare_digest(stored, digest):
+                    # A different envelope under a still-pending update id: not
+                    # the journaled command. Distinct from "replayed" so a
+                    # caller can tell "already done" from "conflicting".
+                    self._advance(c, msg.channel, clock=now, sent_at=None)
+                    return AuthResult(None, "pending_conflict")
                 # pending + identical envelope: recovery path (no freshness check).
                 if principal is None:
                     # Authorization no longer holds: close it, never execute.
@@ -394,9 +469,12 @@ class ChannelAuth:
         """Mark the voucher's update ``processed`` inside the caller's effect
         transaction. False if it was already processed (the caller must not
         apply its effect; raising rolls the transaction back)."""
+        now = self._read_clock()
+        if now is None:
+            raise ValueError("clock reading is not a finite number")   # rolls back the effect
         cur = c.execute("UPDATE inbound_seen SET status='processed', processed_at=?"
                         " WHERE channel=? AND update_id=? AND status='pending'",
-                        (self._clock(), sender.channel, sender.update_id))
+                        (now, sender.channel, sender.update_id))
         return cur.rowcount == 1
 
     def finish(self, sender: AuthenticatedSender) -> None:
