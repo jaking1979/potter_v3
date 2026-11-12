@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from itertools import islice
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
@@ -150,9 +151,13 @@ class BenchmarkResult:
 async def benchmark(backend: Backend, query: str, expected_ids: Sequence[str], *,
                     production_deadline: float = 2.0, timeout: float = 30.0) -> BenchmarkResult:
     """Measure independently from production; never returns content for injection."""
-    expected = tuple(expected_ids)
-    if (not 1 <= len(expected) <= 3 or len(set(expected)) != len(expected)
-            or any(not isinstance(i, str) or not i for i in expected)
+    try:
+        expected = tuple(islice(expected_ids, 4))
+    except TypeError:
+        raise ValueError('invalid evidence set or deadline') from None
+    if (not 1 <= len(expected) <= 3
+            or any(type(i) is not str or not i for i in expected)
+            or len(set(expected)) != len(expected)
             or not _positive_finite_duration(production_deadline) or not _positive_finite_duration(timeout)):
         raise ValueError('invalid evidence set or deadline')
     status, items, elapsed = await _bounded(backend, query, timeout)
