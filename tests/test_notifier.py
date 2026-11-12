@@ -1409,7 +1409,7 @@ class PendingRecoveryPath(_Reopen):
         swapped = w2.signers["telegram"].envelope(TG_JOSH, "/stop", update_id=msg.update_id,
                                                   sent_at=msg.sent_at)
         res = w2.router.handle(swapped)
-        self.assertEqual((res.outcome, res.reason), ("ignored", "replayed"))
+        self.assertEqual((res.outcome, res.reason), ("ignored", "pending_conflict"))
         self.assertFalse(w2.notifier.kill.is_set())
         from dataclasses import replace
         self.assertEqual(w2.router.handle(replace(msg, text="/stop")).reason,
@@ -2093,6 +2093,165 @@ class AtomicRefusal(unittest.TestCase):
         before = self.snapshot()
         _schema.ensure(db)                                    # idempotent
         self.assertEqual(self.snapshot(), before)
+
+
+# ============================================================ non-finite inputs + pending_conflict (Dolores @ 136b75e)
+
+class NonFiniteInputs(_Reopen):
+    INF, NAN = float("inf"), float("nan")
+
+    def state(self, db=None):
+        with (db or self.w.db).read() as c:
+            return (c.execute("SELECT * FROM inbound_seen ORDER BY channel, update_id").fetchall(),
+                    c.execute("SELECT key, value FROM notifier_state WHERE key LIKE 'hw:%'"
+                              " ORDER BY key").fetchall())
+
+    def auth(self, clock, db=None, **kw):
+        return ChannelAuth(db=db or self.w.db, transport_keys=TRANSPORT_KEYS, clock=clock,
+                           inbound_bindings={"telegram": {TG_JOSH: JOSH}},
+                           outbound_addresses={JOSH: {"telegram": "chat-1001"}}, **kw)
+
+    # -- 1. max_skew_s ---------------------------------------------------------------
+    def test_non_finite_or_out_of_range_skew_is_rejected_at_construction(self):
+        for bad in (self.NAN, self.INF, -self.INF, 0, -1, True, False, "300", None, 3600.5):
+            with self.subTest(skew=bad), self.assertRaises(ValueError):
+                self.auth(lambda: self.w.now, max_skew_s=bad)
+        for ok in (1, 1.5, 300, 3600):
+            with self.subTest(skew=ok):
+                self.assertEqual(self.auth(lambda: self.w.now, max_skew_s=ok).max_skew_s,
+                                 float(ok))
+
+    def test_year_old_envelope_is_refused_with_maximum_skew(self):
+        auth = self.auth(lambda: self.w.now, max_skew_s=3600)
+        old = self.w.signers["telegram"].envelope(TG_JOSH, "/stop", update_id="y1",
+                                                  sent_at=T - 365 * 86400)
+        self.assertEqual(auth.authenticate(old).reason, "stale_transport")
+
+    # -- 2. clock --------------------------------------------------------------------
+    def test_non_finite_clock_fails_closed_without_writes_new_and_pending(self):
+        pending = self.w.tg_msg("/stop")
+        self.assertTrue(self.w.auth.authenticate(pending).ok)       # pending row
+        for bad in (self.INF, -self.INF, self.NAN, "now", None, True):
+            with self.subTest(clock=bad):
+                before = self.state()
+                auth = self.auth(lambda b=bad: b)
+                self.assertEqual(auth.authenticate(pending).reason, "clock_invalid")
+                fresh = self.w.tg_msg("/stop")
+                self.assertEqual(auth.authenticate(fresh).reason, "clock_invalid")
+                self.assertEqual(self.state(), before)                # nothing written
+                with self.assertRaises(ValueError):
+                    auth.reconcile_clock()
+                with self.assertRaises(ValueError):
+                    auth.repair_watermark()
+                self.assertEqual(self.state(), before)
+        # Clock restored: new instances work, no permanent clock_regression.
+        w2 = self.reopen()
+        res = w2.router.handle(pending)
+        self.assertEqual(res.outcome, "stopped", res)
+        w2.notifier.kill.clear()
+        self.assertEqual(w2.router.handle(self.w.tg_msg("/stop")).outcome, "stopped")
+        self.assertTrue(all(math_finite(v) for _, raw in self.state()[1]
+                            for v in json.loads(raw).values() if v is not None))
+
+    def test_clock_raising_fails_closed(self):
+        def broken():
+            raise OSError("clock source down")
+        self.assertEqual(self.auth(broken).authenticate(self.w.tg_msg("/stop")).reason,
+                         "clock_invalid")
+
+    def test_non_finite_clock_cannot_mark_processed(self):
+        msg = self.w.tg_msg("/stop")
+        sender = self.w.auth.authenticate(msg).sender               # pending
+        self.w.auth._clock = lambda: self.INF                        # clock goes bad mid-flight
+        with self.assertRaises(ValueError):
+            self.w.notifier.stop(sender)                             # effect tx rolls back
+        self.assertFalse(self.w.notifier.kill.is_set())
+        self.w.auth._clock = lambda: self.w.now
+        self.assertEqual(self.pending_count(), 1)                   # still resumable
+        self.assertEqual(self.w.router.handle(msg).outcome, "stopped")
+
+    def test_stored_non_finite_watermark_refuses_until_operator_repair(self):
+        for bad in ("Infinity", "NaN", "-Infinity"):
+            with self.subTest(stored=bad):
+                with self.w.db.tx() as c:
+                    c.execute("INSERT INTO notifier_state (key, value) VALUES"
+                              " ('hw:telegram', ?) ON CONFLICT(key) DO UPDATE SET"
+                              " value=excluded.value",
+                              ('{"max_clock": %s, "max_sent_at": %s}' % (bad, T),))
+                before = self.state()
+                self.assertEqual(self.w.router.handle(self.w.tg_msg("/noop")).reason,
+                                 "watermark_corrupt")
+                w2 = self.reopen()                                    # across instances
+                self.assertEqual(w2.router.handle(self.w.tg_msg("/noop")).reason,
+                                 "watermark_corrupt")
+                with self.assertRaises(Exception):
+                    w2.auth.reconcile_clock()                         # not a repair path
+                self.assertEqual(self.state(), before)
+                self.assertEqual(w2.auth.repair_watermark(), ["hw:telegram"])
+                self.assertEqual(w2.auth.high_water("telegram")["max_clock"], self.w.now)
+                self.assertEqual(w2.router.handle(self.w.tg_msg("/noop")).reason,
+                                 "unknown_command")
+                self.assertEqual(w2.auth.repair_watermark(), [])      # nothing left to fix
+
+    def test_non_finite_clock_refuses_migration_without_writes(self):
+        from notifier import _schema
+        from runtime import JournalUnavailable, Outbox
+        path = Path(self._tmp.name) / "v0.db"
+        db = Database(path)
+        Outbox(db)
+        with db.tx() as c:
+            for stmt in _schema.V0_SCHEMA:
+                c.execute(stmt)
+            c.execute("INSERT INTO meta (key, value) VALUES ('notifier_schema', 'e1.v0')")
+        for bad in (self.INF, self.NAN):
+            with self.subTest(clock=bad), self.assertRaises(JournalUnavailable):
+                _schema.ensure(db, clock=lambda b=bad: b)
+            with db.read() as c:
+                self.assertEqual(c.execute("SELECT value FROM meta WHERE key='notifier_schema'"
+                                           ).fetchone()[0], "e1.v0")
+
+    # -- 3. sent_at ------------------------------------------------------------------
+    def test_non_finite_sent_at_is_a_normal_refusal_new_and_pending(self):
+        pending = self.w.tg_msg("/ack job:digest:d1")
+        self.assertTrue(self.w.auth.authenticate(pending).ok)
+        for bad in (self.NAN, self.INF, -self.INF):
+            for update_id in ("fresh-x", pending.update_id):           # new and pending
+                with self.subTest(sent_at=bad, update_id=update_id):
+                    before = self.state()
+                    env = self.w.signers["telegram"].envelope(TG_JOSH, "/stop",
+                                                              update_id=update_id, sent_at=bad)
+                    res = self.w.router.handle(env)                     # no exception
+                    self.assertEqual((res.outcome, res.reason), ("ignored", "invalid_sent_at"))
+                    self.assertEqual(self.state(), before)
+        from dataclasses import replace
+        for bad in (True, "1800000000", None):
+            with self.subTest(sent_at=bad):
+                self.assertEqual(self.w.router.handle(replace(pending, sent_at=bad)).reason,
+                                 "invalid_sent_at")
+        self.assertFalse(self.w.notifier.kill.is_set())
+        self.assertEqual(self.w.router.handle(self.w.tg_msg("/stop")).outcome, "stopped")
+        self.assertEqual(self.w.router.handle(pending).outcome, "refused")   # still resumable
+
+    # -- 4. pending_conflict vs replayed --------------------------------------------
+    def test_pending_conflict_is_distinct_from_replayed(self):
+        pending = self.w.tg_msg("/ack job:digest:d1")
+        self.assertTrue(self.w.auth.authenticate(pending).ok)       # pending
+        other = self.w.signers["telegram"].envelope(TG_JOSH, "/stop", update_id=pending.update_id,
+                                                    sent_at=pending.sent_at)
+        self.assertEqual(self.w.router.handle(other).reason, "pending_conflict")
+        self.assertFalse(self.w.notifier.kill.is_set())
+        w2 = self.reopen()                                            # restart
+        self.assertEqual(w2.router.handle(other).reason, "pending_conflict")
+        self.assertEqual(w2.router.handle(pending).outcome, "refused")  # original still runs
+        # Now processed: both the original and a different envelope are "replayed".
+        self.assertEqual(w2.router.handle(pending).reason, "replayed")
+        self.assertEqual(w2.router.handle(other).reason, "replayed")
+        self.assertEqual(self.reopen().router.handle(pending).reason, "replayed")
+
+
+def math_finite(v):
+    import math
+    return isinstance(v, (int, float)) and math.isfinite(v)
 
 
 # ============================================================ long work (item 5)

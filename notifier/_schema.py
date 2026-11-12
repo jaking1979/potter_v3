@@ -220,7 +220,11 @@ def ensure(db: Database, *, clock=None) -> None:
             if row is not None and row[0] != EXPECTED_OUTBOX_SCHEMA:
                 raise JournalUnavailable(f"outbox schema {row[0]!r}, need c3.v0; refusing")
             if version == PREVIOUS_SCHEMA_VERSION:
-                _migrate_v0(c, (clock or _time.time)())     # catalog check precedes writes
+                now = (clock or _time.time)()
+                if (not isinstance(now, (int, float)) or isinstance(now, bool)
+                        or now != now or now in (float("inf"), float("-inf"))):
+                    raise JournalUnavailable("clock reading is not finite; refusing to migrate")
+                _migrate_v0(c, float(now))                   # catalog check precedes writes
             # 2. Accepted: create C3's and E1's objects in this same transaction.
             for stmt in OUTBOX_SCHEMA:
                 c.execute(stmt)
