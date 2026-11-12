@@ -9,6 +9,8 @@ class BoundedBackend:
     when it suppresses cancellation after the caller's deadline. Saturation fails
     closed without queuing work. One instance cannot control other instances,
     processes, detached children, or a backend that blocks the event loop.
+    Rebinding is permitted only after the old loop closes and no search is
+    active. The underlying backend must itself support use on a new loop.
     """
     def __init__(self, backend, limit=1):
         if type(limit) is not int or not 1 <= limit <= 32:
@@ -23,7 +25,9 @@ class BoundedBackend:
         if self._loop is None:
             self._loop = loop
         elif self._loop is not loop:
-            raise RuntimeError("backend bound to another loop")
+            if self._active or not self._loop.is_closed():
+                raise RuntimeError("backend bound to another loop")
+            self._loop = loop
         if self._active >= self._limit:
             raise RuntimeError("retrieval capacity unavailable")
         self._active += 1
