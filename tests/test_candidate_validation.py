@@ -8,6 +8,23 @@ from dataclasses import replace
 from model_broker.broker import Broker, Candidate, Caps, Refused, Request
 
 class InvalidCandidateTests(unittest.TestCase):
+    def test_candidate_field_bounds_refuse_without_reservation(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
+            req = Request('x','12345678-1234-4234-8234-123456789abc','research','private','2026-11-06','2026-11')
+            good = Candidate('g'*200,'p'*200,True,frozenset({'research'}),frozenset({'private'}),1,2)
+            over = frozenset(str(i) for i in range(65))
+            bad = (replace(good,model='x'*201), replace(good,provider='x'*201),
+                   replace(good,validated_tasks=over), replace(good,privacy_classes=over),
+                   replace(good,validated_tasks=frozenset({'x'*201})),
+                   replace(good,privacy_classes=frozenset({'x'*201})))
+            for item in bad:
+                with self.subTest(item=item):
+                    with self.assertRaisesRegex(Refused,'malformed_candidate'):
+                        b.reserve(req,[good,item])
+            bounded = replace(good, validated_tasks=frozenset({'research', *(str(i) for i in range(63))}))
+            self.assertEqual(b.reserve(req,[bounded]),bounded)
+
     def test_list_growth_between_precheck_and_snapshot_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
             b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
