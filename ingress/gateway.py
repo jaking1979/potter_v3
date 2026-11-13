@@ -244,6 +244,7 @@ class IngressGateway:
         # event_id -> (reason, attempts) for rows whose quarantine AND block
         # record both failed; process-local fallback so pending() still moves on.
         self._volatile_blocked: dict[str, tuple[str, int]] = {}
+        self._scan_resume = 0   # rowid after which pending() resumes (cap hit)
 
     # ---- public adapters -------------------------------------------------------
 
@@ -285,27 +286,47 @@ class IngressGateway:
         reaches later valid rows. If even that record cannot be written, the
         row is held in this process's memory instead. Each call first retries
         quarantine for at most ``RETRY_BLOCKED`` blocked rows (least recently
-        tried first); a blocked row is never returned or acked."""
+        tried first); a blocked row is never returned or acked.
+
+        Bounded work: every row read counts toward ``max_scan``, including
+        rows skipped because they are held as blocked in memory. A call that
+        stops at the scan cap leaves a process-local resume point, so the next
+        call continues after it (and wraps to the start once it reaches the
+        end); a call that fills ``limit`` or reaches the end starts the next
+        one from the oldest row again. A restart drops the resume point and
+        the in-memory holds; those rows are then re-examined, fail again and
+        are re-held, still within each call's cap."""
         cap = self.MAX_SCAN if max_scan is None else max_scan
         self._retry_blocked()
-        out: list[InboundEvent] = []
-        cursor, scanned = 0, 0
-        while len(out) < limit and scanned < cap:
-            batch = self._store.pending_records(min(limit - len(out), cap - scanned),
+        found: list[tuple[int, InboundEvent]] = []
+        start = self._scan_resume
+        cursor, scanned, wrapped = start, 0, start == 0
+        while len(found) < limit and scanned < cap:
+            batch = self._store.pending_records(min(limit - len(found), cap - scanned),
                                                 after=cursor)
             if not batch:
-                break
+                if wrapped:
+                    break
+                cursor, wrapped = 0, True       # resumed mid-table: wrap once
+                continue
             for rowid, event_id, raw in batch:
-                cursor = rowid
+                if wrapped and start and rowid > start:
+                    break                       # back where this call began
+                cursor, scanned = rowid, scanned + 1
                 if event_id in self._volatile_blocked:
-                    continue                    # already known bad; not re-examined
-                scanned += 1
+                    continue                    # held bad row: counted, not re-examined
                 ev, why = self._restore_checked(raw, self._store.lookup_event(event_id))
                 if ev is not None:
-                    out.append(ev)
+                    found.append((rowid, ev))
                 else:
                     self._quarantine(event_id, why)
-        return out
+            else:
+                continue
+            break
+        # Resume after the last row read only when the cap (not limit or end
+        # of table) ended the call; otherwise start from the oldest next time.
+        self._scan_resume = cursor if scanned >= cap and len(found) < limit else 0
+        return [ev for _rowid, ev in sorted(found, key=lambda f: f[0])]   # oldest first
 
     def recovery_blocked(self) -> list[tuple[str, str, int]]:
         """(event_id, reason, attempts) of rows that failed to restore and
@@ -325,8 +346,13 @@ class IngressGateway:
             durable = self._store.blocked(self.RETRY_BLOCKED)
         except Exception:
             durable = []
+        # In-memory holds rotate (re-inserted at the end on each failure) and
+        # get at least half the budget when durable holds also exist.
         volatile = [(e, why, n) for e, (why, n) in self._volatile_blocked.items()]
-        for event_id, why, _n in (durable + volatile)[:self.RETRY_BLOCKED]:
+        v_share = min(len(volatile), max(self.RETRY_BLOCKED // 2,
+                                         self.RETRY_BLOCKED - len(durable)))
+        picks = durable[:self.RETRY_BLOCKED - v_share] + volatile[:v_share]
+        for event_id, why, _n in picks:
             self._quarantine(event_id, why)
 
     def quarantined(self) -> list[tuple[str, str]]:
@@ -364,8 +390,8 @@ class IngressGateway:
         if durable:
             self._volatile_blocked.pop(event_id, None)
         else:
-            _why, n = self._volatile_blocked.get(event_id, (why, 0))
-            self._volatile_blocked[event_id] = (why, n + 1)
+            _why, n = self._volatile_blocked.pop(event_id, (why, 0))
+            self._volatile_blocked[event_id] = (why, n + 1)    # to the back: rotation
         try:
             emit_ingress_trace(self._sink, event_id=event_id,
                                delivery_key=str(uuid.uuid4()), channel="inbox",

@@ -2044,6 +2044,82 @@ class QuarantineFailureCannotStall(Fixture):
         self.assertEqual(len(gw.recovery_blocked()), 3)
 
 
+class VolatileHoldsAreBoundedWork(Fixture):
+    """Dolores at 15ddc2f: rows held as blocked in memory were skipped before
+    ``scanned += 1``, so they did not consume ``max_scan`` and one call could
+    read the whole blocked backlog. Every row read now counts; a call that
+    stops at the cap resumes after it on the next call."""
+
+    corrupt = PendingScanCannotStarve.corrupt
+    setup_rows = QuarantineFailureCannotStall.setup_rows
+    failing = QuarantineFailureCannotStall.failing
+
+    def count_reads(self, gw):
+        reads = []
+        orig = gw._store.pending_records
+
+        def counting(limit, after=0):
+            rows = orig(limit, after)
+            reads.append(len(rows))
+            return rows
+        gw._store.pending_records = counting
+        return reads
+
+    def drain_until(self, gw, want, cap, max_calls):
+        reads = self.count_reads(gw)
+        for call in range(1, max_calls + 1):
+            reads.clear()
+            got = gw.pending(limit=1, max_scan=cap)
+            self.assertLessEqual(sum(reads), cap)                       # bounded per call
+            if got:
+                self.assertEqual(got, [want])
+                return call
+        self.fail("no progress")
+
+    def test_139_volatile_holds_consume_scan_budget(self):
+        bad, good = self.setup_rows(n_bad=50)
+        with self.failing("quarantine", "block"):
+            calls = self.drain_until(self.gw, good, cap=10, max_calls=7)
+            self.assertEqual(calls, 6)                   # 50 bad / 10 per call, then good
+            self.assertEqual(len(self.gw.recovery_blocked()), 50)
+            # Held state never reads as resolved, and stays bounded on later calls.
+            calls = self.drain_until(self.gw, good, cap=10, max_calls=7)
+            self.assertEqual(len(self.gw.recovery_blocked()), 50)
+            self.assertEqual(self.gw.quarantined(), [])
+            self.assertFalse(any(self.gw.ack(e) for e in bad))
+
+    def test_140_volatile_failure_then_recovery_drains_all(self):
+        bad, good = self.setup_rows(n_bad=50)
+        with self.failing("quarantine", "block"):
+            self.drain_until(self.gw, good, cap=10, max_calls=7)
+        for _ in range(5):                               # 16 retries per call
+            self.gw.pending(max_scan=10)
+        self.assertEqual(self.gw.recovery_blocked(), [])
+        self.assertEqual(sorted(self.gw.quarantined()), sorted((e, "malformed") for e in bad))
+        self.assertEqual(self.gw.pending(), [good])
+
+    def test_141_restart_while_failing_is_bounded_and_progresses(self):
+        bad, good = self.setup_rows(n_bad=50)
+        with self.failing("quarantine", "block"):
+            self.drain_until(self.gw, good, cap=10, max_calls=7)
+            restarted = self.gateway()                   # memory holds + resume lost
+            self.assertEqual(restarted.recovery_blocked(), [])
+            self.drain_until(restarted, good, cap=10, max_calls=7)
+            self.assertEqual(len(restarted.recovery_blocked()), 50)   # re-held, not resolved
+
+    def test_142_resumed_call_wraps_and_returns_oldest_first(self):
+        v1 = self.gw.ingest_telegram(self.tg(msg_id=1, ref="w1")).event
+        bad = [self.gw.ingest_telegram(self.tg(msg_id=i, ref=f"w{i}")).event_id
+               for i in range(2, 7)]
+        v2 = self.gw.ingest_telegram(self.tg(msg_id=7, ref="w7")).event
+        self.corrupt(bad, "garbage")
+        with self.failing("quarantine", "block"):
+            self.assertEqual(self.gw.pending(limit=5, max_scan=4), [v1])      # cap hit
+            self.assertEqual(self.gw.pending(limit=5, max_scan=4), [v1, v2])  # resumed+wrapped
+            self.assertEqual(self.gw.pending(limit=5, max_scan=100), [v1, v2])
+            self.assertEqual(self.gw.pending(limit=1, max_scan=100), [v1])    # oldest again
+
+
 class Structure(unittest.TestCase):
     def test_43_ingress_passes_notifier_lint(self):
         self.assertEqual([f for f in lint.scan(ROOT) if f.path.startswith("ingress")], [])
