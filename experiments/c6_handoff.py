@@ -4,6 +4,7 @@ The SQLite journal here stands in for an independent effect journal. It is not
 C2 and it does not protect either file from coordinated restore or tampering.
 """
 import sqlite3
+from contextlib import closing
 
 from tracing.sqlite_sink import TraceStoreRefused, validate_jsonl
 
@@ -19,13 +20,13 @@ class Handoff:
 
     @classmethod
     def bootstrap(cls, path, sink):
-        with sqlite3.connect(path) as c:
+        with closing(sqlite3.connect(path)) as c, c:
             c.execute('CREATE TABLE intent (event_id TEXT PRIMARY KEY, record TEXT NOT NULL, state TEXT NOT NULL)')
         return cls(path, sink)
 
     def begin(self, event_id, record):
         record = validate_jsonl(record, self.sink.environment)
-        with sqlite3.connect(self.path) as c:
+        with closing(sqlite3.connect(self.path)) as c, c:
             c.execute('BEGIN IMMEDIATE')
             row = c.execute('SELECT record FROM intent WHERE event_id=?', (event_id,)).fetchone()
             if row is not None and row[0] != record:
@@ -34,7 +35,7 @@ class Handoff:
                 c.execute('INSERT INTO intent VALUES (?, ?, ?)', (event_id, record, 'pending'))
 
     def reconcile(self, event_id):
-        with sqlite3.connect(self.path) as c:
+        with closing(sqlite3.connect(self.path)) as c, c:
             row = c.execute('SELECT record, state FROM intent WHERE event_id=?', (event_id,)).fetchone()
         if row is None or row[1] not in ('pending', 'done'):
             raise HandoffRefused('unknown or invalid intent')
@@ -46,9 +47,12 @@ class Handoff:
                 raise HandoffRefused('completed trace absent or changed')
             return False
         self.sink.put(event_id, record)  # local idempotency handles crash after append
-        with sqlite3.connect(self.path) as c:
+        with closing(sqlite3.connect(self.path)) as c, c:
             c.execute('BEGIN IMMEDIATE')
             updated = c.execute("UPDATE intent SET state='done' WHERE event_id=? AND record=? AND state='pending'", (event_id, record))
             if updated.rowcount != 1:
+                current = c.execute('SELECT record, state FROM intent WHERE event_id=?', (event_id,)).fetchone()
+                if current == (record, 'done'):
+                    return False
                 raise HandoffRefused('intent changed during handoff')
         return True
