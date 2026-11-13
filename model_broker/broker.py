@@ -228,6 +228,11 @@ class Broker:
             raise Refused("invalid_request")
         if not _canonical_buckets(req.task_id, req.day, req.month):
             raise Refused("invalid_budget_bucket")
+        # Configuration is a finite concrete sequence. Do not iterate an
+        # arbitrary caller object (which may consume state or never finish).
+        if type(candidates) not in (list, tuple) or len(candidates) > 1024:
+            raise Refused("malformed_candidate")
+        candidates = tuple(candidates)
         eligible = []
         for c in candidates:
             if not (type(c) is Candidate
@@ -338,6 +343,7 @@ class Broker:
             db.execute('BEGIN')
             self._validate_ledger(db)
             return db.execute("SELECT model,provider,worst,actual,state FROM broker_calls WHERE call_id=?", (call_id,)).fetchone()
+
 
 
 
