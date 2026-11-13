@@ -94,17 +94,27 @@ class Candidate:
         return cls.from_config(snapshot)
 
 
+def _valid_label(value):
+    if type(value) is not str or not 0 < len(value) <= _MAX_CANDIDATE_LABEL_LENGTH:
+        return False
+    try:
+        value.encode('utf-8')
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _valid_candidate(c):
     return (type(c) is Candidate
-        and type(c.model) is str and 0 < len(c.model) <= _MAX_CANDIDATE_LABEL_LENGTH
-        and type(c.provider) is str and 0 < len(c.provider) <= _MAX_CANDIDATE_LABEL_LENGTH
+        and _valid_label(c.model)
+        and _valid_label(c.provider)
         and type(c.approved) is bool and type(c.available) is bool
         and type(c.validated_tasks) is frozenset
         and len(c.validated_tasks) <= _MAX_CANDIDATE_SET_MEMBERS
-        and all(type(v) is str and 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH for v in c.validated_tasks)
+        and all(_valid_label(v) for v in c.validated_tasks)
         and type(c.privacy_classes) is frozenset
         and len(c.privacy_classes) <= _MAX_CANDIDATE_SET_MEMBERS
-        and all(type(v) is str and 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH for v in c.privacy_classes)
+        and all(_valid_label(v) for v in c.privacy_classes)
         and type(c.expected_usd_micros) is int and type(c.worst_usd_micros) is int
         and 0 <= c.expected_usd_micros <= c.worst_usd_micros <= _MAX_I64)
 
