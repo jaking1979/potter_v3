@@ -56,6 +56,23 @@ class HandoffTests(unittest.TestCase):
         with self.assertRaises(HandoffRefused):
             self.h.reconcile(EVENT)
 
+    def test_interleaved_reconcilers_do_not_report_a_false_fault(self):
+        self.h.begin(EVENT, LINE)
+        second = Handoff(self.h.path, self.sink)
+        actual_put = self.sink.put
+        results = []
+
+        def interleave(event_id, record):
+            self.sink.put = actual_put
+            results.append(second.reconcile(event_id))
+            return actual_put(event_id, record)
+
+        self.sink.put = interleave
+        self.assertFalse(self.h.reconcile(EVENT))
+        self.assertEqual(results, [True])
+        self.assertEqual(self.sink.records(), ((EVENT, LINE),))
+        self.assertFalse(self.h.reconcile(EVENT))
+
 
 if __name__ == '__main__':
     unittest.main()
