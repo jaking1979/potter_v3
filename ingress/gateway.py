@@ -62,7 +62,7 @@ REASONS = frozenset({
     # accepted
     "accepted",
     # rejected / not new
-    "duplicate", "duplicate_pending", "expired", "replay_conflict", "transport_unverified", "webhook_unverified",
+    "duplicate", "duplicate_pending", "expired", "quarantined", "replay_conflict", "transport_unverified", "webhook_unverified",
     "malformed", "missing_message_id", "oversized_raw", "oversized_body",
     "oversized_attachment", "too_many_attachments", "bot_sender", "sender_not_allowlisted",
     "trace_error", "ingress_error", "attachment_reclaimed", "clock_regression",
@@ -259,14 +259,48 @@ class IngressGateway:
     # ---- durable handoff (runner side) ----------------------------------------
 
     def pending(self, limit: int = 100) -> list[InboundEvent]:
-        """Accepted events not yet acked as handed off, oldest first. Call on
-        runner start-up to recover anything accepted before a crash."""
-        out = []
-        for event_id, raw in self._store.pending_records(limit):
-            ev = self._restore(raw, self._store.lookup_event(event_id))
-            if ev is not None:
-                out.append(ev)
+        """Accepted events not yet acked as handed off, oldest first (up to
+        ``limit`` valid ones). Call on runner start-up to recover anything
+        accepted before a crash. A row that cannot be restored (malformed, or
+        not matching its minted digest) is quarantined - durably moved out of
+        ``pending``, its text dropped, traced, and listed by ``quarantined()``
+        - so invalid rows can never starve later valid ones, now or after a
+        restart, and a corrupt event is never returned."""
+        out: list[InboundEvent] = []
+        cursor = 0
+        while len(out) < limit:
+            batch = self._store.pending_records(limit - len(out), after=cursor)
+            if not batch:
+                break
+            for rowid, event_id, raw in batch:
+                cursor = rowid
+                ev = self._restore(raw, self._store.lookup_event(event_id))
+                if ev is not None:
+                    out.append(ev)
+                else:
+                    self._quarantine(event_id)   # never returned; never starves later rows
         return out
+
+    def quarantined(self) -> list[str]:
+        """Event ids quarantined because their stored record could not be
+        restored. For an operator; never returned by ``pending()``."""
+        return self._store.quarantined()
+
+    def _quarantine(self, event_id: str) -> bool:
+        now = self._clock()
+        try:
+            done = self._store.quarantine(event_id, now)
+        except Exception:
+            return False
+        if done:
+            try:
+                emit_ingress_trace(self._sink, event_id=event_id,
+                                   delivery_key=str(uuid.uuid4()), channel="quarantine",
+                                   accepted=False, reason="quarantined", trust="none",
+                                   content_digest="0" * 64, now=now, environment=self._env)
+            except Exception:
+                pass
+        return done
 
     def ack(self, event_id: str) -> bool:
         """The runner has durably enqueued this event (idempotently, keyed on
@@ -804,6 +838,8 @@ class IngressGateway:
                         st = tx.inbox_status(prior.event_id)
                         if st is not None and st[0] == "pending":
                             recovered = self._restore(st[1], prior.event_digest)
+                            if recovered is None:
+                                tx.quarantine(prior.event_id, now)   # corrupt: never returned
                     reason = "duplicate_pending" if recovered is not None else "duplicate"
                     trace(False, reason, "none")
                     return IngressResult(False, reason, event_id=prior.event_id,

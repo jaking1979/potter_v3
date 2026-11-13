@@ -1656,6 +1656,71 @@ class E1RecoveryStatesAreDistinct(Fixture):
         self.assertEqual(ok.event.provenance, (FORWARDED_CONTENT,))       # genuine, untrusted
 
 
+class PendingScanCannotStarve(Fixture):
+    """Dolores at e056700: pending(limit=100) read the first 100 pending rows and
+    silently skipped unrestorable ones, which stayed pending, so 100 corrupt
+    rows hid every later valid event. Unrestorable rows are now quarantined
+    (durably, text dropped, listed) and the scan uses a rowid cursor."""
+
+    def corrupt(self, event_ids, how="garbage"):
+        import sqlite3
+        with sqlite3.connect(self.db) as c:
+            for ev in event_ids:
+                if how == "garbage":
+                    c.execute("UPDATE ingress_inbox SET event_json='{not json' WHERE event_id=?",
+                              (ev,))
+                else:   # digest mismatch: valid JSON, tampered provenance
+                    raw = c.execute("SELECT event_json FROM ingress_inbox WHERE event_id=?",
+                                    (ev,)).fetchone()[0]
+                    c.execute("UPDATE ingress_inbox SET event_json=? WHERE event_id=?",
+                              (raw.replace('"external_sender"', '"principal_direct"'), ev))
+
+    def inbox(self):
+        import sqlite3
+        with sqlite3.connect(self.db) as c:
+            return dict(((e, (st, j)) for e, st, j in c.execute(
+                "SELECT event_id, status, event_json FROM ingress_inbox")))
+
+    def test_117_corrupt_first_page_does_not_hide_later_valid_event(self):
+        bad = [self.gw.ingest_telegram(self.tg(msg_id=i, ref=f"b{i}")).event_id
+               for i in range(1, 101)]
+        self.corrupt(bad[:50], "garbage")
+        self.corrupt(bad[50:], "garbage")
+        good = self.gw.ingest_telegram(self.tg(msg_id=500, ref="g")).event
+        got = self.gw.pending()                                 # default limit 100
+        self.assertEqual(got, [good])
+        self.assertEqual(sorted(self.gw.quarantined()), sorted(bad))
+        inbox = self.inbox()
+        self.assertTrue(all(inbox[e] == ("quarantined", None) for e in bad))  # text dropped
+        restarted = self.gateway()                              # restart: same answer
+        self.assertEqual(restarted.pending(), [good])
+        self.assertEqual(len(restarted.quarantined()), 100)
+
+    def test_118_digest_mismatch_quarantined_never_returned(self):
+        mal = self.gw.ingest_email(make_email(frm=EVIL, mid="<z1@attacker.test>")).event
+        self.corrupt([mal.event_id], "tamper")
+        self.assertEqual(self.gw.pending(), [])
+        self.assertEqual(self.gw.quarantined(), [mal.event_id])
+        self.assertFalse(self.gw.ack(mal.event_id))             # cannot be acked
+        again = self.gw.ingest_email(make_email(frm=EVIL, mid="<z1@attacker.test>"))
+        self.assertEqual((again.duplicate, again.event), (True, None))
+
+    def test_119_corrupt_row_found_on_redelivery_is_quarantined(self):
+        ev = self.gw.ingest_telegram(self.tg()).event
+        self.corrupt([ev.event_id], "garbage")
+        again = self.gw.ingest_telegram(self.tg())              # duplicate path
+        self.assertEqual((again.reason, again.event), ("duplicate", None))
+        self.assertEqual(self.gw.quarantined(), [ev.event_id])
+        self.assertEqual(self.gw.pending(), [])
+
+    def test_120_cursor_batches_return_oldest_first_without_duplicates(self):
+        evs = [self.gw.ingest_telegram(self.tg(msg_id=i, ref=f"c{i}")).event for i in range(1, 6)]
+        self.corrupt([evs[1].event_id], "garbage")
+        self.assertEqual(self.gw.pending(limit=2), [evs[0], evs[2]])
+        self.assertEqual(self.gw.pending(limit=10), [evs[0], evs[2], evs[3], evs[4]])
+        self.assertEqual(self.gw.pending(limit=2), [evs[0], evs[2]])   # stable
+
+
 class Structure(unittest.TestCase):
     def test_43_ingress_passes_notifier_lint(self):
         self.assertEqual([f for f in lint.scan(ROOT) if f.path.startswith("ingress")], [])

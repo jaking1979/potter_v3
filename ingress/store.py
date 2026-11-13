@@ -43,7 +43,8 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS ingress_inbox (
         event_id TEXT PRIMARY KEY,
         event_json TEXT,
-        status TEXT NOT NULL CHECK (status IN ('pending','handed_off','expired')),
+        status TEXT NOT NULL CHECK (status IN ('pending','handed_off','expired',
+                                               'quarantined')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         CHECK ((status = 'pending') = (event_json IS NOT NULL)))""",
@@ -132,11 +133,14 @@ class IngressStore:
                             "AND decision='accepted'", (event_id,)).fetchone()
         return row[0] if row else None
 
-    def pending_records(self, limit: int) -> list[tuple[str, str]]:
+    def pending_records(self, limit: int, after: int = 0) -> list[tuple[int, str, str]]:
+        """(rowid, event_id, event_json) of pending rows after ``after``, oldest
+        first. The rowid is a cursor, so a caller scanning in batches never
+        re-reads (or gets stuck on) rows it has already seen."""
         with self._conn() as c:
-            return c.execute("SELECT event_id, event_json FROM ingress_inbox WHERE "
-                             "status='pending' ORDER BY created_at, rowid LIMIT ?",
-                             (limit,)).fetchall()
+            return c.execute("SELECT rowid, event_id, event_json FROM ingress_inbox WHERE "
+                             "status='pending' AND rowid > ? ORDER BY rowid LIMIT ?",
+                             (after, limit)).fetchall()
 
     def pending_record(self, event_id: str) -> str | None:
         with self._conn() as c:
@@ -144,13 +148,26 @@ class IngressStore:
                             "status='pending'", (event_id,)).fetchone()
         return row[0] if row else None
 
+    def quarantine(self, event_id: str, now: int) -> bool:
+        """A pending row that cannot be restored (malformed, or it does not
+        match the digest minted at acceptance) is moved out of ``pending`` for
+        good: it can never starve later rows, never be returned or acked, and
+        its untrustworthy text is dropped. Visible via ``quarantined()``."""
+        with self.transaction() as tx:
+            return tx.quarantine(event_id, now)
+
+    def quarantined(self) -> list[str]:
+        with self._conn() as c:
+            return [r[0] for r in c.execute(
+                "SELECT event_id FROM ingress_inbox WHERE status='quarantined' ORDER BY rowid")]
+
     def ack(self, event_id: str, now: int) -> bool:
         """Mark handed off and drop the text. Idempotent: True if the event is
         (now or already) handed off, False if unknown or expired."""
         with self.transaction() as tx:
             row = tx._c.execute("SELECT status FROM ingress_inbox WHERE event_id=?",
                                 (event_id,)).fetchone()
-            if row is None or row[0] == "expired":
+            if row is None or row[0] in ("expired", "quarantined"):
                 return False
             tx._c.execute("UPDATE ingress_inbox SET status='handed_off', event_json=NULL, "
                           "updated_at=? WHERE event_id=? AND status='pending'", (now, event_id))
@@ -275,6 +292,12 @@ class _Tx:
 
     def unstage(self, stage_id: str) -> None:
         self._c.execute("DELETE FROM attachment_staged WHERE stage_id=?", (stage_id,))
+
+    def quarantine(self, event_id: str, now: int) -> bool:
+        cur = self._c.execute("UPDATE ingress_inbox SET status='quarantined', event_json=NULL,"
+                              " updated_at=? WHERE event_id=? AND status='pending'",
+                              (now, event_id))
+        return cur.rowcount == 1
 
     def inbox_put(self, event_id: str, event_json: str, now: int) -> None:
         self._c.execute("INSERT INTO ingress_inbox VALUES (?,?,'pending',?,?)",
