@@ -4,6 +4,7 @@ Inputs are already aligned complete grade records. This cannot establish the
 protected mapping, independence, blinding, or exercise validity.
 """
 from evaluation.a4a.blind_grading import DIMENSIONS, validate_grades
+from evaluation.a4a.scoring_rules import is_applicable
 
 
 def category_prevalence(first, second):
@@ -33,7 +34,7 @@ def category_prevalence(first, second):
         for rows in indexed:
             counts = dict.fromkeys(sorted(options), 0)
             for record in rows.values():
-                if dimension == 'follow_through' and not record['responsibility']:
+                if not is_applicable(dimension, record['responsibility']):
                     continue
                 for label in ('A', 'B'):
                     counts[record['outputs'][label][dimension]] += 1

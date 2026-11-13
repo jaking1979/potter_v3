@@ -1,5 +1,6 @@
 """Synthetic multi-dimension summary; caller classifications are unverified."""
 from evaluation.a4a.synthetic_validity import _summarize_dimension
+from evaluation.a4a.scoring_rules import INVALID_MULTIPLIER
 
 def summarize_dimensions(planned_ids, dimensions):
     if type(dimensions) is not dict or not dimensions or len(dimensions) > 100:
@@ -12,7 +13,7 @@ def summarize_dimensions(planned_ids, dimensions):
                       for dimension, result in individual.items()
                       if case in result['affected']}
                for case in sorted(affected)}
-    if len(affected) * 10 > len(planned_ids):
+    if len(affected) * INVALID_MULTIPLIER > len(planned_ids):
         return {'status': 'invalid_rerun', 'affected_ids': sorted(affected),
                 'affected_reasons': reasons}
     # A case-level alignment failure invalidates all its dimension ratings.

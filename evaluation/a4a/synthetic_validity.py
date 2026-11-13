@@ -5,6 +5,7 @@ realignment, independent grading, blinding, provenance, or correct labels.
 The agreed preparation protocol is not a ratified acceptance rule.
 """
 from evaluation.a4a.wilson import wilson_95
+from evaluation.a4a.scoring_rules import AFFECTED, CLASSIFICATIONS, INVALID_MULTIPLIER
 
 
 def _summarize_dimension(planned_ids, classifications):
@@ -22,16 +23,15 @@ def _summarize_dimension(planned_ids, classifications):
         raise ValueError('duplicate planned case ID')
     if type(classifications) is not dict or set(classifications) != set(planned_ids):
         raise ValueError('classifications must cover exactly the planned IDs')
-    allowed = {'agree', 'disagree', 'missing', 'duplicate', 'unalignable'}
-    if any(type(x) is not str or x not in allowed for x in classifications.values()):
+    if any(type(x) is not str or x not in CLASSIFICATIONS for x in classifications.values()):
         raise ValueError('unknown classification')
     affected = {k: classifications[k] for k in planned_ids
-                if classifications[k] in {'missing', 'duplicate', 'unalignable'}}
+                if classifications[k] in AFFECTED}
     n = len(planned_ids)
     result = {'planned_cases': n, 'affected': affected,
               'independence_assumption': 'distinct cases are assumed independent'}
     # Integer arithmetic preserves the strict >10% boundary.
-    if len(affected) * 10 > n:
+    if len(affected) * INVALID_MULTIPLIER > n:
         result['status'] = 'invalid_rerun'
         return result
     agreements = sum(classifications[k] == 'agree' for k in planned_ids)

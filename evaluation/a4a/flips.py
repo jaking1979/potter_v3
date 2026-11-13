@@ -4,6 +4,7 @@ This cannot prove mapping, blinding, exercise validity, or the absence of flips
 in excluded records. It never renders a pass/fail verdict.
 """
 from evaluation.a4a.blind_grading import validate_grades
+from evaluation.a4a.scoring_rules import is_applicable
 
 
 def two_step_flips(first, second):
@@ -13,9 +14,8 @@ def two_step_flips(first, second):
     if (first['case_id'] != second['case_id']
             or first['responsibility'] != second['responsibility']):
         raise ValueError('case or responsibility mismatch')
-    dimensions = ['done', 'trust']
-    if first['responsibility']:
-        dimensions.append('follow_through')
+    dimensions = [d for d in ('done', 'trust', 'follow_through')
+                  if is_applicable(d, first['responsibility'])]
     flips = []
     for label in ('A', 'B'):
         for dimension in dimensions:
