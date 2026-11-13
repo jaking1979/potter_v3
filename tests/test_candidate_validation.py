@@ -8,6 +8,19 @@ from dataclasses import replace
 from model_broker.broker import Broker, Candidate, Caps, Refused, Request
 
 class InvalidCandidateTests(unittest.TestCase):
+    def test_surrogate_candidate_is_refused_before_reservation(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
+            req = Request('x','12345678-1234-4234-8234-123456789abc','research','private','2026-11-06','2026-11')
+            good = Candidate('m','p',True,frozenset({'research'}),frozenset({'private'}),1,2)
+            bads = (replace(good, model='x\ud800'), replace(good, provider='x\ud800'),
+                    replace(good, validated_tasks=frozenset({'x\ud800'})),
+                    replace(good, privacy_classes=frozenset({'x\ud800'})))
+            for bad in bads:
+                with self.assertRaisesRegex(Refused, '^malformed_candidate$'):
+                    b.reserve(req, [bad])
+            self.assertEqual(b.reserve(req, [good]), good)
+
     def test_json_config_conversion_is_bounded_and_detached(self):
         fields = dict(model='m', provider='p', approved=True,
                       validated_tasks=['research'], privacy_classes=['private'],
