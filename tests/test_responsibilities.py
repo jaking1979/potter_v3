@@ -1607,6 +1607,83 @@ class TerminalFinalsAreDurable(Base):
         self.assertEqual(self.counts(w, "bill.watch", tid)["finals"], ("failed", True))
 
 
+class FinalTimingUsesTheTerminalCommit(Base):
+    """Dolores @e33eecc: _record_terminal stored the time it ran, the backfill
+    stored the task's committed updated_at, so a short run whose record was
+    merely delayed past 30 s was treated as long work. Both now use C2's
+    committed terminal timestamp."""
+    Crash = TerminalFinalsAreDurable.Crash
+    crash_at_record = TerminalFinalsAreDurable.crash_at_record
+    counts = TerminalFinalsAreDurable.counts
+    fatal_def = TerminalFinalsAreDurable.fatal_def
+    reopen = TerminalFinalsAreDurable.reopen
+
+    def run_failure(self, *, long, path):
+        d, holder = self.fatal_def(long=long)
+        w = self.world(definitions=[d])
+        holder["w"] = w
+        w.runner.tick()
+        real = w.runner._record_terminal
+        if path == "delayed":
+            def delayed(*a, **k):
+                w.now += 31                     # scheduler pause after the commit
+                return real(*a, **k)
+            w.runner._record_terminal = delayed
+            w.runner.run_once()
+            w2 = w
+        else:                                   # crash, then the backfill sweep
+            self.crash_at_record(w)
+            with self.assertRaises(self.Crash):
+                w.runner.run_once()
+            w2 = self.reopen(w, [d])
+            w2.now = w.now + 31
+            holder["w"] = w2
+            w2.runner.deliver_pending_finals()
+        tid = w2.runner.tasks.by_trigger(f"resp:notes.fatal:slot:{int(rw.T0 // 3600)}").id
+        return self.counts(w2, "notes.fatal", tid)
+
+    def test_short_failure_owes_no_final_whether_delayed_or_backfilled(self):
+        for path in ("delayed", "backfill"):
+            with self.subTest(path=path):
+                with tempfile.TemporaryDirectory() as t:
+                    self.tmp = t
+                    c = self.run_failure(long=False, path=path)
+                    self.assertEqual((c["alert"], c["final"], c["finals"]),
+                                     (1, 0, ("failed", True)))
+
+    def test_long_failure_owes_a_final_whether_delayed_or_backfilled(self):
+        for path in ("delayed", "backfill"):
+            with self.subTest(path=path):
+                with tempfile.TemporaryDirectory() as t:
+                    self.tmp = t
+                    c = self.run_failure(long=True, path=path)
+                    self.assertEqual((c["alert"], c["final"], c["finals"]),
+                                     (1, 1, ("failed", True)))
+
+    def test_short_success_with_a_delayed_delivery_owes_no_final(self):
+        w = self.world(definitions=[rw.batch(n=1)])
+        real = w.runner._deliver_final
+
+        def delayed(*a, **k):
+            w.now += 31                         # pause between commit and delivery
+            return real(*a, **k)
+
+        w.runner._deliver_final = delayed
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "done")
+        c = self.counts(w, "notes.batch", r.task_id)
+        self.assertEqual((c["final"], c["finals"]), (0, ("done", True)))
+
+    def test_long_success_control_owes_a_final(self):
+        w = self.world(definitions=[rw.batch(n=1)])
+        w.ext.hooks["s1"] = ("before", lambda eff: setattr(w, "now", w.now + 30))
+        w.runner.tick()
+        r = w.runner.run_once()
+        c = self.counts(w, "notes.batch", r.task_id)
+        self.assertEqual((c["final"], c["finals"]), (1, ("done", True)))
+
+
 class Structure(Base):
     def test_runner_passes_the_direct_send_lint(self):
         self.assertEqual(lint.scan(HERE.parent), [])

@@ -576,9 +576,11 @@ class ResponsibilityRunner:
                         c, task.id, kind="job_result",
                         text=f"{text} Receipt: {receipt_link(task.id)}")
                 self.tasks.complete(task.id, self._worker, tx=c)
+                # Completion time = C2's committed terminal timestamp, read in
+                # this same transaction (the same source the backfill uses).
                 c.execute("INSERT OR IGNORE INTO responsibility_finals (task_id, responsibility,"
-                          " outcome, created_at) VALUES (?,?,?,?)",
-                          (task.id, d.id, DONE, self._now()))
+                          " outcome, created_at) SELECT id, ?, state, updated_at FROM tasks"
+                          " WHERE id=? AND state=?", (d.id, task.id, DONE))
         except Stopped:
             raise _Interrupt()          # rolled back: not complete, nothing announced
         self._deliver_final(task.id)
@@ -729,8 +731,12 @@ class ResponsibilityRunner:
         durable record, so a crash between that commit and this call is
         recovered by ``deliver_pending_finals`` (``_backfill_terminal_finals``)."""
         with self.db.tx() as c:
+            # Completion time = C2's committed terminal timestamp (tasks.updated_at),
+            # never the time this call happens to run: a delayed record must not
+            # turn a short run into long work. Same source as the backfill.
             c.execute("INSERT OR IGNORE INTO responsibility_finals (task_id, responsibility,"
-                      " outcome, created_at) VALUES (?,?,?,?)", (t.id, d.id, t.state, self._now()))
+                      " outcome, created_at) SELECT id, ?, state, updated_at FROM tasks"
+                      " WHERE id=? AND state IN (?,?)", (d.id, t.id, FAILED, ESCALATED))
         self._deliver_final(t.id)
 
     def _backfill_terminal_finals(self) -> None:
