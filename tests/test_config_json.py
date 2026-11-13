@@ -16,6 +16,14 @@ class DecodeCandidates(unittest.TestCase):
         self.assertIs(type(value), tuple)
         self.assertEqual(value[0], Candidate.from_json_config(self.item))
 
+    def test_lone_surrogates_refused_in_all_candidate_labels(self):
+        for field in ('model', 'provider', 'validated_tasks', 'privacy_classes'):
+            bad = dict(self.item, **{field: ['\ud800'] if field.endswith('s') else '\ud800'})
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, '^malformed_configuration$'):
+                    decode_candidates(json.dumps([bad]).encode('utf-8'))
+        self.assertEqual(decode_candidates(json.dumps([dict(self.item, model='café')]).encode())[0].model, 'café')
+
     def test_invalid_bytes_and_limits_are_refused_without_echo(self):
         for raw in (b"x" * (MAX_CONFIG_BYTES + 1), b"\xff", b"NaN", b"{", "[]", bytearray(b"[]")):
             with self.subTest(raw_type=type(raw)):
