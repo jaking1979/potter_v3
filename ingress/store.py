@@ -47,7 +47,10 @@ _SCHEMA = (
                                                'quarantined')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
-        CHECK ((status = 'pending') = (event_json IS NOT NULL)))""",
+        quarantine_reason TEXT CHECK (quarantine_reason IS NULL OR
+                                      quarantine_reason IN ('malformed','digest_mismatch')),
+        CHECK ((status = 'pending') = (event_json IS NOT NULL)),
+        CHECK ((status = 'quarantined') = (quarantine_reason IS NOT NULL)))""",
     "CREATE INDEX IF NOT EXISTS ingress_inbox_pending ON ingress_inbox (status, created_at)",
     # Attachment lifecycle. A blob is written to the (independent, non-
     # transactional) AttachmentStore only after a durable ``staged`` marker is
@@ -148,18 +151,20 @@ class IngressStore:
                             "status='pending'", (event_id,)).fetchone()
         return row[0] if row else None
 
-    def quarantine(self, event_id: str, now: int) -> bool:
+    def quarantine(self, event_id: str, now: int, reason: str) -> bool:
         """A pending row that cannot be restored (malformed, or it does not
         match the digest minted at acceptance) is moved out of ``pending`` for
         good: it can never starve later rows, never be returned or acked, and
         its untrustworthy text is dropped. Visible via ``quarantined()``."""
         with self.transaction() as tx:
-            return tx.quarantine(event_id, now)
+            return tx.quarantine(event_id, now, reason)
 
-    def quarantined(self) -> list[str]:
+    def quarantined(self) -> list[tuple[str, str]]:
+        """(event_id, reason) only - never stored text."""
         with self._conn() as c:
-            return [r[0] for r in c.execute(
-                "SELECT event_id FROM ingress_inbox WHERE status='quarantined' ORDER BY rowid")]
+            return [tuple(r) for r in c.execute(
+                "SELECT event_id, quarantine_reason FROM ingress_inbox"
+                " WHERE status='quarantined' ORDER BY rowid")]
 
     def ack(self, event_id: str, now: int) -> bool:
         """Mark handed off and drop the text. Idempotent: True if the event is
@@ -293,14 +298,15 @@ class _Tx:
     def unstage(self, stage_id: str) -> None:
         self._c.execute("DELETE FROM attachment_staged WHERE stage_id=?", (stage_id,))
 
-    def quarantine(self, event_id: str, now: int) -> bool:
+    def quarantine(self, event_id: str, now: int, reason: str) -> bool:
         cur = self._c.execute("UPDATE ingress_inbox SET status='quarantined', event_json=NULL,"
-                              " updated_at=? WHERE event_id=? AND status='pending'",
-                              (now, event_id))
+                              " quarantine_reason=?, updated_at=? WHERE event_id=?"
+                              " AND status='pending'", (reason, now, event_id))
         return cur.rowcount == 1
 
     def inbox_put(self, event_id: str, event_json: str, now: int) -> None:
-        self._c.execute("INSERT INTO ingress_inbox VALUES (?,?,'pending',?,?)",
+        self._c.execute("INSERT INTO ingress_inbox (event_id, event_json, status, created_at,"
+                        " updated_at) VALUES (?,?,'pending',?,?)",
                         (event_id, event_json, now, now))
 
     def get(self, dedupe_key: str) -> SeenRow | None:

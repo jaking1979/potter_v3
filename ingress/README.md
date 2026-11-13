@@ -124,12 +124,12 @@ Each decision runs in one `BEGIN IMMEDIATE` transaction: look up, insert, emit t
 An accepted event is written to `ingress_inbox` in the **same transaction** as its dedupe row and its trace, so a commit never leaves a dedupe row without a recoverable event.
 
 - **Recovery.** The event stays `pending` until the runner calls `gateway.ack(event_id)` after a durable enqueue. If the process crashes before that, the event comes back either from `gateway.pending()` (call it at start-up) or from the sender's re-delivery (`duplicate_pending`).
-- **Integrity and quarantine.** A restored event must match the digest minted at acceptance. A row that can't be restored (malformed, or not matching its digest) is never returned. It is **quarantined**:
+- **Integrity and quarantine.** A restored event must match the digest minted at acceptance. A row that can't be restored (`malformed`, or `digest_mismatch`) is never returned, accepted, acked or retried. In one transaction it is **quarantined**:
   - durably moved out of `pending`, with its untrustworthy text dropped;
-  - traced, and listed by `gateway.quarantined()` for an operator;
-  - refused by `ack`.
+  - traced as `corrupt_pending`;
+  - listed by `gateway.quarantined()` as (event_id, reason), with no content.
 
-  `pending()` scans with a rowid cursor until it has `limit` valid events, so corrupt rows can't starve later valid ones, now or after a restart. The duplicate re-delivery path quarantines in the same way (`test_117`–`test_120`).
+  `pending(limit, max_scan)` scans with a rowid cursor and examines at most `max_scan` rows per call (default `MAX_SCAN` = 1000). Every call therefore makes forward progress: corrupt rows can't starve later valid ones, across calls and after a restart, and quarantined rows are never re-scanned. The duplicate re-delivery path quarantines in the same way. `expire_pending` is unchanged for valid rows (`test_117`–`test_124`).
 - **Retention.** `ack` drops the stored text. `expire_pending(max_age_s)` drops the text of events left pending too long. Those events are lost on purpose and traced as `expired`.
 - **Idempotency.** `vouches()` is an integrity check, not consumption: it stays true on repeated calls. Single processing comes from the runner's queue, keyed on `event_id`; C2 `TaskStore.submit(f"ingress:{event_id}", …)` is idempotent.
 

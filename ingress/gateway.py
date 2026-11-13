@@ -62,7 +62,7 @@ REASONS = frozenset({
     # accepted
     "accepted",
     # rejected / not new
-    "duplicate", "duplicate_pending", "expired", "quarantined", "replay_conflict", "transport_unverified", "webhook_unverified",
+    "duplicate", "duplicate_pending", "expired", "quarantined", "corrupt_pending", "replay_conflict", "transport_unverified", "webhook_unverified",
     "malformed", "missing_message_id", "oversized_raw", "oversized_body",
     "oversized_attachment", "too_many_attachments", "bot_sender", "sender_not_allowlisted",
     "trace_error", "ingress_error", "attachment_reclaimed", "clock_regression",
@@ -258,45 +258,56 @@ class IngressGateway:
 
     # ---- durable handoff (runner side) ----------------------------------------
 
-    def pending(self, limit: int = 100) -> list[InboundEvent]:
+    MAX_SCAN = 1000     # rows examined per pending() call (bounded work)
+
+    def pending(self, limit: int = 100, max_scan: int | None = None) -> list[InboundEvent]:
         """Accepted events not yet acked as handed off, oldest first (up to
         ``limit`` valid ones). Call on runner start-up to recover anything
-        accepted before a crash. A row that cannot be restored (malformed, or
-        not matching its minted digest) is quarantined - durably moved out of
-        ``pending``, its text dropped, traced, and listed by ``quarantined()``
-        - so invalid rows can never starve later valid ones, now or after a
-        restart, and a corrupt event is never returned."""
+        accepted before a crash.
+
+        No starvation: the scan uses a rowid cursor and examines at most
+        ``max_scan`` rows (default ``MAX_SCAN``) per call. A row that cannot
+        be restored - ``malformed`` or ``digest_mismatch`` against the digest
+        minted at acceptance - is quarantined in one transaction: durably moved
+        out of ``pending`` (never returned, accepted, acked or retried), its
+        untrustworthy text dropped, traced as ``corrupt_pending``, and listed
+        by ``quarantined()`` as (event_id, reason). Each call therefore makes
+        forward progress, so later valid rows are reached on this or a
+        following call, also after a restart."""
+        cap = self.MAX_SCAN if max_scan is None else max_scan
         out: list[InboundEvent] = []
-        cursor = 0
-        while len(out) < limit:
-            batch = self._store.pending_records(limit - len(out), after=cursor)
+        cursor, scanned = 0, 0
+        while len(out) < limit and scanned < cap:
+            batch = self._store.pending_records(min(limit - len(out), cap - scanned),
+                                                after=cursor)
             if not batch:
                 break
             for rowid, event_id, raw in batch:
-                cursor = rowid
-                ev = self._restore(raw, self._store.lookup_event(event_id))
+                cursor, scanned = rowid, scanned + 1
+                ev, why = self._restore_checked(raw, self._store.lookup_event(event_id))
                 if ev is not None:
                     out.append(ev)
                 else:
-                    self._quarantine(event_id)   # never returned; never starves later rows
+                    self._quarantine(event_id, why)
         return out
 
-    def quarantined(self) -> list[str]:
-        """Event ids quarantined because their stored record could not be
-        restored. For an operator; never returned by ``pending()``."""
+    def quarantined(self) -> list[tuple[str, str]]:
+        """(event_id, reason) of inbox rows quarantined as ``malformed`` or
+        ``digest_mismatch``. For an operator; no stored text, never returned
+        by ``pending()``."""
         return self._store.quarantined()
 
-    def _quarantine(self, event_id: str) -> bool:
+    def _quarantine(self, event_id: str, why: str) -> bool:
         now = self._clock()
         try:
-            done = self._store.quarantine(event_id, now)
+            done = self._store.quarantine(event_id, now, why)
         except Exception:
             return False
         if done:
             try:
                 emit_ingress_trace(self._sink, event_id=event_id,
-                                   delivery_key=str(uuid.uuid4()), channel="quarantine",
-                                   accepted=False, reason="quarantined", trust="none",
+                                   delivery_key=str(uuid.uuid4()), channel="inbox",
+                                   accepted=False, reason="corrupt_pending", trust="none",
                                    content_digest="0" * 64, now=now, environment=self._env)
             except Exception:
                 pass
@@ -344,15 +355,21 @@ class IngressGateway:
         return collected
 
     @staticmethod
-    def _restore(raw: str | None, digest: str | None) -> InboundEvent | None:
-        """Rebuild a stored event; refuse it unless it matches the minted digest."""
+    def _restore_checked(raw: str | None, digest: str | None
+                         ) -> tuple[InboundEvent | None, str | None]:
+        """Rebuild a stored event: (event, None), or (None, "malformed" |
+        "digest_mismatch") - it must match the digest minted at acceptance."""
         if not raw or not digest:
-            return None
+            return None, "malformed"
         try:
             ev = InboundEvent.from_record(json.loads(raw))
         except Exception:
-            return None
-        return ev if ev.digest() == digest else None
+            return None, "malformed"
+        return (ev, None) if ev.digest() == digest else (None, "digest_mismatch")
+
+    @classmethod
+    def _restore(cls, raw: str | None, digest: str | None) -> InboundEvent | None:
+        return cls._restore_checked(raw, digest)[0]
 
     def vouches(self, event: object) -> bool:
         """True only for an event this gateway minted and recorded, unchanged.
@@ -837,9 +854,9 @@ class IngressGateway:
                     if prior.decision == "accepted":
                         st = tx.inbox_status(prior.event_id)
                         if st is not None and st[0] == "pending":
-                            recovered = self._restore(st[1], prior.event_digest)
-                            if recovered is None:
-                                tx.quarantine(prior.event_id, now)   # corrupt: never returned
+                            recovered, why = self._restore_checked(st[1], prior.event_digest)
+                            if recovered is None:                      # corrupt: never returned
+                                tx.quarantine(prior.event_id, now, why)
                     reason = "duplicate_pending" if recovered is not None else "duplicate"
                     trace(False, reason, "none")
                     return IngressResult(False, reason, event_id=prior.event_id,

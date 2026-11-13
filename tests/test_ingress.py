@@ -1689,7 +1689,7 @@ class PendingScanCannotStarve(Fixture):
         good = self.gw.ingest_telegram(self.tg(msg_id=500, ref="g")).event
         got = self.gw.pending()                                 # default limit 100
         self.assertEqual(got, [good])
-        self.assertEqual(sorted(self.gw.quarantined()), sorted(bad))
+        self.assertEqual(sorted(self.gw.quarantined()), sorted((e, "malformed") for e in bad))
         inbox = self.inbox()
         self.assertTrue(all(inbox[e] == ("quarantined", None) for e in bad))  # text dropped
         restarted = self.gateway()                              # restart: same answer
@@ -1700,7 +1700,7 @@ class PendingScanCannotStarve(Fixture):
         mal = self.gw.ingest_email(make_email(frm=EVIL, mid="<z1@attacker.test>")).event
         self.corrupt([mal.event_id], "tamper")
         self.assertEqual(self.gw.pending(), [])
-        self.assertEqual(self.gw.quarantined(), [mal.event_id])
+        self.assertEqual(self.gw.quarantined(), [(mal.event_id, "digest_mismatch")])
         self.assertFalse(self.gw.ack(mal.event_id))             # cannot be acked
         again = self.gw.ingest_email(make_email(frm=EVIL, mid="<z1@attacker.test>"))
         self.assertEqual((again.duplicate, again.event), (True, None))
@@ -1710,7 +1710,7 @@ class PendingScanCannotStarve(Fixture):
         self.corrupt([ev.event_id], "garbage")
         again = self.gw.ingest_telegram(self.tg())              # duplicate path
         self.assertEqual((again.reason, again.event), ("duplicate", None))
-        self.assertEqual(self.gw.quarantined(), [ev.event_id])
+        self.assertEqual(self.gw.quarantined(), [(ev.event_id, "malformed")])
         self.assertEqual(self.gw.pending(), [])
 
     def test_120_cursor_batches_return_oldest_first_without_duplicates(self):
@@ -1719,6 +1719,63 @@ class PendingScanCannotStarve(Fixture):
         self.assertEqual(self.gw.pending(limit=2), [evs[0], evs[2]])
         self.assertEqual(self.gw.pending(limit=10), [evs[0], evs[2], evs[3], evs[4]])
         self.assertEqual(self.gw.pending(limit=2), [evs[0], evs[2]])   # stable
+
+    def test_121_scan_cap_respected_and_101_corrupt_rows_still_progress(self):
+        bad = [self.gw.ingest_telegram(self.tg(msg_id=i, ref=f"x{i}")).event_id
+               for i in range(1, 106)]                           # 105 corrupt rows
+        self.corrupt(bad, "garbage")
+        good = self.gw.ingest_telegram(self.tg(msg_id=900, ref="ok")).event
+        seen = []
+        orig = self.gw._store.pending_records
+
+        def counting(limit, after=0):
+            rows = orig(limit, after)
+            seen.extend(rows)
+            return rows
+        self.gw._store.pending_records = counting
+        self.assertEqual(self.gw.pending(max_scan=40), [])      # cap: 40 rows examined
+        self.assertEqual(len(seen), 40)
+        self.assertEqual(len(self.gw.quarantined()), 40)
+        calls = 1
+        while True:                                             # successive calls progress
+            got = self.gw.pending(max_scan=40)
+            calls += 1
+            if got:
+                break
+            self.assertLess(calls, 10)
+        self.assertEqual(got, [good])
+        self.assertEqual(len(self.gw.quarantined()), 105)
+
+    def test_122_quarantine_survives_restart_and_is_not_rescanned(self):
+        bad = [self.gw.ingest_telegram(self.tg(msg_id=i, ref=f"r{i}")).event_id
+               for i in range(1, 4)]
+        self.corrupt(bad, "garbage")
+        self.gw.pending()
+        restarted = self.gateway()
+        scanned = []
+        orig = restarted._store.pending_records
+        restarted._store.pending_records = lambda limit, after=0: scanned.extend(
+            r := orig(limit, after)) or r
+        self.assertEqual(restarted.pending(), [])
+        self.assertEqual(scanned, [])                           # not re-scanned
+        self.assertEqual(len(restarted.quarantined()), 3)
+
+    def test_123_quarantine_trace_and_listing_hold_no_content(self):
+        ev = self.gw.ingest_telegram(self.tg(text=SENTINEL)).event
+        self.corrupt([ev.event_id], "garbage")
+        self.traces.clear()
+        self.gw.pending()
+        self.assertEqual(len(self.traces), 1)
+        self.assertNotIn(SENTINEL, "".join(self.traces) + repr(self.gw.quarantined()))
+        self.assertNotIn(SENTINEL, repr(self.inbox()))
+
+    def test_124_expire_pending_unchanged_for_valid_rows(self):
+        a = self.gw.ingest_telegram(self.tg(msg_id=1, ref="e1")).event
+        later = self.gateway(clock=lambda: T + 7200)
+        self.assertEqual(later.expire_pending(60), [a.event_id])
+        self.assertEqual(later.pending(), [])
+        self.assertEqual(later.quarantined(), [])               # expiry is not quarantine
+        self.assertEqual(self.inbox()[a.event_id], ("expired", None))
 
 
 class Structure(unittest.TestCase):
