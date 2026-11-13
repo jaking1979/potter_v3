@@ -353,11 +353,15 @@ class ResponsibilityRunner:
         return self._policy.decide(PolicyRequest(self._caller(d), step.capability, action,
                                                  approval=approval, live_state=live,
                                                  provenance=provenance,
-                                                 retry_intent=retry_intent))
+                                                 retry_intent=retry_intent),
+                                   trace_task_id=action.task_id)
 
     def _build(self, step: Step, ctx: StepContext, task_id: str):
         try:
-            return step.build(ctx, task_id)
+            action = step.build(ctx, task_id)
+            if getattr(action, 'task_id', None) != task_id:
+                raise ValueError('action task does not match claimed task')
+            return action
         except Exception as exc:
             raise _Fatal(f"step {step.id} could not bind its action: {type(exc).__name__}")
 
