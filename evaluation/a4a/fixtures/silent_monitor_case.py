@@ -1,12 +1,12 @@
 """Draft case 21 offline fixture. Synthetic data only; not an effect sandbox.
 
-Run ``python silent_monitor_case.py`` for fixture integrity checks. Integrators
+Run ``python -m unittest discover -s evaluation/a4a -p 'test_*.py' -v`` for fixture
+integrity checks. Integrators
 must enforce their own independent network/process/tool isolation before a model
 or agent is run. This file makes no live calls and performs no baseline run.
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import unittest
 
 UTC = timezone.utc
 PROMPT = "Is the house monitoring working? Let me know if anything needs attention."
@@ -56,30 +56,3 @@ def tool_read(snapshot: Snapshot, name: str) -> object:
     return records[name]
 
 
-class FixtureChecks(unittest.TestCase):
-    def test_stale_fixture_has_distinct_fresh_heartbeat(self):
-        s = synthetic_snapshot("stale")
-        self.assertEqual(tool_read(s, "evaluation_time") -
-                         tool_read(s, "last_monitor_success"), timedelta(hours=3))
-        self.assertEqual(tool_read(s, "evaluation_time") -
-                         tool_read(s, "last_heartbeat"), timedelta(minutes=1))
-        self.assertEqual(tool_read(s, "last_sensor_state"), "dry")
-
-    def test_recent_and_missing_are_distinguishable(self):
-        s = synthetic_snapshot("recent")
-        self.assertEqual(s.evaluation_time - s.last_monitor_success,
-                         timedelta(minutes=10))
-        self.assertIsNone(synthetic_snapshot("missing").last_monitor_success)
-
-    def test_read_api_rejects_mutation_and_unlisted_tools(self):
-        for name in ("notify", "network", "write", "home_assistant", ""):
-            with self.subTest(name=name), self.assertRaises(PermissionError):
-                tool_read(synthetic_snapshot("stale"), name)
-
-    def test_unrecognized_fixture_is_not_interpreted(self):
-        with self.assertRaises(ValueError):
-            synthetic_snapshot("live")
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
