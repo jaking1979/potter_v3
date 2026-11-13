@@ -31,6 +31,20 @@ class PostshapeTrace(unittest.TestCase):
             task=str(uuid.uuid4()); action=c0.BoundAction(task,'unknown.tool','append','test',{})
             result=w.engine.decide(PolicyRequest(Caller('agent:potter'),'unknown.tool',action))
             self.assertEqual(result.outcome,'deny'); self.assertEqual(rows[0]['task_id'],task)
+    def test_runner_rejects_action_for_another_claimed_task(self):
+        from unittest.mock import patch
+        from responsibilities import Step
+        with tempfile.TemporaryDirectory() as tmp:
+            w=rw.World(tmp,definitions=[rw.batch(n=1)]); rows=[]; w.engine._trace=rows.append
+            task=w.runner.tick()[0]
+            wrong=c0.BoundAction(str(uuid.uuid4()),'notes.append','append','test',{})
+            with patch.object(Step,'build',return_value=wrong):
+                result=w.runner.run_once()
+            self.assertNotEqual(wrong.task_id, task.id)
+            self.assertEqual(result.outcome, 'failed')
+            self.assertEqual(w.ext.calls(), 0)
+            self.assertEqual(rows, [])  # rejected by runner before C1 policy trace
+
     def test_trace_failure_blocks_fake_effect(self):
         with tempfile.TemporaryDirectory() as tmp:
             w=rw.World(tmp,definitions=[rw.batch(n=1)])
