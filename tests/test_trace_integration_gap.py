@@ -37,9 +37,8 @@ class TraceLinkIntegrationProbe(unittest.TestCase):
             self.assertEqual(result.outcome, "done")
             self.assertEqual(len(captured), 1)
             self.assertEqual(captured[0]["outcome"], "allow")
-            self.assertNotIn("task_id", captured[0])
-            with self.assertRaises(ValueError):
-                c6_from_hook(captured[0])
+            self.assertEqual(captured[0]["task_id"], tasks[0].id)
+            self.assertEqual(c6_from_hook(captured[0]).task_id, tasks[0].id)
             self.assertEqual(world.runner.tasks.get(tasks[0].id).state, "done")
 
     def test_c6_rejecting_missing_task_prevents_fake_provider_call(self):
@@ -49,6 +48,7 @@ class TraceLinkIntegrationProbe(unittest.TestCase):
             def trace(record):
                 captured.append(record)
                 c6_from_hook(record)
+                raise OSError("synthetic trace failure")
             world.engine._trace = trace
             world.runner.tick()
             world.runner.run_once()
