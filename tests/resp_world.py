@@ -212,11 +212,16 @@ def child_main(tmp: str, signal_path: str, phase: str) -> None:
     so the parent can SIGKILL this process mid-dispatch."""
     w = World(tmp, clock=time.time, definitions=[batch()])
 
+    stop = phase.startswith("stop-")       # /stop commits during the send, then the kill
+
     def hang(eff):
+        if stop:
+            with w.db.tx() as c:
+                w.notifier.kill.set(c, by="test", at=w.clock())
         Path(signal_path).write_text("in-flight")
         time.sleep(120)
 
-    w.ext.hooks["s2"] = (phase, hang)
+    w.ext.hooks["s2"] = (phase.removeprefix("stop-"), hang)
     w.runner.tick()
     w.runner.run_once()
 

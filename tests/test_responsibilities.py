@@ -1818,6 +1818,103 @@ class RealC2Seams(Base):
         self.assertIsNone(w.runner.tasks.by_trigger("resp:x:slot:1"))
 
 
+class StopAfterTheLastKillRead(Base):
+    """Dolores @82aa9d7: a /stop can commit after C2's last kill read and
+    before or during the connector call; ``perform`` runs outside any
+    transaction, so that send is NOT stopped. This is a documented residual
+    window (README, ``kill_switch_for``). These pin what IS guaranteed there:
+    at most one send, settled in the journal; interrupt at the next step
+    boundary; nothing later sent; ambiguity reconciled, never re-dispatched."""
+
+    def stop_after_last_read(self, n=2):
+        reads = []
+
+        class StopAfterRead(KillSwitch):
+            __slots__ = ()
+
+            def __call__(self, eff):
+                ok = super().__call__(eff)              # the real flag, read first
+                reads.append(eff.status)
+                if len(reads) == 2:                     # C2's post-claim read for s1
+                    _set_kill(w)                        # /stop lands right after it
+                return ok
+
+        w = self.world(definitions=[rw.batch(n=n)],
+                       kill_switch=StopAfterRead(str(Path(self.tmp) / "potter.db")))
+        return w, reads
+
+    def assert_paused_after_one_send(self, w, r):
+        self.assertEqual(r.outcome, "interrupted")
+        self.assertEqual(w.ext.calls("s1"), 1)
+        self.assertEqual(w.ext.calls("s2"), 0)              # nothing after it sent
+        task = w.runner.tasks.get(r.task_id)
+        self.assertEqual((task.state, task.consecutive_failures), (QUEUED, 0))
+        self.assertIsNone(w.journal.for_step(r.task_id, "s2"))
+        w.notifier.kill.clear()
+        self.assertEqual(w.runner.run_pending()[-1].outcome, "done")
+        self.assertEqual(w.ext.calls("s1"), 1)              # never re-dispatched
+        self.assertEqual(w.ext.applied(), [("s1", 1), ("s2", 1)])
+        self.assertEqual(w.journal.unresolved(), [])
+
+    def test_stop_between_last_kill_read_and_perform_does_not_stop_that_send(self):
+        w, reads = self.stop_after_last_read()
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(reads[:2], ["pending", "unknown"])  # in-claim, post-claim
+        self.assertTrue(w.notifier.kill.is_set())
+        self.assertEqual(w.journal.for_step(r.task_id, "s1").status, "succeeded")
+        self.assert_paused_after_one_send(w, r)
+
+    def test_stop_while_the_connector_runs_does_not_stop_that_send(self):
+        w = self.world(definitions=[rw.batch(n=2)])
+        w.ext.hooks["s1"] = ("before", lambda eff: _set_kill(w))
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(w.journal.for_step(r.task_id, "s1").status, "succeeded")
+        self.assert_paused_after_one_send(w, r)
+
+    def test_stop_then_ambiguous_outcome_is_reconciled_not_resent(self):
+        w = self.world(definitions=[rw.batch(n=2)])
+
+        def stop_then_lose_the_reply(eff):
+            _set_kill(w)
+            raise TimeoutError("reply lost after the provider applied it")
+        w.ext.hooks["s1"] = ("after", stop_then_lose_the_reply)
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertNotEqual(r.outcome, "done")
+        self.assertEqual(w.ext.calls("s1"), 1)
+        self.assertEqual(w.ext.calls("s2"), 0)
+        w.notifier.kill.clear()
+        self.assertEqual(w.runner.run_pending()[-1].outcome, "done")
+        self.assertEqual(w.ext.calls("s1"), 1)              # reconciled, not re-sent
+        self.assertEqual(w.ext.applied(), [("s1", 1), ("s2", 1)])
+
+    def restart_after_stop_mid_send(self, phase):
+        RestartMidRun.spawn_and_kill(self, phase)
+        w = RestartMidRun.restarted(self)
+        self.assertTrue(w.notifier.kill.is_set())           # the /stop survived the kill
+        self.assertIsNone(w.runner.run_once())              # nothing claimed under /stop
+        self.assertEqual(w.ext.calls("s2"), 1)              # no re-dispatch under /stop
+        self.assertEqual(w.ext.calls("s3"), 0)
+        w.notifier.kill.clear()
+        return w
+
+    def test_restart_after_stop_mid_send_applied_reconciles_once(self):
+        w = self.restart_after_stop_mid_send("stop-after")
+        self.assertEqual(w.runner.run_pending()[-1].outcome, "done")
+        self.assertEqual(w.ext.calls("s2"), 1)              # reconciled, never re-sent
+        self.assertEqual(w.ext.applied(), [("s1", 1), ("s2", 1), ("s3", 1)])
+        self.assertEqual(w.journal.unresolved(), [])
+
+    def test_restart_after_stop_mid_send_not_applied_stays_blocked(self):
+        w = self.restart_after_stop_mid_send("stop-before")
+        self.assertEqual(w.runner.run_once().outcome, "blocked")
+        self.assertEqual(w.ext.calls("s2"), 1)              # "not applied" != "never lands"
+        self.assertEqual(w.ext.calls("s3"), 0)
+        self.assertEqual(w.ext.applied("s2"), [])
+
+
 class Structure(Base):
     def test_runner_passes_the_direct_send_lint(self):
         self.assertEqual(lint.scan(HERE.parent), [])

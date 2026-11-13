@@ -137,8 +137,14 @@ def kill_switch_for(db: Database | str) -> KillSwitch:
     """The kill switch to pass when building the journal a
     ResponsibilityRunner uses: C2 then checks the flag inside the
     dispatch-claim transaction (which /stop cannot commit through) and again
-    after the claim, before ``perform``, so a /stop that lands before the send
-    refuses the dispatch atomically."""
+    after the claim, just before ``perform``.
+
+    Residual window (not closed): C2's last read and the connector call are
+    not one atomic step, since ``perform`` runs outside any transaction. A /stop
+    that commits after that last read does not stop that send. The effect is
+    journaled and settled once (never re-dispatched), and the runner
+    interrupts at the next step boundary. Only a provider- or C4-side fence
+    can make "stop before send" a guarantee."""
     return KillSwitch(db)
 
 
@@ -417,7 +423,8 @@ class ResponsibilityRunner:
         (wire it with ``kill_switch_for``): C2 reads the kill flag inside the
         dispatch-claim transaction, which /stop cannot commit through, and
         again after the claim, before ``perform``, refusing or undoing the
-        claim with ``EffectKilled`` (handled as an interrupt)."""
+        claim with ``EffectKilled`` (handled as an interrupt). A /stop after
+        that last read does not stop the send in hand (see ``kill_switch_for``)."""
         return not self.kill.is_set()
 
     def _execute(self, eff: Effect, conn: Connector) -> Any:
