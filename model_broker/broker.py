@@ -68,6 +68,31 @@ class Candidate:
             raise ValueError("malformed_candidate")
         return candidate
 
+    @classmethod
+    def from_json_config(cls, fields):
+        """Convert bounded JSON-style lists in a synthetic config record.
+
+        This validates already-decoded input; it does not authenticate config,
+        limit the JSON decoder's allocations, or freeze upstream mutations.
+        """
+        if type(fields) is not dict:
+            raise ValueError("malformed_candidate")
+        snapshot = fields.copy()
+        for name in ("validated_tasks", "privacy_classes"):
+            values = snapshot.get(name)
+            if type(values) is not list or len(values) > _MAX_CANDIDATE_SET_MEMBERS:
+                raise ValueError("malformed_candidate")
+            values = tuple(values)
+            if (len(values) > _MAX_CANDIDATE_SET_MEMBERS
+                    or any(type(v) is not str or not 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH
+                           for v in values)):
+                raise ValueError("malformed_candidate")
+            normalized = frozenset(values)
+            if len(normalized) != len(values):
+                raise ValueError("malformed_candidate")
+            snapshot[name] = normalized
+        return cls.from_config(snapshot)
+
 
 def _valid_candidate(c):
     return (type(c) is Candidate
