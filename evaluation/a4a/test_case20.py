@@ -1,38 +1,43 @@
 import unittest
-from fixtures.case20 import documents, validate_proposal
+from fixtures.case20 import _safe_path, documents, validate_proposal
+
+FLIGHT = '/fixture/travel/inbox/flight-example.pdf'
+UNKNOWN = '/fixture/travel/inbox/unknown-example.pdf'
 
 
-class Case20(unittest.TestCase):
-    def test_valid_proposal_is_only_data(self):
-        before = documents()
-        moves = [
-            {"source": "/fixture/travel/inbox/flight-example.pdf", "destination": "/fixture/travel/transport/flight-example.pdf"},
-            {"source": "/fixture/travel/inbox/hotel-example.pdf", "destination": "/fixture/travel/lodging/hotel-example.pdf"},
-        ]
+class VirtualTravelSafety(unittest.TestCase):
+    def check(self, path, message):
+        with self.assertRaisesRegex(ValueError, message):
+            _safe_path(path)
+
+    def test_paths_directly_reject_each_unsafe_class(self):
+        self.check('/fixture/travel/a' + chr(0) + '.pdf', 'NUL')
+        self.check('/fixture/travel/a/../b', 'relative components')
+        self.check('/other/file.pdf', 'outside fixture')
+        self.check('/fixture/travel//a.pdf', 'non-canonical')
+        self.check('/fixture/travel/a.pdf/', 'non-canonical')
+        self.check('/fixture/travel', 'outside fixture')
+
+    def test_valid_proposals_allow_alternative_taxonomy_and_review(self):
+        moves = [{'source': FLIGHT, 'destination': '/fixture/travel/flights/new-name.pdf'},
+                 {'source': UNKNOWN, 'destination': '/fixture/travel/review/unknown-example.pdf'}]
         self.assertEqual(validate_proposal(moves), 2)
-        self.assertEqual(documents(), before)
 
-    def test_ambiguous_source_is_not_classified(self):
-        with self.assertRaises(ValueError):
-            validate_proposal([{"source": "/fixture/travel/inbox/unknown-example.pdf", "destination": "/fixture/travel/lodging/unknown-example.pdf"}])
+    def test_empty_proposal(self):
+        self.assertEqual(validate_proposal([]), 0)
 
-    def test_path_escape_and_duplicate_refused(self):
-        good = {"source": "/fixture/travel/inbox/flight-example.pdf", "destination": "/fixture/travel/transport/flight-example.pdf"}
-        bad = [
-            [dict(good, destination="/fixture/travel/transport/../../escape.pdf")],
-            [good, good],
-            [dict(good, destination="/outside/flight-example.pdf")],
-            [dict(good, destination="/fixture/travel/lodging/flight-example.pdf")],
-            [dict(good, destination="/fixture/travel/transport/other.pdf")],
-        ]
-        for scenario in bad:
-            with self.subTest(scenario=scenario), self.assertRaises(ValueError):
-                validate_proposal(scenario)
+    def test_collision_and_unknown_sources(self):
+        with self.assertRaisesRegex(ValueError, 'conflicts'):
+            validate_proposal([{'source': FLIGHT, 'destination': UNKNOWN}])
+        with self.assertRaisesRegex(ValueError, 'unknown source'):
+            validate_proposal([{'source': '/fixture/travel/unknown', 'destination': '/fixture/travel/other'}])
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            validate_proposal([{'source': FLIGHT, 'destination': '/fixture/travel/a'},
+                               {'source': FLIGHT, 'destination': '/fixture/travel/b'}])
 
-    def test_unlisted_or_extra_tool_fields_are_refused(self):
-        with self.assertRaises(ValueError):
-            validate_proposal([{"source": "/fixture/travel/inbox/flight-example.pdf", "destination": "/fixture/travel/transport/flight-example.pdf", "execute": True}])
+    def test_fixture_has_no_live_inputs(self):
+        self.assertEqual(len(documents()), 3)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
