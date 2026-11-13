@@ -31,7 +31,7 @@ class BrokerTests(unittest.TestCase):
         huge = 1 << 63
         with self.assertRaises(ValueError):
             Broker(self.path, Caps(huge, 20, 30, 60))
-        with self.assertRaisesRegex(Refused, 'no_eligible_candidate'):
+        with self.assertRaisesRegex(Refused, 'malformed_candidate'):
             self.b.reserve(req('overflow'), [candidate(expected=0, worst=huge)])
         self.assertIsNone(self.b.status('overflow'))
         self.b.reserve(req(), [candidate()])
@@ -395,5 +395,6 @@ else:
 
 
 if __name__ == "__main__": unittest.main()
+
 
 
