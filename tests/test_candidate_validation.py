@@ -8,6 +8,25 @@ from dataclasses import replace
 from model_broker.broker import Broker, Candidate, Caps, Refused, Request
 
 class InvalidCandidateTests(unittest.TestCase):
+    def test_lone_surrogates_refused_at_config_and_reservation_boundaries(self):
+        fields = dict(model='m', provider='p', approved=True,
+                      validated_tasks=frozenset({'research'}), privacy_classes=frozenset({'private'}),
+                      expected_usd_micros=1, worst_usd_micros=2)
+        surrogate = '\ud800'
+        for name in ('model', 'provider', 'validated_tasks', 'privacy_classes'):
+            bad = {**fields, name: frozenset({surrogate}) if name.endswith('s') else surrogate}
+            with self.subTest(field=name):
+                with self.assertRaisesRegex(ValueError, '^malformed_candidate$'):
+                    Candidate.from_config(bad)
+        self.assertEqual(Candidate.from_config({**fields, 'model': 'café'}).model, 'café')
+        candidate = Candidate.from_config(fields)
+        object.__setattr__(candidate, 'model', surrogate)
+        with tempfile.TemporaryDirectory() as d:
+            broker = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
+            request = Request('x','12345678-1234-4234-8234-123456789abc','research','private','2026-11-06','2026-11')
+            with self.assertRaisesRegex(Refused, '^malformed_candidate$'):
+                broker.reserve(request, [candidate])
+
     def test_json_config_conversion_is_bounded_and_detached(self):
         fields = dict(model='m', provider='p', approved=True,
                       validated_tasks=['research'], privacy_classes=['private'],
