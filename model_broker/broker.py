@@ -233,6 +233,9 @@ class Broker:
         if type(candidates) not in (list, tuple) or len(candidates) > 1024:
             raise Refused("malformed_candidate")
         candidates = tuple(candidates)
+        # A shared list can grow after the precheck and before copying.
+        if len(candidates) > 1024:
+            raise Refused("malformed_candidate")
         eligible = []
         for c in candidates:
             if not (type(c) is Candidate
