@@ -1,7 +1,7 @@
 name: C6 real integration probe
 on:
   push:
-    branches: [dolores/c6-real-trace-gap-20261113]
+    branches: [dolores/c6-c1-bound-task-seam-20261113]
 permissions:
   contents: read
 jobs:
