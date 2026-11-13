@@ -1580,6 +1580,18 @@ class KillSwitch(_EffectFixture):
     def _journal(self, kill):
         return TestJournal(self.db, kill_switch=kill)
 
+    def test_kill_switch_property_is_read_only(self):
+        kill = lambda e: False                             # noqa: E731
+        self.assertIs(self._journal(kill).kill_switch, kill)
+        self.assertIsNone(TestJournal(self.db).kill_switch)          # default: none configured
+        self.assertIsNone(EffectJournal(self.db).kill_switch)
+        j = self._journal(kill)
+        with self.assertRaises(AttributeError):
+            j.kill_switch = None
+        with self.assertRaises(AttributeError):
+            del j.kill_switch
+        self.assertIs(j.kill_switch, kill)                 # unchanged by the attempts
+
     def test_killed_at_claim_dispatches_nothing(self):
         for kill in (lambda e: True, lambda e: None, lambda e: 1 / 0):     # True, non-bool, error
             with self.subTest(kill=kill), self.assertRaises(EffectKilled):

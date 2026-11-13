@@ -556,6 +556,12 @@ class EffectJournal:
             raise ValueError(TRUSTED_CLOCK_ONLY)
         return now
 
+    @property
+    def kill_switch(self) -> Callable[[Effect], bool] | None:
+        """The kill switch this journal was built with (read-only), so a caller
+        can refuse a journal assembled without one."""
+        return self._kill
+
     def _killed(self, eff: Effect) -> bool:
         """Fail closed: anything but an explicit False from the kill switch, an
         exception included, stops the dispatch."""
