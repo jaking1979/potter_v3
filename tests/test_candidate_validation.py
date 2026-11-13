@@ -8,6 +8,28 @@ from dataclasses import replace
 from model_broker.broker import Broker, Candidate, Caps, Refused, Request
 
 class InvalidCandidateTests(unittest.TestCase):
+    def test_config_factory_validates_and_reserve_rechecks(self):
+        fields = dict(model='m', provider='p', approved=True,
+                      validated_tasks=frozenset({'research'}),
+                      privacy_classes=frozenset({'private'}),
+                      expected_usd_micros=1, worst_usd_micros=2)
+        candidate = Candidate.from_config(fields)
+        fields['model'] = 'changed'
+        self.assertEqual(candidate.model, 'm')
+        for bad in (None, {'unexpected_sensitive_key': 1},
+                    {**fields, 'approved': 1}, {**fields, 'model': 'x' * 201},
+                    {**fields, 'validated_tasks': frozenset(str(i) for i in range(65))}):
+            with self.subTest(kind=type(bad)):
+                with self.assertRaisesRegex(ValueError, '^malformed_candidate$'):
+                    Candidate.from_config(bad)
+        object.__setattr__(candidate, 'model', '')
+        with tempfile.TemporaryDirectory() as d:
+            b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
+            req = Request('x','12345678-1234-4234-8234-123456789abc','research','private','2026-11-06','2026-11')
+            with self.assertRaisesRegex(Refused, 'malformed_candidate'):
+                b.reserve(req, [candidate])
+            self.assertEqual(b.reserve(req, [Candidate.from_config(fields)]).model, 'changed')
+
     def test_candidate_field_bounds_refuse_without_reservation(self):
         with tempfile.TemporaryDirectory() as d:
             b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
