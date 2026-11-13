@@ -45,9 +45,10 @@ class QueueModel:
             self.db.rollback()
             raise
 
-    def claim(self, work_id):
+    def claim(self, work_id, after_lock=None):
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if after_lock is not None: after_lock()
             row = self.db.execute('SELECT payload FROM work WHERE id=? AND state=?', (work_id, 'pending')).fetchone()
             if row is None:
                 self.db.rollback()
@@ -59,9 +60,10 @@ class QueueModel:
             self.db.rollback()
             raise
 
-    def forget(self, fact_id):
+    def forget(self, fact_id, after_lock=None):
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if after_lock is not None: after_lock()
             self.db.execute('INSERT OR IGNORE INTO unknown SELECT id FROM work WHERE fact_id=? AND state=?', (fact_id, 'in_flight'))
             self.db.execute('DELETE FROM work WHERE fact_id=? AND state=?', (fact_id, 'pending'))
             self.db.execute('UPDATE work SET payload=NULL WHERE fact_id=? AND state=?', (fact_id, 'in_flight'))
@@ -175,4 +177,79 @@ class ProcessOrderingTests(unittest.TestCase):
                     outcomes.join_thread()
 
 
+# Explicitly force both serialization orders, not just scheduler-selected races.
+def _ordered_operation(path, kind, is_first, locked, release, attempting, outcomes):
+    db = QueueModel(path)
+    try:
+        def hold():
+            locked.set()
+            if not release.wait(10):
+                raise TimeoutError("first transaction was not released")
+        if not is_first:
+            attempting.set()
+        hook = hold if is_first else None
+        if kind == "claim":
+            result = db.claim("q", after_lock=hook)
+        else:
+            db.forget("f", after_lock=hook)
+            result = "forgotten"
+        outcomes.put((kind, result, None))
+    except BaseException as exc:
+        outcomes.put((kind, None, repr(exc)))
+    finally:
+        db.db.close()
+
+
+class ForcedProcessOrderingTests(unittest.TestCase):
+    def test_each_transaction_order_is_forced_at_the_write_lock(self):
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        for first_kind in ("forget", "claim"):
+            with self.subTest(first=first_kind), tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "queue.sqlite")
+                QueueModel.bootstrap(path)
+                setup = QueueModel(path)
+                setup.transaction("INSERT INTO fact VALUES (?, ?, ?)", ("f", "synthetic-secret", 1))
+                self.assertTrue(setup.enqueue("q", "f"))
+                setup.db.close()
+                locked, release, attempting, outcomes = ctx.Event(), ctx.Event(), ctx.Event(), ctx.Queue()
+                second_kind = "claim" if first_kind == "forget" else "forget"
+                procs = [ctx.Process(target=_ordered_operation,
+                    args=(path, kind, is_first, locked, release, attempting, outcomes))
+                    for kind, is_first in ((first_kind, True), (second_kind, False))]
+                try:
+                    procs[0].start()
+                    self.assertTrue(locked.wait(10), "first did not acquire lock")
+                    procs[1].start()
+                    self.assertTrue(attempting.wait(10), "second did not attempt operation")
+                    release.set()
+                    results = [outcomes.get(timeout=10) for _ in procs]
+                    for proc in procs:
+                        proc.join(10)
+                        self.assertEqual(proc.exitcode, 0)
+                    self.assertTrue(all(error is None for _, _, error in results), results)
+                    claimed = next(value for kind, value, _ in results if kind == "claim")
+                    self.assertEqual(claimed, None if first_kind == "forget" else "synthetic-secret")
+                    check = QueueModel(path)
+                    try:
+                        self.assertEqual(check.db.execute("SELECT value, active FROM fact").fetchone(), (None, 0))
+                        work = check.db.execute("SELECT payload, state FROM work").fetchall()
+                        unknown = check.db.execute("SELECT work_id FROM unknown").fetchall()
+                        self.assertEqual((work, unknown), ([], []) if first_kind == "forget"
+                                         else ([(None, "in_flight")], [("q",)]))
+                        self.assertFalse(check.enqueue("later", "f"))
+                    finally:
+                        check.db.close()
+                finally:
+                    release.set()
+                    for proc in procs:
+                        if proc.is_alive():
+                            proc.terminate()
+                        if proc.pid is not None:
+                            proc.join(5)
+                    outcomes.close()
+                    outcomes.join_thread()
+
+
 if __name__ == '__main__': unittest.main()
+
