@@ -55,6 +55,34 @@ class Candidate:
     worst_usd_micros: int
     available: bool = True
 
+    @classmethod
+    def from_config(cls, fields):
+        """Validate an offline config record; not an authenticated config loader."""
+        if type(fields) is not dict:
+            raise ValueError("malformed_candidate")
+        try:
+            candidate = cls(**fields)
+        except TypeError:
+            raise ValueError("malformed_candidate") from None
+        if not _valid_candidate(candidate):
+            raise ValueError("malformed_candidate")
+        return candidate
+
+
+def _valid_candidate(c):
+    return (type(c) is Candidate
+        and type(c.model) is str and 0 < len(c.model) <= _MAX_CANDIDATE_LABEL_LENGTH
+        and type(c.provider) is str and 0 < len(c.provider) <= _MAX_CANDIDATE_LABEL_LENGTH
+        and type(c.approved) is bool and type(c.available) is bool
+        and type(c.validated_tasks) is frozenset
+        and len(c.validated_tasks) <= _MAX_CANDIDATE_SET_MEMBERS
+        and all(type(v) is str and 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH for v in c.validated_tasks)
+        and type(c.privacy_classes) is frozenset
+        and len(c.privacy_classes) <= _MAX_CANDIDATE_SET_MEMBERS
+        and all(type(v) is str and 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH for v in c.privacy_classes)
+        and type(c.expected_usd_micros) is int and type(c.worst_usd_micros) is int
+        and 0 <= c.expected_usd_micros <= c.worst_usd_micros <= _MAX_I64)
+
 
 @dataclass(frozen=True)
 class Request:
@@ -241,18 +269,7 @@ class Broker:
             raise Refused("malformed_candidate")
         eligible = []
         for c in candidates:
-            if not (type(c) is Candidate
-                and type(c.model) is str and 0 < len(c.model) <= _MAX_CANDIDATE_LABEL_LENGTH
-                and type(c.provider) is str and 0 < len(c.provider) <= _MAX_CANDIDATE_LABEL_LENGTH
-                and type(c.approved) is bool and type(c.available) is bool
-                and type(c.validated_tasks) is frozenset
-                and len(c.validated_tasks) <= _MAX_CANDIDATE_SET_MEMBERS
-                and all(type(v) is str and 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH for v in c.validated_tasks)
-                and type(c.privacy_classes) is frozenset
-                and len(c.privacy_classes) <= _MAX_CANDIDATE_SET_MEMBERS
-                and all(type(v) is str and 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH for v in c.privacy_classes)
-                and type(c.expected_usd_micros) is int and type(c.worst_usd_micros) is int
-                and 0 <= c.expected_usd_micros <= c.worst_usd_micros <= _MAX_I64):
+            if not _valid_candidate(c):
                 raise Refused("malformed_candidate")
             if (c.approved and c.available and req.task_class in c.validated_tasks
                     and req.privacy_class in c.privacy_classes):
