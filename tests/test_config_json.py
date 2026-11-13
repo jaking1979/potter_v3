@@ -31,3 +31,21 @@ class DecodeCandidates(unittest.TestCase):
         bad = dict(self.item, privacy_classes=["public", "public"])
         with self.assertRaisesRegex(ValueError, "^malformed_configuration$"):
             decode_candidates(json.dumps([self.item, bad]).encode())
+
+    def test_lone_surrogates_refused_at_config_boundaries(self):
+        for field in ("model", "provider", "validated_tasks", "privacy_classes"):
+            bad = dict(self.item)
+            bad[field] = ["x\ud800"] if field in ("validated_tasks", "privacy_classes") else "x\ud800"
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "^malformed_candidate$"):
+                    Candidate.from_json_config(bad)
+                with self.assertRaisesRegex(ValueError, "^malformed_configuration$"):
+                    decode_candidates(json.dumps([bad]).encode())
+                record = dict(bad)
+                record["validated_tasks"] = frozenset(record["validated_tasks"])
+                record["privacy_classes"] = frozenset(record["privacy_classes"])
+                with self.assertRaisesRegex(ValueError, "^malformed_candidate$"):
+                    Candidate.from_config(record)
+
+        good = dict(self.item, model="café", validated_tasks=["résumé"])
+        self.assertEqual(decode_candidates(json.dumps([good]).encode())[0].model, "café")
