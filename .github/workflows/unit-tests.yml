@@ -45,6 +45,7 @@ jobs:
           if test -d evaluation/a4a; then
             set -o pipefail
             python -m unittest discover -s evaluation/a4a -p 'test_*.py' -v 2>&1 | tee /tmp/potter-a4a.log
+            grep -Eq '^Ran [1-9][0-9]* tests? in ' /tmp/potter-a4a.log || { echo 'No A4a tests discovered' >&2; exit 1; }
             if grep -Eq '\.\.\. skipped |^OK \(skipped=' /tmp/potter-a4a.log; then
               echo "Required A4a test was skipped" >&2
               exit 1
