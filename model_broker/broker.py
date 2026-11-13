@@ -24,6 +24,9 @@ class LedgerUnavailable(Refused):
 
 
 _MAX_I64 = (1 << 63) - 1  # SQLite INTEGER is signed 64-bit
+# Experimental offline input bounds, not authenticated configuration policy.
+_MAX_CANDIDATE_LABEL_LENGTH = 200
+_MAX_CANDIDATE_SET_MEMBERS = 64
 
 _COLUMNS = ('call_id', 'task_id', 'task_class', 'privacy_class', 'day', 'month',
             'model', 'provider', 'expected', 'worst', 'actual', 'state')
@@ -239,13 +242,15 @@ class Broker:
         eligible = []
         for c in candidates:
             if not (type(c) is Candidate
-                and type(c.model) is str and bool(c.model)
-                and type(c.provider) is str and bool(c.provider)
+                and type(c.model) is str and 0 < len(c.model) <= _MAX_CANDIDATE_LABEL_LENGTH
+                and type(c.provider) is str and 0 < len(c.provider) <= _MAX_CANDIDATE_LABEL_LENGTH
                 and type(c.approved) is bool and type(c.available) is bool
                 and type(c.validated_tasks) is frozenset
-                and all(type(v) is str and bool(v) for v in c.validated_tasks)
+                and len(c.validated_tasks) <= _MAX_CANDIDATE_SET_MEMBERS
+                and all(type(v) is str and 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH for v in c.validated_tasks)
                 and type(c.privacy_classes) is frozenset
-                and all(type(v) is str and bool(v) for v in c.privacy_classes)
+                and len(c.privacy_classes) <= _MAX_CANDIDATE_SET_MEMBERS
+                and all(type(v) is str and 0 < len(v) <= _MAX_CANDIDATE_LABEL_LENGTH for v in c.privacy_classes)
                 and type(c.expected_usd_micros) is int and type(c.worst_usd_micros) is int
                 and 0 <= c.expected_usd_micros <= c.worst_usd_micros <= _MAX_I64):
                 raise Refused("malformed_candidate")
