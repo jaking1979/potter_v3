@@ -357,7 +357,10 @@ class ResponsibilityRunner:
 
     def _build(self, step: Step, ctx: StepContext, task_id: str):
         try:
-            return step.build(ctx, task_id)
+            action = step.build(ctx, task_id)
+            if getattr(action, 'task_id', None) != task_id:
+                raise ValueError('action is not bound to claimed task')
+            return action
         except Exception as exc:
             raise _Fatal(f"step {step.id} could not bind its action: {type(exc).__name__}")
 
