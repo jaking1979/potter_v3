@@ -238,11 +238,7 @@ class IngressStore:
             tx._c.executemany("UPDATE ingress_inbox SET status='expired', event_json=NULL, "
                               "updated_at=? WHERE event_id=?", [(now, i) for i in ids])
             for event_id in ids:
-                refs = [r[0] for r in tx._c.execute(
-                    "SELECT ref FROM attachment_refs WHERE event_id=?", (event_id,))]
-                tx._c.execute("DELETE FROM attachment_refs WHERE event_id=?", (event_id,))
-                tx._c.executemany("INSERT OR REPLACE INTO attachment_staged VALUES (?,?,?)",
-                                  [(f"release:{event_id}", r, now) for r in refs])
+                tx.release_refs(event_id, now)
             return ids
 
     # ---- attachments ---------------------------------------------------------
@@ -352,7 +348,19 @@ class _Tx:
         cur = self._c.execute("UPDATE ingress_inbox SET status='quarantined', event_json=NULL,"
                               " quarantine_reason=?, updated_at=? WHERE event_id=?"
                               " AND status='pending'", (reason, now, event_id))
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return False
+        # The event will never be delivered: release its attachment refs so the
+        # blobs become GC candidates (a blob shared with a live event is kept).
+        self.release_refs(event_id, now)
+        return True
+
+    def release_refs(self, event_id: str, now: int) -> None:
+        refs = [r[0] for r in self._c.execute(
+            "SELECT ref FROM attachment_refs WHERE event_id=?", (event_id,))]
+        self._c.execute("DELETE FROM attachment_refs WHERE event_id=?", (event_id,))
+        self._c.executemany("INSERT OR REPLACE INTO attachment_staged VALUES (?,?,?)",
+                            [(f"release:{event_id}", r, now) for r in refs])
 
     def inbox_put(self, event_id: str, event_json: str, now: int) -> None:
         self._c.execute("INSERT INTO ingress_inbox (event_id, event_json, status, created_at,"

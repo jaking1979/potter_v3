@@ -1879,6 +1879,38 @@ class SchemaUpgrade(Fixture):
         self.assertEqual(self.layout()[0], ("e3.v1",))
 
 
+class QuarantineRetention(Fixture):
+    """Review on 6295404 (non-blocking): quarantine retention. Text is dropped
+    at quarantine time; the gap was that a quarantined event kept its
+    attachment refs forever, so its blobs were never reclaimable."""
+
+    corrupt = PendingScanCannotStarve.corrupt
+    inbox = PendingScanCannotStarve.inbox
+    tg_att = AttachmentLifecycle.tg_att
+
+    def test_129_quarantine_releases_attachments_and_keeps_only_id_reason(self):
+        ev = self.gw.ingest_telegram(self.tg_att()).event
+        ref = ev.attachments[0].ref
+        self.corrupt([ev.event_id], "garbage")
+        self.assertEqual(self.gw.pending(), [])
+        self.assertEqual(self.gw.quarantined(), [(ev.event_id, "malformed")])
+        self.assertEqual(self.inbox()[ev.event_id], ("quarantined", None))   # no text
+        self.assertEqual(IngressStore(self.db).attachment_state()[1], [])    # refs released
+        self.assertEqual(self.gw.gc_attachments(grace_s=3600), [])          # within grace
+        self.assertEqual(len(self.gateway(clock=lambda: T + 7200).gc_attachments()), 1)
+        self.assertNotIn(ref, self.attachments.blobs)
+        self.assertEqual(self.gw.quarantined(), [(ev.event_id, "malformed")])  # audit kept
+
+    def test_130_quarantine_never_reclaims_a_blob_shared_with_a_live_event(self):
+        bad = self.gw.ingest_telegram(self.tg_att(msg_id=1, ref="s1")).event
+        live = self.gw.ingest_telegram(self.tg_att(msg_id=2, ref="s2")).event
+        self.assertEqual(bad.attachments[0].ref, live.attachments[0].ref)   # same bytes
+        self.corrupt([bad.event_id], "garbage")
+        self.assertEqual(self.gw.pending(), [live])
+        self.assertEqual(self.gateway(clock=lambda: T + 7200).gc_attachments(), [])
+        self.assertIn(live.attachments[0].ref, self.attachments.blobs)
+
+
 class Structure(unittest.TestCase):
     def test_43_ingress_passes_notifier_lint(self):
         self.assertEqual([f for f in lint.scan(ROOT) if f.path.startswith("ingress")], [])
