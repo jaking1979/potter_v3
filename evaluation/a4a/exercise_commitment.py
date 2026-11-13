@@ -10,17 +10,20 @@ import re
 
 from evaluation.a4a.fixture_commitment import fixture_digest
 from evaluation.a4a.plan_binding import plan_digest
+from evaluation.a4a.scoring_rules import (
+    CLASSIFICATIONS, DIMENSIONS, FOLLOW_THROUGH_RULE, INVALID_MULTIPLIER,
+)
 
 _SCHEMA = 'potter.a4a-exercise-commitment/v1'
 # This is an experimental descriptor, not an L17 decision or attestation that
 # code implements the descriptor. Any rules change requires a version bump;
 # protected source/version binding is still required before a real exercise.
 _RULES = {'version': 'synthetic-grader-pair/v1',
-          'dimensions': ['done', 'reexplaining', 'speed', 'trust', 'follow_through'],
-          'follow_through': 'responsibility-only',
+          'dimensions': list(DIMENSIONS),
+          'follow_through': FOLLOW_THROUGH_RULE,
           'affected_cases': 'union-across-planned-dimensions',
-          'invalid_when': 'affected-times-10-greater-than-planned',
-          'classifications': ['agree', 'disagree', 'missing', 'duplicate', 'unalignable'],
+          'invalid_when': f'affected-times-{INVALID_MULTIPLIER}-greater-than-planned',
+          'classifications': list(CLASSIFICATIONS),
           'result': 'descriptive-only'}
 
 

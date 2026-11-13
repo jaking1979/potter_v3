@@ -5,6 +5,7 @@ helper cannot establish blinding, mapping provenance, case independence or the
 integrity of what a grader saw; it does not calculate pass/fail thresholds.
 """
 from evaluation.a4a.blind_grading import validate_grades
+from evaluation.a4a.scoring_rules import DIMENSIONS, INVALID_MULTIPLIER, is_applicable
 
 
 def count_case_agreement(first, second, expected_cases):
@@ -33,11 +34,9 @@ def count_case_agreement(first, second, expected_cases):
             indexed.setdefault(case_id, []).append(row)
         passes.append(indexed)
     result = {key: {'agreements': 0, 'denominator': 0, 'affected': []}
-              for key in ('done', 'reexplaining', 'speed', 'trust', 'follow_through')}
+              for key in DIMENSIONS}
     for case_id, responsibility in expected_cases.items():
-        dims = ['done', 'reexplaining', 'speed', 'trust']
-        if responsibility:
-            dims.append('follow_through')
+        dims = [dim for dim in DIMENSIONS if is_applicable(dim, responsibility)]
         entries = [index.get(case_id, []) for index in passes]
         issue = None
         if any(len(rows) != 1 for rows in entries):
@@ -69,7 +68,7 @@ def affected_case_summary(counts, expected_cases):
     """
     if not isinstance(expected_cases, dict) or not expected_cases:
         raise ValueError('expected case plan required')
-    expected_dimensions = {'done', 'reexplaining', 'speed', 'trust', 'follow_through'}
+    expected_dimensions = set(DIMENSIONS)
     if not isinstance(counts, dict) or set(counts) != expected_dimensions:
         raise ValueError('invalid agreement counts')
     case_ids = set()
@@ -88,4 +87,4 @@ def affected_case_summary(counts, expected_cases):
             case_ids.add(case_id)
     n = len(expected_cases)
     return {'affected_case_ids': sorted(case_ids), 'affected_count': len(case_ids),
-            'planned_cases': n, 'invalid_over_ten_percent': len(case_ids) * 10 > n}
+            'planned_cases': n, 'invalid_over_ten_percent': len(case_ids) * INVALID_MULTIPLIER > n}

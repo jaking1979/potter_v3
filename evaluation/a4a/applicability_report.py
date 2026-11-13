@@ -1,8 +1,9 @@
 """Synthetic applicability-aware summary. Not a grading gate or proof of a locked plan."""
 from evaluation.a4a.wilson import wilson_95
+from evaluation.a4a.scoring_rules import AFFECTED, CLASSIFICATIONS, INVALID_MULTIPLIER
 
-_AFFECTED = frozenset(('missing', 'duplicate', 'unalignable'))
-_ALLOWED = _AFFECTED | frozenset(('agree', 'disagree'))
+_AFFECTED = AFFECTED
+_ALLOWED = frozenset(CLASSIFICATIONS)
 
 def summarize_applicability(planned_ids, applicability, classifications):
     """Plan is supplied independently of classifications; no inferred applicability.
@@ -42,7 +43,7 @@ def summarize_applicability(planned_ids, applicability, classifications):
     affected = set(affected_reasons)
     report = {'affected_ids': sorted(affected), 'affected_reasons': affected_reasons,
               'planned_cases': len(planned_ids)}
-    if len(affected) * 10 > len(planned_ids):
+    if len(affected) * INVALID_MULTIPLIER > len(planned_ids):
         report['status'] = 'invalid_rerun'
         return report
     results = {}

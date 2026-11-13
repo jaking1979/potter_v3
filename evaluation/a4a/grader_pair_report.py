@@ -6,6 +6,7 @@ Applicability and L17 wording remain unresolved; this is not a ratified rule.
 """
 from evaluation.a4a.case_agreement import count_case_agreement
 from evaluation.a4a.applicability_report import summarize_applicability
+from evaluation.a4a.scoring_rules import DIMENSIONS, is_applicable
 
 
 def summarize_grader_pairs(first, second, expected_cases):
@@ -19,9 +20,9 @@ def summarize_grader_pairs(first, second, expected_cases):
     # Validate both complete inputs before indexing or reporting anything.
     count_case_agreement(first, second, expected_cases)
     planned = list(expected_cases)
-    dimensions = ('done', 'reexplaining', 'speed', 'trust', 'follow_through')
+    dimensions = DIMENSIONS
     applicability = {d: [case for case in planned
-                         if d != 'follow_through' or expected_cases[case]]
+                         if is_applicable(d, expected_cases[case])]
                      for d in dimensions}
     applicable_sets = {d: set(cases) for d, cases in applicability.items()}
     grouped = []
