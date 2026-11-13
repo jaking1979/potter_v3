@@ -113,14 +113,33 @@ def receipt_link(task_id: str) -> str:
     return f"{RECEIPT_PREFIX}{task_id}"
 
 
-def kill_switch_for(db: Database | str) -> Callable[[Effect], bool]:
-    """The C2 ``EffectJournal(kill_switch=...)`` callable for E1's global kill
-    flag. Pass it when building the journal a ResponsibilityRunner uses: C2
-    then checks the flag inside the dispatch-claim transaction (which /stop
-    cannot commit through) and again after the claim, before ``perform``, so
-    a /stop that lands before the send refuses the dispatch atomically."""
-    flag = KillFlag(as_database(db))
-    return lambda eff: flag.is_set()
+class KillSwitch:
+    """C2 ``EffectJournal(kill_switch=...)`` callable for E1's global kill
+    flag, bound to one database file. A ResponsibilityRunner refuses a journal
+    whose kill switch is not a KillSwitch bound to the runner's own database:
+    without it nothing but E2's early pre-check stands between /stop and a
+    send, so the omission is refused at assembly instead of failing open."""
+    __slots__ = ("_path", "_flag")
+
+    def __init__(self, db: Database | str):
+        db = as_database(db)
+        self._path, self._flag = db.path, KillFlag(db)
+
+    @property
+    def db_path(self) -> str:
+        return self._path
+
+    def __call__(self, eff: Effect) -> bool:
+        return self._flag.is_set()
+
+
+def kill_switch_for(db: Database | str) -> KillSwitch:
+    """The kill switch to pass when building the journal a
+    ResponsibilityRunner uses: C2 then checks the flag inside the
+    dispatch-claim transaction (which /stop cannot commit through) and again
+    after the claim, before ``perform``, so a /stop that lands before the send
+    refuses the dispatch atomically."""
+    return KillSwitch(db)
 
 
 class ResponsibilityRunner:
@@ -135,11 +154,17 @@ class ResponsibilityRunner:
         for name, other in (("journal", journal.db), ("ledger", ledger.db), ("issuer", issuer.db)):
             if other.path != self.db.path:
                 raise ValueError(f"{name} must share the runner's database")
+        ks = journal.kill_switch
+        if not isinstance(ks, KillSwitch) or ks.db_path != self.db.path:
+            # Fail closed: a journal without this database's kill switch would
+            # let a /stop that lands after the pre-check race the send.
+            raise ValueError("journal must be built with kill_switch=kill_switch_for(db)"
+                             " for the runner's database")
         _schema.ensure(self.db, now=clock())
         self.kill = KillFlag(self.db)
         self._clock = clock
         self.tasks = TaskStore(self.db, escalate=self._on_escalation, clock=clock)
-        self.journal, self._policy, self._ledger, self._issuer = journal, policy, ledger, issuer
+        self._journal, self._policy, self._ledger, self._issuer = journal, policy, ledger, issuer
         self._worker, self._lease = worker_id, lease_s
         self._defs: dict[str, Responsibility] = {}
         for d in definitions:
@@ -162,6 +187,12 @@ class ResponsibilityRunner:
         for d in self._defs.values():
             self.tasks.register_job(d.id, d.cadence_s, tolerance=d.tolerance)
         self._alert_holds()
+
+    @property
+    def journal(self) -> EffectJournal:
+        """Read-only: the journal is checked for its kill switch at assembly,
+        so it cannot be swapped afterwards."""
+        return self._journal
 
     def _now(self) -> float:
         return self._clock()
@@ -333,7 +364,7 @@ class ResponsibilityRunner:
     def _effect_of(self, task: Task, step: Step, approvals: Mapping[str, str]) -> Effect | None:
         h = approvals.get(step.id)
         if h is None:
-            return self.journal.for_step(task.id, step.id)
+            return self._journal.for_step(task.id, step.id)
         record = self._approval_for(task.id, h)[2]
         return self._ledger.effect(record["nonce"]) if record else None
 
@@ -343,13 +374,13 @@ class ResponsibilityRunner:
         conn = self._connectors[step.connector]
         h = approvals.get(step.id)
         if h is None:
-            eff = self.journal.for_step(task.id, step.id)
+            eff = self._journal.for_step(task.id, step.id)
             dec = self._decide(d, step, action, ctx, provenance)
             if dec.outcome == ALLOW:
                 if not self._dispatch_permitted():
                     raise _Interrupt()
                 try:
-                    eff = self.journal.record_intent(task.id, step.id, action)
+                    eff = self._journal.record_intent(task.id, step.id, action)
                 except EffectConflict:
                     raise _Fatal(f"step {step.id} is bound to a different action")
                 return self._execute(eff, conn)
@@ -391,7 +422,7 @@ class ResponsibilityRunner:
 
     def _execute(self, eff: Effect, conn: Connector) -> Any:
         try:
-            eff = self.journal.execute(eff.idempotency_key, conn.perform, conn.reconcile,
+            eff = self._journal.execute(eff.idempotency_key, conn.perform, conn.reconcile,
                                        owner=self._worker, connector=conn.identity)
         except EffectKilled:
             # C2 refused the dispatch under its claim lock (or undid the claim
@@ -411,14 +442,14 @@ class ResponsibilityRunner:
         """Before any step continues: every dispatched-but-unsettled effect of
         this task is reconciled through C2 (no dispatch). Anything still unknown
         or in flight blocks the task."""
-        for eff in self.journal.unresolved():
+        for eff in self._journal.unresolved():
             if eff.task_id != task.id or eff.status != UNKNOWN:
                 continue
             conn = self._connectors.get(eff.connector or "")
             if conn is None:
                 raise _Blocked(f"effect {eff.effect_id}: connector not configured")
             try:
-                eff = self.journal.reconcile(eff.idempotency_key, conn.reconcile)
+                eff = self._journal.reconcile(eff.idempotency_key, conn.reconcile)
             except EffectInFlight:
                 raise _Blocked(f"effect {eff.effect_id} still in flight")
             if eff.status == UNKNOWN:
@@ -905,14 +936,14 @@ class ResponsibilityRunner:
         responsibility task. Returns those still unresolved; their tasks stay
         blocked until an authoritative reconcile resolves them."""
         left = []
-        for eff in self.journal.unresolved():
+        for eff in self._journal.unresolved():
             task = self.tasks.get(eff.task_id)
             if task is None or task.kind not in self._defs or eff.status != UNKNOWN:
                 continue
             conn = self._connectors.get(eff.connector or "")
             try:
                 if conn is not None:
-                    eff = self.journal.reconcile(eff.idempotency_key, conn.reconcile)
+                    eff = self._journal.reconcile(eff.idempotency_key, conn.reconcile)
             except EffectInFlight:
                 pass
             if eff.status == UNKNOWN:

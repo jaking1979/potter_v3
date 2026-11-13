@@ -32,7 +32,8 @@ sys.path.insert(0, str(HERE.parent))
 
 import resp_world as rw  # noqa: E402
 from notifier import lint  # noqa: E402
-from responsibilities import (DefinitionError, Event, Responsibility, Schedule,  # noqa: E402
+from responsibilities import (Connector, DefinitionError, Event, KillSwitch,  # noqa: E402
+                              Responsibility, ResponsibilityRunner, Schedule, kill_switch_for,
                               receipt_link)
 from runtime import ACKED, SUPPRESSED, UNKNOWN  # noqa: E402
 from runtime.tasks import DONE, ESCALATED, QUEUED, WAITING_APPROVAL  # noqa: E402
@@ -1718,24 +1719,67 @@ class RealC2Seams(Base):
         self.assertEqual(w.ext.applied(), [("s1", 1), ("s2", 1)])
 
     def test_stop_between_claim_and_send_is_undone_by_c2(self):
-        from runtime import EffectJournal
-        w = self.world(definitions=[rw.batch(n=1)])
-        calls = {"n": 0}
+        # /stop commits in the gap between C2's claim transaction and its
+        # post-claim check. The switch is the real KillSwitch reading the real
+        # E1 flag; the subclass only places the /stop at that moment (its 2nd
+        # read: the 1st is inside the claim). This depends on the switch: with
+        # a KillSwitch that ignored the flag, perform runs and calls() == 1;
+        # a journal with no switch at all is refused at assembly
+        # (test_runner_refuses_journal_without_kill_switch).
+        reads = []
 
-        def flips_after_claim(eff):         # 1st read: inside the claim; 2nd: before send
-            calls["n"] += 1
-            return calls["n"] >= 2 and calls["n"] <= 2
+        class StopAfterClaim(KillSwitch):
+            __slots__ = ()
 
-        w.runner.journal = EffectJournal(w.db, clock=w.clock, kill_switch=flips_after_claim)
+            def __call__(self, eff):
+                reads.append(eff.status)
+                if len(reads) == 2:                       # claim committed, not sent
+                    _set_kill(w)
+                return super().__call__(eff)
+
+        w = self.world(definitions=[rw.batch(n=1)],
+                       kill_switch=StopAfterClaim(str(Path(self.tmp) / "potter.db")))
         w.runner.tick()
         r = w.runner.run_once()
         self.assertEqual(r.outcome, "interrupted")
+        self.assertEqual(reads, ["pending", "unknown"])    # in-claim, then post-claim
         self.assertEqual(w.ext.calls(), 0)                 # perform never ran
         eff = w.journal.for_step(r.task_id, "s1")
         self.assertEqual(eff.status, "pending")            # claim undone by C2
         self.assertIsNone(eff.in_flight_owner)
+        w.notifier.kill.clear()
         self.assertEqual(w.runner.run_once().outcome, "done")
         self.assertEqual(w.ext.applied(), [("s1", 1)])
+
+    def _assemble(self, w, journal):
+        return ResponsibilityRunner(
+            w.db, definitions=[rw.batch(n=1)], journal=journal, policy=w.engine,
+            ledger=w.ledger, issuer=w.issuer, handle_for=w.notifier.handle_for,
+            connectors=[Connector(rw.CONNECTOR, w.ext.perform, w.ext.reconcile)],
+            worker_id="w9", clock=w.clock)
+
+    def test_runner_refuses_journal_without_kill_switch(self):
+        from runtime import EffectJournal
+        w = self.world(definitions=[rw.batch(n=1)])
+        for ks in (None, lambda eff: w.notifier.kill.is_set(), lambda eff: False):
+            with self.assertRaisesRegex(ValueError, "kill_switch"):
+                self._assemble(w, EffectJournal(w.db, clock=w.clock, kill_switch=ks))
+        self._assemble(w, EffectJournal(w.db, clock=w.clock,
+                                        kill_switch=kill_switch_for(w.db)))   # accepted
+
+    def test_runner_refuses_kill_switch_bound_to_another_database(self):
+        from runtime import Database, EffectJournal
+        w = self.world(definitions=[rw.batch(n=1)])
+        other = Database(Path(self.tmp) / "other.db")
+        with self.assertRaisesRegex(ValueError, "kill_switch"):
+            self._assemble(w, EffectJournal(w.db, clock=w.clock,
+                                            kill_switch=kill_switch_for(other)))
+
+    def test_journal_cannot_be_swapped_after_assembly(self):
+        from runtime import EffectJournal
+        w = self.world(definitions=[rw.batch(n=1)])
+        with self.assertRaises(AttributeError):
+            w.runner.journal = EffectJournal(w.db, clock=w.clock)
 
     def test_tick_waits_on_another_writer_and_commits_one_slot(self):
         import threading

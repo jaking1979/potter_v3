@@ -146,7 +146,7 @@ def bill_watch() -> Responsibility:
 
 class World:
     def __init__(self, tmp: str | Path, *, clock=None, definitions=None, worker="w1",
-                 lease_s=60.0, fence=None):
+                 lease_s=60.0, fence=None, kill_switch=None):
         tmp = Path(tmp)
         self.now = T0
         self.clock = clock or (lambda: self.now)
@@ -168,9 +168,10 @@ class World:
                                    ledger=self.ledger,
                                    authenticator=c0.HmacAuthenticator({"e2-test": TEST_KEY}),
                                    clock=lambda: int(self.clock()))
+        if kill_switch is None and kill_switch_for is not None:
+            kill_switch = kill_switch_for(self.db)
         self.journal = EffectJournal(self.db, clock=self.clock, fence=fence,
-                                     kill_switch=kill_switch_for(self.db) if kill_switch_for
-                                     else None)
+                                     kill_switch=kill_switch)
         self.definitions = definitions if definitions is not None else [batch(), bill_watch()]
         self.runner = ResponsibilityRunner(
             self.db, definitions=self.definitions, journal=self.journal, policy=self.engine,

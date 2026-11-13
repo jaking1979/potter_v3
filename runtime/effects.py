@@ -535,6 +535,12 @@ class EffectJournal:
         self._clock = clock
         self._dispatch_timeout = dispatch_timeout_s
 
+    @property
+    def kill_switch(self) -> Callable[[Effect], bool] | None:
+        """The kill switch this journal was built with (read-only), so a
+        caller such as E2's runner can refuse a journal assembled without one."""
+        return self._kill
+
     def _now(self, now: float | None) -> float:
         """A clock reading used for journal writes, deadlines and window checks.
         Non-finite readings are refused before anything is written."""
