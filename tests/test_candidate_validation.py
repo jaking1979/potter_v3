@@ -1,10 +1,52 @@
 import tempfile
 import unittest
+import inspect
+import sys
+import threading
 from pathlib import Path
 from dataclasses import replace
 from model_broker.broker import Broker, Candidate, Caps, Refused, Request
 
 class InvalidCandidateTests(unittest.TestCase):
+    def test_list_growth_between_precheck_and_snapshot_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
+            request = Request('x','12345678-1234-4234-8234-123456789abc','research','private','2026-11-06','2026-11')
+            good = Candidate('good','provider',True,frozenset({'research'}),frozenset({'private'}),1,2)
+            candidates = [good]
+            reached, resume = threading.Event(), threading.Event()
+            source, first = inspect.getsourcelines(Broker.reserve)
+            target = first + next(i for i, line in enumerate(source) if line.strip() == 'candidates = tuple(candidates)')
+            results = []
+            def trace(frame, event, arg):
+                if event == 'line' and frame.f_code is Broker.reserve.__code__ and frame.f_lineno == target:
+                    reached.set()
+                    if not resume.wait(5):
+                        raise TimeoutError('test did not resume')
+                return trace
+            def worker():
+                sys.settrace(trace)
+                try:
+                    b.reserve(request, candidates)
+                except Exception as exc:
+                    results.append(exc)
+                finally:
+                    sys.settrace(None)
+            t = threading.Thread(target=worker)
+            t.start()
+            try:
+                self.assertTrue(reached.wait(5))
+                candidates.extend([good] * 1024)
+            finally:
+                resume.set()
+                t.join(5)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(len(results), 1)
+            self.assertIsInstance(results[0], Refused)
+            self.assertIn('malformed_candidate', str(results[0]))
+            # The refused call wrote no reservation.
+            self.assertEqual(b.reserve(request, [good]), good)
+
     def test_invalid_containers_are_refused_before_iteration_and_write(self):
         with tempfile.TemporaryDirectory() as d:
             b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
