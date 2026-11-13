@@ -62,7 +62,7 @@ REASONS = frozenset({
     # accepted
     "accepted",
     # rejected / not new
-    "duplicate", "duplicate_pending", "expired", "quarantined", "corrupt_pending", "replay_conflict", "transport_unverified", "webhook_unverified",
+    "duplicate", "duplicate_pending", "expired", "quarantined", "corrupt_pending", "quarantine_failed", "replay_conflict", "transport_unverified", "webhook_unverified",
     "malformed", "missing_message_id", "oversized_raw", "oversized_body",
     "oversized_attachment", "too_many_attachments", "bot_sender", "sender_not_allowlisted",
     "trace_error", "ingress_error", "attachment_reclaimed", "clock_regression",
@@ -241,6 +241,9 @@ class IngressGateway:
         self._limits = limits
         self._sink = trace_sink
         self._env = environment
+        # event_id -> (reason, attempts) for rows whose quarantine AND block
+        # record both failed; process-local fallback so pending() still moves on.
+        self._volatile_blocked: dict[str, tuple[str, int]] = {}
 
     # ---- public adapters -------------------------------------------------------
 
@@ -259,6 +262,7 @@ class IngressGateway:
     # ---- durable handoff (runner side) ----------------------------------------
 
     MAX_SCAN = 1000     # rows examined per pending() call (bounded work)
+    RETRY_BLOCKED = 16  # blocked rows whose quarantine is retried per pending() call
 
     def pending(self, limit: int = 100, max_scan: int | None = None) -> list[InboundEvent]:
         """Accepted events not yet acked as handed off, oldest first (up to
@@ -273,8 +277,17 @@ class IngressGateway:
         untrustworthy text dropped, traced as ``corrupt_pending``, and listed
         by ``quarantined()`` as (event_id, reason). Each call therefore makes
         forward progress, so later valid rows are reached on this or a
-        following call, also after a restart."""
+        following call, also after a restart.
+
+        Quarantine failure is not silent and cannot stall recovery: the row is
+        recorded as *recovery blocked* (``recovery_blocked()``), traced as
+        ``quarantine_failed``, and excluded from later scans, so the next call
+        reaches later valid rows. If even that record cannot be written, the
+        row is held in this process's memory instead. Each call first retries
+        quarantine for at most ``RETRY_BLOCKED`` blocked rows (least recently
+        tried first); a blocked row is never returned or acked."""
         cap = self.MAX_SCAN if max_scan is None else max_scan
+        self._retry_blocked()
         out: list[InboundEvent] = []
         cursor, scanned = 0, 0
         while len(out) < limit and scanned < cap:
@@ -283,13 +296,38 @@ class IngressGateway:
             if not batch:
                 break
             for rowid, event_id, raw in batch:
-                cursor, scanned = rowid, scanned + 1
+                cursor = rowid
+                if event_id in self._volatile_blocked:
+                    continue                    # already known bad; not re-examined
+                scanned += 1
                 ev, why = self._restore_checked(raw, self._store.lookup_event(event_id))
                 if ev is not None:
                     out.append(ev)
                 else:
                     self._quarantine(event_id, why)
         return out
+
+    def recovery_blocked(self) -> list[tuple[str, str, int]]:
+        """(event_id, reason, attempts) of rows that failed to restore and
+        whose quarantine write failed. For an operator: no content. They are
+        excluded from ``pending()`` and retried on each call until the
+        quarantine succeeds (or ``expire_pending`` drops them)."""
+        try:
+            rows = self._store.blocked()
+        except Exception:
+            rows = []
+        known = {r[0] for r in rows}
+        return rows + [(e, why, n) for e, (why, n) in self._volatile_blocked.items()
+                       if e not in known]
+
+    def _retry_blocked(self) -> None:
+        try:
+            durable = self._store.blocked(self.RETRY_BLOCKED)
+        except Exception:
+            durable = []
+        volatile = [(e, why, n) for e, (why, n) in self._volatile_blocked.items()]
+        for event_id, why, _n in (durable + volatile)[:self.RETRY_BLOCKED]:
+            self._quarantine(event_id, why)
 
     def quarantined(self) -> list[tuple[str, str]]:
         """(event_id, reason) of inbox rows quarantined as ``malformed`` or
@@ -302,7 +340,9 @@ class IngressGateway:
         try:
             done = self._store.quarantine(event_id, now, why)
         except Exception:
+            self._block(event_id, why, now)
             return False
+        self._volatile_blocked.pop(event_id, None)
         if done:
             try:
                 emit_ingress_trace(self._sink, event_id=event_id,
@@ -313,10 +353,33 @@ class IngressGateway:
                 pass
         return done
 
+    def _block(self, event_id: str, why: str, now: int) -> None:
+        """Quarantine failed: record the row as recovery blocked (durably if
+        possible, else in memory) and trace it. Fail closed either way: the
+        row stays out of ``pending()`` results."""
+        try:
+            durable = self._store.block(event_id, why, now)
+        except Exception:
+            durable = False
+        if durable:
+            self._volatile_blocked.pop(event_id, None)
+        else:
+            _why, n = self._volatile_blocked.get(event_id, (why, 0))
+            self._volatile_blocked[event_id] = (why, n + 1)
+        try:
+            emit_ingress_trace(self._sink, event_id=event_id,
+                               delivery_key=str(uuid.uuid4()), channel="inbox",
+                               accepted=False, reason="quarantine_failed", trust="none",
+                               content_digest="0" * 64, now=now, environment=self._env)
+        except Exception:
+            pass
+
     def ack(self, event_id: str) -> bool:
         """The runner has durably enqueued this event (idempotently, keyed on
         ``event_id``). Drops the stored text; later re-deliveries are plain
         ``duplicate``. Idempotent."""
+        if event_id in self._volatile_blocked:
+            return False
         try:
             return self._store.ack(event_id, self._clock())
         except Exception:
@@ -328,6 +391,7 @@ class IngressGateway:
         now = self._clock()
         ids = self._store.expire(now - max_age_s, now)
         for event_id in ids:
+            self._volatile_blocked.pop(event_id, None)
             try:
                 emit_ingress_trace(self._sink, event_id=event_id,
                                    delivery_key=str(uuid.uuid4()), channel="expired",

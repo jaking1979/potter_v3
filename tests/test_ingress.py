@@ -1793,7 +1793,7 @@ class SchemaUpgrade(Fixture):
     """Dolores at c445503: the inbox gained quarantine_reason but the version
     stayed e3.v0 and CREATE IF NOT EXISTS left an existing v0 table unchanged,
     so a prior-head database opened fine and then failed on first quarantine.
-    The store is now e3.v1; an e3.v0 store is rebuilt atomically on open and
+    The store is now e3.v1 (e3.v2 adds inbox_blocked); an e3.v0 store is rebuilt atomically on open and
     anything else is refused before service, with no write."""
 
     corrupt = PendingScanCannotStarve.corrupt
@@ -1835,7 +1835,7 @@ class SchemaUpgrade(Fixture):
                 c.execute("UPDATE ingress_inbox SET status='quarantined' WHERE event_id=?",
                           (bad,))
         restarted = self.gateway()                              # open = migrate
-        self.assertEqual(self.layout()[0], ("e3.v1",))
+        self.assertEqual(self.layout()[0], ("e3.v2",))
         self.assertEqual(restarted.pending(), [good])           # valid pending path
         self.assertEqual(restarted.quarantined(), [(bad, "malformed")])   # quarantine path
         self.assertEqual(self.inbox()[bad], ("quarantined", None))
@@ -1876,7 +1876,7 @@ class SchemaUpgrade(Fixture):
                 self.assertEqual(self.layout(), before)          # nothing written
 
     def test_128_fresh_store_is_v1(self):
-        self.assertEqual(self.layout()[0], ("e3.v1",))
+        self.assertEqual(self.layout()[0], ("e3.v2",))
 
 
 class QuarantineRetention(Fixture):
@@ -1909,6 +1909,139 @@ class QuarantineRetention(Fixture):
         self.assertEqual(self.gw.pending(), [live])
         self.assertEqual(self.gateway(clock=lambda: T + 7200).gc_attachments(), [])
         self.assertIn(live.attachments[0].ref, self.attachments.blobs)
+
+
+class QuarantineFailureCannotStall(Fixture):
+    """Dolores at adebb10: pending() ignored a failed quarantine and restarted
+    its cursor at 0, so a persistent quarantine fault on the oldest bad rows
+    hid later valid work on every call, silently. A failed quarantine now
+    records the row as recovery blocked (durably, else in memory), traces
+    ``quarantine_failed``, excludes it from later scans, and retries a
+    bounded number of blocked rows per call."""
+
+    corrupt = PendingScanCannotStarve.corrupt
+    inbox = PendingScanCannotStarve.inbox
+    tg_att = AttachmentLifecycle.tg_att
+
+    def setup_rows(self, n_bad=3):
+        bad = [self.gw.ingest_telegram(self.tg(msg_id=i, ref=f"q{i}")).event_id
+               for i in range(1, n_bad + 1)]
+        good = self.gw.ingest_telegram(self.tg(msg_id=99, ref="q99")).event
+        self.corrupt(bad, "garbage")
+        return bad, good
+
+    def failing(self, *names):
+        from unittest import mock
+        stack = __import__("contextlib").ExitStack()
+        for name in names:
+            stack.enter_context(mock.patch.object(
+                IngressStore, name, side_effect=OSError("disk says no")))
+        return stack
+
+    def test_131_dolores_repro_valid_event_reached_and_failure_surfaced(self):
+        bad, good = self.setup_rows()
+        self.traces.clear()
+        with self.failing("quarantine"):
+            self.assertEqual(self.gw.pending(limit=1, max_scan=3), [])   # 3 bad examined
+            self.assertEqual(self.gw.pending(limit=1, max_scan=3), [good])  # then progress
+            self.assertEqual(self.gw.quarantined(), [])
+            blocked = self.gw.recovery_blocked()
+        self.assertEqual(sorted(e for e, _r, _n in blocked), sorted(bad))
+        self.assertTrue(all(r == "malformed" and n >= 1 for _e, r, n in blocked))
+        import hashlib
+        want = hashlib.sha256(("e3.ingress|inbox|blocked|quarantine_failed|none|" + "0" * 64)
+                              .encode()).hexdigest()
+        digests = [json.loads(t)["potter.decision.digest"] for t in self.traces]
+        self.assertEqual(digests, [want] * 6)       # 3 first scan + 3 retried: surfaced
+        self.assertTrue({json.loads(t)["task.id"] for t in self.traces} <= set(bad))
+        self.assertNotIn("not json", "".join(self.traces))
+        self.assertFalse(any(self.gw.ack(e) for e in bad))               # never ackable
+
+    def test_132_failure_then_recovery_quarantines_and_clears(self):
+        bad, good = self.setup_rows()
+        with self.failing("quarantine"):
+            self.gw.pending()
+        self.assertEqual(len(self.gw.recovery_blocked()), 3)
+        self.assertEqual(self.gw.pending(), [good])                      # fault gone
+        self.assertEqual(self.gw.recovery_blocked(), [])
+        self.assertEqual(sorted(self.gw.quarantined()), sorted((e, "malformed") for e in bad))
+        self.assertTrue(all(self.inbox()[e] == ("quarantined", None) for e in bad))
+
+    def test_133_blocked_state_survives_restart_and_still_progresses(self):
+        bad, good = self.setup_rows()
+        with self.failing("quarantine"):
+            self.gw.pending(limit=1, max_scan=3)
+            restarted = self.gateway()                                   # new process
+            self.assertEqual(restarted.pending(limit=1, max_scan=3), [good])
+            attempts = {e: n for e, _r, n in restarted.recovery_blocked()}
+        self.assertEqual(set(attempts), set(bad))
+        self.assertTrue(all(n >= 2 for n in attempts.values()))          # retried
+        again = self.gateway()                                           # recovered
+        self.assertEqual(again.pending(), [good])
+        self.assertEqual(len(again.quarantined()), 3)
+        self.assertEqual(again.recovery_blocked(), [])
+
+    def test_134_block_record_also_failing_falls_back_to_memory(self):
+        bad, good = self.setup_rows()
+        with self.failing("quarantine", "block"):
+            self.assertEqual(self.gw.pending(limit=1, max_scan=3), [])
+            self.assertEqual(self.gw.pending(limit=1, max_scan=3), [good])
+            self.assertEqual(sorted(e for e, _r, _n in self.gw.recovery_blocked()), sorted(bad))
+            self.assertFalse(any(self.gw.ack(e) for e in bad))
+        self.assertEqual(self.gw.pending(), [good])                      # retried, recovered
+        self.assertEqual(self.gw.recovery_blocked(), [])
+        self.assertEqual(len(self.gw.quarantined()), 3)
+
+    def test_135_retry_is_bounded_per_call(self):
+        bad, good = self.setup_rows(n_bad=self.gw.RETRY_BLOCKED + 9)
+        with self.failing("quarantine"):
+            self.gw.pending()
+        calls = []
+        orig = IngressStore.quarantine
+
+        def counting(store, *a, **kw):
+            calls.append(a[0])
+            return orig(store, *a, **kw)
+        from unittest import mock
+        with mock.patch.object(IngressStore, "quarantine", counting):
+            self.assertEqual(self.gw.pending(), [good])
+        self.assertEqual(len(calls), self.gw.RETRY_BLOCKED)              # bounded
+        self.assertEqual(len(self.gw.recovery_blocked()), 9)
+        self.gw.pending()
+        self.assertEqual(self.gw.recovery_blocked(), [])
+
+    def test_136_blocked_attachment_refs_kept_until_quarantined_then_released(self):
+        ev = self.gw.ingest_telegram(self.tg_att()).event
+        self.corrupt([ev.event_id], "garbage")
+        with self.failing("quarantine"):
+            self.gw.pending()
+        self.assertEqual(len(IngressStore(self.db).attachment_state()[1]), 1)   # not torn
+        self.gw.pending()
+        self.assertEqual(IngressStore(self.db).attachment_state()[1], [])       # released
+        self.assertEqual(self.gw.quarantined(), [(ev.event_id, "malformed")])
+
+    def test_137_expiry_clears_blocked_rows(self):
+        bad, good = self.setup_rows()
+        with self.failing("quarantine"):
+            self.gw.pending()
+            later = self.gateway(clock=lambda: T + 7200)
+            self.assertEqual(sorted(later.expire_pending(60)), sorted(bad + [good.event_id]))
+        self.assertEqual(later.recovery_blocked(), [])
+        self.assertEqual(later.pending(), [])
+
+    def test_138_v1_store_upgrades_to_v2(self):
+        import sqlite3
+        self.setup_rows()
+        with sqlite3.connect(self.db) as c:
+            c.execute("DROP TABLE inbox_blocked")
+            c.execute("UPDATE meta SET value='e3.v1' WHERE key='ingress_schema'")
+        gw = self.gateway()
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='ingress_schema'"
+                                       ).fetchone(), ("e3.v2",))
+        with self.failing("quarantine"):
+            gw.pending()
+        self.assertEqual(len(gw.recovery_blocked()), 3)
 
 
 class Structure(unittest.TestCase):

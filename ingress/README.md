@@ -7,7 +7,7 @@ Adapters that turn inbound Telegram updates, email (AgentMail/Gmail raw RFC 5322
 | `events.py` | Provenance kinds, `Segment`, `AttachmentRef`, `InboundEvent`. An import-time assert proves no untrusted kind is in C1's `TRUSTED_SOURCES` and ingress never emits `system_policy`. |
 | `gateway.py` | `IngressGateway.ingest_telegram / ingest_email / ingest_webhook / ingest_web` → `IngressResult`. `vouches(event)` confirms an event was minted here, unchanged. |
 | `content.py` | `IngressLimits`, forwarded/quoted splitting, injection-indicator flags. |
-| `store.py` | `IngressStore` (SQLite dedupe + ingress log, `meta.ingress_schema=e3.v1`; an e3.v0 store is rebuilt to v1 atomically on open, any other version or layout is refused before service) and the `AttachmentStore` seam (`InMemoryAttachmentStore` fake). |
+| `store.py` | `IngressStore` (SQLite dedupe + ingress log, `meta.ingress_schema=e3.v2`; an e3.v0 store is rebuilt atomically on open, e3.v1 gains the `inbox_blocked` table, any other version or layout is refused before service) and the `AttachmentStore` seam (`InMemoryAttachmentStore` fake). |
 | `traces.py` | One C6 `DecisionTrace` per ingress decision. |
 
 ## Provenance (the boundary)
@@ -130,6 +130,11 @@ An accepted event is written to `ingress_inbox` in the **same transaction** as i
   - listed by `gateway.quarantined()` as (event_id, reason), with no content.
 
   `pending(limit, max_scan)` scans with a rowid cursor and examines at most `max_scan` rows per call (default `MAX_SCAN` = 1000). Every call therefore makes forward progress: corrupt rows can't starve later valid ones, across calls and after a restart, and quarantined rows are never re-scanned. The duplicate re-delivery path quarantines in the same way. `expire_pending` is unchanged for valid rows (`test_117`–`test_124`).
+- **Quarantine failure.** If the quarantine write itself fails, `pending()` does not skip it silently:
+  - the row is recorded as **recovery blocked** (`inbox_blocked`: event_id, reason, attempts, timestamps; no content), traced as `quarantine_failed`, and listed by `gateway.recovery_blocked()`;
+  - blocked rows are excluded from later scans, so the next call (also after a restart) reaches later valid rows; if even the block record cannot be written, the row is held in process memory instead, with the same effect;
+  - a blocked row is never returned or acked, and keeps its attachment refs until it is actually quarantined (then released) or expired;
+  - each `pending()` call first retries quarantine for at most `RETRY_BLOCKED` = 16 blocked rows (least recently tried first); success clears the block in the same transaction (`test_131`–`test_138`).
 - **Retention.** `ack` drops the stored text. `expire_pending(max_age_s)` drops the text of events left pending too long. Those events are lost on purpose and traced as `expired`. Quarantine is terminal and keeps only (event_id, reason, timestamps): its text is dropped when it is quarantined, and its attachment refs are released then, as on expiry, so `gc_attachments` can reclaim blobs no live event shares (`test_129`). The id/reason row stays as the operator's audit record, like `handed_off`/`expired` rows.
 - **Idempotency.** `vouches()` is an integrity check, not consumption: it stays true on repeated calls. Single processing comes from the runner's queue, keyed on `event_id`; C2 `TaskStore.submit(f"ingress:{event_id}", …)` is idempotent.
 

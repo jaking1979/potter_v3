@@ -23,9 +23,11 @@ from typing import Iterator, Protocol
 
 from .events import sha256
 
-SCHEMA_VERSION = "e3.v1"
+SCHEMA_VERSION = "e3.v2"
 # e3.v0 -> e3.v1 added ingress_inbox.quarantine_reason and the 'quarantined'
 # status. SQLite cannot alter a CHECK, so the table is rebuilt (see _migrate_v0).
+# e3.v1 -> e3.v2 added the inbox_blocked table (created by the _SCHEMA pass).
+_KNOWN_OLDER = ("e3.v0", "e3.v1")
 _V0_INBOX_COLUMNS = ("event_id", "event_json", "status", "created_at", "updated_at")
 _V1_INBOX_COLUMNS = _V0_INBOX_COLUMNS + ("quarantine_reason",)
 
@@ -79,6 +81,17 @@ _SCHEMA = (
         hkey TEXT PRIMARY KEY,
         sent_at REAL NOT NULL,
         created_at INTEGER NOT NULL)""",
+    # Recovery blocked: a pending row that failed to restore AND whose
+    # quarantine write failed. It is excluded from pending() scans (so it can
+    # never starve later rows), never returned or acked, retried a bounded
+    # number per pending() call, and listed by recovery_blocked(). Holds no
+    # content. Cleared in the same transaction that quarantines or expires it.
+    """CREATE TABLE IF NOT EXISTS inbox_blocked (
+        event_id TEXT PRIMARY KEY,
+        reason TEXT NOT NULL CHECK (reason IN ('malformed','digest_mismatch')),
+        attempts INTEGER NOT NULL CHECK (attempts >= 1),
+        first_failed_at INTEGER NOT NULL,
+        last_failed_at INTEGER NOT NULL)""",
 )
 
 
@@ -104,11 +117,12 @@ class IngressStore:
                 version = self._stored_version(c)
                 if version == "e3.v0":
                     self._migrate_v0(c)
-                elif version not in (None, SCHEMA_VERSION):
+                elif version not in (None, SCHEMA_VERSION) + _KNOWN_OLDER:
                     raise RuntimeError("unsupported ingress schema")
                 for stmt in _SCHEMA:
                     c.execute(stmt)
-                if not self._inbox_is_v1(c):
+                if not (self._inbox_is_v1(c) and self._inbox_columns(c, "inbox_blocked") ==
+                        ("event_id", "reason", "attempts", "first_failed_at", "last_failed_at")):
                     raise RuntimeError("unsupported ingress schema")
                 c.execute("INSERT INTO meta VALUES ('ingress_schema', ?) ON CONFLICT(key)"
                           " DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
@@ -192,7 +206,8 @@ class IngressStore:
         re-reads (or gets stuck on) rows it has already seen."""
         with self._conn() as c:
             return c.execute("SELECT rowid, event_id, event_json FROM ingress_inbox WHERE "
-                             "status='pending' AND rowid > ? ORDER BY rowid LIMIT ?",
+                             "status='pending' AND rowid > ? AND event_id NOT IN"
+                             " (SELECT event_id FROM inbox_blocked) ORDER BY rowid LIMIT ?",
                              (after, limit)).fetchall()
 
     def pending_record(self, event_id: str) -> str | None:
@@ -209,6 +224,30 @@ class IngressStore:
         with self.transaction() as tx:
             return tx.quarantine(event_id, now, reason)
 
+    def block(self, event_id: str, reason: str, now: int) -> bool:
+        """Record that ``event_id`` failed to restore and could not be
+        quarantined. Only a still-pending row can be blocked. Idempotent:
+        repeats bump ``attempts``."""
+        with self.transaction() as tx:
+            status = tx.inbox_status(event_id)
+            if status is None or status[0] != "pending":
+                return False
+            tx._c.execute(
+                "INSERT INTO inbox_blocked VALUES (?,?,1,?,?) ON CONFLICT(event_id) DO UPDATE"
+                " SET attempts=attempts+1, last_failed_at=excluded.last_failed_at",
+                (event_id, reason, now, now))
+            return True
+
+    def blocked(self, limit: int | None = None) -> list[tuple[str, str, int]]:
+        """(event_id, reason, attempts) of still-pending blocked rows, least
+        recently tried first. No content."""
+        with self._conn() as c:
+            return [tuple(r) for r in c.execute(
+                "SELECT b.event_id, b.reason, b.attempts FROM inbox_blocked b JOIN ingress_inbox i"
+                " ON i.event_id=b.event_id WHERE i.status='pending'"
+                " ORDER BY b.last_failed_at, b.event_id LIMIT ?",
+                (-1 if limit is None else limit,))]
+
     def quarantined(self) -> list[tuple[str, str]]:
         """(event_id, reason) only - never stored text."""
         with self._conn() as c:
@@ -224,6 +263,9 @@ class IngressStore:
                                 (event_id,)).fetchone()
             if row is None or row[0] in ("expired", "quarantined"):
                 return False
+            if tx._c.execute("SELECT 1 FROM inbox_blocked WHERE event_id=?",
+                             (event_id,)).fetchone():
+                return False                    # never returned, so never ackable
             tx._c.execute("UPDATE ingress_inbox SET status='handed_off', event_json=NULL, "
                           "updated_at=? WHERE event_id=? AND status='pending'", (now, event_id))
             return True
@@ -239,6 +281,7 @@ class IngressStore:
                               "updated_at=? WHERE event_id=?", [(now, i) for i in ids])
             for event_id in ids:
                 tx.release_refs(event_id, now)
+                tx._c.execute("DELETE FROM inbox_blocked WHERE event_id=?", (event_id,))
             return ids
 
     # ---- attachments ---------------------------------------------------------
@@ -350,6 +393,7 @@ class _Tx:
                               " AND status='pending'", (reason, now, event_id))
         if cur.rowcount != 1:
             return False
+        self._c.execute("DELETE FROM inbox_blocked WHERE event_id=?", (event_id,))
         # The event will never be delivered: release its attachment refs so the
         # blobs become GC candidates (a blob shared with a live event is kept).
         self.release_refs(event_id, now)
