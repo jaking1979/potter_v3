@@ -24,11 +24,13 @@
 
 ``meta.responsibilities_schema`` pins the layout; any other value fails closed.
 
-Upgrades (``e2.v0`` / ``e2.v1`` -> ``e2.v2``) run inside ONE transaction with
+Upgrades (``e2.v0`` / ``e2.v1`` / ``e2.v2`` -> ``e2.v3``) run inside ONE transaction with
 the version bump, so an interrupted upgrade leaves the old version and no
 partial claims. Before ``e2.v1`` there were no claims, and ``e2.v1`` itself was
 reached from ``e2.v0`` with an empty migration, so both reconcile existing E1
-requests (``_reconcile_legacy``). Old E2 code refuses to open the upgraded file
+requests (``_reconcile_legacy``). Every upgrade also records tasks that had
+already FAILED or ESCALATED as delivered (``_baseline_terminal_finals``), since
+``e2.v3`` recovers terminal-failure finals from C2's state. Old E2 code refuses to open the upgraded file
 (its own version check), but a process already running old code cannot be
 fenced from here: stop every old runner before upgrading.
 """
@@ -40,8 +42,9 @@ import sqlite3
 
 from runtime import Database, JournalUnavailable
 
-SCHEMA_VERSION = "e2.v2"
-UPGRADABLE = ("e2.v0", "e2.v1")
+SCHEMA_VERSION = "e2.v3"
+UPGRADABLE = ("e2.v0", "e2.v1", "e2.v2")
+RECONCILE_FROM = ("e2.v0", "e2.v1")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 CLAIMABLE = ("pending", "approved")
 LIVE_TASK_STATES = ("queued", "running", "waiting_approval")
@@ -130,6 +133,18 @@ def _reconcile_legacy(c: sqlite3.Connection, now: float) -> None:
                 _hold(c, task_id, step_id, ref, why, now)
 
 
+def _baseline_terminal_finals(c: sqlite3.Connection, now: float) -> None:
+    """e2.v3 makes terminal FAILED/ESCALATED finals durable (recovered from
+    C2's terminal state). Tasks that already ended under older code were
+    handled best-effort then; record them as delivered, so an upgrade does not
+    re-announce history."""
+    if not _has_table(c, "tasks"):
+        return
+    c.execute("INSERT OR IGNORE INTO responsibility_finals (task_id, responsibility, outcome,"
+              " created_at, delivered_at) SELECT id, kind, state, updated_at, ? FROM tasks"
+              " WHERE state IN ('failed','escalated')", (now,))
+
+
 def _hold(c: sqlite3.Connection, task_id: str, step_id: str, ref: str, reason: str,
           now: float) -> None:
     c.execute("INSERT OR IGNORE INTO responsibility_holds (task_id, step_id, action_ref,"
@@ -146,7 +161,9 @@ def ensure(db: Database, *, now: float = 0.0) -> None:
             got = c.execute("SELECT value FROM meta WHERE key='responsibilities_schema'"
                             ).fetchone()[0]
             if got in UPGRADABLE:
-                _reconcile_legacy(c, now)
+                if got in RECONCILE_FROM:
+                    _reconcile_legacy(c, now)
+                _baseline_terminal_finals(c, now)
                 c.execute("UPDATE meta SET value=? WHERE key='responsibilities_schema'",
                           (SCHEMA_VERSION,))
                 got = SCHEMA_VERSION

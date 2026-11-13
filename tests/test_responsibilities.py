@@ -967,7 +967,7 @@ class UpgradeFromLegacy(Base):
 
     def upgraded(self, **kw):
         w = rw.World(self.tmp, **kw)
-        self.assertEqual(schema_version(self.tmp), "e2.v2")
+        self.assertEqual(schema_version(self.tmp), "e2.v3")
         return w
 
     def claim(self, w, task_id):
@@ -1115,7 +1115,7 @@ class UpgradeFromLegacy(Base):
                              cwd=str(HERE), capture_output=True, text=True, timeout=120)
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("JournalUnavailable", out.stderr)
-        self.assertIn("e2.v2", out.stderr)
+        self.assertIn("e2.v3", out.stderr)
 
 
 class ScheduleOrdering(Base):
@@ -1415,6 +1415,196 @@ class FinalMarkedOnlyOnProof(Base):
         w2.notifier.kill.clear()
         self.assertEqual(w2.runner.deliver_pending_finals(), 1)
         self.assertEqual(self.finals(w2, task.id), (True, 1))
+
+
+class TerminalFinalsAreDurable(Base):
+    """Dolores @6f073f4 (reproduced): FAILED / ESCALATED / rejected-approval
+    paths committed the terminal state and then sent their final messages
+    with no durable record, so a crash in between lost the long-work final
+    and the failure alert for good."""
+
+    class Crash(BaseException):
+        pass
+
+    def crash_at_record(self, w):
+        def boom(*a, **k):
+            raise self.Crash()
+        w.runner._record_terminal = boom
+
+    def counts(self, w, job, task_id):
+        with w.db.read() as c:
+            rows = [r[0] for r in c.execute("SELECT notification_id FROM outbox WHERE"
+                                            " channel='telegram'")]
+            fin = c.execute("SELECT outcome, delivered_at FROM responsibility_finals WHERE"
+                            " task_id=?", (task_id,)).fetchone()
+        return {"alert": rows.count(f"job:{job}:{task_id}"),
+                "final": rows.count(f"work:{job}:{task_id}:final"),
+                "escalation": rows.count(f"job:potter.ops:escalation:task:{task_id}"),
+                "finals": None if fin is None else (fin[0], fin[1] is not None)}
+
+    def fatal_def(self, rid="notes.fatal", long=True, delivery="josh"):
+        holder = {}
+
+        def boom_params(ctx):
+            if long:
+                holder["w"].now += 31          # the run has been going for 30 s+
+            raise ValueError("cannot bind")    # -> _Fatal -> FAILED
+
+        d = Responsibility(rid, Schedule(3600.0), delivery,
+                           (rw.Step("s1", "notes.append", "append", "notes/x", rw.CONNECTOR,
+                                    parameters=boom_params),))
+        return d, holder
+
+    def reopen(self, w, defs, **kw):
+        w2 = rw.World(self.tmp, worker="w-reopened", definitions=defs, **kw)
+        w2.now = w.now + 5
+        return w2
+
+    def test_failed_crash_after_commit_is_recovered_once(self):
+        d, holder = self.fatal_def()
+        w = self.world(definitions=[d])
+        holder["w"] = w
+        w.runner.tick()
+        self.crash_at_record(w)
+        with self.assertRaises(self.Crash):
+            w.runner.run_once()
+        tid = w.runner.tasks.by_trigger(f"resp:notes.fatal:slot:{int(rw.T0 // 3600)}").id
+        self.assertEqual(w.runner.tasks.get(tid).state, "failed")
+        self.assertEqual(self.counts(w, "notes.fatal", tid),
+                         {"alert": 0, "final": 0, "escalation": 0, "finals": None})
+        w2 = self.reopen(w, [d])
+        holder["w"] = w2
+        for _ in range(3):
+            w2.runner.deliver_pending_finals()
+            w2.runner.report_progress()
+            w2.runner.watchdog()
+        self.assertEqual(self.counts(w2, "notes.fatal", tid),
+                         {"alert": 1, "final": 1, "escalation": 0, "finals": ("failed", True)})
+        final = w2.body(f"work:notes.fatal:{tid}:final")
+        self.assertEqual((final["outcome"], final["receipt"]), ("failed", receipt_link(tid)))
+
+    def test_failed_crash_before_commit_announces_nothing_until_it_really_fails(self):
+        d, holder = self.fatal_def(long=False)
+        w = self.world(definitions=[d])
+        holder["w"] = w
+        w.runner.tick()
+
+        def boom(*a, **k):
+            raise self.Crash()
+
+        real = w.runner.tasks.fail
+        w.runner.tasks.fail = boom
+        with self.assertRaises(self.Crash):
+            w.runner.run_once()
+        tid = w.runner.tasks.by_trigger(f"resp:notes.fatal:slot:{int(rw.T0 // 3600)}").id
+        self.assertEqual(w.runner.tasks.get(tid).state, "running")
+        w.runner.deliver_pending_finals()
+        self.assertEqual(self.counts(w, "notes.fatal", tid),
+                         {"alert": 0, "final": 0, "escalation": 0, "finals": None})
+        w.runner.tasks.fail = real
+        w2 = self.reopen(w, [d])
+        w2.now = w.now + 10_000                # dead worker's lease expired
+        holder["w"] = w2
+        w2.runner.run_pending()
+        self.assertEqual(w2.runner.tasks.get(tid).state, "failed")
+        self.assertEqual(self.counts(w2, "notes.fatal", tid)["alert"], 1)
+        self.assertEqual(self.counts(w2, "notes.fatal", tid)["finals"], ("failed", True))
+
+    def test_escalated_crash_after_commit_is_recovered_once(self):
+        w = self.world(definitions=[rw.batch(n=1)])
+
+        def slow_fail(eff):
+            w.now += 31
+            rw.fail_definitely(eff)
+
+        w.ext.hooks["s1"] = ("before", slow_fail)
+        w.runner.tick()
+        self.assertEqual([w.runner.run_once().outcome for _ in range(2)], ["retry", "retry"])
+        self.crash_at_record(w)
+        with self.assertRaises(self.Crash):
+            w.runner.run_once()                # third failure escalates, then crash
+        tid = w.runner.tasks.by_trigger(f"resp:notes.batch:slot:{int(rw.T0 // 3600)}").id
+        self.assertEqual(w.runner.tasks.get(tid).state, ESCALATED)
+        w2 = self.reopen(w, [rw.batch(n=1)])
+        for _ in range(2):
+            w2.runner.watchdog()
+            w2.runner.report_progress()
+        c = self.counts(w2, "notes.batch", tid)
+        self.assertEqual((c["final"], c["escalation"], c["alert"], c["finals"]),
+                         (1, 1, 0, ("escalated", True)))
+        self.assertEqual(w2.body(f"work:notes.batch:{tid}:final")["outcome"], "escalated")
+
+    def test_rejected_approval_crash_after_commit_is_recovered_once(self):
+        w = self.world()
+        w.runner.on_event("bill.due", {"id": "deny-1", "amount": 5})
+        r = w.runner.run_once()
+        self.assertEqual(w.say(f"/deny {r.detail}").outcome, "denied")
+        self.crash_at_record(w)
+        with self.assertRaises(self.Crash):
+            w.runner.poll_approvals()
+        self.assertEqual(w.runner.tasks.get(r.task_id).state, "failed")
+        self.assertEqual(self.counts(w, "bill.watch", r.task_id)["alert"], 0)
+        w2 = self.reopen(w, [rw.batch(), rw.bill_watch()])
+        w2.runner.deliver_pending_finals()
+        w2.runner.deliver_pending_finals()
+        c = self.counts(w2, "bill.watch", r.task_id)
+        self.assertEqual((c["alert"], c["finals"]), (1, ("failed", True)))
+        self.assertEqual(w2.ext.calls("pay"), 0)
+
+    def test_escalation_inside_claim_is_backfilled(self):
+        # C2 escalates a task whose lease expired three times inside claim();
+        # the runner never sees that transition, the sweep does.
+        w = self.world(definitions=[rw.batch(n=1)])
+        w.runner.tick()
+        for i in range(3):
+            self.assertIsNotNone(w.runner.tasks.claim(f"dead-{i}", 1))
+            w.now += 5
+        w.runner.tasks.claim("dead-x", 1)        # 3rd expiry escalates the task
+        tid = w.runner.tasks.by_trigger(f"resp:notes.batch:slot:{int(rw.T0 // 3600)}").id
+        self.assertEqual(w.runner.tasks.get(tid).state, ESCALATED)
+        w.runner.deliver_pending_finals()
+        self.assertEqual(self.counts(w, "notes.batch", tid)["finals"], ("escalated", True))
+
+    def test_silent_failure_owes_nothing_and_is_marked(self):
+        d, holder = self.fatal_def(rid="notes.quietfail", delivery="silent")
+        w = self.world(definitions=[d])
+        holder["w"] = w
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "failed")
+        c = self.counts(w, "notes.quietfail", r.task_id)
+        self.assertEqual((c["alert"], c["final"], c["finals"]), (0, 0, ("failed", True)))
+
+    def test_kill_keeps_a_failure_final_pending_until_cleared(self):
+        d, holder = self.fatal_def()
+        w = self.world(definitions=[d])
+        holder["w"] = w
+        w.runner.tick()
+        self.crash_at_record(w)
+        with self.assertRaises(self.Crash):
+            w.runner.run_once()
+        tid = w.runner.tasks.by_trigger(f"resp:notes.fatal:slot:{int(rw.T0 // 3600)}").id
+        _set_kill(w)
+        w2 = self.reopen(w, [d])
+        w2.runner.deliver_pending_finals()
+        self.assertEqual(self.counts(w2, "notes.fatal", tid)["finals"], ("failed", False))
+        w2.notifier.kill.clear()
+        w2.runner.deliver_pending_finals()
+        c = self.counts(w2, "notes.fatal", tid)
+        self.assertEqual((c["alert"], c["final"], c["finals"]), (1, 1, ("failed", True)))
+
+    def test_upgrade_does_not_reannounce_failures_handled_by_old_code(self):
+        out = subprocess.run([sys.executable, str(HERE / "legacy_fixture.py"), "e2_467b2b9",
+                              "denied_polled", self.tmp], capture_output=True, text=True,
+                             timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        tid = json.loads(out.stdout.strip().splitlines()[-1])["task_id"]
+        w = rw.World(self.tmp)
+        before = w.outbox_ids()
+        w.runner.deliver_pending_finals()
+        w.runner.watchdog()
+        self.assertEqual(w.outbox_ids(), before)          # nothing re-announced
+        self.assertEqual(self.counts(w, "bill.watch", tid)["finals"], ("failed", True))
 
 
 class Structure(Base):

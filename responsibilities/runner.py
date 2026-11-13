@@ -533,9 +533,10 @@ class ResponsibilityRunner:
                 why = "missing" if pa is None else ("expired" if pa.status == "pending"
                                                     else pa.status)
                 t = self.tasks.approval_resolved(tid, False, error=f"approval {why}")
-            self._report(d, tid, t.state)
             if t.state in TERMINAL:
-                self._final_messages(d, t, None)
+                self._record_terminal(d, t)
+            else:
+                self._report(d, tid, t.state)
             out.append(RunResult(tid, d.id, QUEUED if t.state == QUEUED else t.state))
         return out
 
@@ -589,8 +590,11 @@ class ResponsibilityRunner:
 
         What is owed is fixed at completion (``finals.created_at``): a final
         message if the run was long work (30 s or more since its first report),
-        nothing for a short or silent run. The marker is set only when nothing
-        is owed, or when E1's outbox holds this task's ``work:...:final`` row.
+        nothing for a short or silent run; for FAILED (not silent) also the
+        failure alert with its receipt. The marker is set only when nothing
+        is owed, or when E1's outbox holds every owed row (``work:...:final``,
+        and for FAILED ``job:<id>:<task>``). ESCALATED is announced through the
+        ops job's own durable escalation sweep.
         Any notifier failure (kill flag, a missing recipient address, anything
         else) leaves the marker pending for the next sweep; ``NotifierError``
         is never read as "already finished" on its own. A final whose
@@ -607,6 +611,16 @@ class ResponsibilityRunner:
         if d is None:
             return False                       # never mark what we cannot deliver
         owed = False
+        alert_owed = outcome == FAILED and not self._handles[d.id].silent
+        if alert_owed and not self._outbox_has(f"job:{d.id}:{task_id}"):
+            if self.kill.is_set():
+                return False
+            try:
+                with self.db.tx() as c:
+                    self._handles[d.id].notify(c, task_id, kind="alert",
+                                               text=f"{d.id} failed. Receipt: {receipt_link(task_id)}")
+            except NotifierError:
+                pass                           # judged below, by the outbox
         if not self._handles[d.id].silent:
             lw = self._long_work(d, task_id)
             owed = lw is not None and completed_at - lw[1] >= LONG_WORK_ACK_S
@@ -623,20 +637,27 @@ class ResponsibilityRunner:
                         pass
         if owed and not self._final_enqueued(d, task_id):
             return False                       # retried by the next sweep
+        if alert_owed and not self._outbox_has(f"job:{d.id}:{task_id}"):
+            return False
         with self.db.tx() as c:
             c.execute("UPDATE responsibility_finals SET delivered_at=? WHERE task_id=?"
                       " AND delivered_at IS NULL", (self._now(), task_id))
         return True
 
     def _final_enqueued(self, d: Responsibility, task_id: str) -> bool:
-        """Durable proof: E1's outbox holds this task's long-work final.
-        Read-only over C3's table (no E1 API answers this; see README gaps)."""
+        return self._outbox_has(f"work:{d.id}:{task_id}:final")
+
+    def _outbox_has(self, notification_id: str) -> bool:
+        """Durable proof: E1's outbox holds this notification. Read-only over
+        C3's table (no E1 API answers this; see README gaps)."""
         with self.db.read() as c:
             return c.execute("SELECT 1 FROM outbox WHERE notification_id=? LIMIT 1",
-                             (f"work:{d.id}:{task_id}:final",)).fetchone() is not None
+                             (notification_id,)).fetchone() is not None
 
     def deliver_pending_finals(self) -> int:
-        """Recovery sweep: re-deliver every committed-but-undelivered final."""
+        """Recovery sweep: re-deliver every committed-but-undelivered final,
+        including terminal failures whose finals row a crash prevented."""
+        self._backfill_terminal_finals()
         with self.db.read() as c:
             ids = [r[0] for r in c.execute("SELECT task_id FROM responsibility_finals"
                                            " WHERE delivered_at IS NULL ORDER BY created_at")]
@@ -702,37 +723,38 @@ class ResponsibilityRunner:
                       (task_id, ref, approval_id, self._now()))
             c.execute("DELETE FROM responsibility_holds WHERE task_id=?", (task_id,))
 
-    def _final_messages(self, d: Responsibility, task: Task, text: str | None, *,
-                        outcome: str | None = None) -> bool:
-        """Enqueue the final messages. False if the kill flag stopped them."""
-        outcome = outcome or task.state
-        receipt = receipt_link(task.id)
-        try:
-            lw = self._long_work(d, task.id)
-            # Long work = ran 30 s or more since its first report. Decided from
-            # the persisted start time, not from whether an ack was recorded.
-            if lw is not None and self._now() - lw[1] >= LONG_WORK_ACK_S:
-                lw[0].finish(receipt, self._now(), outcome=outcome)
-            handle = self._handles[d.id]
-            with self.db.tx() as c:
-                if outcome == DONE and text:
-                    handle.notify(c, task.id, kind="job_result", text=f"{text} Receipt: {receipt}")
-                elif outcome == FAILED:
-                    handle.notify(c, task.id, kind="alert",
-                                  text=f"{d.id} failed. Receipt: {receipt}")
-                # ESCALATED: the escalation alert goes through the ops job.
-        except Stopped:
-            return False
-        return True
+    def _record_terminal(self, d: Responsibility, t: Task) -> None:
+        """After C2 committed a FAILED / ESCALATED state: record that its final
+        messages are owed, then deliver them. C2's terminal state is itself the
+        durable record, so a crash between that commit and this call is
+        recovered by ``deliver_pending_finals`` (``_backfill_terminal_finals``)."""
+        with self.db.tx() as c:
+            c.execute("INSERT OR IGNORE INTO responsibility_finals (task_id, responsibility,"
+                      " outcome, created_at) VALUES (?,?,?,?)", (t.id, d.id, t.state, self._now()))
+        self._deliver_final(t.id)
+
+    def _backfill_terminal_finals(self) -> None:
+        """Every FAILED / ESCALATED task of these responsibilities without a
+        finals row gets one (completion time = the task's last update)."""
+        if not self._defs:
+            return
+        marks = ",".join("?" * len(self._defs))
+        with self.db.tx() as c:
+            c.execute("INSERT OR IGNORE INTO responsibility_finals (task_id, responsibility,"
+                      " outcome, created_at) SELECT t.id, t.kind, t.state, t.updated_at"
+                      f" FROM tasks t WHERE t.state IN (?,?) AND t.kind IN ({marks})"
+                      " AND NOT EXISTS (SELECT 1 FROM responsibility_finals f"
+                      " WHERE f.task_id = t.id)", (FAILED, ESCALATED, *self._defs))
 
     def _retry(self, d: Responsibility, task: Task, error: str, outcome: str) -> RunResult:
         try:
             t = self.tasks.fail(task.id, self._worker, error, retryable=True)
         except LeaseLost:
             return RunResult(task.id, d.id, OUT_LEASE_LOST)
-        self._report(d, task.id, t.state)
         if t.state in TERMINAL:
-            self._final_messages(d, t, None)
+            self._record_terminal(d, t)
+        else:
+            self._report(d, task.id, t.state)
         return RunResult(task.id, d.id, OUT_ESCALATED if t.state == ESCALATED else outcome, error)
 
     def _fatal(self, d: Responsibility, task: Task, error: str) -> RunResult:
@@ -740,8 +762,7 @@ class ResponsibilityRunner:
             t = self.tasks.fail(task.id, self._worker, error, retryable=False)
         except LeaseLost:
             return RunResult(task.id, d.id, OUT_LEASE_LOST)
-        self._report(d, task.id, t.state)
-        self._final_messages(d, t, None)
+        self._record_terminal(d, t)
         return RunResult(task.id, d.id, OUT_ESCALATED if t.state == ESCALATED else OUT_FAILED,
                          error)
 

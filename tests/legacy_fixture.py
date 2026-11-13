@@ -16,6 +16,7 @@ Scenarios (bill.watch: a lookup step, then a pay step that needs approval):
   none             waiting, no request (worker died between parking and issuing)
   multiple         waiting, two pending requests for the same action (the old race)
   multiple_queued  as multiple, then the newer one approved and polled: queued
+  denied_polled    denied and polled: FAILED under the old code (alert sent then)
 """
 from __future__ import annotations
 
@@ -71,6 +72,9 @@ def build(legacy: str, scenario: str, tmp: str) -> dict:
         w.runner.poll_approvals()
     elif scenario == "terminal":
         assert w.say(f"/deny {r.detail}").outcome == "denied"
+    elif scenario == "denied_polled":
+        assert w.say(f"/deny {r.detail}").outcome == "denied"
+        w.runner.poll_approvals()
     elif scenario in ("multiple", "multiple_queued"):
         task = w.runner.tasks.get(r.task_id)
         action = w.runner._waiting_step(task)[2]
