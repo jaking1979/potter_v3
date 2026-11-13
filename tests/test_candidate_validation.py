@@ -8,6 +8,28 @@ from dataclasses import replace
 from model_broker.broker import Broker, Candidate, Caps, Refused, Request
 
 class InvalidCandidateTests(unittest.TestCase):
+    def test_json_config_conversion_is_bounded_and_detached(self):
+        fields = dict(model='m', provider='p', approved=True,
+                      validated_tasks=['research'], privacy_classes=['private'],
+                      expected_usd_micros=1, worst_usd_micros=2)
+        candidate = Candidate.from_json_config(fields)
+        fields['validated_tasks'].append('later')
+        self.assertEqual(candidate.validated_tasks, frozenset({'research'}))
+        self.assertEqual(candidate.privacy_classes, frozenset({'private'}))
+        good = {**fields, 'validated_tasks': ['research']}
+        bads = ({**good, 'validated_tasks': ['x'] * 65},
+                {**good, 'privacy_classes': ['private', 'private']},
+                {**good, 'privacy_classes': [False]},
+                {**good, 'privacy_classes': ['x' * 201]},
+                {**good, 'privacy_classes': iter(['private'])},
+                {**good, 'unknown_secret_key': 'secret'})
+        for bad in bads:
+            with self.subTest(case=type(bad.get('privacy_classes'))):
+                with self.assertRaisesRegex(ValueError, '^malformed_candidate$'):
+                    Candidate.from_json_config(bad)
+        boundary = {**good, 'privacy_classes': [str(i) for i in range(64)]}
+        self.assertEqual(len(Candidate.from_json_config(boundary).privacy_classes), 64)
+
     def test_config_factory_validates_and_reserve_rechecks(self):
         fields = dict(model='m', provider='p', approved=True,
                       validated_tasks=frozenset({'research'}),
