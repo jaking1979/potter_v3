@@ -42,7 +42,7 @@ import enum
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
@@ -160,6 +160,7 @@ class Decision:
     action_hash: str | None = None
     # Holds action parameters: never logged, never in repr, never traced.
     intent: c0.EffectIntent | None = field(default=None, repr=False, compare=False)
+    task_id: str | None = None  # correlation only; not authenticated ownership
 
     @property
     def allowed(self) -> bool:
@@ -167,10 +168,13 @@ class Decision:
 
     def trace_record(self) -> dict[str, Any]:
         """Redaction-safe record for C6 tracing."""
-        return {"decision_id": self.decision_id, "outcome": self.outcome,
+        record = {"decision_id": self.decision_id, "outcome": self.outcome,
                 "reason_code": self.reason_code, "capability": self.capability,
                 "risk": self.risk, "action_hash": self.action_hash,
                 "effect_id": self.intent.effect_id if self.intent else None}
+        if self.task_id is not None:
+            record["task_id"] = self.task_id
+        return record
 
 
 class _ProbeLedger:
@@ -224,12 +228,22 @@ class PolicyEngine:
                 raise TypeError
         except Exception:
             decision_id = _default_id("dec")
+        task_id = None
         try:
+            self._check_shape(request)
+            candidate = request.action.task_id
+            try:
+                if isinstance(candidate, str) and str(uuid.UUID(candidate)) == candidate:
+                    task_id = candidate
+            except (ValueError, AttributeError):
+                pass  # keep the policy result, but do not invent C6 attribution
             decision = self._decide(decision_id, request)
         except _Deny as d:
             decision = self._make(decision_id, DENY, d.code)
         except Exception:
             decision = self._make(decision_id, DENY, "engine_error")
+        if task_id is not None:
+            decision = replace(decision, task_id=task_id)
         try:
             self._trace(decision.trace_record())
         except Exception:
