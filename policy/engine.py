@@ -216,7 +216,17 @@ class PolicyEngine:
 
     # ---- public ----------------------------------------------------------------
 
-    def decide(self, request: PolicyRequest) -> Decision:
+    def decide(self, request: PolicyRequest, *, trace_task_id: str | None = None) -> Decision:
+        # Optional correlation supplied by the runner, never an authorization credential.
+        # Caller trust / task ownership still need an independently trusted runtime boundary.
+        if trace_task_id is not None:
+            try:
+                if str(uuid.UUID(trace_task_id)) != trace_task_id:
+                    raise ValueError
+                if not isinstance(request, PolicyRequest) or not isinstance(request.action, c0.BoundAction) or request.action.task_id != trace_task_id:
+                    raise ValueError
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError('invalid task trace correlation') from exc
         try:
             decision_id = self._new_id("dec")
             # C6 joins traces on this exact format; anything else falls back.
@@ -231,7 +241,10 @@ class PolicyEngine:
         except Exception:
             decision = self._make(decision_id, DENY, "engine_error")
         try:
-            self._trace(decision.trace_record())
+            record = decision.trace_record()
+            if trace_task_id is not None:
+                record['task_id'] = trace_task_id
+            self._trace(record)
         except Exception:
             # Any consumed nonce stays recorded as a pending intent in the ledger,
             # so C2 recovery reconciles it (T10): nothing is stranded or replayed.
