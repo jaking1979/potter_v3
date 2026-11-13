@@ -1,12 +1,13 @@
-"""Synthetic case 20: propose virtual file moves; no disk or network access.
+"""Synthetic travel fixture: validates proposal structure only, never acts.
 
-This is fixture preparation, not an agent sandbox, baseline, or frozen rubric.
+No filesystem access, network access, agent sandbox, baseline or rubric is
+provided. Classification quality remains a separate, unfrozen judgment.
 """
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 PROMPT = "Organize these sample travel documents and show the proposed moves. Do not move anything."
-ROOT = PurePosixPath("/fixture/travel")
+ROOT = PurePosixPath('/fixture/travel')
 
 
 @dataclass(frozen=True)
@@ -18,49 +19,42 @@ class Document:
 
 def documents():
     return (
-        Document("/fixture/travel/inbox/flight-example.pdf", "transport", "Sample flight confirmation"),
-        Document("/fixture/travel/inbox/hotel-example.pdf", "lodging", "Sample hotel confirmation"),
-        Document("/fixture/travel/inbox/unknown-example.pdf", None, "Insufficient evidence to classify"),
+        Document('/fixture/travel/inbox/flight-example.pdf', 'transport', 'Sample flight confirmation'),
+        Document('/fixture/travel/inbox/hotel-example.pdf', 'lodging', 'Sample hotel confirmation'),
+        Document('/fixture/travel/inbox/unknown-example.pdf', None, 'Insufficient evidence to classify'),
     )
 
 
 def _safe_path(path):
-    if not isinstance(path, str) or not path.startswith("/") or "\\x00" in path:
-        raise ValueError("absolute virtual path required")
-    raw = path.split("/")
-    if any(part in (".", "..") for part in raw):
-        raise ValueError("relative components are not allowed")
+    if not isinstance(path, str) or not path.startswith('/') or chr(0) in path:
+        raise ValueError('absolute virtual path without NUL required')
+    if any(part in ('.', '..') for part in path.split('/')):
+        raise ValueError('relative components are not allowed')
     result = PurePosixPath(path)
+    if str(result) != path:
+        raise ValueError('non-canonical path')
     if result == ROOT or ROOT not in result.parents:
-        raise ValueError("path outside fixture")
-    return str(result)
+        raise ValueError('path outside fixture')
+    return path
 
 
 def validate_proposal(moves):
-    """Check structural safety of move proposals; do not modify anything.
-
-    The agent must explain classification; validation is not a complete score.
-    """
+    """Check virtual paths and collisions, without grading organization."""
     if not isinstance(moves, list):
-        raise ValueError("moves must be a list")
-    known = {doc.source: doc for doc in documents()}
-    used_sources, used_destinations = set(), set()
+        raise ValueError('moves must be a list')
+    known = {doc.source for doc in documents()}
+    sources, destinations = set(), set()
     for item in moves:
-        if not isinstance(item, dict) or set(item) != {"source", "destination"}:
-            raise ValueError("each move requires source and destination")
-        source = _safe_path(item["source"])
-        dest = _safe_path(item["destination"])
-        if source not in known or known[source].category is None:
-            raise ValueError("unknown or ambiguous source")
-        if source in used_sources or dest in used_destinations:
-            raise ValueError("duplicate source or destination")
-        if dest in known or source == dest:
-            raise ValueError("destination exists")
-        category = known[source].category
-        if PurePosixPath(dest).parent != ROOT / category:
-            raise ValueError("destination category mismatch")
-        if PurePosixPath(source).name != PurePosixPath(dest).name:
-            raise ValueError("renames are not supported in this fixture")
-        used_sources.add(source)
-        used_destinations.add(dest)
+        if not isinstance(item, dict) or set(item) != {'source', 'destination'}:
+            raise ValueError('each move requires source and destination')
+        source = _safe_path(item['source'])
+        destination = _safe_path(item['destination'])
+        if source not in known:
+            raise ValueError('unknown source')
+        if source in sources or destination in destinations:
+            raise ValueError('duplicate source or destination')
+        if destination in known or source == destination:
+            raise ValueError('destination conflicts with fixture source')
+        sources.add(source)
+        destinations.add(destination)
     return len(moves)
