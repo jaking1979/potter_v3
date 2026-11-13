@@ -10,6 +10,12 @@
   still holds an unexpired lease (LeaseLost otherwise). A task whose lease
   expired (worker killed) is reclaimed by the next ``claim`` and resumes from
   its persisted checkpoint; its effects are protected by the effect journal.
+* Release: the live lease holder can hand a running task back to ``queued``
+  without recording a failure (``release``): a pause such as a kill flag.
+* Caller transactions: ``submit`` and ``complete`` accept ``tx=``, the
+  caller's open ``Database.tx()`` transaction, so their writes commit or roll
+  back with the caller's own. Time is still sampled under the write lock, all
+  lease checks still run, and nothing is committed or rolled back for the caller.
 * Escalation: ``escalate_after`` (3) consecutive failures of a task - an
   explicit ``fail`` or an expired lease - move it to ``escalated`` and fire the
   ``escalate`` callback once. A scheduled job escalates after 3 consecutive
@@ -24,8 +30,10 @@ per escalation. A crash between commit and callback loses the notification
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import math
+import os
 import sqlite3
 import time
 import uuid
@@ -249,13 +257,16 @@ class TaskStore:
 
     # -- submission / claiming --------------------------------------------
     def submit(self, trigger_key: str, kind: str, payload: Any = None, *,
-               job: str | None = None, now: float | None = None) -> tuple[Task, bool]:
+               job: str | None = None, now: float | None = None,
+               tx: sqlite3.Connection | None = None) -> tuple[Task, bool]:
         """Create the task for ``trigger_key`` unless it exists. Returns
-        (task, created). Payloads are JSON and must never contain secrets."""
+        (task, created). Payloads are JSON and must never contain secrets.
+        ``tx``: the caller's open write transaction (see ``_in``), so the insert
+        commits or rolls back with the caller's own writes."""
         if not trigger_key or not kind:
             raise ValueError("trigger_key and kind required")
         tid = task_id_for(trigger_key)
-        with self.db.tx() as c:
+        with self._in(tx) as c:
             now = self._now(now)   # sampled under the write lock, not before it
             cur = c.execute("INSERT OR IGNORE INTO tasks (id, trigger_key, kind, job, payload, state,"
                             " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -362,8 +373,24 @@ class TaskStore:
         self._fire(fired)   # only reached once the transaction committed
         return out
 
-    def complete(self, task_id: str, worker_id: str, *, now: float | None = None) -> Task:
+    def release(self, task_id: str, worker_id: str, *, now: float | None = None) -> Task:
+        """Hand a running task back to ``queued`` WITHOUT recording a failure:
+        a pause (e.g. a kill flag), not an error. Only the live lease holder
+        may release: the lease (owner, expiry, clock rollback) is checked inside
+        the write transaction, with time sampled under the lock. Task and job
+        failure counters are untouched; the next claim resumes from the
+        persisted checkpoint."""
         with self.db.tx() as c:
+            now = self._now(now)   # sampled under the write lock, not before it
+            self._owned(c, task_id, worker_id, now)
+            return self._move(c, task_id, RUNNING, QUEUED, now)
+
+    def complete(self, task_id: str, worker_id: str, *, now: float | None = None,
+                 tx: sqlite3.Connection | None = None) -> Task:
+        """``tx``: the caller's open write transaction (see ``_in``), so the
+        terminal state commits atomically with the caller's own writes (e.g. a
+        finals row). The lease is checked inside it, at lock time."""
+        with self._in(tx) as c:
             now = self._now(now)   # sampled under the write lock, not before it
             t = self._owned(c, task_id, worker_id, now)
             out = self._move(c, task_id, RUNNING, DONE, now)
@@ -395,6 +422,27 @@ class TaskStore:
         return self.get(task_id_for(trigger_key))
 
     # -- internals ---------------------------------------------------------
+    def _in(self, tx: sqlite3.Connection | None):
+        """The caller's open write transaction, or a fresh one of our own.
+
+        A caller-supplied ``tx`` must be an open transaction on THIS database
+        (normally ``Database.tx()``, i.e. BEGIN IMMEDIATE). Before anything is
+        read or the clock is sampled, a no-op write makes sure the write lock is
+        held: with BEGIN IMMEDIATE it already is; a deferred transaction takes
+        it here, or fails if its snapshot is stale. The caller owns the
+        transaction: nothing is committed or rolled back on its behalf, and any
+        exception propagates so the caller's own writes roll back with ours."""
+        if tx is None:
+            return self.db.tx()
+        if not isinstance(tx, sqlite3.Connection) or not tx.in_transaction:
+            raise ValueError("tx must be an open write transaction (Database.tx())")
+        files = {os.path.realpath(r[2]) for r in tx.execute("PRAGMA database_list") if r[1] == "main"}
+        if files != {os.path.realpath(self.db.path)}:
+            raise ValueError("tx belongs to a different database")
+        tx.execute("UPDATE meta SET value=value WHERE key='schema'")   # hold the write lock now
+        return contextlib.nullcontext(tx)
+
+
     def _move(self, c: sqlite3.Connection, task_id: str, src: str, dst: str, now: float,
               error: str | None = None) -> Task:
         _check(src, dst)

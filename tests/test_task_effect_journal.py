@@ -209,6 +209,27 @@ def _late_dispatcher(db, ext_path, dedupe, key, started, go, q):
         q.put(repr(exc))
 
 
+def _crash_in_caller_tx(db, op, ready):
+    """Open the caller's own transaction, write the caller's row and the C2 row
+    in it, then die before COMMIT (os._exit skips every cleanup)."""
+    database = Database(db)
+    store = TaskStore(database)
+    if op == "release":
+        store.release(task_id_for("crash:release"), "w", now=T + 1)   # its own committed tx
+        ready.set()
+        os._exit(1)
+    c = database._connect()
+    c.execute("BEGIN IMMEDIATE")
+    if op == "submit":
+        c.execute("INSERT INTO caller_rows VALUES ('watermark', 1)")
+        store.submit("crash:submit", "x", now=T + 1, tx=c)
+    elif op == "complete":
+        c.execute("INSERT INTO caller_rows VALUES ('final', 1)")
+        store.complete(task_id_for("crash:complete"), "w", now=T + 1, tx=c)
+    ready.set()
+    os._exit(1)
+
+
 def _submit_worker(db, barrier, q):
     store = TaskStore(db)
     barrier.wait(30)
@@ -1724,16 +1745,7 @@ class NonFiniteLeases(_TmpDB):
         self.assertEqual(self.store.claim("w2", LEASE, now=T + 41).lease_owner, "w2")
 
 
-class LeaseClockUnderLock(_TmpDB):
-    """Trusted time is sampled after the write lock is held (Dolores review
-    of 0564323): a lease operation that waits on the lock past its lease's
-    expiry is refused, and the reclaim at that time succeeds."""
-
-    def setUp(self):
-        super().setUp()
-        self.t = [T]
-        self.timed = TaskStore(self.db, clock=lambda: self.t[0], escalate_after=10)
-
+class _LockHolder:
     def _blocked(self, op, advance_to):
         """Run ``op`` while another connection holds the write lock; the clock
         advances to ``advance_to`` before the lock is released."""
@@ -1757,6 +1769,18 @@ class LeaseClockUnderLock(_TmpDB):
             return op()
         finally:
             th.join(30)
+
+
+
+class LeaseClockUnderLock(_LockHolder, _TmpDB):
+    """Trusted time is sampled after the write lock is held (Dolores review
+    of 0564323): a lease operation that waits on the lock past its lease's
+    expiry is refused, and the reclaim at that time succeeds."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = [T]
+        self.timed = TaskStore(self.db, clock=lambda: self.t[0], escalate_after=10)
 
     def test_lease_ops_waiting_on_the_lock_past_expiry_are_refused(self):
         ops = {"heartbeat": lambda tid: self.timed.heartbeat(tid, "w", LEASE),
@@ -1804,6 +1828,205 @@ class LeaseClockUnderLock(_TmpDB):
         t = TaskStore(self.db).get(task.id)                # restart: nothing changed
         self.assertEqual((t.state, t.lease_expires_at, t.updated_at), (RUNNING, T + 40, T + 10))
         self.assertEqual(self.store.complete(task.id, "w", now=T + 11).state, DONE)   # forward clock ok
+
+
+class CallerTransactionSeams(_LockHolder, _TmpDB):
+    """submit(tx=)/complete(tx=)/release() seams E2 builds on: atomic with the
+    caller's writes, time sampled under the lock, leases still enforced."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = [T]
+        self.timed = TaskStore(self.db, clock=lambda: self.t[0], escalate_after=10)
+        with _sql(self.db) as c:                           # a caller-owned table in the same file
+            c.execute("CREATE TABLE IF NOT EXISTS caller_rows (name TEXT PRIMARY KEY, v INTEGER)")
+        self.database = Database(self.db)
+
+    def _committed_state(self, task_id):
+        """Read what is committed, from a separate plain connection (WAL readers
+        never wait for the caller's write lock)."""
+        with _sql(self.db) as c:
+            row = c.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return row[0] if row else None
+
+    def _caller_rows(self):
+        with _sql(self.db) as c:
+            return sorted(r[0] for r in c.execute("SELECT name FROM caller_rows"))
+
+    def _running(self, key):
+        task, _ = self.store.submit(key, "x", now=T)
+        self.store.claim("w", LEASE, now=T)
+        return task
+
+    # -- submit(tx=) --------------------------------------------------------------
+    def test_submit_commits_with_the_caller_and_not_before(self):
+        with self.database.tx() as c:
+            c.execute("INSERT INTO caller_rows VALUES ('watermark', 1)")
+            task, created = self.store.submit("tx:submit", "x", now=T, tx=c)
+            self.assertTrue(created)
+            self.assertIsNone(self._committed_state(task.id))       # not committed for the caller
+        self.assertEqual(self.store.get(task.id).state, QUEUED)
+        self.assertEqual(self._caller_rows(), ["watermark"])
+
+    def test_submit_rolls_back_with_the_caller(self):
+        with self.assertRaises(RuntimeError):
+            with self.database.tx() as c:
+                c.execute("INSERT INTO caller_rows VALUES ('watermark', 1)")
+                self.store.submit("tx:rollback", "x", now=T, tx=c)
+                raise RuntimeError("caller fails after the insert")
+        self.assertIsNone(self.store.by_trigger("tx:rollback"))
+        self.assertEqual(self._caller_rows(), [])
+
+    def test_submit_samples_time_under_the_callers_lock(self):
+        self.t[0] = T + 5
+        def op():
+            with self.database.tx() as c:                  # blocks at BEGIN IMMEDIATE
+                return self.timed.submit("tx:time", "x", tx=c)[0]
+        task = self._blocked(op, advance_to=T + 50)
+        with _sql(self.db) as c:
+            self.assertEqual(c.execute("SELECT created_at FROM tasks WHERE id=?", (task.id,)).fetchone()[0],
+                             T + 50)
+
+    # -- complete(tx=) ------------------------------------------------------------
+    def test_complete_commits_atomically_with_the_callers_final_row(self):
+        task = self._running("tx:complete")
+        with self.database.tx() as c:
+            c.execute("INSERT INTO caller_rows VALUES ('final', 1)")
+            self.assertEqual(self.store.complete(task.id, "w", now=T + 1, tx=c).state, DONE)
+            self.assertEqual(self._committed_state(task.id), RUNNING)         # nothing committed yet
+        self.assertEqual((self.store.get(task.id).state, self._caller_rows()), (DONE, ["final"]))
+
+    def test_complete_with_expired_or_foreign_lease_refused_and_caller_rolls_back(self):
+        task = self._running("tx:expired")
+        for worker, at in (("w", T + LEASE + 1), ("intruder", T + 1)):
+            with self.subTest(worker=worker), self.assertRaises(LeaseLost):
+                with self.database.tx() as c:
+                    c.execute("INSERT INTO caller_rows VALUES ('final', 1)")
+                    self.store.complete(task.id, worker, now=at, tx=c)
+        self.assertEqual((self.store.get(task.id).state, self._caller_rows()), (RUNNING, []))
+
+    def test_complete_waiting_on_the_callers_lock_past_expiry_refused(self):
+        task, _ = self.timed.submit("tx:lock", "x")
+        self.timed.claim("w", LEASE)                       # lease to T+30
+        self.t[0] = T + 20
+        def op():
+            with self.database.tx() as c:                  # the caller waits for the lock...
+                c.execute("INSERT INTO caller_rows VALUES ('final', 1)")
+                return self.timed.complete(task.id, "w", tx=c)
+        with self.assertRaises(LeaseLost):                 # ...past the lease: refused
+            self._blocked(op, advance_to=T + 40)
+        self.assertEqual(self._caller_rows(), [])          # the caller's final row rolled back too
+        self.assertEqual(self.timed.claim("w2", LEASE).lease_owner, "w2")   # reclaim succeeds
+
+    def test_deferred_caller_tx_still_samples_time_after_the_lock(self):
+        # A deferred BEGIN holds no write lock; complete(tx=) must take it (and
+        # wait for it) BEFORE reading the clock.
+        task, _ = self.timed.submit("tx:deferred-lock", "x")
+        self.timed.claim("w", LEASE)                       # lease to T+30
+        self.t[0] = T + 20
+        a = sqlite3.connect(self.db, isolation_level=None, timeout=30)
+        try:
+            a.execute("BEGIN")                             # deferred, no snapshot yet
+            with self.assertRaises(LeaseLost):
+                self._blocked(lambda: self.timed.complete(task.id, "w", tx=a), advance_to=T + 40)
+            a.execute("ROLLBACK")
+        finally:
+            a.close()
+        self.assertEqual(self._committed_state(task.id), RUNNING)
+
+    # -- tx validation -------------------------------------------------------------
+    def test_tx_must_be_an_open_transaction_on_this_database(self):
+        c = sqlite3.connect(self.db, isolation_level=None)
+        other = sqlite3.connect(os.path.join(self.tmp.name, "other.sqlite"), isolation_level=None)
+        try:
+            with self.assertRaisesRegex(ValueError, "open write transaction"):
+                self.store.submit("tx:bad", "x", now=T, tx=c)          # no transaction open
+            with self.assertRaisesRegex(ValueError, "open write transaction"):
+                self.store.submit("tx:bad", "x", now=T, tx="not a connection")
+            other.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(ValueError, "different database"):
+                self.store.submit("tx:bad", "x", now=T, tx=other)
+            other.execute("ROLLBACK")
+        finally:
+            c.close()
+            other.close()
+        self.assertIsNone(self.store.by_trigger("tx:bad"))
+
+    def test_deferred_tx_takes_the_lock_and_stale_snapshot_fails(self):
+        a = sqlite3.connect(self.db, isolation_level=None, timeout=1)
+        try:
+            a.execute("BEGIN")                             # deferred: reads only so far
+            a.execute("SELECT COUNT(*) FROM tasks").fetchone()
+            self.store.submit("other-writer", "x", now=T)  # another writer commits meanwhile
+            with self.assertRaises(sqlite3.OperationalError):   # stale snapshot cannot write
+                self.store.submit("tx:stale", "x", now=T, tx=a)
+            a.execute("ROLLBACK")
+            a.execute("BEGIN")                             # fresh deferred tx: the probe takes the lock
+            self.store.submit("tx:deferred", "x", now=T, tx=a)
+            a.execute("COMMIT")
+        finally:
+            a.close()
+        self.assertIsNone(self.store.by_trigger("tx:stale"))
+        self.assertEqual(self.store.by_trigger("tx:deferred").state, QUEUED)
+
+    # -- release ----------------------------------------------------------------------
+    def test_release_is_a_pause_not_a_failure(self):
+        self.store.register_job("j", 3600, now=T)
+        task, _ = self.store.submit("rel", "x", job="j", now=T)
+        self.store.claim("w", LEASE, now=T)
+        self.store.checkpoint(task.id, "w", {"step": 2}, now=T + 1)
+        out = self.store.release(task.id, "w", now=T + 2)
+        self.assertEqual((out.state, out.lease_owner, out.lease_expires_at), (QUEUED, None, None))
+        self.assertEqual((out.consecutive_failures, out.attempts, out.checkpoint), (0, 1, {"step": 2}))
+        self.assertEqual(self.store.job("j").consecutive_failures, 0)
+        again = self.store.claim("w2", LEASE, now=T + 3)   # resumes from the checkpoint
+        self.assertEqual((again.id, again.checkpoint, again.consecutive_failures), (task.id, {"step": 2}, 0))
+        self.assertEqual(self.escalations, [])
+
+    def test_release_requires_the_live_lease_holder(self):
+        task = self._running("rel:checks")
+        self.store.heartbeat(task.id, "w", LEASE, now=T + 10)          # last write T+10, lease to T+40
+        cases = (("intruder", T + 11, "does not hold"), ("w", T + 41, "does not hold"),
+                 ("w", T + 5, "rollback"))
+        for worker, at, msg in cases:
+            with self.subTest(worker=worker, at=at), self.assertRaisesRegex(LeaseLost, msg):
+                self.store.release(task.id, worker, now=at)
+        t = TaskStore(self.db).get(task.id)                            # restart: unchanged
+        self.assertEqual((t.state, t.lease_owner), (RUNNING, "w"))
+        self.assertEqual(self.store.claim("w2", LEASE, now=T + 41).lease_owner, "w2")  # expired: reclaim
+
+    def test_release_waiting_on_the_lock_past_expiry_refused(self):
+        task, _ = self.timed.submit("rel:lock", "x")
+        self.timed.claim("w", LEASE)
+        self.t[0] = T + 20
+        with self.assertRaises(LeaseLost):
+            self._blocked(lambda: self.timed.release(task.id, "w"), advance_to=T + 40)
+        self.assertEqual(self.timed.claim("w2", LEASE).lease_owner, "w2")
+
+    # -- crash at each boundary ----------------------------------------------------------
+    def _crash(self, op):
+        ready = SPAWN.Event()
+        p = SPAWN.Process(target=_crash_in_caller_tx, args=(self.db, op, ready))
+        p.start()
+        p.join(60)
+        self.assertTrue(ready.is_set())
+        self.assertEqual(p.exitcode, 1)
+
+    def test_crash_before_caller_commit_leaves_neither_row(self):
+        self._crash("submit")
+        self.assertIsNone(TaskStore(self.db).by_trigger("crash:submit"))
+        self.assertEqual(self._caller_rows(), [])
+        task = self._running("crash:complete")
+        self._crash("complete")
+        t = TaskStore(self.db).get(task.id)
+        self.assertEqual((t.state, t.lease_owner, self._caller_rows()), (RUNNING, "w", []))
+        self.assertEqual(self.store.complete(task.id, "w", now=T + 2).state, DONE)   # still completable
+
+    def test_crash_after_release_commit_keeps_the_release(self):
+        task = self._running("crash:release")
+        self._crash("release")
+        t = TaskStore(self.db).get(task.id)
+        self.assertEqual((t.state, t.lease_owner, t.consecutive_failures), (QUEUED, None, 0))
 
 
 class JobUpperLimits(_TmpDB):

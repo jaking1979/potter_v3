@@ -23,6 +23,14 @@ queued ──claim──▶ running ──complete──▶ done
 
 Each worker mutation checks, inside its write transaction, that the worker still holds a live lease. If it doesn't, the call raises `LeaseLost`. Every `TaskStore` write samples trusted time *after* `BEGIN IMMEDIATE` holds the lock; the `now=` test value is applied there too. Waiting on the lock is therefore measured: a heartbeat that gets the lock after its lease expired is refused, and the reclaim at that time succeeds. A lease holder whose clock reads earlier than the task's last write (rollback) also gets `LeaseLost`.
 
+**Seams for E2.**
+- **`submit(..., tx=c)` and `complete(..., tx=c)`.** These write inside the caller's open transaction on the same database file, so the caller's own rows (a schedule watermark, a finals row) commit or roll back together with the task change.
+  - The caller's transaction must be open on *this* file, normally `Database.tx()`.
+  - Before anything is read or the clock is sampled, a no-op write makes sure the write lock is held. That is a no-op under `BEGIN IMMEDIATE`; a deferred transaction takes the lock there, or fails if its snapshot is stale.
+  - Lease checks still run at lock time.
+  - Nothing is committed or rolled back on the caller's behalf: any exception propagates.
+- **`release(task_id, worker_id)`.** Only the live lease holder can call it (owner, expiry and clock rollback are checked under the lock). It returns a running task to `queued` without recording a failure. The checkpoint is kept, and task and job failure counters are untouched.
+
 **Non-finite inputs.**
 - **Leases.** `claim` and `heartbeat` reject a `lease_s` that is NaN, ±inf, ≤ 0, or > `MAX_LEASE_S` (1 day), before any write. A persisted lease that isn't a finite time within `MAX_LEASE_S` of now is treated as **expired**: the task can be reclaimed, the reclaim counts as a failure, and the holder gets `LeaseLost`. This covers +inf written before validation and NaN, which SQLite stores as NULL.
 - **Jobs.** `register_job` rejects a cadence or tolerance that is non-finite, out of range, or whose product overflows, on both create and update. `stale_jobs` applies the same upper limits to persisted rows, so a finite but over-limit row is flagged too. An invalid update leaves the row unchanged.
