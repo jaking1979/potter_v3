@@ -5,6 +5,25 @@ from dataclasses import replace
 from model_broker.broker import Broker, Candidate, Caps, Refused, Request
 
 class InvalidCandidateTests(unittest.TestCase):
+    def test_invalid_containers_are_refused_before_iteration_and_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
+            request = Request('x','12345678-1234-4234-8234-123456789abc','research','private','2026-11-06','2026-11')
+            good = Candidate('good','provider',True,frozenset({'research'}),frozenset({'private'}),1,2)
+            seen = []
+            def stream():
+                seen.append(True)
+                yield good
+            class HostileList(list):
+                def __iter__(self):
+                    raise AssertionError('must not iterate')
+            for items in (None, 'x', {'x': good}, stream(), HostileList([good]), [good] * 1025):
+                with self.subTest(kind=type(items)):
+                    with self.assertRaisesRegex(Refused, 'malformed_candidate'):
+                        b.reserve(request,items)
+            self.assertEqual(seen, [])
+            self.assertEqual(b.reserve(request,(good,)),good)
+
     def test_malformed_candidate_refuses_whole_set_without_reservation(self):
         with tempfile.TemporaryDirectory() as d:
             b = Broker.bootstrap(Path(d)/'ledger.db', Caps(50,50,50,50))
@@ -28,4 +47,5 @@ class InvalidCandidateTests(unittest.TestCase):
             request = Request('x','12345678-1234-4234-8234-123456789abc','research','private','2026-11-06','2026-11')
             good = Candidate('good','provider',True,frozenset({'research'}),frozenset({'private'}),1,2)
             self.assertEqual(b.reserve(request,[replace(good,approved=False),good]),good)
+
 
