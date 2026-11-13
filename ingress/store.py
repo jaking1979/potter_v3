@@ -23,7 +23,11 @@ from typing import Iterator, Protocol
 
 from .events import sha256
 
-SCHEMA_VERSION = "e3.v0"
+SCHEMA_VERSION = "e3.v1"
+# e3.v0 -> e3.v1 added ingress_inbox.quarantine_reason and the 'quarantined'
+# status. SQLite cannot alter a CHECK, so the table is rebuilt (see _migrate_v0).
+_V0_INBOX_COLUMNS = ("event_id", "event_json", "status", "created_at", "updated_at")
+_V1_INBOX_COLUMNS = _V0_INBOX_COLUMNS + ("quarantine_reason",)
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -90,17 +94,63 @@ class SeenRow:
 class IngressStore:
     def __init__(self, path: str | Path):
         self._path = str(path)
+        # One BEGIN IMMEDIATE transaction: read the stored version BEFORE
+        # creating anything, migrate a known older layout, verify the result,
+        # and stamp the version. Any unknown version or unexpected layout rolls
+        # back with no write, so the gateway never serves a half-upgraded store.
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
-            for stmt in _SCHEMA:
-                c.execute(stmt)
-            row = c.execute("SELECT value FROM meta WHERE key='ingress_schema'").fetchone()
-            if row is None:
-                c.execute("INSERT INTO meta VALUES ('ingress_schema', ?)", (SCHEMA_VERSION,))
-            elif row[0] != SCHEMA_VERSION:
+            try:
+                version = self._stored_version(c)
+                if version == "e3.v0":
+                    self._migrate_v0(c)
+                elif version not in (None, SCHEMA_VERSION):
+                    raise RuntimeError("unsupported ingress schema")
+                for stmt in _SCHEMA:
+                    c.execute(stmt)
+                if not self._inbox_is_v1(c):
+                    raise RuntimeError("unsupported ingress schema")
+                c.execute("INSERT INTO meta VALUES ('ingress_schema', ?) ON CONFLICT(key)"
+                          " DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
+                c.execute("COMMIT")
+            except BaseException:
                 c.execute("ROLLBACK")
-                raise RuntimeError("unsupported ingress schema")
-            c.execute("COMMIT")
+                raise
+
+    @staticmethod
+    def _stored_version(c: sqlite3.Connection) -> str | None:
+        if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+                     ).fetchone() is None:
+            return None
+        row = c.execute("SELECT value FROM meta WHERE key='ingress_schema'").fetchone()
+        return None if row is None else row[0]
+
+    @staticmethod
+    def _inbox_columns(c: sqlite3.Connection, table: str = "ingress_inbox") -> tuple[str, ...]:
+        return tuple(r[1] for r in c.execute(f"PRAGMA table_info({table})"))
+
+    @classmethod
+    def _inbox_is_v1(cls, c: sqlite3.Connection) -> bool:
+        sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND"
+                        " name='ingress_inbox'").fetchone()
+        return (cls._inbox_columns(c) == _V1_INBOX_COLUMNS and sql is not None
+                and "'quarantined'" in sql[0] and "quarantine_reason IS NOT NULL" in sql[0])
+
+    @classmethod
+    def _migrate_v0(cls, c: sqlite3.Connection) -> None:
+        """Rebuild an e3.v0 ``ingress_inbox`` as e3.v1 inside the caller's
+        transaction. Every row is copied unchanged (no v0 row can be
+        quarantined, so ``quarantine_reason`` is NULL); the v1 CHECKs re-verify
+        each one. Tables added after v0 are created by the caller's _SCHEMA pass."""
+        if cls._inbox_columns(c) != _V0_INBOX_COLUMNS:   # missing, or not the v0 shape
+            raise RuntimeError("unsupported ingress schema")
+        c.execute("DROP INDEX IF EXISTS ingress_inbox_pending")
+        c.execute("ALTER TABLE ingress_inbox RENAME TO ingress_inbox_v0")
+        c.execute(next(s for s in _SCHEMA if "TABLE IF NOT EXISTS ingress_inbox " in s))
+        c.execute("INSERT INTO ingress_inbox (event_id, event_json, status, created_at,"
+                  " updated_at) SELECT event_id, event_json, status, created_at, updated_at"
+                  " FROM ingress_inbox_v0")
+        c.execute("DROP TABLE ingress_inbox_v0")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:

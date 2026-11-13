@@ -1778,6 +1778,107 @@ class PendingScanCannotStarve(Fixture):
         self.assertEqual(self.inbox()[a.event_id], ("expired", None))
 
 
+# The exact e3.v0 ingress_inbox DDL shipped through e056700 (no
+# quarantine_reason; status CHECK without 'quarantined').
+V0_INBOX_DDL = """CREATE TABLE ingress_inbox (
+        event_id TEXT PRIMARY KEY,
+        event_json TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending','handed_off','expired')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK ((status = 'pending') = (event_json IS NOT NULL)))"""
+
+
+class SchemaUpgrade(Fixture):
+    """Dolores at c445503: the inbox gained quarantine_reason but the version
+    stayed e3.v0 and CREATE IF NOT EXISTS left an existing v0 table unchanged,
+    so a prior-head database opened fine and then failed on first quarantine.
+    The store is now e3.v1; an e3.v0 store is rebuilt atomically on open and
+    anything else is refused before service, with no write."""
+
+    corrupt = PendingScanCannotStarve.corrupt
+    inbox = PendingScanCannotStarve.inbox
+
+    def to_v0(self):
+        """Rewrite self.db into the exact prior-head layout, keeping its rows."""
+        import sqlite3
+        c = sqlite3.connect(self.db, isolation_level=None)
+        c.execute("BEGIN")
+        c.execute("DROP INDEX ingress_inbox_pending")
+        c.execute("ALTER TABLE ingress_inbox RENAME TO tmp_v1")
+        c.execute(V0_INBOX_DDL)
+        c.execute("CREATE INDEX ingress_inbox_pending ON ingress_inbox (status, created_at)")
+        c.execute("INSERT INTO ingress_inbox SELECT event_id, event_json, status, created_at,"
+                  " updated_at FROM tmp_v1")
+        c.execute("DROP TABLE tmp_v1")
+        c.execute("UPDATE meta SET value='e3.v0' WHERE key='ingress_schema'")
+        c.execute("COMMIT")
+        c.close()
+
+    def layout(self):
+        import sqlite3
+        with sqlite3.connect(self.db) as c:
+            return (c.execute("SELECT value FROM meta WHERE key='ingress_schema'").fetchone(),
+                    sorted(c.execute("SELECT type, name, sql FROM sqlite_master")),
+                    sorted(c.execute("SELECT * FROM ingress_inbox")))
+
+    def test_125_v0_store_upgrades_and_serves_pending_and_quarantine(self):
+        good = self.gw.ingest_telegram(self.tg(msg_id=1, ref="u1")).event
+        bad = self.gw.ingest_telegram(self.tg(msg_id=2, ref="u2")).event_id
+        done = self.gw.ingest_telegram(self.tg(msg_id=3, ref="u3")).event_id
+        self.assertTrue(self.gw.ack(done))
+        self.to_v0()
+        self.corrupt([bad], "garbage")
+        import sqlite3
+        with sqlite3.connect(self.db) as c:                     # really the old layout
+            with self.assertRaises(sqlite3.IntegrityError):
+                c.execute("UPDATE ingress_inbox SET status='quarantined' WHERE event_id=?",
+                          (bad,))
+        restarted = self.gateway()                              # open = migrate
+        self.assertEqual(self.layout()[0], ("e3.v1",))
+        self.assertEqual(restarted.pending(), [good])           # valid pending path
+        self.assertEqual(restarted.quarantined(), [(bad, "malformed")])   # quarantine path
+        self.assertEqual(self.inbox()[bad], ("quarantined", None))
+        self.assertEqual(self.inbox()[done], ("handed_off", None))        # rows kept as-is
+        self.assertTrue(restarted.ack(good.event_id))
+        again = self.gw.ingest_telegram(self.tg(msg_id=1, ref="u1"))      # dedupe survives
+        self.assertEqual((again.duplicate, again.event), (True, None))
+
+    def test_126_upgrade_is_idempotent_across_restarts(self):
+        good = self.gw.ingest_telegram(self.tg(msg_id=1, ref="i1")).event
+        self.to_v0()
+        self.gateway()
+        once = self.layout()
+        self.gateway()
+        self.assertEqual(self.layout(), once)
+        fresh = self.gateway()
+        self.assertEqual(fresh.pending(), [good])
+
+    def test_127_unknown_version_or_layout_refused_without_write(self):
+        import sqlite3
+        cases = {
+            "future version": "UPDATE meta SET value='e3.v9' WHERE key='ingress_schema'",
+            "v1 labelled v0": "UPDATE meta SET value='e3.v0' WHERE key='ingress_schema'",
+            "v0 shape labelled v1": None,
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.setUp()                                    # fresh tmp dir per case
+                self.gw.ingest_telegram(self.tg(msg_id=1, ref="k1"))
+                if sql is None:
+                    self.to_v0()
+                    sql = "UPDATE meta SET value='e3.v1' WHERE key='ingress_schema'"
+                with sqlite3.connect(self.db) as c:
+                    c.execute(sql)
+                before = self.layout()
+                with self.assertRaisesRegex(RuntimeError, "unsupported ingress schema"):
+                    IngressStore(self.db)
+                self.assertEqual(self.layout(), before)          # nothing written
+
+    def test_128_fresh_store_is_v1(self):
+        self.assertEqual(self.layout()[0], ("e3.v1",))
+
+
 class Structure(unittest.TestCase):
     def test_43_ingress_passes_notifier_lint(self):
         self.assertEqual([f for f in lint.scan(ROOT) if f.path.startswith("ingress")], [])

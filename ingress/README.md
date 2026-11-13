@@ -7,7 +7,7 @@ Adapters that turn inbound Telegram updates, email (AgentMail/Gmail raw RFC 5322
 | `events.py` | Provenance kinds, `Segment`, `AttachmentRef`, `InboundEvent`. An import-time assert proves no untrusted kind is in C1's `TRUSTED_SOURCES` and ingress never emits `system_policy`. |
 | `gateway.py` | `IngressGateway.ingest_telegram / ingest_email / ingest_webhook / ingest_web` → `IngressResult`. `vouches(event)` confirms an event was minted here, unchanged. |
 | `content.py` | `IngressLimits`, forwarded/quoted splitting, injection-indicator flags. |
-| `store.py` | `IngressStore` (SQLite dedupe + ingress log, `meta.ingress_schema=e3.v0`) and the `AttachmentStore` seam (`InMemoryAttachmentStore` fake). |
+| `store.py` | `IngressStore` (SQLite dedupe + ingress log, `meta.ingress_schema=e3.v1`; an e3.v0 store is rebuilt to v1 atomically on open, any other version or layout is refused before service) and the `AttachmentStore` seam (`InMemoryAttachmentStore` fake). |
 | `traces.py` | One C6 `DecisionTrace` per ingress decision. |
 
 ## Provenance (the boundary)
