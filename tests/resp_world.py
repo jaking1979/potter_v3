@@ -21,6 +21,10 @@ from policy import Capability, CapabilityRegistry, PolicyEngine, RiskClass  # no
 from policy._contracts import approval as c0  # noqa: E402
 from responsibilities import (Connector, Event, Responsibility, ResponsibilityRunner,  # noqa: E402
                               Schedule, Step)
+try:                                     # absent in the vendored legacy E2 code
+    from responsibilities import kill_switch_for  # noqa: E402
+except ImportError:                      # pragma: no cover - legacy fixtures only
+    kill_switch_for = None
 from runtime import Database, EffectFailed, EffectJournal, JournalApprovalLedger  # noqa: E402
 
 T0 = 1_800_000_000.0
@@ -164,7 +168,9 @@ class World:
                                    ledger=self.ledger,
                                    authenticator=c0.HmacAuthenticator({"e2-test": TEST_KEY}),
                                    clock=lambda: int(self.clock()))
-        self.journal = EffectJournal(self.db, clock=self.clock, fence=fence)
+        self.journal = EffectJournal(self.db, clock=self.clock, fence=fence,
+                                     kill_switch=kill_switch_for(self.db) if kill_switch_for
+                                     else None)
         self.definitions = definitions if definitions is not None else [batch(), bill_watch()]
         self.runner = ResponsibilityRunner(
             self.db, definitions=self.definitions, journal=self.journal, policy=self.engine,

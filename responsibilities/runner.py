@@ -47,7 +47,7 @@ from notifier.issuer import ApprovalIssuer, ApprovalRefusal
 from notifier.kill import KillFlag
 from policy import ALLOW, RECONCILE, Caller, DelegationHop, PolicyEngine, PolicyRequest
 from runtime import (EFFECT_FAILED, SUCCEEDED, UNKNOWN, Database, Effect, EffectConflict,
-                     EffectInFlight, EffectJournal, EffectOutcomeUnknown, Escalation,
+                     EffectInFlight, EffectJournal, EffectKilled, EffectOutcomeUnknown, Escalation,
                      JournalApprovalLedger, LeaseLost, Task, TaskStore, URGENT)
 from runtime.tasks import ESCALATE_AFTER
 from runtime.db import as_database
@@ -111,6 +111,16 @@ class _Waiting(Exception):
 
 def receipt_link(task_id: str) -> str:
     return f"{RECEIPT_PREFIX}{task_id}"
+
+
+def kill_switch_for(db: Database | str) -> Callable[[Effect], bool]:
+    """The C2 ``EffectJournal(kill_switch=...)`` callable for E1's global kill
+    flag. Pass it when building the journal a ResponsibilityRunner uses: C2
+    then checks the flag inside the dispatch-claim transaction (which /stop
+    cannot commit through) and again after the claim, before ``perform``, so
+    a /stop that lands before the send refuses the dispatch atomically."""
+    flag = KillFlag(as_database(db))
+    return lambda eff: flag.is_set()
 
 
 class ResponsibilityRunner:
@@ -371,23 +381,22 @@ class ResponsibilityRunner:
         return self._execute(eff, conn)
 
     def _dispatch_permitted(self) -> bool:
-        """SEAM (E1 #28 / C2): the kill check right before a dispatch.
-
-        Today this is a plain read of E1's kill flag, followed by a separate C2
-        ``execute`` call. A ``/stop`` that commits between the two can still be
-        followed by one dispatch. E1 (1b88a01) closed that window for notifier
-        sends with a private gate (kill check + ``notifier_sending`` row in one
-        transaction, which ``stop()`` waits on), but that gate does not cover
-        connector effects and is not a public API. This dispatch must use either
-        a public form of that gate, which ``stop()`` would also wait on, or a C2
-        ``execute`` kill predicate evaluated inside its claim transaction. Until
-        one exists, the window is open; see README."""
+        """Early kill check before a dispatch: a cheap pre-check only, not
+        atomic on its own. The authoritative check is C2's ``kill_switch``
+        (wire it with ``kill_switch_for``): C2 reads the kill flag inside the
+        dispatch-claim transaction, which /stop cannot commit through, and
+        again after the claim, before ``perform``, refusing or undoing the
+        claim with ``EffectKilled`` (handled as an interrupt)."""
         return not self.kill.is_set()
 
     def _execute(self, eff: Effect, conn: Connector) -> Any:
         try:
             eff = self.journal.execute(eff.idempotency_key, conn.perform, conn.reconcile,
                                        owner=self._worker, connector=conn.identity)
+        except EffectKilled:
+            # C2 refused the dispatch under its claim lock (or undid the claim
+            # before send): nothing was sent. Same as an interrupt.
+            raise _Interrupt()
         except (EffectOutcomeUnknown, EffectInFlight) as exc:
             raise _Blocked(f"effect {eff.effect_id} unresolved ({type(exc).__name__})")
         except EffectConflict:

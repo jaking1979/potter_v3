@@ -15,15 +15,31 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = "c2.v2"
+SCHEMA_VERSION = "c2.v5"
 
 # In-place upgrades of an existing journal, keyed by the stored version.
-# Upgraded rows carry no contract digest, so they are never trusted for a
-# re-dispatch after an ambiguous outcome (they need a fence or reconciliation).
+# Upgraded rows carry no contract digest and no first-dispatch time, so they
+# are never trusted for a re-dispatch after an ambiguous outcome (they need a
+# fence or authoritative reconciliation).
+# Each step adds a column (table, column, type) only if it is missing, so a
+# partially upgraded file migrates safely.
+_CONNECTOR = ("effects", "connector", "TEXT")
+_DIGEST = ("effects", "connector_digest", "TEXT")
+_FIRST = ("effects", "first_dispatched_at", "REAL")
+_BASIS = ("effects", "failed_basis", "TEXT")   # NULL on a migrated FAILED row => re-checked
+# Per-claim signed deadlines (c2.v5). A migrated row that was already
+# dispatched has no recorded deadline, so it is never trusted for a retry.
+_DEADLINES = (("effects", "dispatch_deadline", "REAL"),
+              ("effects", "dispatch_ticket", "TEXT"),
+              ("effects", "max_dispatch_deadline", "REAL"),
+              ("effects", "last_claim_at", "REAL"),
+              ("effects", "unbounded_dispatch", "INTEGER NOT NULL DEFAULT 0"))
 MIGRATIONS = {
-    "c2.v0": ("ALTER TABLE effects ADD COLUMN connector TEXT",
-              "ALTER TABLE effects ADD COLUMN connector_digest TEXT"),
-    "c2.v1": ("ALTER TABLE effects ADD COLUMN connector_digest TEXT",),
+    "c2.v0": (_CONNECTOR, _DIGEST, _FIRST, _BASIS, *_DEADLINES),
+    "c2.v1": (_DIGEST, _FIRST, _BASIS, *_DEADLINES),
+    "c2.v2": (_FIRST, _BASIS, *_DEADLINES),
+    "c2.v3": (_BASIS, *_DEADLINES),
+    "c2.v4": _DEADLINES,
 }
 
 SCHEMA = (
@@ -71,6 +87,13 @@ SCHEMA = (
         updated_at REAL NOT NULL,
         connector TEXT,
         connector_digest TEXT,
+        first_dispatched_at REAL,
+        failed_basis TEXT,
+        dispatch_deadline REAL,
+        dispatch_ticket TEXT,
+        max_dispatch_deadline REAL,
+        last_claim_at REAL,
+        unbounded_dispatch INTEGER NOT NULL DEFAULT 0,
         UNIQUE (task_id, effect_id))""",
     "CREATE INDEX IF NOT EXISTS effects_status ON effects (status)",
     """CREATE TABLE IF NOT EXISTS approval_nonces (
@@ -103,8 +126,10 @@ class Database:
                           (SCHEMA_VERSION,))
                 got = c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0]
                 if got in MIGRATIONS:
-                    for stmt in MIGRATIONS[got]:
-                        c.execute(stmt)
+                    for table, column, kind in MIGRATIONS[got]:
+                        have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+                        if column not in have:
+                            c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
                     c.execute("UPDATE meta SET value=? WHERE key='schema'", (SCHEMA_VERSION,))
                     got = SCHEMA_VERSION
                 if got != SCHEMA_VERSION:

@@ -2,6 +2,7 @@
 only offline fakes exist in this repository."""
 from .definitions import (DefinitionError, Event, Responsibility, Schedule, Step,
                           StepContext)
-from .runner import (OPS_JOB, Connector, ResponsibilityRunner, RunResult, receipt_link)
+from .runner import (OPS_JOB, Connector, ResponsibilityRunner, RunResult, kill_switch_for,
+                     receipt_link)
 
 __all__ = [n for n in dir() if not n.startswith("_")]

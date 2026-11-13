@@ -1684,6 +1684,96 @@ class FinalTimingUsesTheTerminalCommit(Base):
         self.assertEqual((c["final"], c["finals"]), (1, ("done", True)))
 
 
+class RealC2Seams(Base):
+    """E2 on the real C2 (claude/c2-task-effect-journal a4eef4d): no E2 fork
+    of runtime/tasks.py. These go through C2's own submit(tx=), complete(tx=),
+    release() and the in-claim kill switch."""
+
+    def test_stop_after_the_early_check_is_refused_under_the_c2_claim_lock(self):
+        # Closes the long-open window: /stop lands after E2's cheap pre-check;
+        # C2's kill switch, read inside the claim transaction, refuses.
+        w = self.world(definitions=[rw.batch(n=2)])
+        real = w.runner._dispatch_permitted
+
+        fired = []
+
+        def check_then_stop():
+            ok = real()
+            if w.ext.calls() == 1 and not fired:   # s1 done; /stop races s2's dispatch
+                fired.append(True)
+                _set_kill(w)
+            return ok
+
+        w.runner._dispatch_permitted = check_then_stop
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "interrupted")
+        self.assertEqual(w.ext.calls(), 1)                 # s2 never sent
+        eff = w.journal.for_step(r.task_id, "s2")
+        self.assertEqual((eff.status, eff.dispatches), ("pending", 0))
+        task = w.runner.tasks.get(r.task_id)
+        self.assertEqual((task.state, task.consecutive_failures), (QUEUED, 0))
+        w.notifier.kill.clear()
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(w.ext.applied(), [("s1", 1), ("s2", 1)])
+
+    def test_stop_between_claim_and_send_is_undone_by_c2(self):
+        from runtime import EffectJournal
+        w = self.world(definitions=[rw.batch(n=1)])
+        calls = {"n": 0}
+
+        def flips_after_claim(eff):         # 1st read: inside the claim; 2nd: before send
+            calls["n"] += 1
+            return calls["n"] >= 2 and calls["n"] <= 2
+
+        w.runner.journal = EffectJournal(w.db, clock=w.clock, kill_switch=flips_after_claim)
+        w.runner.tick()
+        r = w.runner.run_once()
+        self.assertEqual(r.outcome, "interrupted")
+        self.assertEqual(w.ext.calls(), 0)                 # perform never ran
+        eff = w.journal.for_step(r.task_id, "s1")
+        self.assertEqual(eff.status, "pending")            # claim undone by C2
+        self.assertIsNone(eff.in_flight_owner)
+        self.assertEqual(w.runner.run_once().outcome, "done")
+        self.assertEqual(w.ext.applied(), [("s1", 1)])
+
+    def test_tick_waits_on_another_writer_and_commits_one_slot(self):
+        import threading
+        w = self.world()
+        w2 = rw.World(self.tmp, worker="w2")
+        holding, release = threading.Event(), threading.Event()
+
+        def hold_write_lock():
+            with w2.db.tx():                 # another process-like writer
+                holding.set()
+                release.wait(10)
+
+        h = threading.Thread(target=hold_write_lock)
+        h.start()
+        self.assertTrue(holding.wait(10))
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("tick", w.runner.tick()))
+        t.start()
+        t.join(0.5)
+        self.assertTrue(t.is_alive())        # blocked on the write lock, nothing half-done
+        with w.db.read() as c:
+            self.assertIsNone(c.execute("SELECT value FROM responsibility_state WHERE"
+                                        " key='watermark:notes.batch'").fetchone())
+        release.set()
+        h.join(10)
+        t.join(10)
+        self.assertEqual(len(out["tick"]), 1)
+        self.assertEqual(w.runner.tick(), [])
+
+    def test_c2_refuses_a_caller_transaction_from_another_database(self):
+        w = self.world()
+        other = rw.World(Path(self.tmp) / "other" if (Path(self.tmp) / "other").mkdir() is None
+                         else self.tmp)
+        with other.db.tx() as c, self.assertRaises(ValueError):
+            w.runner.tasks.submit("resp:x:slot:1", "notes.batch", {}, job="notes.batch", tx=c)
+        self.assertIsNone(w.runner.tasks.by_trigger("resp:x:slot:1"))
+
+
 class Structure(Base):
     def test_runner_passes_the_direct_send_lint(self):
         self.assertEqual(lint.scan(HERE.parent), [])
