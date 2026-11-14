@@ -1,7 +1,7 @@
 name: A4a exact-head offline coverage probe
 on:
   push:
-    branches: [dolores/case21-observation-0231-20261114]
+    branches: [dolores/a4a-case21-exercise-runner-0533]
 permissions:
   contents: read
 jobs:
