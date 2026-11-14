@@ -1,7 +1,7 @@
 name: C6 real integration probe
 on:
   push:
-    branches: [dolores/c6-wait-reason-2032]
+    branches: [dolores/c6-policy-identity-0032-20261114]
 permissions:
   contents: read
 jobs:
@@ -24,5 +24,9 @@ jobs:
       - run: python -m pip install jsonschema==4.23.0
       - name: Run focused real-component probe
         run: python -m unittest discover -s tests -p test_postshape_trace.py -v
+      - name: Run adapter integration tests
+        run: python -m unittest discover -s tests -p test_policy_trace_adapter.py -v
+      - name: Run trace identity tests
+        run: python -m unittest discover -s tests -p test_trace_identity.py -v
       - name: Run full Python suite
         run: python -m unittest discover -s tests -v
