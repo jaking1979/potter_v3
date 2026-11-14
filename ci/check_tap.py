@@ -14,6 +14,8 @@ def check(output):
     found = {}
     for line in lines:
         match = PATTERN.fullmatch(line)
+        if not match and re.match(r"^# (?:tests|pass|fail|cancelled|skipped|todo)(?:\s|$)", line):
+            return False
         if match:
             key, value = match.groups()
             if key in found:
