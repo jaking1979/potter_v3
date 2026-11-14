@@ -105,6 +105,10 @@ class _Fatal(Exception):
     pass
 
 
+class _TaskBindingMismatch(_Fatal):
+    pass
+
+
 class _Waiting(Exception):
     pass
 
@@ -358,11 +362,11 @@ class ResponsibilityRunner:
     def _build(self, step: Step, ctx: StepContext, task_id: str):
         try:
             action = step.build(ctx, task_id)
-            if getattr(action, 'task_id', None) != task_id:
-                raise ValueError('action is not bound to claimed task')
-            return action
         except Exception as exc:
             raise _Fatal(f"step {step.id} could not bind its action: {type(exc).__name__}")
+        if getattr(action, 'task_id', None) != task_id:
+            raise _TaskBindingMismatch(f"step {step.id} task binding mismatch")
+        return action
 
     def _already_done(self, task: Task, step: Step, approvals: Mapping[str, str]):
         eff = self._effect_of(task, step, approvals)
@@ -526,7 +530,7 @@ class ResponsibilityRunner:
         except sqlite3.IntegrityError:      # defensive: someone else's claim won
             return self._approval_for(task_id, h)[0]
 
-    def _waiting_step(self, task: Task) -> tuple[Responsibility, Step, Any] | None:
+    def _waiting_step(self, task: Task, *, report_binding_mismatch: bool = False) -> tuple[Responsibility, Step, Any] | None:
         """(definition, waiting step, its action rebuilt now) for a waiting task."""
         d = self._defs.get(task.kind)
         if d is None or task.state != WAITING_APPROVAL:
@@ -539,6 +543,10 @@ class ResponsibilityRunner:
             if step.id == cp.get("waiting"):
                 try:
                     return d, step, self._build(step, ctx, task.id)
+                except _TaskBindingMismatch:
+                    if report_binding_mismatch:
+                        raise
+                    return None
                 except Exception:
                     return None
             eff = self._effect_of(task, step, approvals)
@@ -567,8 +575,13 @@ class ResponsibilityRunner:
             cp = task.checkpoint or {}
             h = cp.get("approvals", {}).get(cp.get("waiting", ""))
             aid, status, _ = self._approval_for(tid, h) if h else (None, None, None)
+            binding_mismatch = False
             if aid is None:
-                ws = self._waiting_step(task)
+                try:
+                    ws = self._waiting_step(task, report_binding_mismatch=True)
+                except _TaskBindingMismatch:
+                    ws = None
+                    binding_mismatch = True
                 if ws is not None and ws[2].hash() == h:
                     if self.kill.is_set() or self._issue(tid, ws[1], ws[2]) is not None:
                         continue                 # issued now, or after the flag clears
@@ -580,7 +593,7 @@ class ResponsibilityRunner:
             if pa is not None and pa.status == "approved":
                 t = self.tasks.approval_resolved(tid, True)
             else:
-                why = "missing" if pa is None else ("expired" if pa.status == "pending"
+                why = ("task binding mismatch" if binding_mismatch else "missing") if pa is None else ("expired" if pa.status == "pending"
                                                     else pa.status)
                 t = self.tasks.approval_resolved(tid, False, error=f"approval {why}")
             if t.state in TERMINAL:
@@ -959,3 +972,4 @@ class ResponsibilityRunner:
             if eff.status == UNKNOWN:
                 left.append(eff)
         return left
+
