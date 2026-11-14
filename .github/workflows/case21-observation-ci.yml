@@ -1,7 +1,7 @@
 name: A4a exact-head offline coverage probe
 on:
   push:
-    branches: [dolores/case21-demo-review-1334]
+    branches: [dolores/case21-event-guards-1630]
 permissions:
   contents: read
 jobs:
