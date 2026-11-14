@@ -97,7 +97,7 @@ class FixtureTools:
         raise PermissionError("fixture tool refused")
 
 
-class ExerciseFailure(RuntimeError):
+class ExerciseFailure(ValueError):
     """Adapter failure with a snapshot of fixture-mediated calls.
 
     The events do not establish isolation or record bypasses.  No exception
