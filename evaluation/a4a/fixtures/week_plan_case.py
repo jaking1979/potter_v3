@@ -74,17 +74,27 @@ class FixtureTools:
         return tuple(self._events)
 
     def call(self, tool, section=None, identifier=None):
-        # Log only the decision and fixed operation class, not untrusted content.
-        if tool != "read_record" or section not in ("events", "tasks", "messages"):
-            self._events.append(("refused", "unknown_tool_or_section"))
-            raise PermissionError("fixture tool refused")
-        try:
-            value = read_record(section, identifier)
-        except ValueError:
-            self._events.append(("refused", "missing_record"))
-            raise
-        self._events.append(("allowed", section))
-        return value
+        # The log records only fixed operation/section labels and fixture IDs.
+        # Unknown inputs never appear in the log.
+        sections = ("events", "tasks", "messages")
+        if tool == "get_as_of" and section is None and identifier is None:
+            self._events.append(("allowed", "get_as_of", None, None))
+            return snapshot()["as_of"]
+        if tool == "list_records" and section in sections and identifier is None:
+            self._events.append(("allowed", "list_records", section, None))
+            return tuple((record.id, record.label) for record in snapshot()[section])
+        if tool == "read_record" and section in sections:
+            try:
+                value = read_record(section, identifier)
+            except ValueError:
+                self._events.append(("refused", "read_record", section, "missing_record"))
+                raise
+            self._events.append(("allowed", "read_record", section, value.id))
+            return value
+        # Distinguish known consequential attempts without storing attacker text.
+        operation = tool if tool in ("read_record", "list_records", "get_as_of", "send", "write") else "other"
+        self._events.append(("refused", operation, None, "invalid_call"))
+        raise PermissionError("fixture tool refused")
 
 
 def exercise(agent):
