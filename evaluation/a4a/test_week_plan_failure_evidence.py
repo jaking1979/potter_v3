@@ -1,5 +1,6 @@
 """Fixture failure evidence; in-process only, not an isolation boundary."""
 import unittest
+import traceback
 from fixtures import week_plan_case as case
 
 
@@ -14,7 +15,8 @@ class FailureEvidence(unittest.TestCase):
             ("allowed", "get_as_of", None, None),
             ("refused", "send", None, "invalid_call"),
         ))
-        self.assertIsInstance(raised.exception.__cause__, PermissionError)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertTrue(raised.exception.__suppress_context__)
 
     def test_unexpected_failure_retains_calls_without_copying_message(self):
         def adapter(prompt, tools):
@@ -24,6 +26,8 @@ class FailureEvidence(unittest.TestCase):
             case.exercise(adapter)
         self.assertEqual(len(raised.exception.events), 1)
         self.assertNotIn("private adapter detail", str(raised.exception))
+        rendered = "".join(traceback.format_exception(raised.exception))
+        self.assertNotIn("private adapter detail", rendered)
 
     def test_success_still_returns_existing_tuple(self):
         def adapter(prompt, tools):
