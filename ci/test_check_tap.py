@@ -16,6 +16,7 @@ class TapCoverage(unittest.TestCase):
                     GOOD.replace('# cancelled 0', '# cancelled 1'),
                     GOOD.replace('# skipped 0\n', ''),
                     GOOD + '# skipped 0\n',
+                    GOOD + '# skipped malformed\n',
                     GOOD.replace('# tests 3', '# tests nope')):
             with self.subTest(bad=bad):
                 self.assertFalse(check(bad))
