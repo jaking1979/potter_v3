@@ -1,7 +1,7 @@
 name: C6 replay bridge offline probe
 on:
   push:
-    branches: [dolores/c6-sink-replay-0125-20261114]
+    branches: [dolores/c6-single-tx-replay-0231]
 permissions:
   contents: read
 jobs:
