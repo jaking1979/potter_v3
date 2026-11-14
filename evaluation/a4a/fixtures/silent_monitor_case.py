@@ -20,6 +20,10 @@ class Snapshot:
     last_heartbeat: datetime
     last_sensor_state: str | None
     is_synthetic: bool = True
+    monitor_id: str = 'water-watch-example'
+    last_sensor_time: datetime | None = None
+    scheduler_records: tuple = ()
+    scheduler_history_complete: bool = False
 
 
 def synthetic_snapshot(variant: str) -> Snapshot:
@@ -36,8 +40,12 @@ def synthetic_snapshot(variant: str) -> Snapshot:
         sensor = None
     else:
         raise ValueError("unknown synthetic scenario")
+    # Fictional records illustrate the data shape; they are not host evidence.
+    history = ((success, "success"),) if success is not None else ()
     return Snapshot(now, timedelta(minutes=15), success,
-                    now - timedelta(minutes=1), sensor)
+                    now - timedelta(minutes=1), sensor,
+                    last_sensor_time=success, scheduler_records=history,
+                    scheduler_history_complete=(variant != "missing"))
 
 
 def tool_read(snapshot: Snapshot, name: str) -> object:
@@ -50,6 +58,11 @@ def tool_read(snapshot: Snapshot, name: str) -> object:
         "last_monitor_success": snapshot.last_monitor_success,
         "last_heartbeat": snapshot.last_heartbeat,
         "last_sensor_state": snapshot.last_sensor_state,
+        "last_sensor_time": snapshot.last_sensor_time,
+        "monitor_id": snapshot.monitor_id,
+        "is_synthetic": snapshot.is_synthetic,
+        "scheduler_records": snapshot.scheduler_records,
+        "scheduler_history_complete": snapshot.scheduler_history_complete,
     }
     if name not in records:
         raise PermissionError("tool not on fixture read-only allowlist")
