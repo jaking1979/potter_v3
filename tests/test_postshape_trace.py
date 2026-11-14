@@ -62,9 +62,43 @@ class PostshapeTrace(unittest.TestCase):
             self.assertEqual(w.runner.tasks.get(task.id).state, "waiting_approval")
             self.assertEqual(w.ext.calls("pay"), 0)
 
+    def test_missing_request_wrong_rebuild_fails_with_binding_reason(self):
+        from unittest.mock import patch
+        from responsibilities import Step
+        class Crash(BaseException): pass
+        with tempfile.TemporaryDirectory() as tmp:
+            w = rw.World(tmp, definitions=[rw.bill_watch()])
+            w.runner.on_event('bill.due', {'id':'missing-test', 'amount':120})
+            with patch.object(w.runner, '_issue', side_effect=Crash()):
+                with self.assertRaises(Crash): w.runner.run_once()
+            with w.db.read() as c:
+                tid = c.execute("SELECT id FROM tasks WHERE state='waiting_approval'").fetchone()[0]
+            wrong = c0.BoundAction(str(uuid.uuid4()), 'notes.append', 'append', 'test', {})
+            with patch.object(Step, 'build', return_value=wrong):
+                outcomes = w.runner.poll_approvals()
+            self.assertEqual([x.outcome for x in outcomes], ['failed'])
+            self.assertIn('task binding mismatch', w.runner.tasks.get(tid).last_error)
+            self.assertEqual(w.ext.calls('pay'), 0)
+            with w.db.read() as c:
+                self.assertEqual(c.execute('SELECT count(*) FROM approval_requests').fetchone()[0], 0)
+
+    def test_wrong_rebuild_causes_issuer_void(self):
+        from unittest.mock import patch
+        from responsibilities import Step
+        with tempfile.TemporaryDirectory() as tmp:
+            w = rw.World(tmp, definitions=[rw.bill_watch()])
+            w.runner.on_event('bill.due', {'id':'wrong-live', 'amount':120})
+            result = w.runner.run_once()
+            wrong = c0.BoundAction(str(uuid.uuid4()), 'notes.append', 'append', 'test', {})
+            with patch.object(Step, 'build', return_value=wrong):
+                self.assertIsNone(w.runner.live_action(result.detail, result.task_id))
+                self.assertEqual(w.say('/approve ' + result.detail).reason, 'state_changed')
+            self.assertEqual(w.ext.calls('pay'), 0)
+
     def test_trace_failure_blocks_fake_effect(self):
         with tempfile.TemporaryDirectory() as tmp:
             w=rw.World(tmp,definitions=[rw.batch(n=1)])
             def fail(_): raise OSError('fixture')
             w.engine._trace=fail; w.runner.tick(); w.runner.run_once()
             self.assertEqual(w.ext.calls(),0)
+
