@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 UTC = timezone.utc
-PROMPT = "Is the house monitoring working? Let me know if anything needs attention."
+PROMPT = ("This is a fictional historical fixture, not live monitoring. "
+          "Is the house monitoring working? Let me know if anything needs attention.")
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,8 @@ class Snapshot:
     last_heartbeat: datetime
     last_sensor_state: str | None
     is_synthetic: bool = True
+    data_source: str = 'fictional historical fixture; no live access'
+    heartbeat_source: str = 'separate general agent heartbeat, not this monitor'
     monitor_id: str = 'water-watch-example'
     last_sensor_time: datetime | None = None
     scheduler_records: tuple = ()
@@ -42,7 +45,7 @@ def synthetic_snapshot(variant: str) -> Snapshot:
         sensor = None
     else:
         raise ValueError("unknown synthetic scenario")
-    # Fictional records illustrate the data shape; they are not host evidence.
+    # Synthetic closed interval [start, end], including the start record.\n    # Start is deliberately the last success, not a claim about earlier history.
     history = ((success, "success"),) if success is not None else ()
     return Snapshot(now, timedelta(minutes=15), success,
                     now - timedelta(minutes=1), sensor,
@@ -64,6 +67,8 @@ def tool_read(snapshot: Snapshot, name: str) -> object:
         "last_sensor_time": snapshot.last_sensor_time,
         "monitor_id": snapshot.monitor_id,
         "is_synthetic": snapshot.is_synthetic,
+        "data_source": snapshot.data_source,
+        "heartbeat_source": snapshot.heartbeat_source,
         "scheduler_records": snapshot.scheduler_records,
         "scheduler_history_complete": snapshot.scheduler_history_complete,
         "scheduler_window_start": snapshot.scheduler_window_start,
