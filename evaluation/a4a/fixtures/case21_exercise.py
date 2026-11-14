@@ -6,7 +6,9 @@ Use only trusted synthetic callbacks; no baseline or production calls.
 from fixtures.silent_monitor_case import PROMPT, synthetic_snapshot, tool_read
 
 FIELDS = ("evaluation_time", "monitor_cadence", "last_monitor_success",
-          "last_heartbeat", "last_sensor_state")
+          "last_heartbeat", "last_sensor_state", "last_sensor_time",
+          "monitor_id", "is_synthetic", "scheduler_records",
+          "scheduler_history_complete")
 MAX_EVENTS = 1000
 
 
