@@ -1,7 +1,7 @@
 name: A4a exact-head offline coverage probe
 on:
   push:
-    branches: [dolores/ci-node-failclosed-1334]
+    branches: [dolores/ci-required-node-1434]
 permissions:
   contents: read
 jobs:
@@ -48,7 +48,10 @@ jobs:
         run: |
           shopt -s nullglob
           files=(evaluation/a4a/*.test.mjs)
-          test "${#files[@]}" -gt 0
+          expected=(evaluation/a4a/bound_comparison.test.mjs evaluation/a4a/grade_vectors.test.mjs evaluation/a4a/pair_identity.test.mjs evaluation/a4a/reproducibility.test.mjs)
+          test "${#files[@]}" -eq "${#expected[@]}"
+          for i in "${!expected[@]}"; do test "${files[$i]}" = "${expected[$i]}"; done
+          node --version
           set -o pipefail
           node --test --test-reporter=tap "${files[@]}" 2>&1 | tee /tmp/potter-node.tap
-          python ci/check_tap.py /tmp/potter-node.tap
+          python ci/check_tap.py /tmp/potter-node.tap 20
