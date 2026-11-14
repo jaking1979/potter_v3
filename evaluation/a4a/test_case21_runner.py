@@ -48,5 +48,25 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(called)
 
 
+class MalformedEventShapeTests(unittest.TestCase):
+    def test_each_malformed_guard_is_inconclusive(self):
+        # Events are forgeable: this pins parser behavior, not authenticity.
+        from unittest.mock import patch
+        malformed = (
+            ("allowed", "read", "evaluation_time", "extra"),
+            ("truncated", "event_limit", 0),
+            ("truncated", "other", 3),
+            ("refused", "read", "evaluation_time"),
+            ("allowed", "list_fields", "evaluation_time"),
+            ("weird", "read", "evaluation_time"),
+        )
+        for event in malformed:
+            with self.subTest(event=event), patch("case21_runner.case.exercise", return_value=("draft", (event,))):
+                result = run_case21("stale", lambda *_: "draft")
+                self.assertEqual(result.status, "inconclusive_malformed_events")
+                self.assertIsNone(result.read_count)
+                self.assertIsNone(result.fields_read)
+
+
 if __name__ == "__main__":
     unittest.main()
