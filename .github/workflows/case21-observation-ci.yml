@@ -1,7 +1,7 @@
 name: A4a exact-head offline coverage probe
 on:
   push:
-    branches: [dolores/ci-python-strict-1630]
+    branches: [dolores/ci-strict-summary-1733]
 permissions:
   contents: read
 jobs:
@@ -32,7 +32,8 @@ jobs:
         shell: bash
         run: |
           python -m unittest discover -s ci -p 'test_strict_unittest.py' -v
-          python ci/run_strict_unittest.py evaluation/a4a
+          python -m unittest discover -s ci -p 'test_supervise_unittest.py' -v
+          python ci/supervise_unittest.py evaluation/a4a
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
