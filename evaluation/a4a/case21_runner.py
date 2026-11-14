@@ -15,6 +15,20 @@ class ExerciseResult:
     output: str | None
     events: tuple
 
+    @property
+    def read_count(self):
+        """Number of recorded fixture reads, not proof of isolation."""
+        return sum(1 for event in self.events
+                   if len(event) == 3 and event[0] == "allowed"
+                   and event[1] == "read" and event[2] in case.FIELDS)
+
+    @property
+    def fields_read(self):
+        """Unique recorded field names; in-process event logs can be forged."""
+        return tuple(sorted({event[2] for event in self.events
+                            if len(event) == 3 and event[0] == "allowed"
+                            and event[1] == "read" and event[2] in case.FIELDS}))
+
 
 def run_case21(scenario, callback):
     """Run one fictional scenario; do not award a score.
