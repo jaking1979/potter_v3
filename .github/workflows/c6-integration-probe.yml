@@ -1,7 +1,7 @@
 name: C6 real integration probe
 on:
   push:
-    branches: [dolores/c6-claim-binding-20261113]
+    branches: [dolores/c6-wait-binding-1927]
 permissions:
   contents: read
 jobs:
