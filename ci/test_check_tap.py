@@ -7,6 +7,12 @@ class TapCoverage(unittest.TestCase):
     def test_good(self):
         self.assertTrue(check(GOOD))
 
+    def test_explicit_minimum(self):
+        self.assertTrue(check(GOOD, 3))
+        self.assertFalse(check(GOOD, 4))
+        for minimum in (0, -1, True, '3'):
+            self.assertFalse(check(GOOD, minimum))
+
     def test_bad_summaries_fail_closed(self):
         for bad in (GOOD.replace('# tests 3', '# tests 0'),
                     GOOD.replace('# pass 3', '# pass 2'),
