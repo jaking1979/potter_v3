@@ -48,6 +48,12 @@ class ApprovedOutageProbe(unittest.TestCase):
     def test_short_outage_resumes_and_inspects_real_chain(self):
         with tempfile.TemporaryDirectory() as tmp:
             w, sink, waiting = self.ready(tmp)
+            attempted = []
+            hook = w.engine._trace
+            def observe(record):
+                attempted.append(dict(record))
+                return hook(record)
+            w.engine._trace = observe
             backup = sink.path.with_suffix(".backup")
             sink.path.rename(backup)
             self.assertEqual(w.runner.run_once().outcome, "retry")
@@ -56,6 +62,10 @@ class ApprovedOutageProbe(unittest.TestCase):
             self.assertEqual(w.runner.run_once().outcome, "done")
             self.assertEqual(w.ext.calls("pay"), 1)
             rows = [json.loads(row[1]) for row in sink.records()]
-            # Preserve records for review: assert chain still contains original task,
-            # without claiming it proves a persisted allow for the approved effect.
-            self.assertTrue(any(r.get("task.id") == waiting.task_id for r in rows))
+            approved = [r for r in attempted if r["reason_code"] == "ok_approved"]
+            reconciled = [r for r in attempted if r["reason_code"] == "reconcile_pending_intent"]
+            self.assertEqual(len(approved), 1)
+            self.assertEqual(len(reconciled), 1)
+            subjects = {r.get("potter.subject.id") for r in rows}
+            self.assertNotIn(approved[0]["decision_id"], subjects)
+            self.assertIn(reconciled[0]["decision_id"], subjects)
