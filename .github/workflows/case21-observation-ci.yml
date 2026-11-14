@@ -1,7 +1,7 @@
 name: A4a exact-head offline coverage probe
 on:
   push:
-    branches: [dolores/ci-node-failclosed-1334]
+    branches: [dolores/ci-python-strict-1630]
 permissions:
   contents: read
 jobs:
@@ -31,13 +31,8 @@ jobs:
       - name: A4a Python test discovery
         shell: bash
         run: |
-          set -o pipefail
-          python -m unittest discover -s evaluation/a4a -p 'test_*.py' -v 2>&1 | tee /tmp/potter-a4a.log
-          grep -Eq '^Ran [1-9][0-9]* tests? in ' /tmp/potter-a4a.log || { echo 'No A4a tests discovered' >&2; exit 1; }
-          if grep -Eq '\.\.\. skipped |^OK \(skipped=' /tmp/potter-a4a.log; then
-            echo "Required A4a test was skipped" >&2
-            exit 1
-          fi
+          python -m unittest discover -s ci -p 'test_strict_unittest.py' -v
+          python ci/run_strict_unittest.py evaluation/a4a
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
