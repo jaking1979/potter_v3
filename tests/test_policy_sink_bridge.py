@@ -3,6 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from tracing.policy_sink_bridge import emit_replay_safe
 from tracing.sqlite_sink import SqliteTraceSink, TraceStoreRefused
@@ -53,3 +54,9 @@ class PolicyReplayBridgeTests(unittest.TestCase):
         with self.assertRaises(Exception):
             emit_replay_safe(self.sink, self.trace)
         self.assertFalse(self.path.exists())
+
+    def test_unrelated_store_refusal_is_never_treated_as_retry(self):
+        emit_replay_safe(self.sink, self.trace)
+        with patch.object(self.sink, 'put', side_effect=TraceStoreRefused('unrelated refusal')):
+            with self.assertRaisesRegex(TraceStoreRefused, 'unrelated refusal'):
+                emit_replay_safe(self.sink, self.trace)
