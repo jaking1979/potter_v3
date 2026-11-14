@@ -1,7 +1,7 @@
 name: Approved trace outage characterization
 on:
   push:
-    branches: [dolores/c6-approved-outage-probe-1227]
+    branches: [dolores/c6-outage-controls-1334]
 permissions:
   contents: read
 jobs:
