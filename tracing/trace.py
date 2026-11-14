@@ -1,15 +1,24 @@
 """Offline trace record primitives; no persistence or runtime wiring."""
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 import json
 import re
 from uuid import UUID
 
 _HASH = re.compile(r'^[0-9a-f]{64}$')
 _DECISION_ID = re.compile(r'^dec-[0-9a-f]{32}$')
+_UTC_TIMESTAMP = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)$')
 _COMPONENTS = frozenset({'policy', 'task', 'effect'})
 _OUTCOMES = frozenset({'allow', 'deny', 'reconcile', 'accepted', 'blocked', 'completed', 'failed', 'unknown'})
 _ENVIRONMENTS = frozenset({'synthetic', 'replay', 'staging', 'production'})
+
+def validate_timestamp(value):
+    if not isinstance(value, str) or not _UTC_TIMESTAMP.fullmatch(value):
+        raise ValueError('timestamp must be canonical UTC ISO 8601')
+    try:
+        datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError as exc:
+        raise ValueError('timestamp must be canonical UTC ISO 8601') from exc
 
 @dataclass(frozen=True)
 class DecisionTrace:
@@ -45,12 +54,7 @@ class DecisionTrace:
                         raise ValueError()
                 except (ValueError, AttributeError) as exc:
                     raise ValueError('subject ID must be a canonical UUID') from exc
-        try:
-            dt = datetime.fromisoformat(self.timestamp.replace('Z', '+00:00'))
-            if dt.tzinfo is None or dt.utcoffset() != timezone.utc.utcoffset(dt):
-                raise ValueError()
-        except (ValueError, AttributeError) as exc:
-            raise ValueError('timestamp must be UTC ISO 8601') from exc
+        validate_timestamp(self.timestamp)
 
     def jsonl(self):
         data = {'schema': 'potter.trace.decision/v0', 'task.id': self.task_id,
