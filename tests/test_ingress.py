@@ -2120,6 +2120,104 @@ class VolatileHoldsAreBoundedWork(Fixture):
             self.assertEqual(self.gw.pending(limit=1, max_scan=100), [v1])    # oldest again
 
 
+class CountingDict(dict):
+    """dict whose items() iteration counts every entry it yields."""
+    visits = 0
+
+    def items(self):
+        for kv in super().items():
+            CountingDict.visits += 1
+            yield kv
+
+
+class RetrySelectionIsBounded(Fixture):
+    """Dolores at b77e20e: _retry_blocked() built a list of ALL in-memory holds
+    before slicing to RETRY_BLOCKED, so each pending() call cost CPU/memory
+    proportional to the held backlog. Selection now reads only the chosen
+    prefix, keeping rotation and the durable/volatile split."""
+
+    corrupt = PendingScanCannotStarve.corrupt
+    setup_rows = QuarantineFailureCannotStall.setup_rows
+    failing = QuarantineFailureCannotStall.failing
+
+    def held(self, gw, n):
+        import uuid
+        d = CountingDict((str(uuid.UUID(int=i + 1)), ("malformed", 1)) for i in range(n))
+        gw._volatile_blocked = d
+        return d
+
+    def tried(self):
+        calls = []
+        from unittest import mock
+
+        def record(store, event_id, now, reason):
+            calls.append(event_id)
+            raise OSError("still failing")
+        return calls, mock.patch.object(IngressStore, "quarantine", record)
+
+    def test_143_selection_visits_bounded_for_any_backlog(self):
+        r = self.gw.RETRY_BLOCKED
+        for n in (r, 1_000, 100_000):
+            with self.subTest(backlog=n):
+                self.held(self.gw, n)
+                calls, patch = self.tried()
+                with patch, self.failing("block"):
+                    CountingDict.visits = 0
+                    self.assertEqual(self.gw.pending(max_scan=10), [])
+                self.assertLessEqual(CountingDict.visits, r)            # bounded selection
+                self.assertEqual(len(calls), r)                         # full retry budget
+                self.assertEqual(len(self.gw._volatile_blocked), n)     # nothing dropped
+
+    def test_144_rotation_reaches_every_hold_and_none_resolve_while_failing(self):
+        r = self.gw.RETRY_BLOCKED
+        n = r * 5
+        self.held(self.gw, n)
+        seen = []
+        for _ in range(5):
+            calls, patch = self.tried()
+            with patch, self.failing("block"):
+                self.gw.pending(max_scan=10)
+            seen.extend(calls)
+        self.assertEqual(len(seen), n)
+        self.assertEqual(len(set(seen)), n)                             # each tried once
+        self.assertEqual(len(self.gw._volatile_blocked), n)             # still held
+        self.assertTrue(all(c == 2 for _w, c in self.gw._volatile_blocked.values()))
+
+    def test_145_durable_and_volatile_share_the_budget(self):
+        r = self.gw.RETRY_BLOCKED
+        bad, good = self.setup_rows(n_bad=r + 4)
+        with self.failing("quarantine"):
+            self.gw.pending(max_scan=100)                               # all durable-held
+        self.assertEqual(len(self.gw.recovery_blocked()), r + 4)
+        held = set(self.held(self.gw, 10_000))
+        calls, patch = self.tried()
+        with patch, self.failing("block"):
+            CountingDict.visits = 0
+            self.assertEqual(self.gw.pending(max_scan=100), [good])
+        durable = [c for c in calls if c in set(bad)]
+        volatile = [c for c in calls if c in held]
+        self.assertEqual(len(durable) + len(volatile), r)
+        self.assertEqual((len(durable), len(volatile)), (r // 2, r // 2))
+        self.assertLessEqual(CountingDict.visits, r)
+
+    def test_146_restart_and_recovery_keep_progress(self):
+        bad, good = self.setup_rows(n_bad=40)
+        with self.failing("quarantine", "block"):
+            for _ in range(5):
+                self.gw.pending(max_scan=10)
+            self.assertEqual(len(self.gw.recovery_blocked()), 40)
+        restarted = self.gateway()                                      # memory holds gone
+        self.assertEqual(restarted.recovery_blocked(), [])
+        with self.failing("quarantine", "block"):
+            restarted.pending(max_scan=10)                              # re-held, bounded
+            self.assertEqual(len(restarted.recovery_blocked()), 10)
+        for _ in range(6):                                              # fault cleared
+            restarted.pending(max_scan=50)
+        self.assertEqual(restarted.recovery_blocked(), [])
+        self.assertEqual(sorted(restarted.quarantined()), sorted((e, "malformed") for e in bad))
+        self.assertEqual(restarted.pending(), [good])
+
+
 class Structure(unittest.TestCase):
     def test_43_ingress_passes_notifier_lint(self):
         self.assertEqual([f for f in lint.scan(ROOT) if f.path.startswith("ingress")], [])

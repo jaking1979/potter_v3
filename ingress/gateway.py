@@ -41,6 +41,7 @@ The untrusted-source boundary (T11/T12; T19 PASS 2 items 2 and 4):
 """
 from __future__ import annotations
 
+import itertools
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -347,11 +348,14 @@ class IngressGateway:
         except Exception:
             durable = []
         # In-memory holds rotate (re-inserted at the end on each failure) and
-        # get at least half the budget when durable holds also exist.
-        volatile = [(e, why, n) for e, (why, n) in self._volatile_blocked.items()]
-        v_share = min(len(volatile), max(self.RETRY_BLOCKED // 2,
-                                         self.RETRY_BLOCKED - len(durable)))
-        picks = durable[:self.RETRY_BLOCKED - v_share] + volatile[:v_share]
+        # get at least half the budget when durable holds also exist. Only the
+        # chosen prefix is read (islice), so selection costs O(RETRY_BLOCKED)
+        # however large the in-memory backlog is.
+        v_share = min(len(self._volatile_blocked),
+                      max(self.RETRY_BLOCKED // 2, self.RETRY_BLOCKED - len(durable)))
+        volatile = [(e, why, n) for e, (why, n) in
+                    itertools.islice(self._volatile_blocked.items(), v_share)]
+        picks = durable[:self.RETRY_BLOCKED - v_share] + volatile
         for event_id, why, _n in picks:
             self._quarantine(event_id, why)
 
