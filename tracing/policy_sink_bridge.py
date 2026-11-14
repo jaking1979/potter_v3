@@ -1,6 +1,6 @@
 """Offline policy replay bridge; not effect-atomic or authenticated audit."""
 import json
-from tracing.sqlite_sink import SqliteTraceSink, TraceStoreRefused, validate_jsonl
+from tracing.sqlite_sink import SqliteTraceSink, TraceStoreConflict, validate_jsonl
 from tracing.trace import DecisionTrace
 
 
@@ -17,7 +17,7 @@ def emit_replay_safe(sink, trace):
     line = trace.jsonl()
     try:
         return sink.put(trace.trace_id, line)
-    except TraceStoreRefused:
+    except TraceStoreConflict:
         # Revalidate the entire authoritative store before considering a retry.
         # If the attempted insert failed for an unrelated reason this read must
         # fail as well or find no matching row, and the original error remains.
