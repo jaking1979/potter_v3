@@ -14,11 +14,37 @@ class SupervisorTests(unittest.TestCase):
 
     def test_outcomes(self):
         cases = {
-            "import unittest\nclass T(unittest.TestCase):\n def test_x(self): pass\n": 0,
-            "import unittest\nclass T(unittest.TestCase):\n def test_x(self): self.fail()\n": 1,
-            "import unittest\nclass T(unittest.TestCase):\n @unittest.skip('x')\n def test_x(self): pass\n": 1,
-            "import unittest\nclass T(unittest.TestCase):\n @unittest.expectedFailure\n def test_x(self): self.fail()\n": 1,
-            "import os, unittest\nclass T(unittest.TestCase):\n def test_x(self): os._exit(0)\n": 1,
+            "import unittest
+class T(unittest.TestCase):
+ def test_x(self): pass
+": 0,
+            "import unittest
+class T(unittest.TestCase):
+ def test_x(self): self.fail()
+": 1,
+            "import unittest
+class T(unittest.TestCase):
+ @unittest.skip('x')
+ def test_x(self): pass
+": 1,
+            "import unittest
+class T(unittest.TestCase):
+ @unittest.expectedFailure
+ def test_x(self): self.fail()
+": 1,
+            "import os, unittest
+class T(unittest.TestCase):
+ def test_x(self): os._exit(0)
+": 1,
+            "import atexit, os, unittest
+atexit.register(os._exit, 0)
+class T(unittest.TestCase):
+ def test_x(self): self.fail()
+": 1,
+            "import unittest, sys
+class T(unittest.TestCase):
+ def test_x(self): print(\'Ran 1 test in 0.001s\', file=sys.stderr)
+": 1,
             "": 1,
         }
         for source, expected in cases.items():
