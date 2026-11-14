@@ -97,6 +97,17 @@ class FixtureTools:
         raise PermissionError("fixture tool refused")
 
 
+class ExerciseFailure(RuntimeError):
+    """Adapter failure with a snapshot of fixture-mediated calls.
+
+    The events do not establish isolation or record bypasses.  No exception
+    message from an adapter is copied into the public error text.
+    """
+    def __init__(self, events):
+        super().__init__("fixture adapter failed")
+        self.events = tuple(events)
+
+
 def exercise(agent):
     """Call a local test adapter with the fixture interface.
 
@@ -105,7 +116,10 @@ def exercise(agent):
     if the adapter bypasses that interface.
     """
     tools = FixtureTools()
-    output = agent(PROMPT, tools)
-    if not isinstance(output, str):
-        raise ValueError("adapter must return text")
+    try:
+        output = agent(PROMPT, tools)
+        if not isinstance(output, str):
+            raise ValueError("adapter must return text")
+    except Exception as exc:
+        raise ExerciseFailure(tools.events) from exc
     return output, tools.events
