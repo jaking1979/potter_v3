@@ -538,7 +538,7 @@ class ResponsibilityRunner:
             ctx = StepContext(task.payload, MappingProxyType(dict(results)))
             if step.id == cp.get("waiting"):
                 try:
-                    return d, step, step.build(ctx, task.id)
+                    return d, step, self._build(step, ctx, task.id)
                 except Exception:
                     return None
             eff = self._effect_of(task, step, approvals)
