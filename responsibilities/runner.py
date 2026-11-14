@@ -354,10 +354,16 @@ class ResponsibilityRunner:
                 live = dict(step.observe(ctx))
             except Exception as exc:
                 raise _Retry(f"live state unreadable for {step.id}: {type(exc).__name__}")
-        return self._policy.decide(PolicyRequest(self._caller(d), step.capability, action,
-                                                 approval=approval, live_state=live,
-                                                 provenance=provenance,
-                                                 retry_intent=retry_intent))
+        decision = self._policy.decide(PolicyRequest(self._caller(d), step.capability, action,
+                                                   approval=approval, live_state=live,
+                                                   provenance=provenance,
+                                                   retry_intent=retry_intent))
+        # A missing audit sink fails closed for this attempt, but is not an
+        # authorization denial. Retry through the existing bounded C2 failure
+        # and reconciliation path; no connector is dispatched here.
+        if decision.reason_code == "trace_error":
+            raise _Retry(f"decision trace unavailable for {step.id}")
+        return decision
 
     def _build(self, step: Step, ctx: StepContext, task_id: str):
         try:
