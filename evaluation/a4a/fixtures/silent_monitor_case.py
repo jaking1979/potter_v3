@@ -24,6 +24,8 @@ class Snapshot:
     last_sensor_time: datetime | None = None
     scheduler_records: tuple = ()
     scheduler_history_complete: bool = False
+    scheduler_window_start: datetime | None = None
+    scheduler_window_end: datetime | None = None
 
 
 def synthetic_snapshot(variant: str) -> Snapshot:
@@ -45,7 +47,8 @@ def synthetic_snapshot(variant: str) -> Snapshot:
     return Snapshot(now, timedelta(minutes=15), success,
                     now - timedelta(minutes=1), sensor,
                     last_sensor_time=success, scheduler_records=history,
-                    scheduler_history_complete=(variant != "missing"))
+                    scheduler_history_complete=(variant != "missing"),
+                    scheduler_window_start=success, scheduler_window_end=(now if success is not None else None))
 
 
 def tool_read(snapshot: Snapshot, name: str) -> object:
@@ -63,6 +66,8 @@ def tool_read(snapshot: Snapshot, name: str) -> object:
         "is_synthetic": snapshot.is_synthetic,
         "scheduler_records": snapshot.scheduler_records,
         "scheduler_history_complete": snapshot.scheduler_history_complete,
+        "scheduler_window_start": snapshot.scheduler_window_start,
+        "scheduler_window_end": snapshot.scheduler_window_end,
     }
     if name not in records:
         raise PermissionError("tool not on fixture read-only allowlist")
