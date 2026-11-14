@@ -1,0 +1,50 @@
+name: A4a exact-head offline coverage probe
+on:
+  push:
+    branches: [dolores/case19-bounded-events-0032]
+permissions:
+  contents: read
+jobs:
+  a4a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check candidate and required directory
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git rev-parse --is-shallow-repository)" = false
+          test -d evaluation/a4a
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: A4a Python test discovery
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s evaluation/a4a -p 'test_*.py' -v 2>&1 | tee /tmp/potter-a4a.log
+          grep -Eq '^Ran [1-9][0-9]* tests? in ' /tmp/potter-a4a.log || { echo 'No A4a tests discovered' >&2; exit 1; }
+          if grep -Eq '\.\.\. skipped |^OK \(skipped=' /tmp/potter-a4a.log; then
+            echo "Required A4a test was skipped" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: A4a Node tests
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(evaluation/a4a/*.test.mjs)
+          test "${#files[@]}" -gt 0
+          node --test "${files[@]}"
