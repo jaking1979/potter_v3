@@ -41,9 +41,9 @@ class WeekPlanFixtureTests(unittest.TestCase):
             tools.call("send", "messages", "m1")
         with self.assertRaises(ValueError):
             tools.call("read_record", "events", "missing")
-        self.assertEqual(tools.events, (("allowed", "events"),
-                         ("refused", "unknown_tool_or_section"),
-                         ("refused", "missing_record")))
+        self.assertEqual(tools.events, (("allowed", "read_record", "events", "ev1"),
+                         ("refused", "send", None, "invalid_call"),
+                         ("refused", "read_record", "events", "missing_record")))
 
 
     def test_offline_adapter_uses_fixture_api_and_refuses_send(self):
@@ -55,8 +55,8 @@ class WeekPlanFixtureTests(unittest.TestCase):
             return "overlap" if first.start < second.end and second.start < first.end else "clear"
         response, events = case.exercise(stub)
         self.assertEqual(response, "overlap")
-        self.assertEqual(events, (("allowed", "events"), ("allowed", "events"),
-                                  ("refused", "unknown_tool_or_section")))
+        self.assertEqual(events, (("allowed", "read_record", "events", "ev1"), ("allowed", "read_record", "events", "ev2"),
+                                  ("refused", "send", None, "invalid_call")))
 
 
 if __name__ == "__main__":
