@@ -8,7 +8,8 @@ from fixtures.silent_monitor_case import PROMPT, synthetic_snapshot, tool_read
 FIELDS = ("evaluation_time", "monitor_cadence", "last_monitor_success",
           "last_heartbeat", "last_sensor_state", "last_sensor_time",
           "monitor_id", "is_synthetic", "scheduler_records",
-          "scheduler_history_complete")
+          "scheduler_history_complete", "scheduler_window_start",
+          "scheduler_window_end")
 MAX_EVENTS = 1000
 
 
