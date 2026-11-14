@@ -1,6 +1,8 @@
 """Real offline SQLite sink replay behavior; no provider or production access."""
 from dataclasses import replace
 from pathlib import Path
+import json
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -57,6 +59,28 @@ class PolicyReplayBridgeTests(unittest.TestCase):
 
     def test_unrelated_store_refusal_is_never_treated_as_retry(self):
         emit_replay_safe(self.sink, self.trace)
-        with patch.object(self.sink, 'put', side_effect=TraceStoreRefused('unrelated refusal')):
+        with patch.object(self.sink, 'put_time_retry', side_effect=TraceStoreRefused('unrelated refusal')):
             with self.assertRaisesRegex(TraceStoreRefused, 'unrelated refusal'):
                 emit_replay_safe(self.sink, self.trace)
+
+    def test_uncorrelated_denial_retry_uses_same_transaction_rule(self):
+        event_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+        denial = {'schema':'potter.trace.uncorrelated-denial/v0',
+                  'decision.id':SUBJECT, 'potter.environment':'synthetic',
+                  'time':'2026-11-06T15:00:00Z'}
+        line = json.dumps(denial, sort_keys=True, separators=(',', ':')) + '\n'
+        self.assertTrue(self.sink.put_time_retry(event_id, line))
+        denial['time'] = '2026-11-06T16:00:00Z'
+        retry = json.dumps(denial, sort_keys=True, separators=(',', ':')) + '\n'
+        with patch.object(self.sink, 'records', side_effect=AssertionError('extra read')):
+            self.assertFalse(self.sink.put_time_retry(event_id, retry))
+        self.assertEqual(self.sink.records(), ((event_id, line),))
+        with self.assertRaises(TraceStoreRefused):
+            self.sink.put(event_id, retry)
+
+    def test_tampered_record_refuses_retry(self):
+        self.assertTrue(emit_replay_safe(self.sink, self.trace))
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("UPDATE events SET record = record || ' '")
+        with self.assertRaises(TraceStoreRefused):
+            emit_replay_safe(self.sink, replace(self.trace, timestamp='2026-11-06T16:00:00Z'))
