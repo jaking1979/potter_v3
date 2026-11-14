@@ -160,11 +160,18 @@ class SqliteTraceSink:
         return result
 
     def put(self, event_id, line):
-        """True for insertion; False for identical retry; conflict raises.
+        """Strict insert: identical bytes retry, other content conflicts."""
+        return self._put(event_id, line, ignore_retry_time=False)
 
-        A result is returned after the local transaction commits. An uncertain
-        caller retries the same ID and exact record. No external effect is run.
+    def put_time_retry(self, event_id, line):
+        """Offline opt-in: identical record except time keeps the first time.
+
+        This applies to both supported schemas. It does not make effect and
+        trace writes atomic or authenticate the event's identity.
         """
+        return self._put(event_id, line, ignore_retry_time=True)
+
+    def _put(self, event_id, line, *, ignore_retry_time):
         _uuid(event_id)
         canonical = validate_jsonl(line, self.environment)
         c = self._connect()
@@ -175,7 +182,14 @@ class SqliteTraceSink:
             prior = c.execute('SELECT record FROM events WHERE event_id=?', (event_id,)).fetchone()
             if prior:
                 if prior[0] != canonical:
-                    raise TraceStoreConflict('event retry conflicts with stored record')
+                    if not ignore_retry_time:
+                        raise TraceStoreConflict('event retry conflicts with stored record')
+                    before = json.loads(prior[0])
+                    after = json.loads(canonical)
+                    before.pop('time')
+                    after.pop('time')
+                    if before != after:
+                        raise TraceStoreConflict('event retry conflicts with stored record')
                 c.execute('COMMIT')
                 return False
             seq = len(rows) + 1
@@ -186,7 +200,7 @@ class SqliteTraceSink:
             c.execute('COMMIT')
             return True
         finally:
-            c.close()  # rolls back any unfinished transaction
+            c.close()
 
     def for_event(self, event_id):
         """Bind a stable event ID to the existing emitter's single-argument seam."""
