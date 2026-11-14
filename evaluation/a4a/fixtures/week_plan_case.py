@@ -120,6 +120,6 @@ def exercise(agent):
         output = agent(PROMPT, tools)
         if not isinstance(output, str):
             raise ValueError("adapter must return text")
-    except Exception as exc:
-        raise ExerciseFailure(tools.events) from exc
+    except Exception:
+        raise ExerciseFailure(tools.events) from None
     return output, tools.events
