@@ -16,7 +16,7 @@ def main(path):
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     sys.stdout.write(child.stdout)
     sys.stderr.write(child.stderr)
-    if child.returncode != 0 or len(SUMMARY.findall(child.stderr)) != 1:
+    if child.returncode != 0 or len(SUMMARY.findall(child.stderr)) != 1 or child.stderr.splitlines()[-1:] != ["OK"]:
         return 1
     return 0
 
