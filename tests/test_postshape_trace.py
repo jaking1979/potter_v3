@@ -45,6 +45,23 @@ class PostshapeTrace(unittest.TestCase):
             self.assertEqual(w.ext.calls(), 0)
             self.assertEqual(rows, [])  # rejected by runner before C1 policy trace
 
+    def test_waiting_rebuild_cannot_switch_claimed_task(self):
+        from unittest.mock import patch
+        from responsibilities import Step
+        with tempfile.TemporaryDirectory() as tmp:
+            w = rw.World(tmp, definitions=[rw.bill_watch()])
+            w.runner.on_event("bill.due", {"id": "bill-test", "amount": 120})
+            result = w.runner.run_once()
+            self.assertEqual(result.outcome, "waiting_approval")
+            task = w.runner.tasks.get(result.task_id)
+            self.assertIsNotNone(w.runner._waiting_step(task))
+            wrong = c0.BoundAction(str(uuid.uuid4()), "notes.append", "append", "test", {})
+            with patch.object(Step, "build", return_value=wrong):
+                self.assertIsNone(w.runner._waiting_step(task))
+                self.assertEqual(w.runner.poll_approvals(), [])
+            self.assertEqual(w.runner.tasks.get(task.id).state, "waiting_approval")
+            self.assertEqual(w.ext.calls("pay"), 0)
+
     def test_trace_failure_blocks_fake_effect(self):
         with tempfile.TemporaryDirectory() as tmp:
             w=rw.World(tmp,definitions=[rw.batch(n=1)])
