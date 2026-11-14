@@ -1,7 +1,7 @@
 name: A4a exact-head offline coverage probe
 on:
   push:
-    branches: [dolores/case21-demo-1227]
+    branches: [dolores/ci-node-failclosed-1334]
 permissions:
   contents: read
 jobs:
@@ -41,10 +41,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Verify Node coverage guard
+        run: python -m unittest discover -s ci -p 'test_check_tap.py' -v
       - name: A4a Node tests
         shell: bash
         run: |
           shopt -s nullglob
           files=(evaluation/a4a/*.test.mjs)
           test "${#files[@]}" -gt 0
-          node --test "${files[@]}"
+          set -o pipefail
+          node --test --test-reporter=tap "${files[@]}" 2>&1 | tee /tmp/potter-node.tap
+          python ci/check_tap.py /tmp/potter-node.tap
