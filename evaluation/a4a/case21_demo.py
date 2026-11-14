@@ -20,10 +20,14 @@ def _encode(value):
     raise TypeError("unsupported fixture value")
 
 
+class NonSyntheticFixture(ValueError):
+    pass
+
+
 def _collect(_prompt, tools):
     marker = tools.call("read", "is_synthetic")
     if marker is not True:
-        raise ValueError("fixture must be explicitly synthetic")
+        raise NonSyntheticFixture("fixture must be explicitly synthetic")
     records = {"is_synthetic": marker}
     records.update({field: tools.call("read", field) for field in FIELDS if field != "is_synthetic"})
     return json.dumps(records, default=_encode, sort_keys=True)
@@ -36,9 +40,8 @@ def walkthrough(scenario):
         nonlocal marker_refused
         try:
             return _collect(prompt, tools)
-        except ValueError as exc:
-            if str(exc) == "fixture must be explicitly synthetic":
-                marker_refused = True
+        except NonSyntheticFixture:
+            marker_refused = True
             raise
     result = run_case21(scenario, collect)
     status = "refused_non_synthetic" if marker_refused else result.status
