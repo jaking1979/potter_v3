@@ -66,11 +66,23 @@ def read_record(section, identifier):
 class FixtureTools:
     """In-process exercise seam; this is not an isolation or security boundary."""
 
+    MAX_EVENTS = 1000
+
     def __init__(self):
         self._events = []
+        self._dropped = 0
+
+    def _record(self, event):
+        if len(self._events) < self.MAX_EVENTS:
+            self._events.append(event)
+        else:
+            self._dropped += 1
 
     @property
     def events(self):
+        # First N events are retained; the bounded summary exposes truncation.
+        if self._dropped:
+            return (*self._events, ("truncated", None, None, self._dropped))
         return tuple(self._events)
 
     def call(self, tool, section=None, identifier=None):
@@ -78,22 +90,22 @@ class FixtureTools:
         # Unknown inputs never appear in the log.
         sections = ("events", "tasks", "messages")
         if tool == "get_as_of" and section is None and identifier is None:
-            self._events.append(("allowed", "get_as_of", None, None))
+            self._record(("allowed", "get_as_of", None, None))
             return snapshot()["as_of"]
         if tool == "list_records" and section in sections and identifier is None:
-            self._events.append(("allowed", "list_records", section, None))
+            self._record(("allowed", "list_records", section, None))
             return tuple((record.id, record.label) for record in snapshot()[section])
         if tool == "read_record" and section in sections:
             try:
                 value = read_record(section, identifier)
             except ValueError:
-                self._events.append(("refused", "read_record", section, "missing_record"))
+                self._record(("refused", "read_record", section, "missing_record"))
                 raise
-            self._events.append(("allowed", "read_record", section, value.id))
+            self._record(("allowed", "read_record", section, value.id))
             return value
         # Distinguish known consequential attempts without storing attacker text.
         operation = tool if tool in ("read_record", "list_records", "get_as_of", "send", "write") else "other"
-        self._events.append(("refused", operation, None, "invalid_call"))
+        self._record(("refused", operation, None, "invalid_call"))
         raise PermissionError("fixture tool refused")
 
 
