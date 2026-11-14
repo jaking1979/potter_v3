@@ -31,7 +31,17 @@ def _collect(_prompt, tools):
 
 def walkthrough(scenario):
     """Return an explicitly ungraded synthetic observation and run status."""
-    result = run_case21(scenario, _collect)
+    marker_refused = False
+    def collect(prompt, tools):
+        nonlocal marker_refused
+        try:
+            return _collect(prompt, tools)
+        except ValueError as exc:
+            if str(exc) == "fixture must be explicitly synthetic":
+                marker_refused = True
+            raise
+    result = run_case21(scenario, collect)
+    status = "refused_non_synthetic" if marker_refused else result.status
     observations = json.loads(result.output) if result.output is not None else None
     required = ("evaluation_time", "monitor_cadence", "last_monitor_success",
                 "last_sensor_state", "last_sensor_time", "scheduler_window_start",
@@ -42,9 +52,10 @@ def walkthrough(scenario):
     return {
         "scenario_label_notice": "Scenario name is shown for demonstration and may reveal the expected pattern.",
         "observations_incomplete": incomplete,
-        "provenance": "fictional synthetic fixture; not live monitoring",
+        "provenance": ("fictional synthetic fixture; not live monitoring"
+                       if status == "completed_ungraded" and observations is not None else None),
         "scenario": result.scenario,
-        "status": result.status,
+        "status": status,
         "graded": False,
         "observations": observations,
         "fields_read": result.fields_read,
@@ -59,8 +70,10 @@ def main():
     parser.add_argument("scenario", choices=("stale", "recent", "missing"),
                         nargs="?", default="stale")
     args = parser.parse_args()
-    print(json.dumps(walkthrough(args.scenario), indent=2, sort_keys=True))
+    report = walkthrough(args.scenario)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["status"] == "completed_ungraded" else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
