@@ -20,7 +20,7 @@ def run_case21(scenario, callback):
     """Run one fictional scenario; do not award a score.
 
     A mediated refusal or truncated log is visibly inconclusive; the caller
-    must not interpret a completed callback as proof of zero side effects.
+    must not interpret a completed callback as proof of zero side effects.\n    This in-process callback has no timeout; a mediated read is not isolation.
     """
     if scenario not in ("stale", "recent", "missing"):
         raise ValueError("unknown synthetic scenario")
@@ -34,6 +34,8 @@ def run_case21(scenario, callback):
         status = "inconclusive_truncated"
     elif any(event[0] == "refused" for event in events):
         status = "inconclusive_refusal"
+    elif not any(event[0] == "allowed" and event[1] == "read" for event in events):
+        status = "inconclusive_no_fixture_read"
     else:
         status = "completed_ungraded"
     return ExerciseResult(scenario, status, output, events)
