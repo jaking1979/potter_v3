@@ -20,7 +20,7 @@ class SupervisorTests(unittest.TestCase):
             "import unittest\nclass T(unittest.TestCase):\n @unittest.expectedFailure\n def test_x(self): self.fail()\n": 1,
             "import os, unittest\nclass T(unittest.TestCase):\n def test_x(self): os._exit(0)\n": 1,
             "import atexit, os, unittest\natexit.register(os._exit, 0)\nclass T(unittest.TestCase):\n def test_x(self): self.fail()\n": 1,
-            "import unittest, sys\nclass T(unittest.TestCase):\n def test_x(self): print('Ran 1 test in 0.001s', file=sys.stderr)\n": 1,
+            "import unittest, sys\nclass T(unittest.TestCase):\n def test_x(self): print('\\nRan 1 test in 0.001s', file=sys.stderr)\n": 1,
             "": 1,
         }
         for source, expected in cases.items():
