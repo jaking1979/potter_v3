@@ -65,6 +65,25 @@ class WalkthroughTest(unittest.TestCase):
         with patch("case21_demo.walkthrough", return_value=report), patch.object(sys, "argv", ["demo"]):
             self.assertEqual(case21_demo.main(), 1)
 
+    def test_failure_classification_is_bound_to_marker_check(self):
+        def run(marker, later_error=False):
+            class Tools:
+                def call(self, op, field):
+                    if field == "is_synthetic": return marker
+                    if later_error: raise ValueError("fixture must be explicitly synthetic")
+                    return None
+            def fake(scenario, callback):
+                try: callback("", Tools())
+                except ValueError: pass
+                return SimpleNamespace(output=None, status="callback_failed", scenario=scenario,
+                                       fields_read=(), read_count=0, events_dropped=0)
+            with patch("case21_demo.run_case21", side_effect=fake):
+                return walkthrough("stale")
+        self.assertEqual(run(False)["status"], "refused_non_synthetic")
+        report = run(True, True)
+        self.assertEqual(report["status"], "callback_failed")
+        self.assertIsNone(report["provenance"])
+
     def test_invalid_scenario_rejected(self):
         completed = subprocess.run(
             [sys.executable, "-B", str(SCRIPT), "live"],
