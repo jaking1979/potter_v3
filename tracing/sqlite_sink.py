@@ -42,6 +42,10 @@ class TraceStoreRefused(ValueError):
     """Invalid input, conflicting event retry, or invalid existing store."""
 
 
+class TraceStoreConflict(TraceStoreRefused):
+    """Existing event identity has nonidentical content."""
+
+
 def _uuid(value):
     try:
         if not isinstance(value, str) or str(UUID(value)) != value:
@@ -171,7 +175,7 @@ class SqliteTraceSink:
             prior = c.execute('SELECT record FROM events WHERE event_id=?', (event_id,)).fetchone()
             if prior:
                 if prior[0] != canonical:
-                    raise TraceStoreRefused('event retry conflicts with stored record')
+                    raise TraceStoreConflict('event retry conflicts with stored record')
                 c.execute('COMMIT')
                 return False
             seq = len(rows) + 1
