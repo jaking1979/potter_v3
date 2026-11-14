@@ -5,7 +5,9 @@ import sys
 import unittest
 from pathlib import Path
 from fixtures.case21_exercise import FIELDS
-from case21_demo import _collect
+from case21_demo import _collect, walkthrough
+from unittest.mock import patch
+from types import SimpleNamespace
 
 SCRIPT = Path(__file__).with_name("case21_demo.py")
 
@@ -51,6 +53,17 @@ class WalkthroughTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _collect("", tools)
         self.assertEqual(tools.calls, [("read", "is_synthetic")])
+
+    def test_callback_failure_has_no_provenance_and_command_fails(self):
+        result = SimpleNamespace(output=None, status="callback_failed", scenario="stale",
+                                 fields_read=(), read_count=0, events_dropped=0)
+        with patch("case21_demo.run_case21", return_value=result):
+            report = walkthrough("stale")
+        self.assertIsNone(report["provenance"])
+        self.assertIsNone(report["observations_incomplete"])
+        import case21_demo
+        with patch("case21_demo.walkthrough", return_value=report), patch.object(sys, "argv", ["demo"]):
+            self.assertEqual(case21_demo.main(), 1)
 
     def test_invalid_scenario_rejected(self):
         completed = subprocess.run(
