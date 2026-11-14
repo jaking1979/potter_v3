@@ -1,0 +1,24 @@
+name: Approved trace outage characterization
+on:
+  push:
+    branches: [dolores/c6-approved-outage-probe-1227]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact checkout
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install jsonschema==4.23.0
+      - run: python -m unittest discover -s tests -p test_approved_outage_probe.py -v
