@@ -19,6 +19,8 @@ class ObservableHistory(unittest.TestCase):
         self.assertEqual(tools.call("read", "scheduler_records"),
                          ((tools.call("read", "last_monitor_success"), "success"),))
         self.assertTrue(tools.call("read", "scheduler_history_complete"))
+        self.assertEqual(tools.call("read", "scheduler_window_start"), tools.call("read", "last_monitor_success"))
+        self.assertEqual(tools.call("read", "scheduler_window_end"), now)
 
     def test_recent_is_distinct_and_missing_does_not_imply_never_ran(self):
         recent = case.FixtureTools("recent")
@@ -28,3 +30,5 @@ class ObservableHistory(unittest.TestCase):
         self.assertIsNone(missing.call("read", "last_sensor_time"))
         self.assertEqual(missing.call("read", "scheduler_records"), ())
         self.assertFalse(missing.call("read", "scheduler_history_complete"))
+        self.assertIsNone(missing.call("read", "scheduler_window_start"))
+        self.assertIsNone(missing.call("read", "scheduler_window_end"))
