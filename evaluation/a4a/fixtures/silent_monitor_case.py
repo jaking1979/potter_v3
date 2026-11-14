@@ -45,7 +45,8 @@ def synthetic_snapshot(variant: str) -> Snapshot:
         sensor = None
     else:
         raise ValueError("unknown synthetic scenario")
-    # Synthetic closed interval [start, end], including the start record.\n    # Start is deliberately the last success, not a claim about earlier history.
+    # Synthetic closed interval [start, end], including the start record.
+    # Start is deliberately the last success, not a claim about earlier history.
     history = ((success, "success"),) if success is not None else ()
     return Snapshot(now, timedelta(minutes=15), success,
                     now - timedelta(minutes=1), sensor,
