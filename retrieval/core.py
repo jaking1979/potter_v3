@@ -153,8 +153,9 @@ async def benchmark(backend: Backend, query: str, expected_ids: Sequence[str], *
     if type(expected_ids) not in (list, tuple) or not 1 <= len(expected_ids) <= 3:
         raise ValueError('invalid evidence set or deadline')
     expected = tuple(expected_ids)
+    from retrieval.isolated import MAX_ID_CHARS
     if (not 1 <= len(expected) <= 3
-            or any(type(i) is not str or not i for i in expected)
+            or any(type(i) is not str or not 0 < len(i) <= MAX_ID_CHARS for i in expected)
             or len(set(expected)) != len(expected)
             or not _positive_finite_duration(production_deadline) or not _positive_finite_duration(timeout)):
         raise ValueError('invalid evidence set or deadline')
