@@ -30,7 +30,7 @@ class SupervisorTests(unittest.TestCase):
     def test_failed_run_followed_by_forged_ok(self):
         source = """import atexit, os, sys, unittest
 def end():
- sys.stderr.write("OK\\n")
+ sys.stderr.write("\\nOK\\n")
  sys.stderr.flush()
  os._exit(0)
 atexit.register(end)
