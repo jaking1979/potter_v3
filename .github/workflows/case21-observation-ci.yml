@@ -1,7 +1,7 @@
 name: A4a exact-head offline coverage probe
 on:
   push:
-    branches: [dolores/case21-classification-1828]
+    branches: [dolores/case21-evidence-ci-2031]
 permissions:
   contents: read
 jobs:
