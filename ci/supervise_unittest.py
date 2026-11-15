@@ -16,7 +16,10 @@ def main(path):
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     sys.stdout.write(child.stdout)
     sys.stderr.write(child.stderr)
-    if child.returncode != 0 or len(SUMMARY.findall(child.stderr)) != 1 or child.stderr.splitlines()[-1:] != ["OK"]:
+    lines = child.stderr.splitlines()
+    valid_tail = (len(lines) >= 3 and SUMMARY.fullmatch(lines[-3]) is not None
+                  and lines[-2:] == ["", "OK"])
+    if child.returncode != 0 or len(SUMMARY.findall(child.stderr)) != 1 or not valid_tail:
         return 1
     return 0
 
