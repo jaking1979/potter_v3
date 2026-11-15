@@ -12,8 +12,15 @@ def read_candidates_file(path):
     or an atomic snapshot of a concurrently modified file.
     """
     try:
+        if not hasattr(os, "O_NONBLOCK"):
+            raise ValueError("unsupported_platform")
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        with os.fdopen(fd, "rb") as source:
+        try:
+            source = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with source:
             if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
                 raise ValueError("invalid_source")
             raw = source.read(MAX_CONFIG_BYTES + 1)
