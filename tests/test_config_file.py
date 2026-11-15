@@ -28,3 +28,23 @@ class FileConfigTests(unittest.TestCase):
                 os.mkfifo(pipe)
                 with self.assertRaisesRegex(ValueError, "^malformed_configuration$"):
                     read_candidates_file(pipe)
+
+    def test_missing_nonblock_and_fdopen_failure_are_refused(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "data"
+            p.write_bytes(b"[]")
+            with patch("model_broker.config_file.os.O_NONBLOCK", None):
+                with self.assertRaises(ValueError):
+                    read_candidates_file(p)
+            fds = []
+            original = os.open
+            def capture(*args):
+                fd = original(*args)
+                fds.append(fd)
+                return fd
+            with patch("model_broker.config_file.os.open", side_effect=capture), patch("model_broker.config_file.os.fdopen", side_effect=OSError("failure")):
+                with self.assertRaises(ValueError):
+                    read_candidates_file(p)
+            with self.assertRaises(OSError):
+                os.fstat(fds[0])
