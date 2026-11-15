@@ -129,6 +129,8 @@ async def retrieve_turn(backend: Backend, query: str, *, consequential: bool,
     Consequential work remains blocked even after a successful simulated search:
     canonical revalidation and policy integration are not implemented here.
     """
+    if type(query) is not str or len(query) > 4096:
+        raise ValueError('invalid query')
     if not isinstance(consequential, bool) or not _positive_finite_duration(timeout):
         raise ValueError('invalid mode or timeout')
     from retrieval.isolated import SyntheticProcessBackend
@@ -150,6 +152,8 @@ class BenchmarkResult:
 async def benchmark(backend: Backend, query: str, expected_ids: Sequence[str], *,
                     production_deadline: float = 2.0, timeout: float = 30.0) -> BenchmarkResult:
     """Measure independently from production; never returns content for injection."""
+    if type(query) is not str or len(query) > 4096:
+        raise ValueError('invalid query')
     if type(expected_ids) not in (list, tuple) or not 1 <= len(expected_ids) <= 3:
         raise ValueError('invalid evidence set or deadline')
     expected = tuple(expected_ids)
