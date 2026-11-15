@@ -6,6 +6,18 @@ from retrieval.core import Evidence, FakeBackend, benchmark, retrieve_turn, MAX_
 
 
 class RetrievalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_queries_refused_before_adapter(self):
+        class Never:
+            async def search(self, query):
+                raise AssertionError('invalid query reached adapter')
+        for query in (None, 1, 'x' * 4097):
+            with self.subTest(kind=type(query).__name__):
+                with self.assertRaises(ValueError):
+                    await retrieve_turn(Never(), query, consequential=True)
+                with self.assertRaises(ValueError):
+                    await benchmark(Never(), query, ['a'])
+        self.assertEqual((await retrieve_turn(FakeBackend(), 'x' * 4096, consequential=False)).status, 'complete')
+
     async def test_expected_identifier_size_is_validated_before_search(self):
         from retrieval.isolated import MAX_ID_CHARS
         class Never:
