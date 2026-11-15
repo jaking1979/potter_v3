@@ -6,6 +6,17 @@ from retrieval.core import Evidence, FakeBackend, benchmark, retrieve_turn, MAX_
 
 
 class RetrievalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_expected_identifier_size_is_validated_before_search(self):
+        from retrieval.isolated import MAX_ID_CHARS
+        class Never:
+            async def search(self, query):
+                raise AssertionError('invalid expected ID must not call backend')
+        with self.assertRaises(ValueError):
+            await benchmark(Never(), 'q', ['x' * (MAX_ID_CHARS + 1)])
+        item = 'x' * MAX_ID_CHARS
+        result = await benchmark(FakeBackend([Evidence(item, '')]), 'q', [item])
+        self.assertTrue(result.hit)
+
     async def test_unbounded_and_oversized_iterables_fail_closed(self):
         class Repeating:
             async def search(self, query):
