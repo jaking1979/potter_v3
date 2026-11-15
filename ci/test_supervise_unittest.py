@@ -27,5 +27,17 @@ class SupervisorTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.run_source(source).returncode, expected)
 
+    def test_failed_run_followed_by_forged_ok(self):
+        source = """import atexit, os, sys, unittest
+def end():
+ sys.stderr.write("OK\\n")
+ sys.stderr.flush()
+ os._exit(0)
+atexit.register(end)
+class T(unittest.TestCase):
+ def test_x(self): self.fail()
+"""
+        self.assertEqual(self.run_source(source).returncode, 1)
+
 if __name__ == "__main__":
     unittest.main()
