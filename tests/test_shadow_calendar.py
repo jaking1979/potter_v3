@@ -15,7 +15,7 @@ from shadow.policy import engine_policy, make_engine  # noqa: E402
 from test_shadow import OWNER, World  # noqa: E402
 
 CAL = "family@group.calendar.example"
-MON = datetime(2026, 11, 23, 8, 0)
+MON = datetime(2026, 11, 23, 8, 30)
 
 
 def gate_with(fetch, audit=None):

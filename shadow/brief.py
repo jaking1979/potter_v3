@@ -17,6 +17,7 @@ import os
 import uuid
 from datetime import datetime
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from shadow import calendar as cal
 from shadow.turn import Inbound, Outcome, ShadowRuntime
@@ -87,16 +88,22 @@ PROMPT = "{day}"   # kept for callers that pass their own template
 
 class MorningBrief:
     def __init__(self, *, runtime: ShadowRuntime, owner_chat_id: str, state_path: str,
-                 send_hour: int = 7, state: Callable[[], dict] | None = None,
+                 send_hour: int = 8, send_minute: int = 30, tz: str = "America/New_York",
+                 state: Callable[[], dict] | None = None,
                  calendar=None):
         if not (isinstance(send_hour, int) and 0 <= send_hour <= 23):
             raise ValueError("send_hour must be 0-23")
+        if not (isinstance(send_minute, int) and 0 <= send_minute <= 59):
+            raise ValueError("send_minute must be 0-59")
+        self._minute, self._tz = send_minute, ZoneInfo(tz)
         self._rt, self._owner, self._path = runtime, owner_chat_id, state_path
         self._hour, self._state, self._cal = send_hour, state, calendar
 
     def tick(self, now: datetime) -> Outcome | None:
-        """Call periodically with the current local time. None means nothing was due."""
-        if now.weekday() >= 5 or now.hour < self._hour:
+        """Call periodically with the current time (naive = already New York time). None means nothing was due."""
+        if now.tzinfo is not None:              # aware times are read in the brief's own zone
+            now = now.astimezone(self._tz)
+        if now.weekday() >= 5 or (now.hour, now.minute) < (self._hour, self._minute):
             return None
         day = now.date().isoformat()
         state = self._load()

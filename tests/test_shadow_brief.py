@@ -4,7 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -13,7 +13,7 @@ from shadow.brief import LAYOUTS, MAX_ATTEMPTS, MorningBrief, build_prompt, choo
 from shadow.policy import engine_policy, make_engine  # noqa: E402
 from test_shadow import OWNER, World  # noqa: E402
 
-MON_8 = datetime(2026, 11, 23, 8, 0)      # Monday
+MON_8 = datetime(2026, 11, 23, 8, 30)     # Monday
 MON_6 = datetime(2026, 11, 23, 6, 0)
 SAT_8 = datetime(2026, 11, 28, 8, 0)
 
@@ -34,6 +34,20 @@ class T(unittest.TestCase):
         self.assertEqual(self.b.tick(MON_8).status, "replied")
         self.assertIsNone(self.b.tick(MON_8))
         self.assertEqual([c for c, _ in self.w.sent], [OWNER])
+
+    def test_default_send_time_is_0830_new_york_in_winter_and_summer(self):
+        self.assertIsNone(self.b.tick(datetime(2026, 11, 23, 8, 29)))
+        self.assertEqual(self.b.tick(datetime(2026, 11, 23, 8, 30)).status, "replied")
+        # UTC inputs: 13:30Z is 08:30 EST; in July 12:30Z is 08:30 EDT.
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        w = World(t.name)
+        b = MorningBrief(runtime=w.rt, owner_chat_id=OWNER, state_path=os.path.join(t.name, "b"))
+        self.assertIsNone(b.tick(datetime(2026, 7, 6, 12, 29, tzinfo=timezone.utc)))
+        self.assertEqual(b.tick(datetime(2026, 7, 6, 12, 30, tzinfo=timezone.utc)).status, "replied")
+        b2 = MorningBrief(runtime=w.rt, owner_chat_id=OWNER, state_path=os.path.join(t.name, "b2"))
+        self.assertIsNone(b2.tick(datetime(2026, 1, 5, 13, 29, tzinfo=timezone.utc)))
+        self.assertEqual(b2.tick(datetime(2026, 1, 5, 13, 30, tzinfo=timezone.utc)).status, "replied")
 
     def test_not_before_send_time_and_not_on_weekends(self):
         self.assertIsNone(self.b.tick(MON_6))
@@ -91,6 +105,8 @@ class T(unittest.TestCase):
         self.assertLessEqual(len(json.loads(Path(self.state).read_text())), 14)
         with self.assertRaises(ValueError):
             MorningBrief(runtime=self.w.rt, owner_chat_id=OWNER, state_path=self.state, send_hour=24)
+        with self.assertRaises(ValueError):
+            MorningBrief(runtime=self.w.rt, owner_chat_id=OWNER, state_path=self.state, send_minute=60)
 
     def test_corrupt_state_is_treated_as_empty(self):
         Path(self.state).write_text("{not json")

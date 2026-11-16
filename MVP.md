@@ -56,6 +56,6 @@ happen during install.
 
 ## Install-time configuration (values never committed)
 Supplied to `install_shadow.sh` and written to a root-owned config file on the host, not the repo:
-`OWNER_CHAT_ID`, `FAMILY_CALENDAR_ID` (given by Josh in chat 2026-11-16), `BRIEF_SEND_HOUR`,
+`OWNER_CHAT_ID`, `FAMILY_CALENDAR_ID` (given by Josh in chat 2026-11-16), `BRIEF_SEND_TIME` (default 08:30 America/New_York, matching v2),
 `POA_ROOT_PAGE_ID`. Credentials (Telegram token, model key, Notion secret, HA token, Google OAuth)
 are entered on the host only.
