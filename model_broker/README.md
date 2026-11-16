@@ -1,0 +1,40 @@
+# D1 ModelBroker offline prototype
+
+An isolated synthetic implementation of candidate filtering, deterministic cost-based selection and SQLite reservations. T13/T28 requires approved candidates validated for the task and privacy class, lowest expected eligible cost, and hard per-request, per-task, day and month ceilings. The prototype uses caller-supplied integer microdollar estimates and limits, with no real prices, models, provider SDKs, prompts, credentials or live effects. It records a reservation before dispatch, does not release unknown charges after a restart, refuses blind redispatch, and blocks later reservations on a detected cost overrun.
+
+Run `python3 -m unittest tests.test_model_broker` or `python3 -m unittest discover -s tests -p 'test_model_broker.py'`.
+
+Local accounting schema v1 keeps the original reservation in an append-only entry table. Settlement adds a separate signed delta (`actual - reserved`); only that difference becomes available again. Call status and adjustment commit in one `BEGIN IMMEDIATE` transaction. Ordinary ledger UPDATE/DELETE is blocked by SQLite triggers, duplicate settlement is refused, and inconsistent call/ledger rows or unknown schema versions refuse work. Connections are always closed and use SQLite `synchronous=FULL`. A recognized unversioned prototype database is validated and migrated atomically: entries derived from its current rows are marked `legacy_snapshot`, not represented as historical events. No real database is migrated by this code change.
+
+Seventeen synthetic tests cover concurrent reservations/settlement, a killed process before commit, injected settlement failure, append-only checks, restart/unknown reservations, overrun halt, and valid/refused legacy migration. They establish local accounting behavior only. A database owner can drop triggers or restore an old whole database; there is no authenticated external anchor, complete historical audit or multi-host authority. The migration cannot reconstruct dispatch or settlement times and retains unknown charges at their full bound.
+
+Store creation is now explicit: `Broker.bootstrap(path, caps)` exclusively creates a new synthetic store with owner-only initial file permissions. `Broker(path, caps)` opens existing state and refuses missing or empty stores. Every operation uses SQLite `mode=rw`, so losing a file after construction cannot silently create a new accounting history. A failed bootstrap is left for inspection rather than automatically initialized on a later open. Existing recognized stores still open/migrate as above; callers that formerly relied on constructor creation must use the explicit bootstrap once. There is no automatic reset or reservation release.
+
+Dispatch rechecks the global cost-variance halt and all current configured caps in the same transaction as the reserved-to-dispatched transition. A previously reserved call stays reserved if another call has overrun or the dispatching instance's caps have tightened. This is a local accounting checkpoint, not a provider-call fence: a caller that already crossed it may still run after a later overrun, and different instances can still be supplied inconsistent caps. Trusted configuration, cancellation/reconciliation and C1/C2 integration remain required.
+
+The current local suite has 23 passing synthetic tests, adding missing/empty-store refusal, exclusive four-process bootstrap, four-process dispatch single-winner behavior, overrun refusal for prior reservations after restart, and each tightened dispatch cap. These tests do not establish filesystem custody, restore rollback protection, security isolation, provider charge bounds, CI or production readiness.
+
+This is **not a production budget gate**: no trusted task/candidate identity, authoritative period/timezone, hard model output bounds, real price evidence, provider charge guarantees, authenticated settlement, policy/trace integration, multi-host fencing, backup/restore rollback defense, monthly approval path or settlement reconciliation exists. A provider may charge above the estimate; this scaffold detects that only after settlement and cannot prevent the charge. Availability is an input from a synthetic source. A higher-cost escalation requires a separate policy design. T22, T39, A5 and independent review remain gates. Budgets shown in tests are synthetic, not settings.
+
+
+Claude's period-format review correction: requests and all existing ledger rows now require a canonical lowercase hyphenated UUID task ID, an exact valid ISO calendar date `YYYY-MM-DD`, and a month equal to the date's `YYYY-MM`. Alternate spellings, impossible dates and inconsistent months refuse work. Legacy migration and normal reopening fail closed on noncanonical stored rows; the prototype does not rename, merge, erase or release those reservations. This is a compatibility break for synthetic stores using arbitrary task IDs; they require separate reconciliation, not automatic reset.
+
+This validates spelling, not provenance. A caller can still invent another canonical task ID or valid date and receive a separate bucket. No trusted identity or clock is implemented; neither can callers be trusted to select the correct budget period. A delayed reservation dispatched across a period boundary also needs a policy and trustworthy runtime time binding. Until these are integrated and tested, this is not a hard budget ceiling and must not be used as a production gate. Full-ledger validation remains O(n).
+
+
+## Offline dispatch-date boundary experiment
+
+`dispatch_once` now requires an explicit canonical `dispatch_day`, checked
+inside the ledger write transaction against the original reservation day.
+Any day change (and thus month change) refuses dispatch and retains the full
+reservation; retries and reopen do not release or move it. This is a breaking
+interface change. Stale reservations have no automatic rebooking or release.
+
+The date is caller-supplied and is not trusted. The database admission can
+commit before midnight and a real provider call can occur after midnight;
+this seam cannot prevent that race or establish billing periods, clock
+rollback/restart behavior, network effect timing, multi-host consistency,
+provider-reported usage, or hard spending ceilings. It cannot be used as
+a real dispatch authorization. The integration needs a trusted period
+authority and a provider-call protocol with a defined boundary, durable
+uncertainty and reconciliation; independent approval remains required.
