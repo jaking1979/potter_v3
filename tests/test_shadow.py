@@ -77,7 +77,7 @@ class Gate(Base):
     def test_unknown_tool_is_refused_and_audited(self):
         g = self.gate(); g.seal()
         with self.assertRaises(EffectRefused) as cm:
-            g.call("robinhood.place_order", symbol="X")
+            g.call("brokerage.place_order", symbol="X")
         self.assertEqual(cm.exception.reason, "unknown_tool")
         self.assertEqual(self.audit[-1]["outcome"], "refused:unknown_tool")
         self.assertNotIn("X", repr(self.audit))
