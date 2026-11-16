@@ -25,6 +25,7 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 | ModelBroker + cost log (shadow/models.py, costlog.py, model_broker/) | model_broker/, shadow/ | merged from claude/mvp-shadow-runtime | none known |
 | Turn loop + C1 policy wiring + durable trace | shadow/turn.py, policy.py, tracefile.py | wired; trace outage denies the turn | none known |
 | Telegram front door (shadow/telegram.py: E3 ingress + E1 auth) | shadow/ | wired; only principal_direct drives a turn; ack after handle, recover() replays | real Telegram transport verifier/poller not built |
+| Runner loop (shadow/runner.py) | shadow/ | built: recover on start, poll, front door, brief tick; per-step isolation, capped backoff, codes-only logs | Telegram HTTP poller/sender not built |
 | Family Calendar read (shadow/calendar.py) | shadow/ | built: read-only tool bound to one calendar id and an 8-day window, cleaned/capped text, untrusted provenance; real Google transport + readonly OAuth scope not built | none known |
 | Morning Brief (shadow/brief.py) | shadow/ | built: weekday tick, once/day, durable state, system_policy provenance, v2's 7 formats chosen in code (missing state = unpopulated, never quiet), no external content | no scheduler process yet; state/sources (home, inbox, Notion) come later; v2's Todoist, weather and Google Calendar are outside the allowlist |
 | Context Governor v0 (shadow/governor.py) | shadow/ | built: persona + last exchanges, hard budget, no retrieval | none known |
@@ -41,6 +42,6 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 
 ## Log
 - 2026-11-16: v3-core created; CI gate and no-deploy guard added; MVP.md written.
-- 2026-11-16: merged claude/mvp-shadow-runtime (32cc58c); wired C1 PolicyEngine + durable JSONL policy trace into the turn loop (12 tests, mutations killed). Context Governor v0 built (18 tests). Telegram front door wired (11 tests). Morning Brief built (9 tests). Finding 1 (trace-outage retry) concerns approval-bound effects; the shadow install has none (chat.turn needs no approval), so it is backlog, not blocking. Next: runner process, home status.
+- 2026-11-16: merged claude/mvp-shadow-runtime (32cc58c); wired C1 PolicyEngine + durable JSONL policy trace into the turn loop (12 tests, mutations killed). Context Governor v0 built (18 tests). Telegram front door wired (11 tests). Morning Brief built (9 tests). Finding 1 (trace-outage retry) concerns approval-bound effects; the shadow install has none (chat.turn needs no approval), so it is backlog, not blocking. Runner loop built. Next: Telegram HTTP transport (poller + reply tool), Google Calendar transport, then home status.
 - 2026-11-16: finding 3 (dispatch mark) fixed; C2 schema c2.v4; 13 tests; all non-equivalent mutations killed.
 - 2026-11-16: finding 2 (trace join fields) fixed; 12 tests, 15 of 15 mutations killed after one known-answer test was added.
