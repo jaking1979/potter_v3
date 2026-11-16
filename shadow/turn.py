@@ -118,7 +118,15 @@ class ShadowRuntime:
             self._reply("The model call failed. Its cost is unknown and stays reserved.")
             return Outcome("failed", "provider_call_failed")
         self._last = {"plan": plan, "degraded": degraded, "result": result, "error": None}
-        return self._reply(result.text)
+        outcome = self._reply(result.text)
+        if outcome.status == "replied":
+            observe = getattr(self._governor, "observe", None)
+            if callable(observe):
+                try:
+                    observe(msg.text, result.text)    # only completed exchanges are remembered
+                except Exception:
+                    pass                              # memory failing never blocks a reply
+        return outcome
 
     def _why(self) -> str:
         if self._last is None:

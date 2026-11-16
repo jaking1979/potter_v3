@@ -24,7 +24,7 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 | No-effect gate (shadow/gate.py) | shadow/ | merged from claude/mvp-shadow-runtime @32cc58c | none known |
 | ModelBroker + cost log (shadow/models.py, costlog.py, model_broker/) | model_broker/, shadow/ | merged from claude/mvp-shadow-runtime | none known |
 | Turn loop + C1 policy wiring + durable trace | shadow/turn.py, policy.py, tracefile.py | wired; trace outage denies the turn | none known |
-| Context Governor v0 | - | not started | - |
+| Context Governor v0 (shadow/governor.py) | shadow/ | built: persona + last exchanges, hard budget, no retrieval | none known |
 | Install / verify / uninstall scripts | - | not started | - |
 
 ## Open blocking findings (fix Nov 17-18)
@@ -38,6 +38,6 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 
 ## Log
 - 2026-11-16: v3-core created; CI gate and no-deploy guard added; MVP.md written.
-- 2026-11-16: merged claude/mvp-shadow-runtime (32cc58c); wired C1 PolicyEngine + durable JSONL policy trace into the turn loop (12 tests, mutations killed). Next: Context Governor v0, Telegram ingress.
+- 2026-11-16: merged claude/mvp-shadow-runtime (32cc58c); wired C1 PolicyEngine + durable JSONL policy trace into the turn loop (12 tests, mutations killed). Context Governor v0 built (18 tests). Next: Telegram ingress (E3/E1).
 - 2026-11-16: finding 3 (dispatch mark) fixed; C2 schema c2.v4; 13 tests; all non-equivalent mutations killed.
 - 2026-11-16: finding 2 (trace join fields) fixed; 12 tests, 15 of 15 mutations killed after one known-answer test was added.
