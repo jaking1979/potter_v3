@@ -12,7 +12,7 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 | Package | Where | Status | Blocking findings |
 | --- | --- | --- | --- |
 | C0 contracts | contracts/ | present | none known |
-| C1 PolicyEngine | policy/ | present | unaudited-allow dispatch (below) |
+| C1 PolicyEngine | policy/ | present, dispatch mark added | none known |
 | C2 task store / effect journal | runtime/tasks.py, effects.py | present | none known |
 | C3 outbox | runtime/outbox.py | present | none known |
 | C4 fencing (single node) | runtime/fencing.py | present; two-node/Litestream deferred | none known |
@@ -29,7 +29,7 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 ## Open blocking findings (fix Nov 17-18)
 1. Trace outage with a consumed approval: the task is retried three times, escalates, and the approved action is stranded; there is no recovery.
 2. ~~Trace rows lack join fields~~ FIXED in the head below: schema v1 rows carry action hash, effect id, capability and reason; the digest commits to them.
-3. Unaudited-allow dispatch: an approved intent can dispatch under a reconcile record when its original allow trace was never persisted. Add the dispatch mark.
+3. ~~Unaudited-allow dispatch~~ FIXED in the head below: schema c2.v4 adds a dispatch mark; an approval-bound effect cannot dispatch until its allow is durably traced, and reconciliation writes a catch-up allow row first.
 
 ## Backlog (one line each)
 - Two-node fencing, Litestream, signed releases, updater: deferred until after install.
@@ -37,4 +37,5 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 
 ## Log
 - 2026-11-16: v3-core created; CI gate and no-deploy guard added; MVP.md written.
+- 2026-11-16: finding 3 (dispatch mark) fixed; C2 schema c2.v4; 13 tests; all non-equivalent mutations killed.
 - 2026-11-16: finding 2 (trace join fields) fixed; 12 tests, 15 of 15 mutations killed after one known-answer test was added.

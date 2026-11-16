@@ -709,7 +709,7 @@ class ContractRotation(_EffectFixture):
         b.calls = 1
         journal = self._journal(b.perform)            # opening it migrates to c2.v2
         with _sql(self.db) as c:
-            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v3")
+            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v4")
         eff = journal.get(self.key)
         self.assertEqual((eff.status, eff.connector, eff.connector_digest), ("unknown", DEDUPE, None))
         self._restart_refused(journal, b)
@@ -1179,7 +1179,7 @@ class RetentionWindow(_EffectFixture):
             c.execute("UPDATE meta SET value='c2.v2' WHERE key='schema'")
         Database(self.db)
         with _sql(self.db) as c:
-            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v3")
+            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0], "c2.v4")
             cols = [r[1] for r in c.execute("PRAGMA table_info(effects)")]
         self.assertIn("first_dispatched_at", cols)
         self.assertIsNone(self.journal.get(self.key).first_dispatched_at)
@@ -1394,7 +1394,9 @@ class ConformanceHarnessIsLive(unittest.TestCase):
             with self.assertRaisesRegex(ApprovalRefused, "replay"):
                 tac.verify(other, tac.ACTION, tac.NOW, led, tac.AUTH, "eff-1")
             self.assertNotIn("b" * 32, led)
-            # Executing the approved effect resolves it; pending() then clears.
+            # Executing the approved effect resolves it; pending() then clears. The
+            # engine marks the allow as traced; this harness has no engine.
+            self.assertTrue(led.mark_allow_traced(intent))
             ext = External(os.path.join(d, "ext.sqlite"))
             journal.execute(eff.idempotency_key, ext.perform, ext.reconcile, owner="w", connector=CONN, now=T)
             self.assertIsNone(led.pending("a" * 32))

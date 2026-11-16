@@ -66,6 +66,7 @@ MAX_DELEGATION_DEPTH = 8
 REASONS: Mapping[str, str] = MappingProxyType({
     "ok": "all policy gates passed",
     "ok_approved": "all policy gates passed; approval verified and consumed",
+    "ok_approved_catch_up": "catch-up allow record for an approved intent whose original allow trace was never persisted",
     "reconcile_pending_intent": "approval already consumed; route the recorded intent to reconciliation",
     "malformed_request": "request is malformed",
     "invalid_task_id": "action task ID is not a canonical task UUID",
@@ -274,7 +275,11 @@ class PolicyEngine:
             decision = self._make(decision_id, DENY, "engine_error")
         decision = dataclasses.replace(decision, task_id=task_id)
         try:
+            if decision.outcome == RECONCILE and decision.intent is not None:
+                self._catch_up_allow(decision, task_id)
             self._trace(decision.trace_record())
+            if decision.outcome == ALLOW and decision.intent is not None:
+                self._mark_allow_traced(decision.intent)
         except Exception:
             # Any consumed nonce stays recorded as a pending intent in the ledger,
             # so C2 recovery reconciles it (T10): nothing is stranded or replayed.
@@ -282,6 +287,38 @@ class PolicyEngine:
                                   capability=decision.capability, risk=decision.risk,
                                   action_hash=decision.action_hash, task_id=task_id)
         return decision
+
+    # ---- dispatch mark ---------------------------------------------------------
+
+    def _mark_allow_traced(self, intent) -> None:
+        """Tell the ledger the original allow is durably traced. A ledger without
+        the mark (the C0 reference ledger) has nothing to mark. A failure here
+        fails the decision closed: the consumed intent stays pending, unmarked,
+        and cannot be dispatched until reconciliation writes the catch-up allow."""
+        mark = getattr(self._ledger, "mark_allow_traced", None)
+        if mark is not None and mark(intent) is not True:
+            raise RuntimeError("could not mark the allow trace")
+
+    def _catch_up_allow(self, reconcile: Decision, task_id: str | None) -> None:
+        """Before an approved intent is reconciled toward dispatch, make sure an
+        allow record exists for it. If the original allow trace was never
+        persisted (trace outage between consumption and trace), write a catch-up
+        allow row with its own decision id, then mark. Any failure propagates and
+        the caller reports trace_error."""
+        traced = getattr(self._ledger, "allow_traced", None)
+        if traced is None or traced(reconcile.intent):
+            return
+        try:
+            decision_id = self._new_id("dec")
+            if not isinstance(decision_id, str) or not _DECISION_ID.fullmatch(decision_id):
+                raise TypeError
+        except Exception:
+            decision_id = _default_id("dec")
+        catch = self._make(decision_id, ALLOW, "ok_approved_catch_up", capability=reconcile.capability,
+                           risk=reconcile.risk, action_hash=reconcile.action_hash,
+                           intent=reconcile.intent, task_id=task_id)
+        self._trace(catch.trace_record())
+        self._mark_allow_traced(reconcile.intent)
 
     # ---- core ------------------------------------------------------------------
 

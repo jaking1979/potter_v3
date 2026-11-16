@@ -62,6 +62,23 @@ class JournalApprovalLedger:
         eff = self.effect(nonce)
         return eff.intent() if eff is not None and eff.status != SUCCEEDED else None
 
+    def mark_allow_traced(self, intent: EffectIntent) -> bool:
+        """Record that the original allow decision for this approval-bound intent
+        is durably traced. Idempotent; the first time wins. False if the intent
+        is not an approval-bound effect in this journal."""
+        key = idempotency_key(intent.task_id, intent.effect_id, intent.action_hash)
+        with self.db.tx() as c:
+            cur = c.execute("UPDATE effects SET allow_traced_at=COALESCE(allow_traced_at, ?)"
+                            " WHERE idempotency_key=? AND approval_id IS NOT NULL",
+                            (self._clock(), key))
+            return cur.rowcount == 1
+
+    def allow_traced(self, intent: EffectIntent) -> bool:
+        key = idempotency_key(intent.task_id, intent.effect_id, intent.action_hash)
+        with self.db.read() as c:
+            row = c.execute("SELECT allow_traced_at FROM effects WHERE idempotency_key=?", (key,)).fetchone()
+        return row is not None and row[0] is not None
+
     def __contains__(self, nonce: str) -> bool:
         with self.db.read() as c:
             return c.execute("SELECT 1 FROM approval_nonces WHERE nonce=?",

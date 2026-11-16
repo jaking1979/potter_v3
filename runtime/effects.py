@@ -343,6 +343,12 @@ class EffectInFlight(EffectError):
     """Another dispatcher holds this effect right now."""
 
 
+class EffectNotAudited(EffectError):
+    """An approval-bound effect whose original allow decision was never durably
+    traced. Nothing is claimed or dispatched; reconciliation writes the catch-up
+    allow record and marks it."""
+
+
 class EffectConflict(EffectError):
     """This task step is already bound to a different action, or a dispatch
     does not match the connector the effect is bound to."""
@@ -365,6 +371,7 @@ class Effect:
     connector: str | None = None   # identity the effect was (first) dispatched through
     connector_digest: str | None = None   # trusted contract digest at that dispatch, if any
     first_dispatched_at: float | None = None   # journal time of the first dispatch
+    allow_traced_at: float | None = None   # when the original allow decision was durably traced
 
     def intent(self) -> EffectIntent:
         return EffectIntent(self.effect_id, self.task_id, self.action_hash,
@@ -377,7 +384,7 @@ class Effect:
 
 _COLS = ("idempotency_key, task_id, effect_id, action_hash, action_canonical, approval_id,"
          " status, dispatches, in_flight_owner, in_flight_until, result, last_error, connector,"
-         " connector_digest, first_dispatched_at")
+         " connector_digest, first_dispatched_at, allow_traced_at")
 
 
 def _effect(row: tuple) -> Effect:
@@ -406,8 +413,12 @@ class EffectJournal:
                  dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
                  fence: Callable[[Effect], bool] | None = None,
                  trusted_idempotent: TrustedIdempotentRegistry | None = None,
-                 retention_margin_s: float = DEFAULT_RETENTION_MARGIN_S):
+                 retention_margin_s: float = DEFAULT_RETENTION_MARGIN_S,
+                 require_allow_trace: bool = True):
         self.db = as_database(db)
+        if not isinstance(require_allow_trace, bool):
+            raise TypeError("require_allow_trace must be a bool")
+        self._require_allow_trace = require_allow_trace
         if not (isinstance(retention_margin_s, (int, float)) and retention_margin_s >= 0):
             raise ValueError("retention_margin_s must be >= 0")
         self._margin = float(retention_margin_s)   # clock skew / processing slack
@@ -419,6 +430,10 @@ class EffectJournal:
         self._trusted = trusted_idempotent   # fixed for this journal's lifetime
         self._clock = clock
         self._dispatch_timeout = dispatch_timeout_s
+
+    def _require_audited(self, eff: Effect) -> None:
+        if self._require_allow_trace and eff.approval_id and eff.allow_traced_at is None:
+            raise EffectNotAudited(f"effect {eff.effect_id!r} has no durable allow trace; dispatch refused")
 
     def _now(self, now: float | None) -> float:
         return self._clock() if now is None else now
@@ -618,6 +633,7 @@ class EffectJournal:
                 raise EffectOutcomeUnknown(
                     f"effect {key} outcome unknown; re-dispatch refused ({eff.last_error or 'unreconciled'})")
         eff.action()  # integrity check BEFORE anything is dispatched
+        self._require_audited(eff)   # the mark is monotonic: once set it is never cleared
         with self.db.tx() as c:
             if guard is not None:
                 guard()  # under the journal write lock; raising rolls the claim back
