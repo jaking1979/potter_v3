@@ -46,18 +46,25 @@ def emit_policy_event(event, *, task_id, trace_id, environment, timestamp, sink)
         raise ValueError('unsupported policy outcome')
     # Hash only the validated identifier and outcome; no caller text is included.
     # Validate before hashing so arbitrary input never becomes an opaque payload.
+    join = {'action_hash': event.get('action_hash'), 'effect_id': event.get('effect_id'),
+            'capability': event.get('capability'), 'reason_code': event.get('reason_code')}
     probe = DecisionTrace(task_id=task_id, trace_id=trace_id, component='policy',
                           outcome=outcome, decision_digest='0' * 64,
                           environment=environment, timestamp=timestamp,
-                          subject_id=decision_id)
+                          subject_id=decision_id, **join)
     if decision_id is None:
         raise ValueError('decision ID required')
-    digest = hashlib.sha256(json.dumps([probe.subject_id, outcome],
-                            separators=(',', ':')).encode('utf-8')).hexdigest()
+    if any(v is not None for v in join.values()):
+        # v1 digest commits to the join fields; the tag keeps it distinct from v0.
+        material = ['potter.trace.digest/v1', probe.subject_id, outcome, probe.action_hash,
+                    probe.effect_id, probe.capability, probe.reason_code]
+    else:
+        material = [probe.subject_id, outcome]
+    digest = hashlib.sha256(json.dumps(material, separators=(',', ':')).encode('utf-8')).hexdigest()
     emit(DecisionTrace(task_id=task_id, trace_id=trace_id, component='policy',
                        outcome=outcome, decision_digest=digest,
                        environment=environment, timestamp=timestamp,
-                       subject_id=decision_id), sink)
+                       subject_id=decision_id, **join), sink)
 
 
 def emit_policy_audit(event, *, task_id, trace_id, environment, timestamp, sink):

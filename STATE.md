@@ -17,7 +17,7 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 | C3 outbox | runtime/outbox.py | present | none known |
 | C4 fencing (single node) | runtime/fencing.py | present; two-node/Litestream deferred | none known |
 | C5 identity grants | identity/ | present | none known |
-| C6 trace | tracing/ (trace, emitter, policy adapter) | present; no SQLite sink | trace-outage retry; trace join fields |
+| C6 trace | tracing/ (trace, emitter, policy adapter) | present, join fields added; no SQLite sink | trace-outage retry |
 | E1 approvals / notifier | notifier/ | present | none known |
 | E2 responsibility runner | responsibilities/ | present | none known |
 | E3 ingress (Telegram only for MVP) | ingress/ | present | none known |
@@ -28,7 +28,7 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 
 ## Open blocking findings (fix Nov 17-18)
 1. Trace outage with a consumed approval: the task is retried three times, escalates, and the approved action is stranded; there is no recovery.
-2. Trace rows lack join fields (action hash, effect id, capability), so a decision cannot be tied to an effect.
+2. ~~Trace rows lack join fields~~ FIXED in the head below: schema v1 rows carry action hash, effect id, capability and reason; the digest commits to them.
 3. Unaudited-allow dispatch: an approved intent can dispatch under a reconcile record when its original allow trace was never persisted. Add the dispatch mark.
 
 ## Backlog (one line each)
@@ -37,3 +37,4 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 
 ## Log
 - 2026-11-16: v3-core created; CI gate and no-deploy guard added; MVP.md written.
+- 2026-11-16: finding 2 (trace join fields) fixed; 12 tests, 15 of 15 mutations killed after one known-answer test was added.
