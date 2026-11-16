@@ -4,6 +4,20 @@ Branch: `v3-core`, created 2026-11-16 from `claude/integration-staging` @ f611f4
 CI is the only test authority. Nothing merges to main. One audit per integrated SHA.
 A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; everything else is one backlog line.
 
+## Current direction (Josh, 2026-11-16) - supersedes the standalone-service plan
+Build on a FRESH OpenClaw in its own new Proxmox container (never v2's infrastructure). Reuse
+existing open-source pieces; do not reinvent. Our deliverable is configuration + overlay + installer:
+- openclaw.json template: Telegram locked to Josh's chat, read-only tool profile (allow read; deny
+  write/edit/apply_patch/exec/process/browser/gateway/cron/sessions_*), sandbox on, model key capped at $50.
+- Workspace overlay: personality files, Morning Brief skill (adapted from v2 morning-brief-v1-skill, read-only
+  parts) on an 8:30 ET weekday cron.
+- Existing read-only connectors for Calendar, Home Assistant, Gmail, Notion; read-only enforced by provider
+  scopes/tokens, not only tool policy.
+- Installer: wraps OpenClaw's own install + onboard, applies overlay, prompts for each value, runs verify_host.
+- Python shadow runtime (shadow/, policy, tracing, runtime) stays as the harness-independent core for later;
+  it is NOT in the Nov 27 install path. No more custom transports.
+Next: inspect a real OpenClaw install here, prove the lock-down config refuses denied tools, then write the overlay.
+
 ## Gate on this branch
 - `tools/ci_gate.py tests`: exact head, full history, Python 3.12; refuses skips, zero tests, hard exits, forged tails.
 - `tools/nodeploy_guard.py .`: refuses deploy commands, write/secret workflows, secret shapes, private addresses and real-host/credential/Alpha Bot references outside docs.
