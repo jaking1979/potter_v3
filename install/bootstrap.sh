@@ -86,8 +86,12 @@ servers = {}
 if os.environ.get("COMPOSIO_MCP_URL"):
     servers["composio"] = {"transport": "streamable-http", "url": os.environ["COMPOSIO_MCP_URL"]}
 if os.environ.get("AGENTMAIL_API_KEY"):
+    # Read-only to start: anything that sends, replies, forwards, creates or deletes is hidden until the owner
+    # approves switching it on from chat.
     servers["agentmail"] = {"command": "npx", "args": ["-y", "agentmail-mcp"],
-                            "env": {"AGENTMAIL_API_KEY": os.environ["AGENTMAIL_API_KEY"]}}
+                            "env": {"AGENTMAIL_API_KEY": os.environ["AGENTMAIL_API_KEY"]},
+                            "toolFilter": {"exclude": ["*send*", "*reply*", "*forward*", "*delete*", "*create*",
+                                                       "*update*", "*remove*", "*draft*"]}}
 json.dump({"mcp": {"servers": servers}}, open(sys.argv[1], "w"))
 PY
   oc config patch --file "$mcp" --dry-run >/dev/null && oc config patch --file "$mcp" >/dev/null

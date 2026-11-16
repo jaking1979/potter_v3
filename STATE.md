@@ -4,6 +4,8 @@ Branch: `v3-core`, created 2026-11-16 from `claude/integration-staging` @ f611f4
 CI is the only test authority. Nothing merges to main. One audit per integrated SHA.
 A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; everything else is one backlog line.
 
+> Source of truth for scope: docs/SCOPE.md. docs/BUILD_PLAN.md is the long-range menu only.
+
 ## Current direction (Josh, 2026-11-16) - supersedes the standalone-service plan
 Build on a FRESH OpenClaw in its own new Proxmox container (never v2's infrastructure). Reuse
 existing open-source pieces; do not reinvent. Our deliverable is configuration + overlay + installer:

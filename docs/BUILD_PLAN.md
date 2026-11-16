@@ -1,3 +1,5 @@
+> **Superseded for the install by docs/SCOPE.md.** The table below is the long-range menu, not the Nov 27-29 build.
+
 # Potter v3 build plan (Josh, 2026-11-16: "deliver the full thing")
 
 Goal: one installer puts on the OptiPlex (fresh Proxmox container, never v2's infrastructure) the latest

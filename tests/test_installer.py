@@ -59,6 +59,11 @@ class Installer(unittest.TestCase):
     def test_delegated_changes_need_approval_in_overlay(self):
         self.assertIn("autoApproveChanges: false", (ROOT / "overlay/config.base.json5").read_text())
 
+    def test_agentmail_starts_without_any_sending_tool(self):
+        text = (ROOT / "install/bootstrap.sh").read_text()
+        for needle in ('"*send*"', '"*reply*"', '"*forward*"', '"*delete*"', "toolFilter"):
+            self.assertIn(needle, text)
+
     def test_no_secret_shapes_in_overlay(self):
         import re
         for p in (ROOT / "overlay").rglob("*"):
