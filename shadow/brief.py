@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime
 from typing import Callable
 
+from shadow import calendar as cal
 from shadow.turn import Inbound, Outcome, ShadowRuntime
 
 _NS = uuid.UUID("6f1c2f0e-5a0b-4a39-9a55-7d1f3a2b9c01")
@@ -86,11 +87,12 @@ PROMPT = "{day}"   # kept for callers that pass their own template
 
 class MorningBrief:
     def __init__(self, *, runtime: ShadowRuntime, owner_chat_id: str, state_path: str,
-                 send_hour: int = 7, state: Callable[[], dict] | None = None):
+                 send_hour: int = 7, state: Callable[[], dict] | None = None,
+                 calendar=None):
         if not (isinstance(send_hour, int) and 0 <= send_hour <= 23):
             raise ValueError("send_hour must be 0-23")
         self._rt, self._owner, self._path = runtime, owner_chat_id, state_path
-        self._hour, self._state = send_hour, state
+        self._hour, self._state, self._cal = send_hour, state, calendar
 
     def tick(self, now: datetime) -> Outcome | None:
         """Call periodically with the current local time. None means nothing was due."""
@@ -105,8 +107,20 @@ class MorningBrief:
         state[day] = entry
         self._save(state)                       # count the attempt before sending
         fmt = choose_format(**self._signals())
-        msg = Inbound(self._owner, build_prompt(day, fmt), event_id=f"brief:{day}",
-                      provenance=PROVENANCE,
+        events, block = None, ""
+        if self._cal is not None:
+            try:
+                events = self._cal.events(now.date())
+            except Exception:
+                events = None
+            block = "\n\n" + cal.render(events)
+            if fmt == "unpopulated" and events is not None:
+                fmt = "standard"        # the schedule is real data; only state signals are missing
+        text, prov = build_prompt(day, fmt) + block, PROVENANCE
+        if events:
+            prov = PROVENANCE + (cal.PROVENANCE,)   # event text is untrusted
+        msg = Inbound(self._owner, text, event_id=f"brief:{day}",
+                      provenance=prov,
                       task_id=str(uuid.uuid5(_NS, f"{day}:{entry['attempts']}")))
         outcome = self._rt.handle(msg)
         if outcome.status in ("replied", "denied", "refused"):

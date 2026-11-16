@@ -26,6 +26,7 @@ Every tool call goes through one adapter that raises on anything outside this al
 - read-only Notion under the POA root
 - read-only Home Assistant state
 - Gmail read-only scope
+- read-only Google Calendar, the Family Calendar only, today + 7 days (Josh, 2026-11-16)
 - model calls
 
 ## Never
