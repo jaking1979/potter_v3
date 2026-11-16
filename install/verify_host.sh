@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Post-install checks. Prints PASS/FAIL per line; exit status is non-zero if any check fails.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$HERE/lib.sh"
+set +e
+fails=0
+check() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then printf 'PASS  %s\n' "$name"; else printf 'FAIL  %s\n' "$name"; fails=$((fails+1)); fi; }
+cfg() { oc config get "$1" 2>/dev/null; }
+
+check "OpenClaw installed"                         oc --version
+check "config validates"                           oc config validate
+check "gateway healthy"                            oc health
+check "Telegram locked to one allowed user"        bash -c "[ \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config get channels.telegram.dmPolicy | tr -d '\"')\" = allowlist ]"
+check "Telegram groups disabled"                   bash -c "[ \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config get channels.telegram.groupPolicy | tr -d '\"')\" = disabled ]"
+check "gateway/spawn/send tools denied"            bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} config get tools.deny | grep -q gateway"
+check "host exec requires approval"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} config get tools.exec.mode | grep -q ask"
+check "telemetry off"                              bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} config get telemetry.enabled | grep -q false"
+check "bot token file is root-only (600)"          bash -c "[ \"\$(stat -c %a '$SECRETS_DIR/telegram.token')\" = 600 ]"
+check "secrets dir is root-only (700)"             bash -c "[ \"\$(stat -c %a '$SECRETS_DIR')\" = 700 ]"
+check "no secret text inside openclaw.json"        bash -c "! grep -q -E 'sk-or-|[0-9]{6,}:[A-Za-z0-9_-]{20,}' \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config file)\""
+check "Morning Brief job scheduled"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list 2>/dev/null | grep -q potter-morning-brief"
+check "morning-brief skill present"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} skills list 2>/dev/null | grep -q morning-brief"
+check "security audit: 0 critical findings"       bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} security audit 2>&1 | grep -q 'Summary: 0 critical'"
+echo
+[ "$fails" = 0 ] && { echo "All checks passed."; exit 0; } || { echo "$fails check(s) failed."; exit 1; }

@@ -16,7 +16,11 @@ existing open-source pieces; do not reinvent. Our deliverable is configuration +
 - Installer: wraps OpenClaw's own install + onboard, applies overlay, prompts for each value, runs verify_host.
 - Python shadow runtime (shadow/, policy, tracing, runtime) stays as the harness-independent core for later;
   it is NOT in the Nov 27 install path. No more custom transports.
-Next: inspect a real OpenClaw install here, prove the lock-down config refuses denied tools, then write the overlay.
+Built and proven against a real OpenClaw 2026.11.4 in a sandbox profile (2026-11-16):
+install/{install,bootstrap,verify_host,uninstall,lib}.sh, overlay/ (locked config, Potter workspace, morning-brief skill).
+bootstrap -> verify_host: 14/14 PASS. Proxmox container creation is written but NOT yet run on a real Proxmox host.
+Next: `potter` CLI (connect google|notion|homeassistant, switch on|off <capability>), Potter UI branding + Today
+dashboard, voice (talk mode) config, connectors, phone, payments, memory. See docs/BUILD_PLAN.md.
 
 ## Gate on this branch
 - `tools/ci_gate.py tests`: exact head, full history, Python 3.12; refuses skips, zero tests, hard exits, forged tails.

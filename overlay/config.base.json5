@@ -1,0 +1,26 @@
+// Potter v3 base overlay for OpenClaw. Applied with `openclaw config patch`.
+// Placeholders written as at-at-NAME-at-at are filled by the installer from the setup form; no secrets live here.
+{
+  update: { channel: "stable", checkOnStart: true },
+  telemetry: { enabled: false },
+  agents: {
+    defaults: { userTimezone: "@@TIMEZONE@@" },
+  },
+  // Outward and control-plane tools are off for the agent; host commands need a human approval.
+  // Capabilities are switched on one at a time with `potter switch on <capability>`.
+  tools: {
+    deny: ["gateway", "sessions_spawn", "sessions_send"],
+    exec: { mode: "ask" },
+    elevated: { enabled: false },
+  },
+  channels: {
+    telegram: {
+      enabled: true,
+      dmPolicy: "allowlist",
+      allowFrom: ["@@OWNER_TELEGRAM_ID@@"],
+      groupPolicy: "disabled",
+      tokenFile: "@@SECRETS_DIR@@/telegram.token",
+    },
+  },
+  cron: { enabled: true },
+}
