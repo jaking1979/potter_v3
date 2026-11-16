@@ -53,3 +53,9 @@ and a frozen `v3-core` SHA.
 Telegram bot token, model API key capped at $50 at the provider, Notion integration shared only
 with the POA page. Home Assistant token (dedicated v3 user) and Gmail read-only authorization
 happen during install.
+
+## Install-time configuration (values never committed)
+Supplied to `install_shadow.sh` and written to a root-owned config file on the host, not the repo:
+`OWNER_CHAT_ID`, `FAMILY_CALENDAR_ID` (given by Josh in chat 2026-11-16), `BRIEF_SEND_HOUR`,
+`POA_ROOT_PAGE_ID`. Credentials (Telegram token, model key, Notion secret, HA token, Google OAuth)
+are entered on the host only.
