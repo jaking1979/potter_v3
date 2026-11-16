@@ -18,6 +18,9 @@ them. Nothing already in this repo is deleted; the earlier Python runtime lives 
 Potter logic stays behind stable interfaces (AgentRuntime, MemoryStore, ToolRegistry, PolicyEngine,
 Scheduler, TraceSink) so OpenClaw stays swappable, as the charter requires.
 
+> Update 2026-11-16: installing OpenClaw showed it already ships most of rows 3, 4, 6, 7, 12, 13, 14, 16 (see
+> docs/OPENCLAW_FINDINGS.md). Our work on those rows is configuration, branding and skills, not new code.
+
 ## Capability -> reuse source -> what we write
 Candidates below get the T24 one-day reuse check (license, maintenance, fit) before adoption.
 | # | Capability | Reuse (candidate) | We write |
