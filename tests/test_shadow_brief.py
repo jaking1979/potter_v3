@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from shadow.brief import MAX_ATTEMPTS, MorningBrief  # noqa: E402
+from shadow.brief import LAYOUTS, MAX_ATTEMPTS, MorningBrief, build_prompt, choose_format  # noqa: E402
 from shadow.policy import engine_policy, make_engine  # noqa: E402
 from test_shadow import OWNER, World  # noqa: E402
 
@@ -95,6 +95,55 @@ class T(unittest.TestCase):
     def test_corrupt_state_is_treated_as_empty(self):
         Path(self.state).write_text("{not json")
         self.assertEqual(self.b.tick(MON_8).status, "replied")
+
+
+class Formats(unittest.TestCase):
+    def test_missing_state_is_unpopulated_never_quiet(self):
+        self.assertEqual(choose_format(), "unpopulated")
+        self.assertEqual(choose_format(quiet=True), "unpopulated")
+        self.assertEqual(choose_format(stress="normal", busy="normal", quiet=True), "quiet")
+
+    def test_v2_priority_order(self):
+        f = choose_format
+        self.assertEqual(f(stress="high", busy="packed", today="packed", urgent=3), "light")
+        self.assertEqual(f(stress="normal", busy="packed", today="packed", urgent=3), "compact")
+        self.assertEqual(f(stress="normal", busy="packed", today="normal", urgent=2), "priority")
+        self.assertEqual(f(stress="normal", busy="slack", quiet=True), "deep")
+        self.assertEqual(f(stress="normal", busy="normal", stale=True), "deep")
+        self.assertEqual(f(stress="normal", busy="normal", urgent=1), "standard")
+
+    def test_every_format_has_a_layout_and_the_prompt_carries_the_rules(self):
+        for fmt in LAYOUTS:
+            p = build_prompt("2026-11-23", fmt)
+            self.assertIn("Owl Morning Brief - 2026-11-23", p)
+            self.assertIn("untrusted", p)
+            self.assertIn("never in the third person", p)
+            self.assertIn(LAYOUTS[fmt], p)
+
+    def test_without_a_state_source_the_brief_says_unpopulated(self):
+        seen = []
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        w = World(t.name)
+        orig = w.rt.handle
+        w.rt.handle = lambda m: (seen.append(m.text), orig(m))[1]
+        MorningBrief(runtime=w.rt, owner_chat_id=OWNER,
+                     state_path=os.path.join(t.name, "b.json")).tick(MON_8)
+        self.assertIn(LAYOUTS["unpopulated"], seen[0])
+
+    def test_state_source_picks_the_format_and_a_broken_source_is_unpopulated(self):
+        for src, want in ((lambda: {"stress": "high", "busy": "normal"}, "light"),
+                          (lambda: 1 / 0, "unpopulated"), (lambda: "junk", "unpopulated"),
+                          (lambda: {"stress": "normal", "busy": "normal", "evil": "x"}, "standard")):
+            seen = []
+            t = tempfile.TemporaryDirectory()
+            self.addCleanup(t.cleanup)
+            w = World(t.name)
+            orig = w.rt.handle
+            w.rt.handle = lambda m, o=orig, s=seen: (s.append(m.text), o(m))[1]
+            MorningBrief(runtime=w.rt, owner_chat_id=OWNER, state=src,
+                         state_path=os.path.join(t.name, "b.json")).tick(MON_8)
+            self.assertIn(LAYOUTS[want], seen[0])
 
 
 if __name__ == "__main__":

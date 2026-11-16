@@ -25,7 +25,7 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 | ModelBroker + cost log (shadow/models.py, costlog.py, model_broker/) | model_broker/, shadow/ | merged from claude/mvp-shadow-runtime | none known |
 | Turn loop + C1 policy wiring + durable trace | shadow/turn.py, policy.py, tracefile.py | wired; trace outage denies the turn | none known |
 | Telegram front door (shadow/telegram.py: E3 ingress + E1 auth) | shadow/ | wired; only principal_direct drives a turn; ack after handle, recover() replays | real Telegram transport verifier/poller not built |
-| Morning Brief (shadow/brief.py) | shadow/ | built: weekday tick, once/day, durable state, system_policy provenance, no external content | no scheduler process yet; sources (home, inbox) come later |
+| Morning Brief (shadow/brief.py) | shadow/ | built: weekday tick, once/day, durable state, system_policy provenance, v2's 7 formats chosen in code (missing state = unpopulated, never quiet), no external content | no scheduler process yet; state/sources (home, inbox, Notion) come later; v2's Todoist, weather and Google Calendar are outside the allowlist |
 | Context Governor v0 (shadow/governor.py) | shadow/ | built: persona + last exchanges, hard budget, no retrieval | none known |
 | Install / verify / uninstall scripts | - | not started | - |
 
