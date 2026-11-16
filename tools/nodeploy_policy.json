@@ -1,0 +1,20 @@
+{
+  "doc_allow_globs": [
+    "*.md",
+    "docs/*",
+    "governance/*",
+    "tools/nodeploy_policy.json",
+    "tools/nodeploy_guard.py",
+    "tests/test_nodeploy_guard.py"
+  ],
+  "forbidden_literals": [
+    "alpha bot",
+    "alphabot",
+    "alpha_bot",
+    "robinhood",
+    "optiplex",
+    "brooklyn"
+  ],
+  "workflow_allow_deploy_words": [],
+  "forbidden_paths": []
+}

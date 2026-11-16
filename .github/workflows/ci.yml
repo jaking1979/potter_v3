@@ -1,0 +1,30 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [v3-core, "claude/**", "dolores/**"]
+permissions:
+  contents: read
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert the exact head is checked out
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test-only dependency (schema validator, pinned)
+        run: python3 -m pip install jsonschema==4.23.0
+      - name: Tests (a skip, zero tests or an incomplete run fails)
+        run: python3 tools/ci_gate.py tests
+      - name: Tree guard on the exact head
+        run: python3 tools/nodeploy_guard.py .
