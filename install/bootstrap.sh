@@ -46,10 +46,13 @@ umask 077; mkdir -p "$SECRETS_DIR"
 printf '%s' "$TELEGRAM_TOKEN" > "$SECRETS_DIR/telegram.token"
 chmod 700 "$SECRETS_DIR"; chmod 600 "$SECRETS_DIR/telegram.token"
 
+GATEWAY_PASSWORD="$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')"
+printf '%s' "$GATEWAY_PASSWORD" > "$SECRETS_DIR/gateway.password"; chmod 600 "$SECRETS_DIR/gateway.password"
+
 say "Onboarding OpenClaw (non-interactive)"
 oc onboard --non-interactive --accept-risk --flow manual --mode local \
    --auth-choice openrouter-api-key --openrouter-api-key "$OPENROUTER_KEY" \
-   --gateway-bind loopback --gateway-auth token --agent-name Potter \
+   --gateway-bind loopback --gateway-auth password --gateway-password "$GATEWAY_PASSWORD" --agent-name Potter \
    $([ -n "${POTTER_NO_DAEMON:-}" ] && echo --no-install-daemon || echo --install-daemon) >/dev/null
 
 say "Applying the Potter overlay"
@@ -64,6 +67,32 @@ for f in IDENTITY.md SOUL.md USER.md; do
 done
 rm -f "$WS/BOOTSTRAP.md"
 mkdir -p "$WS/skills"; cp -r "$REPO/overlay/workspace/skills/." "$WS/skills/"
+
+if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
+  say "Joining your tailnet and enabling Potter's funnel"
+  command -v tailscale >/dev/null 2>&1 || { curl -fsSL https://tailscale.com/install.sh | sh >/dev/null; }
+  tailscaled --state=/var/lib/tailscale/tailscaled.state >/dev/null 2>&1 &
+  sleep 3
+  tailscale up --authkey "$TAILSCALE_AUTHKEY" --hostname "${POTTER_TS_HOSTNAME:-potter-v3}" --accept-dns=false >/dev/null
+  oc config set gateway.tailscale.mode funnel >/dev/null
+fi
+
+if [ -n "${COMPOSIO_MCP_URL:-}" ] || [ -n "${AGENTMAIL_API_KEY:-}" ]; then
+  say "Connecting MCP servers"
+  mcp="$(mktemp --suffix=.json5)"
+  COMPOSIO_MCP_URL="${COMPOSIO_MCP_URL:-}" AGENTMAIL_API_KEY="${AGENTMAIL_API_KEY:-}" python3 - "$mcp" <<'PY'
+import json, os, sys
+servers = {}
+if os.environ.get("COMPOSIO_MCP_URL"):
+    servers["composio"] = {"transport": "streamable-http", "url": os.environ["COMPOSIO_MCP_URL"]}
+if os.environ.get("AGENTMAIL_API_KEY"):
+    servers["agentmail"] = {"command": "npx", "args": ["-y", "agentmail-mcp"],
+                            "env": {"AGENTMAIL_API_KEY": os.environ["AGENTMAIL_API_KEY"]}}
+json.dump({"mcp": {"servers": servers}}, open(sys.argv[1], "w"))
+PY
+  oc config patch --file "$mcp" --dry-run >/dev/null && oc config patch --file "$mcp" >/dev/null
+  rm -f "$mcp"
+fi
 
 say "Starting the gateway"
 if [ -n "${POTTER_NO_DAEMON:-}" ]; then
@@ -80,4 +109,13 @@ oc cron add --name potter-morning-brief --declaration-key potter-morning-brief \
    --channel telegram --to "$OWNER_TELEGRAM_ID" --announce --best-effort-deliver \
    --message "Run the morning-brief skill and reply with the brief only." >/dev/null
 
+ui_host="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)"
+mkdir -p /etc/potter
+{
+  echo "Potter is installed."
+  [ -n "$ui_host" ] && echo "Open Potter: https://$ui_host/" || echo "Open Potter from this container's address on port 18789 (or add a Tailscale key later)."
+  echo "Password for the web UI (shown once; also stored root-only in the container): $GATEWAY_PASSWORD"
+  echo "Next: open Telegram, message your bot, and say hello. Ask Potter to connect anything that is missing."
+} > /etc/potter/final-note.txt
+chmod 600 /etc/potter/final-note.txt
 say "Done. Next: run verify_host.sh, then message your bot on Telegram."

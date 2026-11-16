@@ -12,6 +12,8 @@
     deny: ["gateway", "sessions_spawn", "sessions_send"],
     exec: { mode: "ask" },
     elevated: { enabled: false },
+    // Potter can propose config changes (add a connector, switch a capability) from chat; each needs your approval.
+    openclaw: { autoApproveChanges: false },
   },
   channels: {
     telegram: {

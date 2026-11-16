@@ -21,7 +21,9 @@ cat <<'BANNER'
   Nothing outside the new container/machine is touched. Have ready:
     1. a Telegram bot token (from @BotFather) and your numeric Telegram user ID
     2. a model API key (OpenRouter) with a spend cap set
-  Google, Notion, Home Assistant and other connections are added afterwards with: potter connect <name>
+    3. optional: a Composio MCP URL, an AgentMail key, a Tailscale auth key
+  You fill these in on a web page; the installer prints its address.
+  Everything else (Google, Notion, Home Assistant, ...) is connected later by chatting with Potter.
 
 BANNER
 
@@ -44,20 +46,17 @@ if [ "$MODE" = proxmox ]; then
   run pct create "$CTID" "local:vztmpl/$tmpl" --hostname "$CT_NAME" --cores "$CT_CORES" --memory "$CT_MEM" \
       --rootfs "$CT_STORE:$CT_DISK" --net0 "name=eth0,bridge=$CT_BRIDGE,ip=dhcp" --unprivileged 1 \
       --features nesting=1 --onboot 1 --start 1
-  run sleep 8
+  run bash -c "printf 'lxc.cgroup2.devices.allow: c 10:200 rwm\nlxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file\n' >> /etc/pve/lxc/$CTID.conf"
+  run pct reboot "$CTID"
+  run sleep 10
   run pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates python3 xz-utils whiptail git"
-  collect_inputs
-  envfile="$(mktemp)"; chmod 600 "$envfile"
-  { for v in OWNER_NAME TIMEZONE OWNER_TELEGRAM_ID TELEGRAM_TOKEN OPENROUTER_KEY BRIEF_TIME; do
-      printf 'export POTTER_%s=%q\n' "$v" "${!v}"; done; } > "$envfile"
   say "Copying the installer into the container"
   run tar -C "$REPO" --exclude=.git -czf /tmp/potter-src.tgz .
   run pct push "$CTID" /tmp/potter-src.tgz /root/potter-src.tgz
   run pct exec "$CTID" -- bash -c "mkdir -p /opt/potter/src && tar -xzf /root/potter-src.tgz -C /opt/potter/src"
-  run pct push "$CTID" "$envfile" /root/potter-inputs.env --perms 600
-  rm -f "$envfile"
-  say "Installing inside the container"
-  run pct exec "$CTID" -- bash -c "set -a; . /root/potter-inputs.env; set +a; cd /opt/potter/src && ./install/bootstrap.sh; rc=\$?; shred -u /root/potter-inputs.env 2>/dev/null || rm -f /root/potter-inputs.env; exit \$rc"
+  ct_ip="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')"
+  say "Opening the setup page. Visit the address it prints in your browser."
+  run pct exec "$CTID" -- bash -c "cd /opt/potter/src && POTTER_FORM_URL_HOST='${ct_ip:-<container-ip>}' python3 install/setup_form.py"
   run pct exec "$CTID" -- bash -c "cd /opt/potter/src && ./install/verify_host.sh"
   say "Container $CTID is ready."
 else

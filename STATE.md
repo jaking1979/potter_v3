@@ -19,7 +19,10 @@ existing open-source pieces; do not reinvent. Our deliverable is configuration +
 Built and proven against a real OpenClaw 2026.11.4 in a sandbox profile (2026-11-16):
 install/{install,bootstrap,verify_host,uninstall,lib}.sh, overlay/ (locked config, Potter workspace, morning-brief skill).
 bootstrap -> verify_host: 14/14 PASS. Proxmox container creation is written but NOT yet run on a real Proxmox host.
-Next: `potter` CLI (connect google|notion|homeassistant, switch on|off <capability>), Potter UI branding + Today
+Added (Josh: no terminal; Composio/AgentMail MCPs; OptiPlex on Tailscale with funnel): browser setup form
+(install/setup_form.py), Composio + AgentMail as mcp.servers, Tailscale join + funnel, password auth, connect-apps skill,
+approval-gated config changes from chat (docs/CHAT_SETUP.md). Tests: 10 form + 9 installer, full gate green.
+Next: Potter UI branding + Today
 dashboard, voice (talk mode) config, connectors, phone, payments, memory. See docs/BUILD_PLAN.md.
 
 ## Gate on this branch

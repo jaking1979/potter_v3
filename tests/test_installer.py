@@ -51,6 +51,14 @@ class Installer(unittest.TestCase):
                        "enabled: false", "telemetry"):
             self.assertIn(needle, text)
 
+    def test_connect_skill_forbids_secrets_in_chat(self):
+        text = (ROOT / "overlay/workspace/skills/connect-apps/SKILL.md").read_text()
+        self.assertIn("Never ask for a secret in chat", text)
+        self.assertIn("read-only", text)
+
+    def test_delegated_changes_need_approval_in_overlay(self):
+        self.assertIn("autoApproveChanges: false", (ROOT / "overlay/config.base.json5").read_text())
+
     def test_no_secret_shapes_in_overlay(self):
         import re
         for p in (ROOT / "overlay").rglob("*"):
