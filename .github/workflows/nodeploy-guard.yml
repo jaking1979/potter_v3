@@ -1,0 +1,23 @@
+name: nodeploy-guard
+on:
+  pull_request:
+  push:
+    branches: [main, v3-core, "claude/**", "dolores/**"]
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Guard behaviour tests
+        run: python3 -m unittest tests.test_nodeploy_guard -v
+      - name: Tree guard on the exact head
+        run: python3 tools/nodeploy_guard.py .
