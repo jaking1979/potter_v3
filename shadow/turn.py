@@ -9,17 +9,29 @@ model call, so Josh can see what context was chosen and what the reply cost.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
 from shadow.gate import EffectRefused
 from shadow.models import ModelRefused, ModelUnavailable
 
 
+def _new_task_id() -> str:
+    return str(uuid.uuid4())
+
+
 @dataclass(frozen=True)
 class Inbound:
     chat_id: str
     text: str
+    # Set by ingress. event_id is the transport's own id (for example a Telegram
+    # update id). task_id is the canonical UUID that policy, trace and the model
+    # call all share for this turn; ingress derives it from event_id so a
+    # redelivery maps to the same task. provenance is decided by ingress, never
+    # by message text.
+    event_id: str | None = None
+    provenance: tuple = ("principal_direct",)
+    task_id: str = field(default_factory=_new_task_id)
 
 
 @dataclass(frozen=True)
@@ -71,6 +83,11 @@ class ShadowRuntime:
             return Outcome("ignored", "not_owner")
         if type(msg.text) is not str or not msg.text.strip() or len(msg.text) > self._max_text:
             return Outcome("ignored", "bad_text")
+        try:
+            if str(uuid.UUID(msg.task_id)) != msg.task_id:
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            return Outcome("ignored", "bad_task_id")
         if msg.text.strip() == "/why":
             return self._reply(self._why())
         try:
@@ -89,7 +106,7 @@ class ShadowRuntime:
         messages = [{"role": "system", "content": c} for c in plan.context]
         messages.append({"role": "user", "content": msg.text})
         try:
-            result = self._model.complete(task_id=str(uuid.uuid4()), task_class=plan.task_class,
+            result = self._model.complete(task_id=msg.task_id, task_class=plan.task_class,
                                           privacy_class=plan.privacy_class, messages=messages)
         except ModelRefused as exc:
             self._last = {"plan": plan, "degraded": degraded, "result": None, "error": exc.reason}
