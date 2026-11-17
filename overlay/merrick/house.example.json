@@ -1,0 +1,46 @@
+{
+  "_comment": "Example only. The installer writes the real house file from the owner's Home Assistant; no entity id is hard-coded in the code.",
+  "temperature_unit": "F",
+  "default_zone": "main",
+  "away_hold_f": 62,
+  "weather_entity": "weather.home",
+  "vacancy_entity": "input_boolean.house_closed",
+  "vacancy_on_state": "on",
+  "zones": {
+    "main": {
+      "name": "Main house",
+      "climate_entity": "climate.main_house",
+      "aliases": ["main house", "house", "downstairs", "central heat", "heat"],
+      "prior_heat_f_per_hour": 1.4,
+      "thermal_lag_minutes": 20
+    },
+    "family_room": {
+      "name": "Family room",
+      "climate_entity": "climate.family_room",
+      "room_sensor": "sensor.family_room_wall_temperature",
+      "aliases": ["family room", "den"],
+      "prior_heat_f_per_hour": 2.2,
+      "thermal_lag_minutes": 10
+    }
+  },
+  "sensors": {
+    "basement": {"entity": "sensor.basement_temperature", "aliases": ["basement", "cellar"]}
+  },
+  "perimeter": {
+    "front door": "binary_sensor.front_door",
+    "kitchen window": "binary_sensor.kitchen_window"
+  },
+  "security_read": {
+    "front door lock": "lock.front_door"
+  },
+  "controllable": ["switch.fireplace_blower"],
+  "protected_entities": ["switch.main_supply"],
+  "unsupported_location_words": [],
+  "cold_watch": {
+    "basement_sensor": "basement",
+    "zone": "main",
+    "basement_alert_f": 40,
+    "basement_urgent_f": 36,
+    "zone_min_current_f": 58
+  }
+}
