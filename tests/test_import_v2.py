@@ -201,5 +201,69 @@ class Apply(Base):
         self.assertNotIn("TOKEN=", (self.state / "mcp-import.json").read_text())
 
 
+class CronInventory(unittest.TestCase):
+    J = [
+        {"name": "heartbeat-main", "payloadKind": "heartbeat", "schedule": {"kind": "every", "everyMs": 1800000}, "message": "", "enabled": True},
+        {"name": "qc-recheck", "payloadKind": "command", "schedule": {"kind": "cron", "cron": "5 * * * *", "tz": "America/New_York"},
+         "message": "sh -lc python3 /x/verifier.py --mode recheck", "sessionTarget": "isolated", "delivery_mode": "none", "enabled": True},
+        {"name": "thermal", "payloadKind": "command", "schedule": {"kind": "every", "everyMs": 3600000}, "message": "sh -lc true", "enabled": True},
+        {"name": "ten-min", "payloadKind": "agentTurn", "schedule": {"kind": "every", "everyMs": 600000}, "message": "go", "agentId": "merrick", "enabled": False},
+        {"name": "trader-loop", "payloadKind": "agentTurn", "schedule": {"kind": "cron", "cron": "0 17 * * 1-5", "tz": None}, "message": "run it",
+         "sessionTarget": "isolated", "channel": "telegram", "delivery_mode": "announce", "delivery_to": "42", "enabled": True},
+        {"name": "old-nudge", "payloadKind": "command", "schedule": {"kind": "at", "at": "2026-08-06T21:10:00.000Z"}, "message": "x", "enabled": False},
+        {"name": "birdhouses", "payloadKind": "systemEvent", "schedule": {"kind": "at", "at": "2026-11-25T14:00:00.000Z"}, "message": "clean them",
+         "sessionTarget": "main", "enabled": True},
+        {"name": "Bad Name", "payloadKind": "command", "schedule": {"kind": "cron", "cron": "0 1 * * *"}, "message": "x"},
+        {"name": "weird", "payloadKind": "command", "schedule": {"kind": "cron", "cron": "nope"}, "message": "x"},
+        {"name": "empty", "payloadKind": "agentTurn", "schedule": {"kind": "cron", "cron": "0 1 * * *"}, "message": ""},
+    ]
+
+    def setUp(self):
+        self.cmds, self.skipped = iv.cron_commands(self.J, {"trader-loop"}, "2026-11-17T00:00:00.000Z", ["oc"])
+        self.by = {c["name"]: c for c in self.cmds}
+
+    def arg(self, name, flag):
+        a = self.by[name]["argv"]
+        return a[a.index(flag) + 1]
+
+    def test_what_is_kept_and_what_is_skipped(self):
+        self.assertEqual(sorted(self.by), ["birdhouses", "qc-recheck", "ten-min", "thermal", "trader-loop"])
+        why = {s["name"]: s["why"] for s in self.skipped}
+        self.assertEqual(why["heartbeat-main"], "built into OpenClaw")
+        self.assertEqual(why["old-nudge"], "one-shot already in the past")
+        self.assertEqual(why["weird"], "schedule not understood")
+        self.assertEqual(why["empty"], "no usable payload")
+        self.assertEqual(why["Bad Name"], "bad name")
+
+    def test_shell_jobs_stay_shell_jobs_and_prompts_stay_prompts(self):
+        self.assertEqual(self.arg("qc-recheck", "--command"), "sh -lc python3 /x/verifier.py --mode recheck")
+        self.assertNotIn("--message", self.by["qc-recheck"]["argv"])
+        self.assertEqual(self.arg("trader-loop", "--message"), "run it")
+        self.assertEqual(self.arg("birdhouses", "--system-event"), "clean them")
+
+    def test_schedules_are_carried_exactly(self):
+        self.assertEqual((self.arg("qc-recheck", "--cron"), self.arg("qc-recheck", "--tz")), ("5 * * * *", "America/New_York"))
+        self.assertEqual(self.arg("trader-loop", "--tz"), "UTC")
+        self.assertEqual(self.arg("thermal", "--every"), "1h")
+        self.assertEqual(self.arg("ten-min", "--every"), "10m")
+        self.assertEqual(self.arg("birdhouses", "--at"), "2026-11-25T14:00:00.000Z")
+
+    def test_standby_disabled_delivery_and_agent(self):
+        self.assertIn("--disabled", self.by["trader-loop"]["argv"])          # shared account -> standby
+        self.assertTrue(self.by["trader-loop"]["standby"])
+        self.assertIn("--disabled", self.by["ten-min"]["argv"])              # was off in v2 -> stays off
+        self.assertFalse(self.by["ten-min"]["standby"])
+        self.assertNotIn("--disabled", self.by["qc-recheck"]["argv"])
+        self.assertEqual((self.arg("trader-loop", "--to"), self.arg("trader-loop", "--channel")), ("42", "telegram"))
+        self.assertIn("--no-deliver", self.by["qc-recheck"]["argv"])
+        self.assertEqual(self.arg("ten-min", "--agent"), "merrick")
+        self.assertNotIn("--session", self.by["birdhouses"]["argv"])
+
+    def test_sub_minute_or_junk_intervals_are_not_guessed(self):
+        c, s = iv.cron_commands([{"name": "fast", "payloadKind": "command", "schedule": {"kind": "every", "everyMs": 500}, "message": "x"}],
+                                set(), "2026", ["oc"])
+        self.assertEqual((c, s[0]["why"]), ([], "schedule not understood"))
+
+
 if __name__ == "__main__":
     unittest.main()

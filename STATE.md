@@ -13,7 +13,9 @@ v2 export received (jaking1979/potter-v2-export @d5362bc, read-only): 76 crons (
 real /home/josh paths), 5 MCP servers, 20 app folders, 3 agents (main, potter-local, merrick), 2 own plugins
 (potter-guardrails, potter-kg), primary model local Ollama. Problems: a live Telegram token in history; apps/ regrouping
 broke command paths (my prompt's fault). Follow-up for v2: docs/V2_EXPORT_FOLLOWUP.md (schema /2, mirrored tree).
-Next: importer v2 reads inventory/cron.json + mirrored tree, recreates /home/josh paths, agents, plugins, services.
+Done: cron_commands() translates inventory/cron.json (real export: 29 kept = 5 run at install, 16 standby, 8 off in v2;
+41 expired one-shots and 6 built-ins skipped). Waiting on Josh: paste the follow-up to v2; model decision (Ollama?).
+Next (after the /2 export): importer v2 reads the mirrored tree, recreates /home/josh paths, agents, plugins, services.
 
 ## Current direction (Josh, 2026-11-16) - supersedes the standalone-service plan
 Build on a FRESH OpenClaw in its own new Proxmox container (never v2's infrastructure). Reuse

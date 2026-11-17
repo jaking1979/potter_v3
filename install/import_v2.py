@@ -136,6 +136,73 @@ def _scan_text_for_secrets(data: bytes) -> bool:
         return False
 
 
+BUILTIN_KINDS = {"heartbeat", "skillCollectionReview"}   # OpenClaw creates these itself
+
+
+def _every(ms) -> str | None:
+    if not isinstance(ms, (int, float)) or ms < 60000:
+        return None
+    m = int(ms // 60000)
+    return f"{m // 60}h" if m % 60 == 0 else f"{m}m"
+
+
+def cron_commands(jobs: list, shared: set, now_iso: str, openclaw: list[str]) -> tuple[list, list]:
+    """Turn v2's real cron inventory (inventory/cron.json) into `openclaw cron add` argv lists.
+
+    Returns (commands, skipped). Each command is {"name", "argv", "standby"}; skipped is {"name", "why"}.
+    A job named in `shared` (it trades, sends, posts or consumes a shared feed) is created disabled (standby).
+    A job v2 had disabled stays disabled. Built-in heartbeat jobs and expired one-shots are skipped.
+    """
+    cmds, skipped = [], []
+    for j in jobs if isinstance(jobs, list) else []:
+        name = str(j.get("name", ""))
+        if not NAME.match(name):
+            skipped.append({"name": name[:60], "why": "bad name"})
+            continue
+        kind = j.get("payloadKind")
+        sched = j.get("schedule") or {}
+        if kind in BUILTIN_KINDS:
+            skipped.append({"name": name, "why": "built into OpenClaw"})
+            continue
+        msg = j.get("message") or ""
+        if kind not in ("agentTurn", "command", "systemEvent") or not msg:
+            skipped.append({"name": name, "why": "no usable payload"})
+            continue
+        argv = openclaw + ["cron", "add", "--name", name, "--declaration-key", "v2-" + name]
+        sk = sched.get("kind")
+        if sk == "cron" and CRON.match(str(sched.get("cron", ""))):
+            argv += ["--cron", sched["cron"], "--tz", sched.get("tz") or "UTC", "--exact"]
+        elif sk == "every" and _every(sched.get("everyMs")):
+            argv += ["--every", _every(sched["everyMs"])]
+        elif sk == "at" and isinstance(sched.get("at"), str):
+            if sched["at"] <= now_iso:
+                skipped.append({"name": name, "why": "one-shot already in the past"})
+                continue
+            argv += ["--at", sched["at"]]
+        else:
+            skipped.append({"name": name, "why": "schedule not understood"})
+            continue
+        argv += {"agentTurn": ["--message", msg], "command": ["--command", msg],
+                 "systemEvent": ["--system-event", msg]}[kind]
+        target = j.get("sessionTarget")
+        if isinstance(target, str) and target and kind != "systemEvent":
+            argv += ["--session", target]
+        if j.get("agentId") and kind == "agentTurn":
+            argv += ["--agent", str(j["agentId"])]
+        if j.get("displayName"):
+            argv += ["--display-name", str(j["displayName"])[:80]]
+        if j.get("delivery_mode") == "announce" and j.get("delivery_to"):
+            argv += ["--channel", str(j.get("channel") or "telegram"), "--to", str(j["delivery_to"]),
+                     "--announce", "--best-effort-deliver"]
+        elif j.get("delivery_mode") == "none":
+            argv += ["--no-deliver"]
+        standby = name in shared
+        if standby or j.get("enabled") is False:
+            argv += ["--disabled"]
+        cmds.append({"name": name, "argv": argv, "standby": standby, "enabled_in_v2": j.get("enabled") is not False})
+    return cmds, skipped
+
+
 INSTALL_OK = {
     "pip install -r requirements.txt": lambda d: [str(d / ".venv/bin/pip"), "install", "-r", "requirements.txt"],
     "python3 -m pip install -r requirements.txt": lambda d: [str(d / ".venv/bin/pip"), "install", "-r", "requirements.txt"],
