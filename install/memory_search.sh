@@ -13,7 +13,7 @@ key_file = os.path.join(os.environ["SECRETS_DIR"], "openrouter.key")
 json.dump({
     "secrets": {"providers": {"potterkeys": {"source": "file", "path": key_file, "mode": "singleValue"}}},
     "memory": {"search": {
-        "provider": "openai-compatible", "model": "mongodb/voyage-4-lite",
+        "provider": "openai-compatible", "model": "openai/text-embedding-3-small",
         "remote": {"baseUrl": "https://openrouter.ai/api/v1/", "apiKey": {"source": "file", "provider": "potterkeys", "id": "value"}},
         "extraPaths": [{"path": p, "evergreen": True} for p in ("preferences", "rules", "learnings", "reference")],
     }},

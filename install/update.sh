@@ -101,6 +101,10 @@ if [ -f "$P" ] && ! cmp -s "$P" "$REPO/overlay/jev/policy.json"; then
   fi
 fi
 
+# 1c. zero data retention: name any model an account that requires it would refuse
+zdr="$(python3 "$HERE/zdr_check.py" "$WS/state/model-policy.json" --embedding openai/text-embedding-3-small 2>/dev/null || true)"
+[ -n "$zdr" ] && step "WARNING, zero data retention: $zdr" || step "zero data retention: every model Potter uses has a ZDR provider"
+
 # 2. Jev for Merrick
 mkdir -p "$POTTER_HOME/jev"; cp "$REPO/overlay/jev/"{client.js,policy.js,telemetry.js,index.js,merrick-decide.mjs} "$POTTER_HOME/jev/"
 if [ -f /usr/local/bin/merrick ] && ! grep -q MERRICK_DECIDE_CMD /usr/local/bin/merrick; then
