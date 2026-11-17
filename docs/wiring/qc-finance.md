@@ -99,7 +99,7 @@ oc cron add --name potter-daily-trading --declaration-key potter-daily-trading -
   this repo; read the cron docs before adding them.
 - Handover registry: add `potter-daily-trading` under `crons` with `enabled: false` and purpose "daily trading
   run under the owner's mandate". The phrase the owner uses is "take over trading"; the `trading-run` skill has
-  the checks that come before `openclaw cron enable potter-daily-trading`.
+  the checks that come before `potter-cron on potter-daily-trading`.
 
 ## 3. Where v2's trading code would live in v3, and its dependencies
 

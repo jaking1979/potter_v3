@@ -38,7 +38,15 @@ FIN = """### Blog/Newsletter Sources
 | Unknown Blog | Blog | RSS via blogwatcher | Medium |
 | A Newsletter | Email | inbox | High |
 """
+VENUE_MD = """# Little Park (Pier 9) — City Events Monitor
+## Official Sources
+| Source | URL | Notes |
+|--------|-----|-------|
+| Events Calendar | https://park.example/events | calendar |
+| Newsroom | https://park.example/news | press |
+"""
 FILES = {"x/city-events-scraper.mjs": SCRAPER, "x/state/m/SOURCES.md": SOURCES_MD,
+         "a/state/venue-monitor/SOURCES.md": VENUE_MD, "y/state/m/SOURCES.md": SOURCES_MD,
          "x/scripts/wine-watchdog.sh": WINE, "x/rules/domains/financial-optimization.md": FIN}
 
 
@@ -48,7 +56,17 @@ class Build(unittest.TestCase):
 
     def test_city_sources_come_from_the_scraper_list(self):
         self.assertEqual([s["url"] for s in self.c["city_events"]["sources"]],
-                         ["https://a.example/events", "https://b.example/news"])
+                         ["https://a.example/events", "https://b.example/news", "https://park.example/events",
+                          "https://park.example/news"])
+        self.assertEqual(self.c["city_events"]["sources"][2]["area"], "Little Park (Pier 9)")
+
+    def test_every_sources_file_is_read_and_copies_do_not_duplicate(self):
+        urls = [s["url"] for s in self.c["local_monitor"]["sources"]]
+        self.assertEqual(len(urls), len(set(urls)))
+        self.assertIn("https://paper.example", urls)
+        rev = mv.build(dict(reversed(list(FILES.items()))))              # the order inside the zip does not matter
+        self.assertEqual(rev["local_monitor"], self.c["local_monitor"])
+        self.assertEqual(rev["city_events"], self.c["city_events"])
 
     def test_local_sources_news_businesses_shops_and_regional_calendar(self):
         got = {(s["name"], s["kind"], s["mode"], s["url"]) for s in self.c["local_monitor"]["sources"]}

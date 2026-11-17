@@ -173,7 +173,10 @@ class Installer(unittest.TestCase):
         boot = (ROOT / "install/bootstrap.sh").read_text()
         self.assertIn("monitors_from_v2.py", boot)
         self.assertIn("--baseline", boot)
-        enabled = boot[boot.index('for j in potter-fetch-city-events'):boot.index("done", boot.index('for j in potter-fetch-city-events'))]
+        line = next(ln for ln in boot.splitlines() if ln.strip().startswith("potter-cron on "))
+        enabled = line.split(">")[0]
+        self.assertEqual(sorted(enabled.split()[2:]), ["potter-fetch-city-events", "potter-fetch-feeds",
+                                                       "potter-fetch-local", "potter-fetch-wine"])
         self.assertNotIn("digest", enabled)
         self.assertNotIn("trading", enabled)
 

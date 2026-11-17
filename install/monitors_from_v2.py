@@ -75,6 +75,19 @@ def site(cell: str) -> str | None:
     return f"https://{cell}" if DOMAIN.match(cell) else None
 
 
+def _unique(sources: list[dict]) -> list[dict]:
+    """One entry per page address and per id (the first wins)."""
+    out, urls, ids = [], set(), set()
+    for src in sources:
+        u = src["url"].rstrip("/").lower()
+        if u in urls or src["id"] in ids:
+            continue
+        urls.add(u)
+        ids.add(src["id"])
+        out.append(src)
+    return out
+
+
 def build(files: dict[str, str]) -> dict:
     cfg = {"_built_from": "the previous assistant's export, at install", "_unverified": []}
     city = []
@@ -82,29 +95,39 @@ def build(files: dict[str, str]) -> dict:
         if name.endswith("-events-scraper.mjs"):
             for i, n, u, a in JS_SOURCE.findall(text):
                 city.append({"id": slug(i), "name": n, "url": u, "area": a})
-    if city:
-        cfg["city_events"] = {"window_days": 90, "sources": city}
-
-    md = next((t for n, t in files.items() if n.endswith("/SOURCES.md")), "")
-    local = []
-    for row in table_rows(md, "News"):
-        u = site(row[1]) if len(row) > 1 else None
-        if u:
-            local.append({"id": slug(row[0]), "name": row[0], "url": u, "kind": "news", "mode": "links"})
-    for word, kind in (("Businesses", "business"), ("Ski Shops", "seasonal")):
-        for row in table_rows(md, word):
-            u = next((site(c) for c in reversed(row) if site(c)), None)
-            name = row[1] if len(row) > 1 else row[0]
+    # Every monitor's SOURCES.md, merged (v2 kept copies in more than one folder): local tables feed the local
+    # monitor; an "Official Sources" table is a single-venue monitor, so its pages join the city events.
+    mds = [t for n, t in sorted(files.items()) if n.endswith("/SOURCES.md")]
+    local, queries = [], []
+    for md in mds:
+        for row in table_rows(md, "News"):
+            u = site(row[1]) if len(row) > 1 else None
             if u:
-                local.append({"id": slug(name), "name": name, "url": u, "kind": kind, "mode": "page"})
+                local.append({"id": slug(row[0]), "name": row[0], "url": u, "kind": "news", "mode": "links"})
+        for word, kind in (("Businesses", "business"), ("Ski Shops", "seasonal")):
+            for row in table_rows(md, word):
+                u = next((site(c) for c in reversed(row) if site(c)), None)
+                name = row[1] if len(row) > 1 else row[0]
+                if u:
+                    local.append({"id": slug(name), "name": name, "url": u, "kind": kind, "mode": "page"})
+        title = re.search(r"^# (.+?)(?:\s+[—-]\s+.*)?$", md, re.M)
+        venue = title.group(1).strip() if title else "Venue"
+        for row in table_rows(md, "Official Sources"):
+            u = site(row[1]) if len(row) > 1 else None
+            if u:
+                city.append({"id": slug(f"{venue} {row[0]}"), "name": f"{venue}: {row[0]}", "url": u, "area": venue})
+        queries += [q.replace('"', "").strip() for q in bullets(md, "Search")]
     for n, t in files.items():
         if n.endswith("-events-scraper.mjs"):
             for u in FETCH_URL.findall(t):
                 local.append({"id": slug(u.split("//")[1].split("/")[0]) + "-events", "name": "Regional events calendar",
                               "url": u, "kind": "events", "mode": "events"})
+    city, local = _unique(city), _unique(local)
+    if city:
+        cfg["city_events"] = {"window_days": 90, "sources": city}
     if local:
         cfg["local_monitor"] = {"window_days": 60, "max_per_source": 15, "sources": local,
-                                "search_queries": [q.replace('"', "").strip() for q in bullets(md, "Search")][:10]}
+                                "search_queries": list(dict.fromkeys(queries))[:10]}
 
     wine = next((t for n, t in files.items() if n.endswith("wine-watchdog.sh")), "")
     w = re.search(r'^WINE="([^"]+)"', wine, re.M)

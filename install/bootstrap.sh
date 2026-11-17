@@ -316,6 +316,12 @@ fi
 
 say "Scheduling the evening check-in (one recurring job)"
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
+cat > /usr/local/bin/potter-cron <<WRAP
+#!/bin/sh
+# Switch a job on or off by name: potter-cron on|off <name> [...]
+exec python3 "$POTTER_HOME/tools/cron_switch.py" "\$@" --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}"
+WRAP
+chmod 755 /usr/local/bin/potter-cron
 q oc cron add --name potter-evening-nudge --declaration-key potter-evening-nudge --cron "*/10 15-21 * * 1-5" \
    --tz "$TIMEZONE" --exact --no-deliver --timeout-seconds 120 \
    --command "python3 $POTTER_HOME/tools/evening_nudge.py --to $OWNER_TELEGRAM_ID --tz $TIMEZONE --state $WS/state/evening-nudge.json --calendar '${WORK_CALENDAR:-}' --openclaw 'openclaw ${OC_PROFILE_FLAG[*]:-}'"
@@ -391,9 +397,7 @@ if [ -n "$MONITORS_READY" ]; then
     python3 "$POTTER_HOME/tools/monitors/$m.py" --config "$WS/state/monitors/config.json" \
       --state-dir "$WS/state/monitors/$d" --baseline >/dev/null 2>&1 || warn "monitor $m could not take its first reading"
   done
-  for j in potter-fetch-city-events potter-fetch-local potter-fetch-wine potter-fetch-feeds; do
-    q oc cron enable "$j" || warn "could not switch on $j"
-  done
+  potter-cron on potter-fetch-city-events potter-fetch-local potter-fetch-wine potter-fetch-feeds >/dev/null || warn "could not switch on every page-checking job"
   python3 - <<'PY'
 import json, os
 p = "/etc/potter/handover.json"
