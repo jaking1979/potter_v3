@@ -8,8 +8,10 @@ The owner can ask you to update yourself. The new code must already be in `/opt/
 copies it in; you cannot fetch the private repository).
 
 1. Run `bash /opt/potter/src/install/update.sh --check` and tell the owner which code version it found.
-2. Run `bash /opt/potter/src/install/update.sh`. It installs potter-core, wires Merrick's Jev decider and refreshes
-   the shipped skills and rules. It does not touch personal rules, secrets or schedules.
-3. Report its output in a few lines. The gateway restarts about 8 seconds after it finishes, so send your report
-   right away; the owner's next message reaches the updated Potter.
-4. If it stops with an error, report the error line exactly and change nothing by hand.
+2. Run `bash /opt/potter/src/install/update.sh` (add `--profile <zip>` only if the owner gave you a v2 export file).
+   It starts the update as a separate background service and returns at once; relay its two lines to the owner.
+3. That service stops your gateway for a minute or two, installs potter-core, the model policy, Merrick's Jev
+   decider, memory search and the shipped skills and rules, starts the gateway, runs the health check, and sends
+   the owner the result on Telegram itself. You will not see it happen: your next turn runs on the new code.
+4. Never stop or restart the gateway yourself for an update, and never edit installed files by hand. If the owner
+   reports a FAIL line from the update message, read `journalctl -u potter-update-*` and report what it says.
