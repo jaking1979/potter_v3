@@ -1,9 +1,20 @@
 {
   "id": "potter-core",
   "name": "Potter Core",
-  "description": "Potter v3: action control with owner approvals and hash-chained receipts; context governor; System-One fast path for house requests.",
-  "version": "3.2.0",
-  "contracts": {},
+  "description": "Potter v3: control with approvals and receipts; context governor and fast path; model broker and spend ledger; staged memory and responsibilities; once-only effects and the Notion outbox.",
+  "version": "3.5.0",
+  "contracts": {
+    "tools": [
+      "memory_stage",
+      "memory_review",
+      "memory_review_apply",
+      "responsibility_track",
+      "responsibility_due",
+      "responsibility_done",
+      "notion_outbox_list",
+      "notion_outbox_settle"
+    ]
+  },
   "activation": {
     "onStartup": true
   },
@@ -72,6 +83,31 @@
           },
           "merrick": {
             "type": "string"
+          }
+        }
+      },
+      "workspace": {
+        "type": "string"
+      },
+      "broker": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "enforce",
+              "shadow"
+            ]
+          },
+          "escalationDailyCapUsd": {
+            "type": "number"
+          },
+          "escalationDailyMax": {
+            "type": "integer"
           }
         }
       }

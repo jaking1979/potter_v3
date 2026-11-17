@@ -201,6 +201,28 @@
    "deliver": true,
    "message": "Report the monthly model-scoring status from trading/monthly-scoring. Reply with the status only.",
    "purpose": "monthly scoring status (off in the old assistant too)"
+  },
+  {
+   "name": "potter-memory-review",
+   "cron": "47 16 * * 0",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 600,
+   "standby": false,
+   "deliver": true,
+   "message": "Run the memory-review skill. If nothing is waiting, output nothing.",
+   "purpose": "weekly review of what Potter proposes to remember (owner approves)"
+  },
+  {
+   "name": "potter-notion-outbox",
+   "cron": "17 */2 * * *",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 600,
+   "standby": false,
+   "deliver": false,
+   "message": "Run the notion-outbox skill. Output nothing unless an item keeps failing.",
+   "purpose": "retries Notion writes that failed"
   }
  ]
 }

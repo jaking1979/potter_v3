@@ -14,6 +14,16 @@ import { tryHouse } from "./lib/fastpath.js";
 import { plan, requestText, tableDomains } from "./lib/governor.js";
 import { createDecisionClient } from "./lib/jev-client.js";
 import { append, recent, verify } from "./lib/receipts.js";
+import { chooseClass, costOf, loadClasses, recordSpend, spentToday, toOverride } from "./lib/broker.js";
+import { alreadyDone, effectKey, enqueue, inDoubt, isOutboxRetry } from "./lib/durable.js";
+import { buildTools } from "./lib/tools.js";
+
+function escalationsToday(path) {
+  if (!existsSync(path)) return 0;
+  const day = new Date().toISOString().slice(0, 10);
+  return readFileSync(path, "utf8").split("\n")
+    .filter((l) => l.startsWith(`{"ts":"${day}`) && l.includes('"kind":"broker"') && l.includes('"cls":"escalation"')).length;
+}
 
 function envFile(path) {
   const out = {};
@@ -78,16 +88,33 @@ export default definePluginEntry({
     const ownerIds = (cfg.ownerIds ?? []).map(String);
     const decider = cfg.governor?.jev === false ? undefined : jevDecider(api, cfg);
     const pending = new Map();
+    const ws = cfg.workspace || "";
+    const spend = join(dir, "spend.jsonl");
+    const outbox = join(dir, "outbox-notion.json");
+    const runClass = new Map();
+
+    // ---- v3.4 / v3.5 tools ----------------------------------------------------------------------------------------
+    if (ws) {
+      for (const tool of buildTools({ staged: join(ws, "state", "memory", "staged.jsonl"), memory: join(ws, "MEMORY.md"),
+        responsibilities: join(ws, "state", "responsibilities.json"), outbox })) api.registerTool(tool);
+    }
 
     // ---- v3.1 Control ----------------------------------------------------------------------------------------
     api.on("before_tool_call", async (event, ctx) => {
       const cls = classify(event?.toolName, event?.params, { ownerIds });
       const trust = trustOf(ctx);
-      const d = decide(cls, trust, cfg);
+      let d = decide(cls, trust, cfg);
+      const effect = cls.risk === "consequential" ? effectKey(event?.toolName, event?.params) : null;
+      if (effect && isOutboxRetry(outbox, effect)) {
+        d = { action: "allow", reason: "retry of a queued Notion write (already decided)", receipt: true };   // v3.5
+      } else if (effect && d.action === "allow") {
+        const prior = alreadyDone(receipts, effect);
+        if (prior) d = { action: "approve", reason: `this exact action already succeeded on ${prior.ts.slice(0, 16).replace("T", " ")} UTC; do it again?`, receipt: true };
+      }
       if (d.receipt) {
         const rec = append(receipts, { phase: "intent", tool: event?.toolName, capability: cls.capability, risk: cls.risk,
           severity: cls.severity, trust, decision: d.would ? `shadow:${d.would}` : d.action, reason: d.reason, target: cls.target,
-          agent: ctx?.agentId ?? null });
+          agent: ctx?.agentId ?? null, effect });
         if (event?.toolCallId) pending.set(event.toolCallId, rec.hash);
       }
       if (d.action === "block") return { block: true, blockReason: `${d.reason} (potter-core)` };
@@ -110,9 +137,39 @@ export default definePluginEntry({
       if (!intent) return;
       pending.delete(event.toolCallId);
       const ok = event.error ? false : (event.result !== undefined ? true : "unknown");
+      const c = classify(event.toolName, event.params, { ownerIds });
+      if (ok === false && c.risk === "consequential" && /^mcp:notion/i.test(c.capability)) {
+        enqueue(outbox, { tool: event.toolName, params: event.params, error: event.error });              // v3.5 outbox
+      }
       append(receipts, { phase: "result", tool: event.toolName, intent, ok, error: event.error ? String(event.error).slice(0, 160) : null,
         ms: event.durationMs ?? null, capability: classify(event.toolName, event.params, { ownerIds }).capability, target: "" });
     });
+
+    // ---- v3.3 model broker -----------------------------------------------------------------------------------------
+    if (cfg.broker?.enabled !== false) {
+      api.on("before_model_resolve", async (event, ctx) => {
+        if (ctx?.trigger === "cron" || (ctx?.agentId && !agents.has(ctx.agentId))) return;  // jobs name their model
+        const text = requestText({ prompt: event?.prompt, currentUserMessage: event?.currentUserMessage });
+        const classes = loadClasses(cfg.policyPath || "");
+        const capUsd = cfg.broker?.escalationDailyCapUsd ?? 3;
+        const spentUsd = spentToday(spend, { cls: "escalation" });
+        const overCount = escalationsToday(govLog) >= (cfg.broker?.escalationDailyMax ?? 20);
+        const pick = chooseClass(text, { domains: tableDomains(text), escalationSpentUsd: overCount ? capUsd : spentUsd, escalationCapUsd: capUsd });
+        if (ctx?.runId) runClass.set(ctx.runId, pick.cls);
+        log(govLog, { kind: "broker", cls: pick.cls, reason: pick.reason, spentUsd: Number(spentUsd.toFixed(4)) });
+        if (pick.cls === "chat" || cfg.broker?.mode === "shadow") return;
+        return toOverride(classes[pick.cls]) ?? undefined;
+      });
+      api.on("llm_output", async (event, ctx) => {
+        const u = event?.usage ?? event?.lastAssistant?.usage ?? {};
+        const num = (...v) => v.find((x) => typeof x === "number" && Number.isFinite(x)) ?? null;
+        recordSpend(spend, { cls: (ctx?.runId && runClass.get(ctx.runId)) || (ctx?.trigger === "cron" ? "job_turn" : "chat"),
+          model: [event?.provider, event?.model].filter(Boolean).join("/") || null,
+          inputTokens: num(u.input, u.inputTokens, u.input_tokens, u.prompt_tokens),
+          outputTokens: num(u.output, u.outputTokens, u.output_tokens, u.completion_tokens),
+          costUsd: costOf(u) ?? num(u.cost?.total) });
+      });
+    }
 
     // ---- v3.2 Brain: System-One fast path ----------------------------------------------------------------------
     if (cfg.fastPath?.enabled !== false) {
@@ -153,7 +210,11 @@ export default definePluginEntry({
         const v = verify(receipts);
         const rows = recent(receipts, 12, (r) => r.phase !== "result" || r.ok !== true);
         const lines = rows.map((r) => `${r.ts.slice(5, 16).replace("T", " ")} ${r.phase} ${r.capability} → ${r.decision ?? (r.ok === true ? "ok" : r.ok)}${r.target ? " (" + r.target + ")" : ""}`);
-        return { text: [`Receipts: ${v.count}, chain ${v.ok ? "intact" : "BROKEN at line " + v.brokenAt}.`, ...lines].join("\n") };
+        const doubt = inDoubt(receipts);
+        const today = spentToday(spend);
+        const head = [`Receipts: ${v.count}, chain ${v.ok ? "intact" : "BROKEN at line " + v.brokenAt}. Model spend today: $${today.toFixed(2)}.`];
+        if (doubt.length) head.push(`In doubt (started, no recorded result): ${doubt.slice(-5).map((r) => `${r.ts.slice(5, 16).replace("T", " ")} ${r.capability}`).join("; ")}. Check these happened once.`);
+        return { text: [...head, ...lines].join("\n") };
       },
     });
   },

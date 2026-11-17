@@ -38,6 +38,35 @@ Every tool call is classified (`lib/classify.js`) and decided (`lib/control.js`)
   decision (intent and zone, confidence floor 0.7) before any slow reasoning.
 - Telemetry, content-free: `<state>/potter-core/governor.jsonl` (domains, source, latency; fast path intent, outcome).
 
-## Not yet (v3.3+)
-Model broker per turn (`before_model_resolve`), tool-surface narrowing (`toolsAllow`, needs the host's tool list),
-memory staging, durable tasks and the Notion outbox.
+## v3.3 Model broker (T28/T13)
+
+`before_model_resolve` (`lib/broker.js`): for each conversation turn Potter picks the model class from the model
+policy: `chat` by default, `escalation` (DeepSeek V4 Pro) when the request asks for depth (trade-offs, strategy,
+root cause, "think hard"), is very long, or is a money decision. Scheduled jobs keep the model they name.
+`llm_output` writes a content-free spend ledger (`<state>/potter-core/spend.jsonl`: class, model, tokens, cost);
+over the daily escalation budget (`broker.escalationDailyCapUsd`, default $3, and at most `escalationDailyMax`
+escalations a day) turns stay on chat. `/receipts` shows today's model spend. `broker.mode: "shadow"` logs the
+choice without applying it.
+
+## v3.4 Memory and responsibilities (T15/T27, T16; Decision Log 11-15, 35-36, 51-53, 63-66)
+
+- Staged memory (`lib/memory.js`): `memory_stage` proposes a fact, preference, pattern or correction with
+  confidence, source and examples; nothing is written to `MEMORY.md` until the owner's review. The weekly job
+  `potter-memory-review` (Sundays) sends the list; `memory_review_apply` (owner-only) writes approved items with
+  provenance; a correction replaces the line it corrects.
+- Responsibilities: `responsibility_track` (cadence, next due, checklist), `responsibility_due`,
+  `responsibility_done`, in `state/responsibilities.json`; briefs and check-ins list what is due.
+
+## v3.5 Durability (T10, T4/T17)
+
+- Once-only effects (`lib/durable.js`): each consequential call has a fingerprint (tool + arguments, never stored
+  themselves). The same call that already succeeded in the last 7 days asks the owner before running again.
+- In doubt: a consequential call with no recorded result after 10 minutes (a crash or restart in between) is listed
+  in `/receipts` to check.
+- Notion outbox: a Notion write that fails is kept (root-only) and retried every two hours by
+  `potter-notion-outbox`; a retry is the same decision and is not asked again; after 6 failures it is given up and
+  the owner is told once.
+
+## Not yet
+Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
+task execution beyond the resumable-execution files.

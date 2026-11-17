@@ -50,7 +50,10 @@ LIVE (2026-11-17): installed on the real host (CT 211); 20/20 health checks; tai
 v3 CORE (docs/V3_CORE.md): potter-core plugin = v3.1 Control (classify/decide/approve, hash-chained receipts,
 /receipts) + v3.2 Brain (Context Governor plan, Merrick fast path without the model, Merrick+Jev). Sandbox: plugin
 loads with 4 hooks + command; house request answered by the fast path in 1.9 s with no model; governor plan logged.
-NEXT: deploy potter-core to CT 211 and test with the real key; v3.3 model broker; v3.4 memory; v3.5 durability.
+LIVE v3.1/v3.2 on CT 211 (2d2b68b): fast path, governor + Jev, receipts, board 3/3, memory search 168/168 (ZDR model).
+v3.3-3.5 (docs/V3_CORE.md): broker + spend ledger, staged memory + weekly review + responsibilities, once-only
+effects + in-doubt list + Notion outbox. Sandbox: 6 hooks, 8 tools, 2 new jobs, no duplicates, fast path 2 s.
+NEXT: deploy 3.3-3.5 to CT 211; Mac node; device-approve button; scheduled away hold; trading-gate fixes.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

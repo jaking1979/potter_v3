@@ -78,8 +78,12 @@ function byVerb(name, base) {
  * @param opts      { ownerIds?: string[] }
  * @returns { capability, risk, severity, target }
  */
+// Potter's own tools that change what Potter believes about the owner: only the owner may apply them.
+const OWNER_ONLY = new Set(["memory_review_apply"]);
+
 export function classify(toolName, params = {}, opts = {}) {
   const name = str(toolName);
+  if (OWNER_ONLY.has(name)) return { capability: name, risk: "consequential", severity: "normal", target: "" };
   const owners = new Set((opts.ownerIds ?? []).map(String));
   if (READ_TOOLS.has(name)) return { capability: name, risk: "read", severity: "normal", target: "" };
 

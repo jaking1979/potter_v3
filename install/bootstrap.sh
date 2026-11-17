@@ -257,12 +257,13 @@ install_plugin "$cdir" potter-core --force
 pcp="$(mktemp --suffix=.json5)"
 OWNER_TELEGRAM_ID="$OWNER_TELEGRAM_ID" WS="$WS" SECRETS_DIR="$SECRETS_DIR" STATE_DIR="$STATE_DIR" python3 -c '
 import json, os, sys
-cfg = {"mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"],
+cfg = {"workspace": os.environ["WS"], "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"],
        "ownerIds": [os.environ["OWNER_TELEGRAM_ID"]], "standingGrants": [],
        "stateDir": os.path.join(os.environ["STATE_DIR"], "potter-core"),
        "jevEnvFile": os.path.join(os.environ["SECRETS_DIR"], "jev.env"),
        "policyPath": os.path.join(os.environ["WS"], "state", "model-policy.json"),
-       "governor": {"enabled": True, "jev": True, "timeoutMs": 2500}, "fastPath": {"enabled": True, "merrick": "merrick"}}
+       "governor": {"enabled": True, "jev": True, "timeoutMs": 2500}, "fastPath": {"enabled": True, "merrick": "merrick"},
+       "broker": {"enabled": True, "mode": "enforce", "escalationDailyCapUsd": 3, "escalationDailyMax": 20}}
 json.dump({"plugins": {"entries": {"potter-core": {"enabled": True, "hooks": {"allowConversationAccess": True}, "config": cfg}}}},
           open(sys.argv[1], "w"))' "$pcp"
 q oc config patch --file "$pcp" --replace-path plugins.entries.potter-core.config; rm -f "$pcp"; rm -rf "$cdir"

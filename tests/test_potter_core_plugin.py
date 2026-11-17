@@ -23,6 +23,26 @@ class PotterCore(unittest.TestCase):
         for k in ("mode", "ownerIds", "standingGrants", "governor", "fastPath", "jevEnvFile", "policyPath"):
             self.assertIn(k, props)
 
+    def test_node_tests_for_v33_to_v35_pass(self):
+        r = subprocess.run(["node", "--test", "core35.test.mjs"], cwd=D, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-800:])
+        self.assertIn("fail 0", r.stdout)
+
+    def test_every_registered_tool_is_declared_in_the_manifest(self):
+        m = json.loads((D / "openclaw.plugin.json").read_text())
+        src = (D / "lib/tools.js").read_text()
+        import re
+        names = re.findall(r'\{ name: "([a-z_]+)"', src)
+        self.assertEqual(sorted(m["contracts"]["tools"]), sorted(names))
+        self.assertTrue(names)
+
+    def test_new_jobs_are_added_once_the_gateway_is_back(self):
+        u = (ROOT / "install/update.sh").read_text()
+        self.assertLess(u.index("systemctl start potter-gateway"), u.rindex("add_new_jobs"))
+        self.assertIn("--only-missing", u)
+        jobs = json.loads((ROOT / "install/jobs.json").read_text())["jobs"]
+        self.assertTrue({"potter-memory-review", "potter-notion-outbox"} <= {j["name"] for j in jobs})
+
     def test_the_jev_client_copy_has_not_drifted(self):
         self.assertEqual((D / "lib/jev-client.js").read_text(), (ROOT / "overlay/jev/client.js").read_text())
 

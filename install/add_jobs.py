@@ -57,10 +57,20 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--set", action="append", default=[])
     ap.add_argument("--handover")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--only-missing", action="store_true", help="create only jobs that do not exist yet")
     ns = ap.parse_args(argv)
     values = dict(s.split("=", 1) for s in ns.set)
     jobs = json.loads(Path(ns.jobs).read_text())["jobs"]
     failed, standby = 0, []
+    if ns.only_missing:
+        r = subprocess.run(shlex.split(ns.openclaw) + ["cron", "list", "--all", "--json"], capture_output=True, text=True)
+        try:
+            listed = json.loads(r.stdout[r.stdout.index("{"):])
+            have = {j.get("name") for j in listed.get("jobs", [])}
+        except ValueError:
+            print("could not read the job list; nothing was added")
+            return 1
+        jobs = [j for j in jobs if j["name"] not in have]
     for job in jobs:
         a = shlex.split(ns.openclaw) + argv_for(job, values)
         if ns.dry_run:

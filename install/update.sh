@@ -54,10 +54,11 @@ p="$(mktemp --suffix=.json5)"
 python3 - "$id" "$C" "$WS" "$SECRETS_DIR" "$p" <<'PY'
 import json, os, sys
 owner, state, ws, secrets, out = sys.argv[1:6]
-cfg = {"mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"], "ownerIds": [owner],
+cfg = {"workspace": ws, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"], "ownerIds": [owner],
        "standingGrants": [], "stateDir": os.path.join(state, "potter-core"),
        "jevEnvFile": os.path.join(secrets, "jev.env"), "policyPath": os.path.join(ws, "state", "model-policy.json"),
-       "governor": {"enabled": True, "jev": True, "timeoutMs": 2500}, "fastPath": {"enabled": True, "merrick": "merrick"}}
+       "governor": {"enabled": True, "jev": True, "timeoutMs": 2500}, "fastPath": {"enabled": True, "merrick": "merrick"},
+       "broker": {"enabled": True, "mode": "enforce", "escalationDailyCapUsd": 3, "escalationDailyMax": 20}}
 json.dump({"plugins": {"entries": {"potter-core": {"enabled": True, "hooks": {"allowConversationAccess": True}}}}}, open(out, "w"))
 json.dump(cfg, open(out + ".cfg", "w"))
 PY
@@ -72,6 +73,8 @@ except ValueError:
     old = {}
 new["standingGrants"] = old.get("standingGrants") or []
 new["mode"] = old.get("mode", new["mode"])
+if isinstance(old.get("broker"), dict):
+    new["broker"] = {**new["broker"], **old["broker"]}      # the owner's broker settings win
 json.dump({"plugins": {"entries": {"potter-core": {"config": new}}}}, open(sys.argv[1], "w"))
 PY
 q oc config patch --file "$p.cfg" --replace-path plugins.entries.potter-core.config; rm -f "$p" "$p.cfg"
@@ -118,6 +121,16 @@ step "merrick: Jev decider wired"
 . "$HERE/memory_search.sh"
 LOG+=("$(potter_memory_search "$(sed -n 's/^OPENROUTER_API_KEY=//p' "$SECRETS_DIR/jev.env" 2>/dev/null)" | tail -n1)")
 
+# Jobs added since this install. Needs the gateway running; existing jobs, including ones the owner took over,
+# are not touched.
+add_new_jobs() {
+TO="$id" python3 "$HERE/add_jobs.py" --jobs "$HERE/jobs.json" --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" --only-missing \
+  --set POTTER_HOME="$POTTER_HOME" --set WS="$WS" --set TZ="$(oc config get agents.defaults.userTimezone 2>/dev/null | tr -d '"' || echo UTC)" \
+  --set TO="$id" --set KG_DB="$C/potter-kg/potter-kg.sqlite" --set SESSIONS="$C/agents/potter/sessions" \
+  --set OC="openclaw ${OC_PROFILE_FLAG[*]:-}" --set JOB_MODEL_ARGS="$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)" \
+  --handover /etc/potter/handover.json >/dev/null && step "jobs: any new ones added" || step "jobs: could not add new ones (see add_jobs output)"
+}
+
 # 3. shipped skills and global rules (personal rules and the index's personal rows are not touched)
 for s in "$REPO/overlay/workspace/skills/"*/; do n="$(basename "$s")"; mkdir -p "$WS/skills/$n"; cp -r "$s". "$WS/skills/$n/"; done
 cp "$REPO/overlay/workspace/rules/global/"*.md "$WS/rules/global/"
@@ -137,11 +150,15 @@ if [ -n "$PROFILE_ZIP" ] && [ -f "$PROFILE_ZIP" ]; then
 fi
 echo "$rev" > "$POTTER_HOME/.potter-rev"
 
+# without systemd (a test machine) the gateway was never stopped
+[ -n "$SYSTEMD" ] || add_new_jobs
+
 # 4. start the gateway again and check it
 if [ -n "$SYSTEMD" ]; then
   systemctl start potter-gateway
   for _ in $(seq 1 60); do oc health >/dev/null 2>&1 && break; sleep 2; done
   trap - ERR
+  add_new_jobs
   hooks="$(oc plugins inspect potter-core --runtime --json 2>/dev/null | grep -o '"name": *"[a-z_]*"' | wc -l)"
   vh="$("$HERE/verify_host.sh" 2>/dev/null || true)"
   health="$(grep -c '^PASS' <<<"$vh" || true)/$(grep -c -E '^(PASS|FAIL)' <<<"$vh" || true)"
