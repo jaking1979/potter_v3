@@ -6,6 +6,11 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 
 > Source of truth for scope: docs/SCOPE.md. docs/BUILD_PLAN.md is the long-range menu only.
 
+## 2026-11-17 reset (Josh): v3 = everything v2 does, no lockdown
+Unlocked overlay (full toolset, v2's rules as behavior), v2 export importer (install/import_v2.py), setup-form upload,
+settings page for secrets (install/settings_page.py), handover skill, docs/V2_PARITY.md, docs/V2_EXPORT_PROMPT.md.
+Waiting on: Josh pastes the export prompt to v2 and uploads the zip. Then: fix whatever the importer reports.
+
 ## Current direction (Josh, 2026-11-16) - supersedes the standalone-service plan
 Build on a FRESH OpenClaw in its own new Proxmox container (never v2's infrastructure). Reuse
 existing open-source pieces; do not reinvent. Our deliverable is configuration + overlay + installer:

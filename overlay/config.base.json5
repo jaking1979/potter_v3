@@ -9,14 +9,13 @@
   },
   // Potter look: accent color, follows the device's light/dark setting.
   ui: { seamColor: "#1F5FD1", prefs: { themeMode: "system" } },
-  // Outward and control-plane tools are off for the agent; host commands need a human approval.
-  // Capabilities are switched on one at a time with `potter switch on <capability>`.
+  // Potter has the full toolset, like v2's main session. Only access control stays: the Telegram allowlist below.
+  // Behavior rules (ask-first Notion writes, EHR wall, no unreviewed sends) live in SOUL.md, as they did in v2.
   tools: {
-    deny: ["gateway", "sessions_spawn", "sessions_send"],
-    exec: { mode: "ask" },
-    elevated: { enabled: false },
-    // Potter can propose config changes (add a connector, switch a capability) from chat; each needs your approval.
-    openclaw: { autoApproveChanges: false },
+    profile: "full",
+    exec: { mode: "full" },
+    // Potter can add connections and change its own settings from chat without a separate approval step.
+    openclaw: { autoApproveChanges: true },
   },
   channels: {
     telegram: {

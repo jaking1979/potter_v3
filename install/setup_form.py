@@ -7,6 +7,8 @@ Secrets are never echoed back or logged. The page stops accepting input after on
 """
 from __future__ import annotations
 
+import email.parser
+import email.policy
 import hmac
 import html
 import http.server
@@ -24,6 +26,8 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 LIFETIME_S = 30 * 60
+MAX_BUNDLE = 150 * 1024 * 1024
+BUNDLE_PATH = Path(os.environ.get("POTTER_V2_BUNDLE_PATH", "/root/v2-export.zip"))
 
 # (key, label, help, kind, required, default)
 FIELDS = [
@@ -91,6 +95,39 @@ def to_env(v: dict) -> dict[str, str]:
     return {f"POTTER_{k}": str(v.get(k, "")).strip() for k, *_ in FIELDS}
 
 
+def parse_multipart(ctype: str, raw: bytes) -> tuple[dict, bytes | None]:
+    """Fields and the (single) uploaded file from a multipart/form-data body."""
+    msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+        b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw)
+    fields, upload = {}, None
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        if part.get_filename() is not None:
+            data = part.get_payload(decode=True) or b""
+            upload = data if data else upload
+        else:
+            fields[name] = (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
+    return fields, upload
+
+
+def check_bundle(data: bytes) -> str:
+    """Empty string if the upload is a usable v2 export; otherwise a plain-language problem."""
+    import io
+    import zipfile
+    sys.path.insert(0, str(HERE))
+    import import_v2
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            plan = import_v2.build_plan(z)
+    except (import_v2.BundleError, zipfile.BadZipFile) as e:
+        return f"That file is not a usable v2 export: {e}"
+    if plan["problems"]:
+        return "The export has problems: " + "; ".join(plan["problems"][:3])
+    return ""
+
+
 def render_form(token: str, errors: dict[str, str], values: dict) -> str:
     rows = []
     for key, label, help_, kind, required, default in FIELDS:
@@ -101,7 +138,12 @@ def render_form(token: str, errors: dict[str, str], values: dict) -> str:
             f'<input id="{key}" name="{key}" type="{"password" if kind == "secret" else "text"}" value="{val}" '
             f'autocomplete="off" spellcheck="false">'
             f'<div class="help">{html.escape(help_)}</div>{msg}')
-    return PAGE.format(body=f'<form method="post" action="/submit?t={token}">' + "".join(rows) +
+    rows.append('<label for="V2_BUNDLE">Potter v2 export file <span>optional</span></label>'
+                '<input id="V2_BUNDLE" name="V2_BUNDLE" type="file" accept=".zip">'
+                '<div class="help">The zip your v2 Potter makes when you paste it the export message. It brings v2\'s rules, '
+                'prompts, schedules and apps into v3. Leave empty to install without it.</div>' +
+                (f'<div class="err">{html.escape(errors["V2_BUNDLE"])}</div>' if "V2_BUNDLE" in errors else ""))
+    return PAGE.format(body=f'<form method="post" enctype="multipart/form-data" action="/submit?t={token}">' + "".join(rows) +
                        '<button type="submit">Install Potter</button></form>',
                        title="Set up Potter")
 
@@ -201,13 +243,31 @@ def make_handler(state: State):
         def do_POST(self):
             if not self._authorized() or urllib.parse.urlparse(self.path).path != "/submit" or state.submitted:
                 return self._send(403, "Forbidden", "text/plain")
-            n = min(int(self.headers.get("Content-Length") or 0), 16384)
-            form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(n).decode(), keep_blank_values=True).items()}
+            n = int(self.headers.get("Content-Length") or 0)
+            ctype = self.headers.get("Content-Type", "")
+            if n > MAX_BUNDLE + 65536 or (not ctype.startswith("multipart/") and n > 16384):
+                return self._send(413, "Too large", "text/plain")
+            raw = self.rfile.read(n)
+            upload = None
+            if ctype.startswith("multipart/"):
+                form, upload = parse_multipart(ctype, raw)
+            else:
+                form = {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode(), keep_blank_values=True).items()}
             errors = validate(form)
+            if upload:
+                msg = check_bundle(upload)
+                if msg:
+                    errors["V2_BUNDLE"] = msg
             if errors:
                 return self._send(400, render_form(state.token, errors, form))
             state.submitted = True
             env = to_env(form)
+            if upload:
+                BUNDLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(BUNDLE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(upload)
+                env["POTTER_V2_BUNDLE"] = str(BUNDLE_PATH)
             state.secrets = [env[f"POTTER_{k}"] for k in SECRET_KEYS]
             threading.Thread(target=state.run, args=(env,), daemon=True).start()
             self.send_response(303)

@@ -10,11 +10,10 @@ The owner does not use a terminal. You make the change; they approve it.
    Todoist and many others; check its tools first), (b) an existing MCP server or OpenClaw skill for the app,
    (c) a ClawHub skill. Say which you chose and why in one line.
 2. Never ask for a secret in chat and never repeat one. If a key or token is needed, send the owner to the
-   Potter settings page (secrets form) or the setup page, and wait. If a service uses OAuth, start the login
+   Potter settings page (secrets form), and wait. If a service uses OAuth, start the login
    flow and send the owner the sign-in link.
-3. Propose the exact change (server name, URL or command, tools to expose) and let the owner approve it through
-   the approval prompt. Do not try to bypass the approval.
-4. After it is applied, probe it, run one harmless read to prove it works, and report PASS or the exact error.
-5. Start every new connection read-only. Turn on writes (send, post, buy, delete, control) only when the owner
-   asks, per capability, and say what you switched on.
+3. Make the change yourself (you have the full toolset): add the MCP server or skill, then tell the owner in one
+   line what you added.
+4. Probe it, run one harmless read to prove it works, and report PASS or the exact error.
+5. External actions still follow the v2 rule: show the draft or action and get a yes before it goes out.
 6. Do not touch other people's accounts, the clinical/EHR space, or the CMC mailbox.

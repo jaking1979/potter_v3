@@ -45,38 +45,39 @@ class Installer(unittest.TestCase):
                OWNER_NAME="Josh", TIMEZONE="America/New_York", SECRETS_DIR="/x")
         self.assertNotEqual(r.returncode, 0)
 
-    def test_overlay_locks_the_agent_down(self):
+    def test_only_access_control_remains_and_toolset_is_full(self):
         text = (ROOT / "overlay/config.base.json5").read_text(encoding="utf-8")
-        for needle in ('dmPolicy: "allowlist"', 'groupPolicy: "disabled"', '"gateway"', 'mode: "ask"',
-                       "enabled: false", "telemetry"):
+        for needle in ('dmPolicy: "allowlist"', 'groupPolicy: "disabled"', 'profile: "full"',
+                       'mode: "full"', "autoApproveChanges: true", "telemetry"):
             self.assertIn(needle, text)
+        self.assertNotIn("deny:", text)
 
     def test_connect_skill_forbids_secrets_in_chat(self):
         text = (ROOT / "overlay/workspace/skills/connect-apps/SKILL.md").read_text()
         self.assertIn("Never ask for a secret in chat", text)
-        self.assertIn("read-only", text)
 
-    def test_delegated_changes_need_approval_in_overlay(self):
-        self.assertIn("autoApproveChanges: false", (ROOT / "overlay/config.base.json5").read_text(encoding="utf-8"))
-
-    def test_agentmail_starts_without_any_sending_tool(self):
+    def test_connectors_are_not_filtered(self):
         text = (ROOT / "install/bootstrap.sh").read_text()
-        for needle in ('"*send*"', '"*reply*"', '"*forward*"', '"*delete*"', "toolFilter"):
-            self.assertIn(needle, text)
+        self.assertNotIn("toolFilter", text)
+        self.assertNotIn("GetLiveContext", text)
 
-    def test_read_only_skills_say_so(self):
+    def test_skills_exist_with_matching_names_and_inbox_stays_off_cmc(self):
         base = ROOT / "overlay/workspace/skills"
-        for name in ("home-status", "inbox-triage"):
-            text = (base / name / "SKILL.md").read_text().lower()
-            self.assertIn("read-only", text, name)
-        self.assertIn("never the cmc mailbox", (base / "inbox-triage/SKILL.md").read_text().lower())
-        self.assertIn("clinical", (base / "inbox-triage/SKILL.md").read_text().lower())
-        for name in ("why-and-cost", "morning-brief", "connect-apps", "home-status", "inbox-triage"):
+        inbox = (base / "inbox-triage/SKILL.md").read_text().lower()
+        self.assertIn("never the cmc mailbox", inbox)
+        self.assertIn("clinical", inbox)
+        for name in ("why-and-cost", "morning-brief", "connect-apps", "home-status", "inbox-triage", "handover"):
             self.assertTrue((base / name / "SKILL.md").read_text().startswith("---\nname: " + name), name)
 
-    def test_home_assistant_exposes_only_the_state_tool(self):
+    def test_v2_rules_are_in_the_soul(self):
+        soul = (ROOT / "overlay/workspace/SOUL.md").read_text().lower()
+        for needle in ("ask-first", "ehr hard wall", "no unreviewed sends", "full toolset"):
+            self.assertIn(needle, soul)
+
+    def test_settings_service_and_v2_import_are_wired_into_bootstrap(self):
         text = (ROOT / "install/bootstrap.sh").read_text()
-        self.assertIn('"include": ["GetLiveContext"]', text)
+        for needle in ("potter-settings.service", "import_v2.py", "--run-installs", "standby"):
+            self.assertIn(needle, text)
 
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())

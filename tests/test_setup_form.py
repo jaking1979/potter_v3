@@ -1,5 +1,6 @@
 """The one-time setup web page: validation, auth, one-shot behavior, secret handling."""
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -133,6 +134,53 @@ class Server(unittest.TestCase):
         self.assertIn("••••", j["log"])
         self.assertIn("hunter2", j["final"])
         self.assertEqual(self.req("POST", f"/submit?t={self.token}", body)[0], 403)   # second submit refused
+
+    def post_multipart(self, fields, filename=None, filedata=None):
+        cmd = ["curl", "-sS", "-i", "-m", "20", "-X", "POST", f"http://127.0.0.1:{self.port}/submit?t={self.token}"]
+        for k, v in fields.items():
+            cmd += ["-F", f"{k}={v}"]
+        if filename:
+            fp = Path(self._t.name) / filename
+            fp.write_bytes(filedata)
+            cmd += ["-F", f"V2_BUNDLE=@{fp}"]
+        out = subprocess.run(cmd, capture_output=True, check=True).stdout.decode()
+        head, _, text = out.partition("\r\n\r\n")
+        return int(head.split("\r\n")[0].split()[1]), text
+
+    def good_bundle(self):
+        import io
+        import json
+        import zipfile
+        b = io.BytesIO()
+        with zipfile.ZipFile(b, "w") as z:
+            z.writestr("manifest.json", json.dumps({"schema": "potter.v2-export/1"}))
+        return b.getvalue()
+
+    def test_good_v2_bundle_upload_is_saved_private_and_passed_on(self):
+        sf.BUNDLE_PATH = Path(self._t.name) / "saved.zip"
+        s, _ = self.post_multipart(GOOD, "bundle.zip", self.good_bundle())
+        self.assertEqual(s, 303)
+        for _ in range(100):
+            if self.state.done:
+                break
+            time.sleep(0.05)
+        self.assertEqual(sf.BUNDLE_PATH.read_bytes(), self.good_bundle())
+        self.assertEqual(stat.S_IMODE(sf.BUNDLE_PATH.stat().st_mode), 0o600)
+        self.assertIn("POTTER_V2_BUNDLE=" + str(sf.BUNDLE_PATH), self.out.read_text())
+
+    def test_bad_v2_bundle_is_rejected_before_anything_runs(self):
+        sf.BUNDLE_PATH = Path(self._t.name) / "saved.zip"
+        s, page = self.post_multipart(GOOD, "bundle.zip", b"not a zip")
+        self.assertEqual(s, 400)
+        self.assertIn("not a usable v2 export", page)
+        self.assertFalse(self.state.submitted)
+        self.assertFalse(sf.BUNDLE_PATH.exists())
+
+    def test_multipart_without_a_file_still_installs(self):
+        sf.BUNDLE_PATH = Path(self._t.name) / "saved.zip"
+        s, _ = self.post_multipart(GOOD)
+        self.assertEqual(s, 303)
+        self.assertNotIn("POTTER_V2_BUNDLE", sf.to_env(GOOD))
 
     def test_expired_page_is_forbidden(self):
         self.state.started = time.time() - sf.LIFETIME_S - 1

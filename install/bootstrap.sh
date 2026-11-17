@@ -94,19 +94,13 @@ servers = {}
 if os.environ.get("COMPOSIO_MCP_URL"):
     servers["composio"] = {"transport": "streamable-http", "url": os.environ["COMPOSIO_MCP_URL"]}
 if os.environ.get("AGENTMAIL_API_KEY"):
-    # Read-only to start: anything that sends, replies, forwards, creates or deletes is hidden until the owner
-    # approves switching it on from chat.
     servers["agentmail"] = {"command": "npx", "args": ["-y", "agentmail-mcp"],
-                            "env": {"AGENTMAIL_API_KEY": os.environ["AGENTMAIL_API_KEY"]},
-                            "toolFilter": {"exclude": ["*send*", "*reply*", "*forward*", "*delete*", "*create*",
-                                                       "*update*", "*remove*", "*draft*"]}}
+                            "env": {"AGENTMAIL_API_KEY": os.environ["AGENTMAIL_API_KEY"]}}
 if os.environ.get("HA_URL"):
-    # Home Assistant's built-in MCP server. Read-only: only the live-state tool is exposed; every control
-    # intent (turn on/off, set, open/close) stays hidden.
+    # Home Assistant's built-in MCP server (state and control).
     servers["homeassistant"] = {"transport": "streamable-http",
                                 "url": os.environ["HA_URL"].rstrip("/") + "/mcp_server/sse",
-                                "headers": {"Authorization": "Bearer " + os.environ["HA_TOKEN"]},
-                                "toolFilter": {"include": ["GetLiveContext"]}}
+                                "headers": {"Authorization": "Bearer " + os.environ["HA_TOKEN"]}}
 json.dump({"mcp": {"servers": servers}}, open(sys.argv[1], "w"))
 PY
   oc config patch --file "$mcp" --dry-run >/dev/null && oc config patch --file "$mcp" >/dev/null
@@ -135,10 +129,48 @@ WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
   systemctl enable --now potter-gateway.service >/dev/null
+  cat > /etc/systemd/system/potter-settings.service <<UNIT
+[Unit]
+Description=Potter settings page (where secrets go)
+After=network-online.target
+
+[Service]
+Environment=POTTER_SECRETS_DIR=$SECRETS_DIR
+Environment=PATH=$POTTER_HOME/node/bin:$POTTER_HOME/openclaw/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 $REPO/install/settings_page.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now potter-settings.service >/dev/null
 else
   nohup openclaw "${OC_PROFILE_FLAG[@]}" gateway run >"${POTTER_HOME}/gateway.log" 2>&1 &
 fi
 for i in $(seq 1 60); do oc health >/dev/null 2>&1 && break; sleep 2; [ "$i" = 60 ] && die "gateway did not become healthy"; done
+
+if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ]; then
+  say "Importing your Potter v2 export (everything starts in standby until you say take over)"
+  mkdir -p "$POTTER_HOME/apps" /etc/potter
+  python3 "$HERE/import_v2.py" apply "$POTTER_V2_BUNDLE" --workspace "$WS" --apps-dir "$POTTER_HOME/apps" \
+      --state-dir /etc/potter --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" \
+      --systemd-dir /etc/systemd/system --run-installs > /etc/potter/import-report.json
+  if [ -f /etc/potter/mcp-import.json ]; then
+    oc config patch --file /etc/potter/mcp-import.json >/dev/null || warn "some imported connections need attention"
+  fi
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
+  # apps the bundle marked safe to run alongside v2 start now; the rest wait for "take over"
+  python3 - <<'PY'
+import json, subprocess
+reg = json.load(open("/etc/potter/handover.json"))
+for a in reg["apps"]:
+    if a["enabled"] and a.get("service"):
+        subprocess.run(["systemctl", "enable", "--now", f"potter-app-{a['name']}.service"], capture_output=True)
+PY
+  shred -u "$POTTER_V2_BUNDLE" 2>/dev/null || rm -f "$POTTER_V2_BUNDLE"
+fi
 
 say "Scheduling the Morning Brief"
 HH="${BRIEF_TIME%:*}"; MM="${BRIEF_TIME#*:}"
@@ -153,6 +185,8 @@ mkdir -p /etc/potter
   echo "Potter is installed."
   [ -n "$ui_host" ] && echo "Open Potter: https://$ui_host/" || echo "Open Potter from this container's address on port 18789 (or add a Tailscale key later)."
   echo "Password for the web UI (shown once; also stored root-only in the container): $GATEWAY_PASSWORD"
+  echo "Settings page (where secrets go, sign in with the same password): http://${ui_host:-<this-container-address>}:8789/"
+  [ -f /etc/potter/handover.json ] && echo "Your v2 export is imported. Everything that acts on shared accounts is in standby. Tell Potter: what is in standby, and take over <name> when v2 has stopped doing it."
   echo "Next: open Telegram, message your bot, and say hello. Ask Potter to connect anything that is missing."
 } > /etc/potter/final-note.txt
 chmod 600 /etc/potter/final-note.txt
