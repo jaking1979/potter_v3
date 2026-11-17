@@ -20,10 +20,11 @@ check "bot token file is root-only (600)"          bash -c "[ \"\$(stat -c %a '$
 check "secrets dir is root-only (700)"             bash -c "[ \"\$(stat -c %a '$SECRETS_DIR')\" = 700 ]"
 check "no model or bot key inside openclaw.json"   bash -c "! grep -q -E 'sk-or-|[0-9]{6,}:[A-Za-z0-9_-]{20,}' \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config file)\""
 check "openclaw.json is root-only (600)"           bash -c "[ \"\$(stat -c %a \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config file)\")\" = 600 ]"
-check "Morning Brief job scheduled"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list 2>/dev/null | grep -q potter-morning-brief"
+check "Morning Brief job scheduled"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list --all --json 2>/dev/null | grep -q potter-morning-brief"
 check "guardrails plugin loaded"                   bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} plugins inspect potter-guardrails --runtime 2>/dev/null | grep -q before_tool_call"
-check "schedule watchdog scheduled"                 bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list 2>/dev/null | grep -q potter-schedule-watch"
-check "morning-brief skill present"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} skills list 2>/dev/null | grep -q morning-brief"
+check "Merrick wired (if Home Assistant was set up)"  bash -c "[ ! -f \"$SECRETS_DIR/ha.env\" ] || { [ \"\$(stat -c %a \"$SECRETS_DIR/ha.env\")\" = 600 ] && command -v merrick >/dev/null && openclaw ${OC_PROFILE_FLAG[*]:-} cron list --all --json 2>/dev/null | grep -q potter-merrick-cold-watch; }"
+check "schedule watchdog scheduled"                 bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list --all --json 2>/dev/null | grep -q potter-schedule-watch"
+check "morning-brief skill present"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} skills list --agent potter 2>/dev/null | grep -q morning-brief"
 check "security audit: 0 critical findings"       bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} security audit 2>&1 | grep -q 'Summary: 0 critical'"
 echo
 [ "$fails" = 0 ] && { echo "All checks passed."; exit 0; } || { echo "$fails check(s) failed."; exit 1; }

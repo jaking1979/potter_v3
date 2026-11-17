@@ -157,6 +157,18 @@ class Installer(unittest.TestCase):
             self.assertIn(needle, boot)
         self.assertIn("openclaw mcp login notion", (ROOT / "overlay/workspace/skills/connect-apps/SKILL.md").read_text())
 
+    def test_merrick_is_wired_with_the_bridge_and_thermostat_job_in_standby(self):
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        for needle in ("ha_bridge.py --env", "/usr/local/bin/merrick", "house_from_v2.py", "agents add merrick",
+                       'allowAgents: ["merrick"]', "potter-merrick-cold-watch", "potter-merrick-collect"):
+            self.assertIn(needle, boot)
+        tick = boot[boot.index("--name potter-merrick-tick"):boot.index("MERRICK_READY=\"$MERRICK_READY\" python3")]
+        self.assertIn("--disabled", tick)
+        self.assertIn("chmod 600 \"$SECRETS_DIR/ha.env\"", boot)
+        skill = (ROOT / "overlay/workspace/skills/home-status/SKILL.md").read_text()
+        self.assertIn("merrick confirm-departure", skill)
+        self.assertIn("ONLY when the owner's own next message", skill)
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 

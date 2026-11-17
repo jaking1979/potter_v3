@@ -236,7 +236,7 @@ ids=[x.strip() for x in os.environ["EXCLUDED_IDS"].split(",") if x.strip()]
 ids+= [i for i in json.load(open("/etc/potter/excluded-ids.json")) if i not in ids]
 json.dump({"plugins":{"entries":{"potter-guardrails":{"config":{"excludedIds":ids}}}}}, open(sys.argv[1],"w"))' "$xp"
   q oc config patch --file "$xp" --replace-path plugins.entries.potter-guardrails.config.excludedIds; rm -f "$xp"
-  shred -u "$POTTER_V2_BUNDLE" 2>/dev/null || rm -f "$POTTER_V2_BUNDLE"
+  POTTER_V2_BUNDLE_COPY="$POTTER_V2_BUNDLE"       # still needed for Merrick's house file; removed at the end
 fi
 
 say "Scheduling the Morning Brief"
@@ -275,10 +275,66 @@ q oc cron add --name potter-evening-nudge --declaration-key potter-evening-nudge
    --tz "$TIMEZONE" --exact --no-deliver --timeout-seconds 120 \
    --command "python3 $POTTER_HOME/tools/evening_nudge.py --to $OWNER_TELEGRAM_ID --tz $TIMEZONE --state $WS/state/evening-nudge.json --calendar '${WORK_CALENDAR:-}' --openclaw 'openclaw ${OC_PROFILE_FLAG[*]:-}'"
 
+if [ -n "${HA_URL:-}" ]; then
+  say "Setting up Merrick, the home specialist"
+  umask 077
+  printf 'HA_URL=%s\nHA_TOKEN=%s\n' "${HA_URL%/}" "$HA_TOKEN" > "$SECRETS_DIR/ha.env"; chmod 600 "$SECRETS_DIR/ha.env"
+  umask 022
+  rm -rf "$POTTER_HOME/merrick"; cp -r "$REPO/overlay/merrick" "$POTTER_HOME/merrick"
+  rm -f "$POTTER_HOME/merrick/testing.py" "$POTTER_HOME/merrick/house.example.json"
+  mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
+  MWS="$(dirname "$WS")/workspace-merrick"; mkdir -p "$MWS/state"
+  cp "$REPO/overlay/workspace-merrick/"*.md "$MWS/"
+  cat > /usr/local/bin/merrick <<WRAP
+#!/bin/sh
+export MERRICK_STATE_DIR="$MWS/state"
+export MERRICK_HOUSE="$MWS/state/house.json"
+export MERRICK_HA_CMD="python3 $POTTER_HOME/tools/ha_bridge.py --env $SECRETS_DIR/ha.env"
+exec python3 -B "$POTTER_HOME/merrick" "\$@"
+WRAP
+  chmod 755 /usr/local/bin/merrick
+  # The house file holds your own device names: it is built from your v2 export, never stored in the repo.
+  MERRICK_READY=""
+  if [ -n "${POTTER_V2_BUNDLE_COPY:-}" ] && [ -f "$POTTER_V2_BUNDLE_COPY" ]; then
+    python3 "$HERE/house_from_v2.py" "$POTTER_V2_BUNDLE_COPY" "$MWS/state/house.json" >/dev/null && MERRICK_READY=1 \
+      || warn "Merrick's house file could not be built from the export; ask Potter to build it from Home Assistant."
+  fi
+  oc agents list 2>/dev/null | grep -q "merrick" || q oc agents add merrick --workspace "$MWS" --non-interactive
+  mp="$(mktemp --suffix=.json5)"
+  printf '{ agents: { entries: { potter: { subagents: { allowAgents: ["merrick"] } } } } }' > "$mp"
+  q oc config patch --file "$mp"; rm -f "$mp"
+  OCF="openclaw ${OC_PROFILE_FLAG[*]:-}"
+  # Reads only: on from day one (duplicate cold alerts are possible until the old assistant's watcher is stopped).
+  q oc cron add --name potter-merrick-cold-watch --declaration-key potter-merrick-cold-watch --cron "0 */2 * * *" \
+     --tz "$TIMEZONE" --exact --no-deliver --timeout-seconds 90 $([ -z "$MERRICK_READY" ] && echo --disabled) \
+     --command "merrick --openclaw '$OCF' cold-watch --to $OWNER_TELEGRAM_ID"
+  q oc cron add --name potter-merrick-collect --declaration-key potter-merrick-collect --cron "7 * * * *" \
+     --tz "$TIMEZONE" --exact --no-deliver --timeout-seconds 180 $([ -z "$MERRICK_READY" ] && echo --disabled) \
+     --command "merrick collect"
+  # Changes thermostats the old assistant also controls: standby until you say "take over the house".
+  q oc cron add --name potter-merrick-tick --declaration-key potter-merrick-tick --cron "*/5 * * * *" \
+     --tz "$TIMEZONE" --exact --no-deliver --timeout-seconds 120 --disabled \
+     --command "merrick --openclaw '$OCF' tick --to $OWNER_TELEGRAM_ID"
+  MERRICK_READY="$MERRICK_READY" python3 - <<'PY'
+import json, os
+p = "/etc/potter/handover.json"
+os.makedirs("/etc/potter", exist_ok=True)
+reg = json.load(open(p)) if os.path.exists(p) else {"crons": [], "apps": [], "secrets_needed": []}
+reg.setdefault("crons", []).append({"name": "potter-merrick-tick", "enabled": False,
+    "purpose": "runs Merrick's scheduled thermostat changes; off until the old assistant stops controlling the house"})
+if not os.environ.get("MERRICK_READY"):
+    for n in ("potter-merrick-cold-watch", "potter-merrick-collect"):
+        reg["crons"].append({"name": n, "enabled": False, "purpose": "needs Merrick's house file first"})
+json.dump(reg, open(p, "w"), indent=1)
+PY
+fi
+
 say "Adding the schedule watchdog (tells you when any job fails or does not run)"
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
 oc cron add --name potter-schedule-watch --declaration-key potter-schedule-watch --every 15m --no-deliver \
    --timeout-seconds 120 \
    --command "python3 $POTTER_HOME/tools/schedule_watch.py --to $OWNER_TELEGRAM_ID --openclaw 'openclaw ${OC_PROFILE_FLAG[*]:-}'" >/dev/null
+
+[ -n "${POTTER_V2_BUNDLE_COPY:-}" ] && { shred -u "$POTTER_V2_BUNDLE_COPY" 2>/dev/null || rm -f "$POTTER_V2_BUNDLE_COPY"; }
 
 say "Done. Next: run verify_host.sh, then message your bot on Telegram."

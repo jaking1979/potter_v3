@@ -26,7 +26,9 @@ via Composio CLI if present, else 18:00; 7 tests; sandbox install passes. Not pr
 Step 4 DONE: Composio by API-key header, Notion pre-registered (OAuth from chat), job tool rule.
 Steps 5-9 CODE DONE, NOT WIRED (built by parallel builders, tests pass, not yet reviewed line by line by the main session):
 - Merrick (overlay/merrick, overlay/workspace-merrick). Data-driven away hold and confirmed departure added (owner,
-  2026-11-17). Bridge exists; the installer must still write /etc/potter/secrets/ha.env and the merrick wrapper.
+  2026-11-17). WIRED: bootstrap writes ha.env (600), the merrick wrapper, the merrick agent (Potter may delegate to it), the
+  house file from the v2 export (install/house_from_v2.py), cold-watch + collect (on) and tick (standby). Sandbox install
+  with the real export passes the health check; merrick ask runs end to end (no real Home Assistant in the sandbox).
 - KG plugin (overlay/plugins/potter-kg, 51 node tests) + Jev layer (overlay/jev, 24 node tests; policy has placeholders).
 - Monitors (overlay/tools/monitor_lib.py + monitors/, 45 tests) + 10 skills. QC (overlay/tools/qc, 39 tests).
 - Trading pre-checks (overlay/tools/trading_precheck.py, 29 tests) + trading-run skill. No trading logic ported.
