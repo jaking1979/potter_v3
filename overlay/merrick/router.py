@@ -24,7 +24,8 @@ _PROTECTED = re.compile(r"\b(un)?lock(s|ed|ing)?\b|\b(dis)?arm(s|ed|ing)?\b|\bal
                         r"\bwater (valve|shut ?off|main)\b|\b(main|shut ?off) valve\b|\bvalve\b|"
                         r"\b(open|close|shut)\b.*\b(door|window|garage)s?\b")
 _CLOSE_UP = re.compile(r"\bclose (up|down) (the )?(house|cabin|place|home)\b|\bclosing up\b|"
-                       r"\b(secure|button up) the (house|cabin|place|home)\b|\bdeparture (sequence|routine)\b")
+                       r"\b(secure|button up) the (house|cabin|place|home)\b|\bdeparture (sequence|routine)\b|"
+                       r"^(please |can you |could you )?lock (it |everything |the (house|cabin|place|home) )?up\b")
 _REASONING = re.compile(r"\b(why|investigate|diagnos\w*|explain|analy[sz]e\w*|compare|trend|history|"
                         r"should (i|we)|what if|recommend\w*|optimi[sz]e\w*|figure out|look into|plan)\b")
 _LATER = re.compile(r"\bat (1?\d|2[0-4])(:\d{2})?\b(?! ?(degrees|deg|f)\b)|\b(by|before|after|until|till) \d|\b\d{1,2}(:\d{2})? ?(am|pm)\b|\b(tonight|tomorrow|"

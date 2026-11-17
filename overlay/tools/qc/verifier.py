@@ -44,7 +44,7 @@ STOPWORDS = set("""a an the and or for with of to in on at by is was are were se
 scheduled schedule reminder reminders follow followup follow-up exists exist created saved filed built fixed sent
 verified etc more about into from has have had be been this that these those it its their there cron job list
 entry entries notion reference library file files query get add update remove new wrote written added patched
-updated committed also already just named called""".split())
+updated committed also already just named called potter openclaw workspace state today tonight""".split())
 
 
 def keywords(text: str) -> list[str]:
@@ -65,7 +65,7 @@ def explicit_paths(text: str) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def check_cron(text: str, jobs: list | None, min_hits: int = 1) -> tuple[str, str]:
+def check_cron(text: str, jobs: list | None, min_hits: int = 2) -> tuple[str, str]:
     """Is there a scheduled job whose name or payload carries the claim's distinctive words?"""
     if jobs is None:
         return UNKNOWN, "job list not available"
@@ -84,7 +84,7 @@ def check_cron(text: str, jobs: list | None, min_hits: int = 1) -> tuple[str, st
     return NOT_FOUND, f"no scheduled job matches {kws[:6]}"
 
 
-def check_file(text: str, workspace: Path | None, max_files: int = 50000) -> tuple[str, str]:
+def check_file(text: str, workspace: Path | None, max_files: int = 50000, min_hits: int = 2) -> tuple[str, str]:
     """Does a named path exist in the workspace, or a file whose name carries a distinctive word?"""
     if workspace is None or not Path(workspace).is_dir():
         return UNKNOWN, "workspace not available"
@@ -116,13 +116,15 @@ def check_file(text: str, workspace: Path | None, max_files: int = 50000) -> tup
             low = fn.lower()
             if os.path.islink(os.path.join(dirpath, fn)):
                 continue                         # a link can point outside the workspace: not evidence
-            if low in names or (low.endswith(FILE_TYPES) and any(k in low for k in kws)) \
+            stem = keywords(low.rsplit(".", 1)[0])
+            if low in names or (low.endswith(FILE_TYPES) and (sum(k in low for k in kws) >= min(min_hits, len(kws))
+                                                               or (stem and all(w in kws for w in stem)))) \
                     or any(fnmatch.fnmatch(low, n) for n in names if "*" in n):
                 return FOUND, f"file matches: {fn}"
     return NOT_FOUND, f"no file in the workspace matches {(paths or kws)[:6]}"
 
 
-def check_text(text: str, haystack: str | None, what: str) -> tuple[str, str]:
+def check_text(text: str, haystack: str | None, what: str, min_hits: int = 2) -> tuple[str, str]:
     """Do the claim's distinctive words appear in a listing (recent commits, a library export)?"""
     if haystack is None:
         return UNKNOWN, f"{what} not available"
@@ -131,7 +133,7 @@ def check_text(text: str, haystack: str | None, what: str) -> tuple[str, str]:
         return UNKNOWN, "no distinctive words to look for"
     low = haystack.lower()
     hits = [k for k in kws if k in low]
-    if hits:
+    if len(hits) >= min(min_hits, len(kws)):
         return FOUND, f"{what} matches {hits[:4]}"
     return NOT_FOUND, f"{what} has nothing matching {kws[:6]}"
 
@@ -140,20 +142,20 @@ class Evidence:
     """Everything the verifier may look at, gathered once and read-only. Any part may be missing (None)."""
 
     def __init__(self, workspace: Path | None = None, jobs: list | None = None, git_log: str | None = None,
-                 library: str | None = None, min_hits: int = 1):
+                 library: str | None = None, min_hits: int = 2):
         self.workspace, self.jobs, self.git_log, self.library, self.min_hits = workspace, jobs, git_log, library, min_hits
 
     def cron(self, text):
         return check_cron(text, self.jobs, self.min_hits)
 
     def file(self, text):
-        return check_file(text, self.workspace)
+        return check_file(text, self.workspace, min_hits=self.min_hits)
 
     def git(self, text):
-        return check_text(text, self.git_log, "recent commits")
+        return check_text(text, self.git_log, "recent commits", self.min_hits)
 
     def lib(self, text):
-        return check_text(text, self.library, "the library")
+        return check_text(text, self.library, "the library", self.min_hits)
 
 
 # category -> evidence to try, in order. Empty = no deterministic check exists for that kind of claim.
@@ -304,7 +306,7 @@ def main(argv: list[str], now: datetime | None = None, run=subprocess.run, out=s
     ap.add_argument("--library-cmd", default=None, help="read-only command that prints the reference library")
     ap.add_argument("--wake-cmd", default=None, help="optional command; gets the fix-it prompt as its last argument")
     ap.add_argument("--grace-min", type=int, default=10)
-    ap.add_argument("--min-keyword-hits", type=int, default=1)
+    ap.add_argument("--min-keyword-hits", type=int, default=2)   # one shared word is not evidence
     ap.add_argument("--dry-run", action="store_true")
     ns = ap.parse_args(argv)
     now = now or datetime.now(timezone.utc)

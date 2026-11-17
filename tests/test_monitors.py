@@ -357,6 +357,17 @@ class CityEvents(Base):
         self.assertEqual((f["kind"], f["detail"], f["area"]), ("page-change", "Nov 27 - 90s dance party", "Area B"))
         self.assertEqual(self.run_mod(city_events, web)[:2], (0, ""))
 
+    def test_lines_still_on_the_page_never_age_out_and_come_back_as_new(self):
+        src = {"id": "cal", "name": "Calendar", "url": "https://cal.example/", "mode": "page"}
+        self.config(city_events={"sources": [src]})
+        web = Web({src["url"]: "<p>Weekly farmers market on the green</p>"})
+        self.run_mod(city_events, web)
+        for day in range(30, 150, 30):                                   # past the 90-day memory
+            self.assertEqual(self.run_mod(city_events, web, now=NOW + timedelta(days=day))[:2], (0, ""), day)
+        web.pages[src["url"]] += "<p>New: winter craft fair at the school</p>"
+        self.run_mod(city_events, web, now=NOW + timedelta(days=150))   # must be reported, not silently re-recorded
+        self.assertEqual([f["detail"] for f in self.findings()], ["New: winter craft fair at the school"])
+
     def test_a_rewritten_page_is_handed_over_in_bounded_chunks_and_nothing_is_lost(self):
         src = {"id": "cal", "name": "Calendar", "url": "https://cal.example/", "mode": "page"}
         self.config(city_events={"sources": [src]})
@@ -562,6 +573,23 @@ class Files(unittest.TestCase):
                 code = mod.main(["--config", str(TOOLS / "monitors/config.example.json"), "--state-dir",
                                  str(Path(d) / mod.NAME)], opener=Web({}), now=NOW, out=out, err=err)
                 self.assertEqual((code, out.getvalue()), (1, ""), mod.NAME)      # every source "down": log only
+
+    def test_each_fetch_job_writes_to_the_folder_its_skill_reads(self):
+        jobs = json.loads((ROOT / "install/jobs.json").read_text())
+        jobs = jobs.get("jobs", jobs) if isinstance(jobs, dict) else jobs
+        dirs = {}
+        for j in jobs:
+            m = re.search(r"monitors/(\w+)\.py .*--state-dir \{WS\}/(state/monitors/[\w-]+)$", j.get("command") or "")
+            if m:
+                dirs[m.group(1)] = m.group(2)
+        self.assertEqual(len(dirs), 4, dirs)
+        self.assertEqual(len(set(dirs.values())), 4, "monitors must not share a state folder")
+        read = set(re.findall(r"(state/monitors/[\w-]+)/findings\.jsonl",
+                              "".join(p.read_text() for p in SKILLS.glob("*/SKILL.md"))))
+        self.assertEqual(set(dirs.values()), read)
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        for mod, d in dirs.items():
+            self.assertIn(f"{mod}:{d.split('/')[-1]}", boot)                 # the first quiet reading uses the same folder
 
     def test_skills_have_valid_front_matter_and_stay_short(self):
         for name in MONITOR_SKILLS:

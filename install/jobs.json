@@ -48,7 +48,7 @@
    "kind": "command",
    "timeout": 180,
    "standby": true,
-   "command": "python3 {POTTER_HOME}/tools/monitors/city_events.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors",
+   "command": "python3 {POTTER_HOME}/tools/monitors/city_events.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors/city-events",
    "purpose": "fetches city event listings (needs the monitor config)"
   },
   {
@@ -58,7 +58,7 @@
    "kind": "command",
    "timeout": 300,
    "standby": true,
-   "command": "python3 {POTTER_HOME}/tools/monitors/local_monitor.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors",
+   "command": "python3 {POTTER_HOME}/tools/monitors/local_monitor.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors/local-monitor",
    "purpose": "fetches local news and businesses (needs the monitor config)"
   },
   {
@@ -68,7 +68,7 @@
    "kind": "command",
    "timeout": 300,
    "standby": true,
-   "command": "python3 {POTTER_HOME}/tools/monitors/wine_price.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors",
+   "command": "python3 {POTTER_HOME}/tools/monitors/wine_price.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors/wine-watch",
    "purpose": "fetches wine prices (needs the monitor config)"
   },
   {
@@ -78,7 +78,7 @@
    "kind": "command",
    "timeout": 300,
    "standby": true,
-   "command": "python3 {POTTER_HOME}/tools/monitors/feed_scan.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors",
+   "command": "python3 {POTTER_HOME}/tools/monitors/feed_scan.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors/financial-feeds",
    "purpose": "fetches financial deal feeds (needs the monitor config)"
   },
   {

@@ -56,6 +56,9 @@ def prepare(home: SafeHome, house: dict, now: float) -> tuple[str, str, Optional
     p = perimeter(home, house)
     if p["open"] or p["unknown"]:
         return "stopped", f"Departure stopped ({_blockers(p)}). Nothing was locked or armed.", None
+    if not p["closed"]:
+        return "stopped", ("Departure stopped: no doors or windows are listed in the house file, so none could be "
+                           "checked. Nothing was locked or armed."), None
     d = devices(house)
     if not d["locks"] and not d["alarm"]:
         return "not_configured", ("Observed: every door and window reads closed. No lock or alarm is listed in the "
@@ -79,8 +82,8 @@ def confirm(home: SafeHome, house: dict, pending: Optional[dict], now: float) ->
     if now > pending["expires"]:
         return "refused", "Refused: that confirmation window has passed. Ask to close up the house again."
     p = perimeter(home, house)                                 # things may have changed since prepare()
-    if p["open"] or p["unknown"]:
-        return "stopped", f"Departure stopped ({_blockers(p)}). Nothing was locked or armed."
+    if p["open"] or p["unknown"] or not p["closed"]:
+        return "stopped", f"Departure stopped ({_blockers(p) or 'no doors or windows listed'}). Nothing was locked or armed."
     d = devices(house)                                         # act on the house file, never on stored ids alone
     results = [home.lock(e, confirmed=True) for e in d["locks"]]
     if d["alarm"]:

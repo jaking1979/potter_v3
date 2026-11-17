@@ -92,6 +92,16 @@ class Departure(unittest.TestCase):
         self.assertEqual(pending["expires"], 1000.0 + departure.PENDING_TTL_S)
         self.assertEqual(self.fake.calls, [])
 
+    def test_no_doors_or_windows_listed_stops_instead_of_claiming_all_closed(self):
+        h = dict(self.h, perimeter={})
+        home = SafeHome(self.fake, h, sleep=lambda s: None)
+        status, text, pending = departure.prepare(home, h, 1000.0)
+        self.assertEqual((status, pending), ("stopped", None))
+        self.assertIn("none could be checked", text)
+        _, _, pending = departure.prepare(self.home, self.h, 1000.0)
+        self.assertEqual(departure.confirm(home, h, pending, 1100.0)[0], "stopped")
+        self.assertEqual(self.fake.calls, [])
+
     def test_confirming_locks_and_arms_with_read_back(self):
         _, _, pending = departure.prepare(self.home, self.h, 1000.0)
         status, text = departure.confirm(self.home, self.h, pending, 1200.0)

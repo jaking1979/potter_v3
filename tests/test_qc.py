@@ -246,6 +246,20 @@ class Evidence(Sandbox):
         # stricter matching is available: two distinctive words must land in the same job
         self.assertEqual(verifier.check_cron("boiler dentist reminder", jobs, min_hits=2)[0], "NOT_FOUND")
 
+    def test_one_shared_word_is_not_evidence(self):
+        jobs = [{"name": "potter-call-summary", "payload": {"message": "summarise calls"}}]
+        claim = {"category": "reminder_set", "claim": "Set a reminder to call the dentist on Friday"}
+        self.assertEqual(verifier.verify_claim(claim, verifier.Evidence(jobs=jobs))[0], "not_done")
+        jobs.append({"name": "dentist-call", "payload": {"message": "Call the dentist (Friday)"}})
+        self.assertEqual(verifier.verify_claim(claim, verifier.Evidence(jobs=jobs))[0], "verified")
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "notes").mkdir()
+            (Path(d) / "notes/boiler-pricing.md").write_text("x")
+            saved = {"category": "saved", "claim": "Saved the boiler service notes"}
+            self.assertEqual(verifier.verify_claim(saved, verifier.Evidence(workspace=Path(d)))[0], "not_done")
+            (Path(d) / "notes/boiler.md").write_text("x")          # a name made only of the claim's words counts
+            self.assertEqual(verifier.verify_claim(saved, verifier.Evidence(workspace=Path(d)))[0], "verified")
+
     def test_each_kind_of_claim_gets_the_right_verdict(self):
         (self.ws / "notes/trip-plan.md").write_text("x")
         ev = verifier.Evidence(workspace=self.ws, jobs=[{"name": "potter-boiler-reminder"}],

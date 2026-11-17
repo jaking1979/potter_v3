@@ -39,6 +39,10 @@ class Table(unittest.TestCase):
             "status": "house_status",
             "how long to heat the house to 68": "heating_estimate",
             "close up the house": "close_up",
+            "lock up the house": "close_up",       # still only checks and asks; locking needs "confirm departure"
+            "lock up": "close_up",
+            "lock the front door": "refuse_protected",
+            "unlock the front door": "refuse_protected",
         })
 
     def test_zone_and_temperature_slots(self):

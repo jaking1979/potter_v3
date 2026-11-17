@@ -363,9 +363,11 @@ python3 "$HERE/add_jobs.py" --jobs "$HERE/jobs.json" --openclaw "openclaw ${OC_P
 if [ -n "$MONITORS_READY" ]; then
   # Fetchers only read public pages and message no one: with sources in place they start now. A first quiet run
   # records what is already listed, so the first real run reports only what is new.
-  for m in city_events local_monitor wine_price feed_scan; do
+  # Each monitor keeps its own folder (seen list, findings, cursor); the skills read them by these names.
+  for pair in city_events:city-events local_monitor:local-monitor wine_price:wine-watch feed_scan:financial-feeds; do
+    m="${pair%%:*}"; d="${pair#*:}"
     python3 "$POTTER_HOME/tools/monitors/$m.py" --config "$WS/state/monitors/config.json" \
-      --state-dir "$WS/state/monitors" --baseline >/dev/null 2>&1 || warn "monitor $m could not take its first reading"
+      --state-dir "$WS/state/monitors/$d" --baseline >/dev/null 2>&1 || warn "monitor $m could not take its first reading"
   done
   for j in potter-fetch-city-events potter-fetch-local potter-fetch-wine potter-fetch-feeds; do
     q oc cron enable "$j" || warn "could not switch on $j"

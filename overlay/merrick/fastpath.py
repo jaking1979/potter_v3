@@ -17,9 +17,6 @@ from .ha import SafeHome, num
 from .router import Route, route
 from .thermal import heating_estimate
 
-OPEN_STATES = {"on", "open", "unlocked", "opening"}
-
-
 def _f(v) -> str:
     return "unknown" if v is None else f"{v:.1f} F"
 
@@ -35,19 +32,7 @@ def _zone_entity(house: dict, zone: Optional[str]) -> Optional[str]:
     return ((house.get("zones") or {}).get(zone or "") or {}).get("climate_entity")
 
 
-def perimeter(home: SafeHome, house: dict) -> dict:
-    """Read every door and window. Unreadable entries are listed as unknown, never assumed closed."""
-    open_, unknown, closed = [], [], []
-    for name, eid in (house.get("perimeter") or {}).items():
-        st = home.read(eid)
-        s = str((st or {}).get("state", "")).lower()
-        if st is None or s in ("", "unknown", "unavailable"):
-            unknown.append(name)
-        elif s in OPEN_STATES:
-            open_.append(name)
-        else:
-            closed.append(name)
-    return {"open": open_, "unknown": unknown, "closed": closed}
+perimeter = departure.perimeter          # one reading of doors and windows, shared with the departure check
 
 
 def _perimeter_text(p: dict) -> str:

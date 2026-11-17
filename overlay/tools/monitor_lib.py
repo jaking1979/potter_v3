@@ -38,7 +38,7 @@ from urllib.parse import urljoin, urlsplit
 
 USER_AGENT = "PotterMonitor/3 (personal assistant; public pages only)"
 TIMEOUT, MAX_BYTES = 20, 2_000_000
-SEEN_MAX, SEEN_DAYS = 5000, 90
+SEEN_MAX, SEEN_DAYS = 20000, 90
 INBOX_MAX, MAX_NEW = 500, 40
 CAPS = {"title": 200, "detail": 1500, "url": 500}
 FIELDS = ("id", "kind", "category", "source", "source_id", "area", "title", "date", "location", "url", "detail", "retailer",
@@ -333,6 +333,10 @@ def _page_items(src, page, seen, now):
         for key in [f"{sid}|baseline"] + [k for k, _ in keyed]:
             seen.add(key, now)
         return []
+    seen.add(f"{sid}|baseline", now)
+    for key, _ in keyed:                                # lines still on the page stay known, so they never age out
+        if key in seen:
+            seen.add(key, now)
     out, chunk, keys = [], [], []
     for key, ln in [(k, ln) for k, ln in keyed if k not in seen] + [(None, None)]:
         if key is None or sum(len(x) + 3 for x in chunk) + len(ln) > CHUNK:
