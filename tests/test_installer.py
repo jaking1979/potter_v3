@@ -92,6 +92,12 @@ class Installer(unittest.TestCase):
         for needle in ("potter-settings.service", "import_v2.py", "--run-installs", "standby"):
             self.assertIn(needle, text)
 
+    def test_watchdog_is_installed_and_every_potter_job_has_a_timeout(self):
+        text = (ROOT / "install/bootstrap.sh").read_text()
+        self.assertIn("potter-schedule-watch", text)
+        self.assertEqual(text.count("cron add"), text.count("--timeout-seconds"))
+        self.assertNotIn("--best-effort-deliver \\\n   --message", text)   # a brief that cannot deliver must count as a failure
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 
@@ -110,8 +116,8 @@ class Installer(unittest.TestCase):
     def test_no_secret_shapes_in_overlay(self):
         import re
         for p in (ROOT / "overlay").rglob("*"):
-            if p.is_file():
-                self.assertIsNone(re.search(r"sk-or-|\d{6,}:[A-Za-z0-9_-]{20,}", p.read_text()), p.name)
+            if p.is_file() and "__pycache__" not in p.parts:
+                self.assertIsNone(re.search(r"sk-or-|\d{6,}:[A-Za-z0-9_-]{20,}", p.read_text(encoding="utf-8")), p.name)
 
 
 if __name__ == "__main__":

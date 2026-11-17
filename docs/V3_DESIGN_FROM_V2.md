@@ -37,6 +37,32 @@ designed out. Source: `jaking1979/potter-v2-export` (schema 2), read-only.
 | Docs-consult gate, OpenClaw docs index | generated index + rule | skipped twice | regenerate the index for 2026.11 at install; gate as a hook |
 | Guest Potter, NotebookLM, board meeting, meal plan skills | skills/state | partly planned only | carried as skills; not wired to schedules until asked |
 
+## Josh's two named problems (2026-11-17) and the design answers
+
+**"A lot of scheduled automations aren't running when they should."** What the export shows: most agent-turn jobs
+have no timeout; many deliver nowhere, so a failure is invisible; isolated job turns fall back to the default model,
+which on record is a very small local model that is weak at tool use; some interval jobs are anchored to the last
+gateway restart; jobs aimed at the main session wait behind whatever it is doing. (The export has no run history,
+so these are the likely causes, not proven ones.) v3 rules for every job:
+1. explicit time zone, exact firing (no stagger), explicit timeout;
+2. agent-turn jobs name their model and their tools; nothing depends on a session default;
+3. deterministic work is a command job, never "ask the agent to remember";
+4. a job that must reach you fails loudly if delivery fails (no best-effort on must-deliver jobs);
+5. **schedule watchdog** (`overlay/tools/schedule_watch.py`, built and tested against a live gateway): every 15
+   minutes a plain program checks every job and messages you once per new problem: FAILED, DID NOT RUN,
+   NOT DELIVERED, SKIPPED, or scheduler unreachable. Silence means everything ran.
+
+**"Merrick is sometimes slow and lost, sometimes perfect."** What the export shows: Merrick has two paths. A fast
+path (one Jev decision, then deterministic engine and Home Assistant calls) and a fallback to a full conversational
+agent on a small model when the fast path does not recognise the request. The pattern you describe fits that
+split: fast-path hits are quick and right; misses are slow and wander. v3 design:
+1. log which path handled every request and how long it took, so misses are visible and countable;
+2. widen the fast path from those logs (every common request becomes a recognised intent);
+3. the fallback agent gets a stronger model, a hard time budget, and must say within seconds what it is doing;
+4. if the budget is hit, Merrick reports what it knows (observed vs estimated) instead of continuing silently;
+5. read-back verification stays mandatory: no "done" without checking Home Assistant state.
+This needs Merrick's real request history to tune; the logging goes in first.
+
 ## What is NOT carried
 41 expired one-shot schedules, heartbeat/skill-review built-ins (OpenClaw makes its own), SwarmVault and Hermes
 leftovers, `.bak` files, the retired claw-auto-router, hard-coded tokens and paths.

@@ -216,7 +216,7 @@ say "Scheduling the Morning Brief"
 HH="${BRIEF_TIME%:*}"; MM="${BRIEF_TIME#*:}"
 oc cron add --name potter-morning-brief --declaration-key potter-morning-brief \
    --cron "$((10#$MM)) $((10#$HH)) * * 1-5" --tz "$TIMEZONE" --exact --agent potter \
-   --channel telegram --to "$OWNER_TELEGRAM_ID" --announce --best-effort-deliver \
+   --channel telegram --to "$OWNER_TELEGRAM_ID" --announce --timeout-seconds 600 \
    --message "Run the morning-brief skill and reply with the brief only." >/dev/null
 
 ui_host="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)"
@@ -230,4 +230,10 @@ mkdir -p /etc/potter
   echo "Next: open Telegram, message your bot, and say hello. Ask Potter to connect anything that is missing."
 } > /etc/potter/final-note.txt
 chmod 600 /etc/potter/final-note.txt
+say "Adding the schedule watchdog (tells you when any job fails or does not run)"
+mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
+oc cron add --name potter-schedule-watch --declaration-key potter-schedule-watch --every 15m --no-deliver \
+   --timeout-seconds 120 \
+   --command "python3 $POTTER_HOME/tools/schedule_watch.py --to $OWNER_TELEGRAM_ID --openclaw 'openclaw ${OC_PROFILE_FLAG[*]:-}'" >/dev/null
+
 say "Done. Next: run verify_host.sh, then message your bot on Telegram."

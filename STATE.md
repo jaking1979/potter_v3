@@ -1,6 +1,7 @@
 ## 2026-11-17 (later): Josh - do NOT blindly copy v2; rebuild each capability the v3 way
 Design of record: docs/V3_DESIGN_FROM_V2.md (capability map, v2 failures designed out, build order). Composio key in the
-export is fine per Josh (no re-export needed for it). Importer is a reading tool only. Next: step 1 of the build order.
+export is fine per Josh (no re-export needed for it). Importer is a reading tool only. Built: schedule watchdog (overlay/tools/schedule_watch.py, 7 tests, proven on a live sandbox gateway), wired into
+bootstrap + verify. Merrick diagnosis and design in the design doc. Next: step 1 of the build order (rules + guardrails port).
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

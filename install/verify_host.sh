@@ -21,6 +21,7 @@ check "secrets dir is root-only (700)"             bash -c "[ \"\$(stat -c %a '$
 check "no model or bot key inside openclaw.json"   bash -c "! grep -q -E 'sk-or-|[0-9]{6,}:[A-Za-z0-9_-]{20,}' \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config file)\""
 check "openclaw.json is root-only (600)"           bash -c "[ \"\$(stat -c %a \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config file)\")\" = 600 ]"
 check "Morning Brief job scheduled"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list 2>/dev/null | grep -q potter-morning-brief"
+check "schedule watchdog scheduled"                 bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list 2>/dev/null | grep -q potter-schedule-watch"
 check "morning-brief skill present"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} skills list 2>/dev/null | grep -q morning-brief"
 check "security audit: 0 critical findings"       bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} security audit 2>&1 | grep -q 'Summary: 0 critical'"
 echo
