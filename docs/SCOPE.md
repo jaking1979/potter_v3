@@ -3,7 +3,8 @@
 Josh's rule (2026-11-17): v3 does **everything v2 does**, built together, all of it available and working, with
 nothing locked down by me. OpenClaw is the harness for now; Potter is what sits on top.
 
-The full list of what v2 does and how v3 gets each item is `docs/V2_PARITY.md`. How v2's real files reach v3 is
+**Design of record: `docs/V3_DESIGN_FROM_V2.md`.** v2 is the picture of what Potter does; each capability is rebuilt
+the v3 way, not copied (Josh, 2026-11-17). `docs/V2_PARITY.md` is the earlier list. How v2's real files reach v3 is
 `docs/V2_EXPORT_PROMPT.md` (one message to v2) and `install/import_v2.py` (the importer).
 
 ## What the install contains

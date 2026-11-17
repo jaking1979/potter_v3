@@ -1,3 +1,7 @@
+## 2026-11-17 (later): Josh - do NOT blindly copy v2; rebuild each capability the v3 way
+Design of record: docs/V3_DESIGN_FROM_V2.md (capability map, v2 failures designed out, build order). Composio key in the
+export is fine per Josh (no re-export needed for it). Importer is a reading tool only. Next: step 1 of the build order.
+
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 
 Branch: `v3-core`, created 2026-11-16 from `claude/integration-staging` @ f611f4b.
