@@ -1,0 +1,19 @@
+{
+  "id": "potter-guardrails",
+  "name": "Potter Guardrails",
+  "description": "Deterministic guards: hard wall for excluded pages, docs-consult-before-build, config write guard.",
+  "version": "3.0.0",
+  "contracts": {},
+  "activation": { "onStartup": true },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "excludedIds": { "type": "array", "items": { "type": "string", "minLength": 16 },
+                       "description": "Ids that must never appear in any tool call (for example a Notion page id)." },
+      "docsGate": { "type": "boolean", "description": "Require a recent docs read before building automation/config. Default true." },
+      "configWriteGuard": { "type": "boolean", "description": "Block direct writes to openclaw.json. Default true." },
+      "auditLog": { "type": "string", "description": "Where guard decisions are logged (no content, only guard/tool/action)." }
+    }
+  }
+}

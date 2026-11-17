@@ -58,7 +58,7 @@ class Installer(unittest.TestCase):
 
     def test_agentmail_uses_the_official_plugin_and_its_channel_starts_in_standby(self):
         text = (ROOT / "install/bootstrap.sh").read_text()
-        for needle in ("clawhub:@agentmail/agentmail", "plugins enable agentmail", '"enabled": True',
+        for needle in ("install_plugin clawhub:@agentmail/agentmail agentmail", '"enabled": True',
                        '"dmPolicy": "allowlist"', '"allowFrom": []', "channels.agentmail.allowFrom"):
             self.assertIn(needle, text)
         self.assertNotIn("agentmail-mcp", text)
@@ -97,6 +97,14 @@ class Installer(unittest.TestCase):
         self.assertIn("potter-schedule-watch", text)
         self.assertEqual(text.count("cron add"), text.count("--timeout-seconds"))
         self.assertNotIn("--best-effort-deliver \\\n   --message", text)   # a brief that cannot deliver must count as a failure
+
+    def test_plugin_installs_are_verified_not_assumed(self):
+        lib = (ROOT / "install/lib.sh").read_text()
+        self.assertIn('grep -q "Installed plugin: $id"', lib)
+        self.assertIn("--accept-capabilities", lib)
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        self.assertIn("install_plugin \"$gdir\" potter-guardrails --force", boot)
+        self.assertNotIn("plugins install", boot)
 
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())

@@ -11,6 +11,16 @@ warn() { printf '\033[33m!! %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31mxx %s\033[0m\n' "$*" >&2; exit 1; }
 oc()   { openclaw "${OC_PROFILE_FLAG[@]}" "$@"; }
 
+# q CMD...  - run quietly; on failure show the command's output so an install never dies silently.
+q() { local out; if ! out="$("$@" 2>&1)"; then printf '%s\n' "$out" >&2; return 1; fi; }
+# install_plugin SOURCE ID [extra flags]  - install and confirm the plugin really landed.
+install_plugin() {
+  local src="$1" id="$2"; shift 2
+  local out; out="$(openclaw "${OC_PROFILE_FLAG[@]}" plugins install "$src" --accept-capabilities "$@" 2>&1)" || true
+  printf '%s' "$out" | grep -q "Installed plugin: $id" || { printf '%s\n' "$out" >&2; die "plugin $id did not install"; }
+  q oc plugins enable "$id"
+}
+
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
 # ask VAR "Prompt" [default] [secret]  - whiptail box when a terminal is available, plain prompt otherwise.
@@ -57,7 +67,7 @@ collect_inputs() {
   ask OPENROUTER_KEY    "Model API key (OpenRouter, with a spend cap set)"  "" secret
   ask BRIEF_TIME        "Morning Brief time, 24h HH:MM (weekdays)"          "08:30"
   COMPOSIO_MCP_URL="${POTTER_COMPOSIO_MCP_URL:-}"; AGENTMAIL_API_KEY="${POTTER_AGENTMAIL_API_KEY:-}"; TAILSCALE_AUTHKEY="${POTTER_TAILSCALE_AUTHKEY:-}"
-  OPENAI_VOICE_KEY="${POTTER_OPENAI_VOICE_KEY:-}"; AGENTMAIL_INBOX="${POTTER_AGENTMAIL_INBOX:-}"; OWNER_EMAILS="${POTTER_OWNER_EMAILS:-}"; HA_URL="${POTTER_HA_URL:-}"; HA_TOKEN="${POTTER_HA_TOKEN:-}"
+  OPENAI_VOICE_KEY="${POTTER_OPENAI_VOICE_KEY:-}"; EXCLUDED_IDS="${POTTER_EXCLUDED_IDS:-}"; AGENTMAIL_INBOX="${POTTER_AGENTMAIL_INBOX:-}"; OWNER_EMAILS="${POTTER_OWNER_EMAILS:-}"; HA_URL="${POTTER_HA_URL:-}"; HA_TOKEN="${POTTER_HA_TOKEN:-}"
   [[ "$OWNER_TELEGRAM_ID" =~ ^[0-9]{4,15}$ ]] || die "Telegram user ID must be a number"
   [[ "$BRIEF_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "brief time must be HH:MM"
   python3 -c "import zoneinfo,sys; zoneinfo.ZoneInfo(sys.argv[1])" "$TIMEZONE" || die "unknown time zone"

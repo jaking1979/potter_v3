@@ -71,8 +71,7 @@ mkdir -p "$WS/skills"; cp -r "$REPO/overlay/workspace/skills/." "$WS/skills/"
 
 if [ -n "${AGENTMAIL_API_KEY:-}" ]; then
   say "Installing the official AgentMail plugin (Potter's own inbox)"
-  oc plugins install clawhub:@agentmail/agentmail >/dev/null
-  oc plugins enable agentmail >/dev/null
+  install_plugin clawhub:@agentmail/agentmail agentmail
   am="$(mktemp --suffix=.json5)"
   AGENTMAIL_API_KEY="$AGENTMAIL_API_KEY" AGENTMAIL_INBOX="${AGENTMAIL_INBOX:-}" OWNER_EMAILS="${OWNER_EMAILS:-}" python3 - "$am" <<'PY'
 import json, os, sys
@@ -137,6 +136,15 @@ PY
   oc config patch --file "$mcp" --dry-run >/dev/null && oc config patch --file "$mcp" >/dev/null
   rm -f "$mcp"
 fi
+
+say "Installing Potter's guardrails (hard wall, docs-before-build, config write guard)"
+gdir="$(mktemp -d)"; cp "$REPO/overlay/plugins/potter-guardrails/"{index.js,guards.js,openclaw.plugin.json,package.json} "$gdir/"
+install_plugin "$gdir" potter-guardrails --force
+gp="$(mktemp --suffix=.json5)"
+EXCLUDED_IDS="${EXCLUDED_IDS:-}" python3 -c 'import json,os,sys
+ids=[x.strip() for x in os.environ["EXCLUDED_IDS"].split(",") if x.strip()]
+json.dump({"plugins":{"entries":{"potter-guardrails":{"enabled":True,"config":{"excludedIds":ids}}}}}, open(sys.argv[1],"w"))' "$gp"
+oc config patch --file "$gp" >/dev/null; rm -rf "$gp" "$gdir"
 
 say "Pinning the plugin trust list (bundled plugins plus the ones just installed)"
 pa="$(mktemp --suffix=.json5)"

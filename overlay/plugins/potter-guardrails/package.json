@@ -1,0 +1,9 @@
+{
+  "name": "potter-guardrails",
+  "version": "3.0.0",
+  "description": "Deterministic safety guards for Potter v3.",
+  "type": "module",
+  "private": true,
+  "openclaw": { "extensions": ["./index.js"] },
+  "peerDependencies": { "openclaw": ">=2026.11.0" }
+}
