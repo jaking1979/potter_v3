@@ -168,7 +168,7 @@ def _table(t: str, house: dict) -> Route:
             return _fallback("multi_zone")
         if sensor and not named:
             return _fallback("unknown_zone")           # that room has a sensor but nothing Merrick can control
-        if control.intent == "hold_away" and house.get("away_hold_f") is None:
+        if control.intent == "hold_away" and house.get("away_hold_f") is None and not house.get("away_hold"):
             return _fallback("not_configured")
         return control
     if _PERIMETER.search(t) or (question and _PROTECTED.search(t)):

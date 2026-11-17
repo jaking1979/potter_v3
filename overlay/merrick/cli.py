@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import budget, coldwatch, fastpath, intentions, pathlog, thermal
+from . import budget, coldwatch, departure, fastpath, intentions, pathlog, thermal
 from .ha import SafeHome
 from .habridge import BridgeHomeAssistant
 
@@ -100,6 +100,9 @@ def cmd_ask(ns) -> int:
     out = fastpath.handle(ns.text, home, house, state / "path-log.jsonl",
                           decide=_decider(ns.decide_cmd) if ns.decide_cmd else None,
                           model=_load(state / "model.json", {}))
+    if out.get("pending_departure"):
+        with _locked(state):
+            _save(state / "departure-pending.json", out.pop("pending_departure"))
     if out["path"] == "fallback":
         now = time.time()
         out.update({"budget_s": ns.budget, "started_epoch": int(now), "deadline_epoch": int(now + ns.budget),
@@ -108,6 +111,23 @@ def cmd_ask(ns) -> int:
                                    "report what is observed, estimated and unknown. Then run fallback-end."})
     print(json.dumps(out, indent=1))
     return 0
+
+
+def cmd_confirm_departure(ns) -> int:
+    """Run ONLY when the owner has explicitly confirmed. Locks and arms what the house file lists, with read-back."""
+    state, house = _state(ns), _house(ns)
+    with _locked(state):
+        pending = _load(state / "departure-pending.json", None)
+        status, text = departure.confirm(SafeHome(_client(ns), house), house, pending, time.time())
+        if status != "stopped":                                # a used or refused confirmation cannot be replayed
+            try:
+                (state / "departure-pending.json").unlink()
+            except OSError:
+                pass
+    pathlog.append(state / "path-log.jsonl", pathlog.record("confirm_departure", "fast", 0.0, status,
+                                                            request="confirm departure", source="table"))
+    print(json.dumps({"outcome": status, "reply": text}, indent=1))
+    return 0 if status == "done" else 1
 
 
 def cmd_budget_check(ns) -> int:
@@ -268,6 +288,7 @@ def main(argv: list[str]) -> int:
         p = sub.add_parser(name); p.add_argument("--to"); p.add_argument("--dry-run", action="store_true")
         p.set_defaults(fn=fn)
     sub.add_parser("collect").set_defaults(fn=cmd_collect)
+    sub.add_parser("confirm-departure").set_defaults(fn=cmd_confirm_departure)
     p = sub.add_parser("intend"); p.add_argument("--description", required=True)
     p.add_argument("--due", required=True, help="ISO time with zone"); p.add_argument("--zone", required=True)
     p.add_argument("--temperature", type=float, required=True); p.add_argument("--until")

@@ -66,6 +66,27 @@ class Cli(unittest.TestCase):
         code, out, _ = self.run_cli("report")
         self.assertIn("[needs_reasoning] why is it cold downstairs", out)
 
+    def test_departure_asks_first_then_locks_and_arms_once_on_confirmation(self):
+        h = dict(HOUSE, departure={"locks": ["lock.front_door"], "alarm": "alarm_control_panel.house"})
+        (self.state / "house.json").write_text(json.dumps(h))
+        self.fake.states["lock.front_door"] = {"state": "unlocked", "attributes": {}}
+        self.fake.states["alarm_control_panel.house"] = {"state": "disarmed", "attributes": {}}
+        code, out, _ = self.run_cli("confirm-departure")                    # nothing was asked yet
+        self.assertEqual((code, json.loads(out)["outcome"]), (1, "refused"))
+        code, out, _ = self.run_cli("ask", "close up the house")
+        res = json.loads(out)
+        self.assertEqual(res["outcome"], "needs_confirmation")
+        self.assertNotIn("pending_departure", res)
+        self.assertTrue((self.state / "departure-pending.json").exists())
+        self.assertEqual(self.fake.calls, [])
+        code, out, _ = self.run_cli("confirm-departure")
+        self.assertEqual((code, json.loads(out)["outcome"]), (0, "done"))
+        self.assertEqual(self.fake.states["lock.front_door"]["state"], "locked")
+        self.assertFalse((self.state / "departure-pending.json").exists())
+        code, out, _ = self.run_cli("confirm-departure")                    # cannot be replayed
+        self.assertEqual((code, json.loads(out)["outcome"]), (1, "refused"))
+        self.assertEqual(len(self.fake.calls), 2)
+
     def test_cold_watch_is_silent_when_all_is_well(self):
         self.assertEqual(self.run_cli("cold-watch"), (0, "", ""))
         saved = json.loads((self.state / "cold-watch.json").read_text())

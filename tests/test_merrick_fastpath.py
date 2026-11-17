@@ -100,19 +100,22 @@ class Actions(Base):
         self.assertEqual(self.fake.states["climate.main_house"]["attributes"]["temperature"], 62.0)
 
     def test_locks_alarms_valves_and_close_up_never_call_a_service(self):
-        for text in ("lock the front door", "arm the alarm", "open the water valve", "close up the house"):
+        for text in ("lock the front door", "arm the alarm", "open the water valve"):
             out = self.ask(text)
             self.assertEqual((out["path"], out["outcome"]), ("fast", "refused"))
+        self.ask("close up the house")                       # only checks and asks; see test_merrick_hold_departure
         self.assertEqual(self.fake.calls, [])
 
     def test_close_up_runs_the_perimeter_check_and_stops_on_an_open_or_unreadable_entry(self):
-        self.assertIn("All 2 doors and windows read closed", self.ask("close up the house")["reply"])
+        self.assertIn("every door and window reads closed", self.ask("close up the house")["reply"])
         self.fake.states["binary_sensor.kitchen_window"]["state"] = "on"
         self.fake.states["binary_sensor.front_door"]["state"] = "unavailable"
-        reply = self.ask("close up the house")["reply"]
-        self.assertTrue(reply.startswith("Departure stopped"))
-        self.assertIn("OPEN: kitchen window.", reply)
-        self.assertIn("Unknown (no reading): front door.", reply)
+        out = self.ask("close up the house")
+        self.assertEqual(out["outcome"], "refused")
+        self.assertTrue(out["reply"].startswith("Departure stopped"))
+        self.assertIn("open: kitchen window", out["reply"])
+        self.assertIn("could not be read: front door", out["reply"])
+        self.assertNotIn("pending_departure", out)
 
 
 class Reads(Base):
@@ -160,7 +163,8 @@ class Reads(Base):
     def test_cold_readings_follow_the_house_file(self):
         r = fastpath.cold_readings(self.home, self.house, now_ts=5.0)
         self.assertEqual(r, {"ts": 5.0, "basement_f": 52.0, "zone_target_f": 62.0, "zone_current_f": 61.0,
-                             "zone_action": "idle", "vacant": True})
+                             "zone_action": "idle", "vacant": True, "expected_hold_f": 62.0,
+                             "expected_hold_reason": "one hold value is configured"})
         self.fake.states["input_boolean.house_closed"]["state"] = "off"
         self.assertFalse(fastpath.cold_readings(self.home, self.house)["vacant"])
         self.fake.states["input_boolean.house_closed"]["state"] = "unavailable"

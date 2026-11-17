@@ -165,6 +165,38 @@ class SafeHome:
                            lambda st: (st or {}).get("state"), lambda seen: seen == want,
                            requested=want, applied=want)
 
+    # ---- departure: the ONLY protected writes, and only with the owner's explicit confirmation ---------------
+    def _departure_refusal(self, entity_id: Any, domain: str, confirmed: bool) -> Optional[str]:
+        if confirmed is not True:
+            return "the owner has not confirmed"
+        if not isinstance(entity_id, str) or not entity_id.lower().startswith(domain + "."):
+            return f"not a {domain} entity"
+        d = self.house.get("departure") or {}
+        listed = [str(e).lower() for e in (d.get("locks") or [])] + [str(d.get("alarm") or "").lower()]
+        if entity_id.lower() not in listed:
+            return "not listed under 'departure' in the house file"
+        return None
+
+    def lock(self, entity_id: str, confirmed: bool = False) -> ActionResult:
+        """Lock a door. There is no unlock."""
+        why = self._departure_refusal(entity_id, "lock", confirmed)
+        if why:
+            return ActionResult(False, "refused", str(entity_id), f"Refused: {why}.", requested="locked")
+        return self._write(entity_id, "lock", "lock", {}, lambda st: (st or {}).get("state"),
+                           lambda seen: seen == "locked", requested="locked", applied="locked")
+
+    def arm(self, entity_id: str, mode: str = "arm_away", confirmed: bool = False) -> ActionResult:
+        """Arm the alarm. There is no disarm."""
+        why = self._departure_refusal(entity_id, "alarm_control_panel", confirmed)
+        if why is None and mode not in ("arm_away", "arm_home"):
+            why = "unknown arming mode"
+        if why:
+            return ActionResult(False, "refused", str(entity_id), f"Refused: {why}.", requested=mode)
+        want = "armed_away" if mode == "arm_away" else "armed_home"
+        return self._write(entity_id, "alarm_control_panel", "alarm_" + mode, {},
+                           lambda st: (st or {}).get("state"), lambda seen: seen in (want, "arming"),
+                           requested=want, applied=want)
+
     def _write(self, entity_id, domain, service, data, extract, matches, **kw) -> ActionResult:
         if self.read(entity_id) is None:                       # the device must exist before anything is sent
             return ActionResult(False, "error", entity_id,

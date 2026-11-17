@@ -71,10 +71,14 @@ def evaluate(readings: dict, th: Thresholds = Thresholds(), previous: Optional[d
                                 f"about {hrs:.0f} hours"})
     # The hold is checked when the house is known to be empty, and also when occupancy is unknown (as v2 did).
     # It is skipped only when the house is known to be occupied: a person changing the heat is not drift.
-    if th.vacancy_hold_f is not None and target is not None and r.get("vacant") is not False \
-            and abs(target - th.vacancy_hold_f) > th.hold_tolerance_f:
+    # The expected hold is decided from the data (see hold.py) when the caller supplies it.
+    want = _n(r.get("expected_hold_f"))
+    expected = want if want is not None else th.vacancy_hold_f
+    if expected is not None and target is not None and r.get("vacant") is not False \
+            and abs(target - expected) > th.hold_tolerance_f:
+        why = f"; {r['expected_hold_reason']}" if want is not None and r.get("expected_hold_reason") else ""
         out.append({"kind": "hold_drift", "severity": "alert", "label": "observed",
-                    "text": f"main zone target is {target:.0f} F (the vacancy hold should be {th.vacancy_hold_f:.0f} F)"})
+                    "text": f"main zone target is {target:.0f} F (the vacancy hold should be {expected:.0f} F{why})"})
     if current is not None and current < th.zone_min_current_f:
         action = r.get("zone_action") or "state unknown"
         out.append({"kind": "zone_underheat", "severity": "alert", "label": "observed",

@@ -2,7 +2,7 @@
   "_comment": "Example only. The installer writes the real house file from the owner's Home Assistant; no entity id is hard-coded in the code.",
   "temperature_unit": "F",
   "default_zone": "main",
-  "away_hold_f": 62,
+  "away_hold": {"normal_f": 62, "cold_f": 64, "raise_when_basement_below_f": 40, "lower_when_basement_above_f": 43, "raise_when_hours_to_freeze_below": 24},
   "weather_entity": "weather.home",
   "vacancy_entity": "input_boolean.house_closed",
   "vacancy_on_state": "on",

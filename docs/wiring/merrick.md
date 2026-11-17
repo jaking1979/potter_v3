@@ -139,3 +139,16 @@ source for most of this.
   `path-log.jsonl` is what tunes it.
 - A request made from the slow path through `merrick ask` adds its own line to the path log, so a single owner
   request that falls back and then sets a temperature counts as two requests.
+
+
+## Owner decisions, 2026-11-17 (implemented after the builder's report)
+- **Away hold is data-driven.** House file key `away_hold`: `normal_f` 62, `cold_f` 64, raised when the basement
+  reads below `raise_when_basement_below_f` (40, v2's pipe-risk line) or the freeze trajectory is under
+  `raise_when_hours_to_freeze_below` (24), lowered again above `lower_when_basement_above_f` (43). Cold watch
+  expects the decided value, so a 64 hold on a cold day is not reported as drift. The thresholds are starting
+  values from v2's baseline protocol: re-derive them from collected data.
+- **Departure after confirmation.** House file key `departure`: `locks`, `alarm`, `arm_mode`. `merrick ask "close
+  up the house"` checks and asks; `merrick confirm-departure` locks and arms (10-minute window, single use,
+  perimeter re-checked, read-back). No unlock, no disarm.
+- Not built: applying the raised hold automatically on a schedule (today it is applied when the owner asks for the
+  away hold, and cold watch reports when the target does not match the decided value).

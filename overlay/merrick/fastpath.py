@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from typing import Callable, Optional
 
-from . import coldwatch, pathlog
+from . import coldwatch, departure, hold, pathlog
 from .ha import SafeHome, num
 from .router import Route, route
 from .thermal import heating_estimate
@@ -77,10 +77,14 @@ def cold_readings(home: SafeHome, house: dict, now_ts: Optional[float] = None) -
         v = home.read(house["vacancy_entity"])
         if v is not None and str(v.get("state")).lower() not in ("unknown", "unavailable", ""):
             vacant = str(v.get("state")).lower() == str(house.get("vacancy_on_state", "on")).lower()
-    return {"ts": time.time() if now_ts is None else now_ts,
-            "basement_f": home.value(sensor) if sensor else None,
-            "zone_target_f": num(attrs.get("temperature")), "zone_current_f": num(attrs.get("current_temperature")),
-            "zone_action": attrs.get("hvac_action"), "vacant": vacant}
+    out = {"ts": time.time() if now_ts is None else now_ts,
+           "basement_f": home.value(sensor) if sensor else None,
+           "zone_target_f": num(attrs.get("temperature")), "zone_current_f": num(attrs.get("current_temperature")),
+           "zone_action": attrs.get("hvac_action"), "vacant": vacant}
+    d = hold.decide(house, out["basement_f"], None, out["zone_target_f"])
+    if d is not None:
+        out["expected_hold_f"], out["expected_hold_reason"] = d["target_f"], d["reason"]
+    return out
 
 
 def _act(res, what: str) -> tuple[str, str]:
@@ -106,11 +110,6 @@ def _execute(r: Route, home: SafeHome, house: dict, model: dict) -> tuple[str, s
             st = home.read(eid)
             text += f" {name}: {(st or {}).get('state', 'unknown')}."
         return "ok", text
-    if r.intent == "close_up":
-        p = perimeter(home, house)
-        stop = "Departure stopped: something is open or unreadable. " if p["open"] or p["unknown"] else ""
-        return "refused", (f"{stop}{_perimeter_text(p)} Locking and arming are not done by Merrick: "
-                           "the owner does these directly in Home Assistant.")
     if r.intent == "house_status":
         lines = ["Observed: " + _zone_line(home.zone_reading(z)) for z in (house.get("zones") or {})]
         for name, s in (house.get("sensors") or {}).items():
@@ -135,7 +134,12 @@ def _execute(r: Route, home: SafeHome, house: dict, model: dict) -> tuple[str, s
     if r.intent == "turn_off":
         return _act(home.set_hvac_mode(entity, "off"), f"{zname} heating and cooling off{assumed}")
     if r.intent == "hold_away":
-        return _act(home.set_temperature(entity, house["away_hold_f"]), f"{zname} away hold{assumed}")
+        cw = house.get("cold_watch") or {}
+        sensor = ((house.get("sensors") or {}).get(cw.get("basement_sensor", "basement")) or {}).get("entity")
+        d = hold.decide(house, home.value(sensor) if sensor else None, None,
+                        (home.zone_reading(zone) or {}).get("setpoint_f") if zone else None)
+        return _act(home.set_temperature(entity, d["target_f"]),
+                    f"{zname} away hold {d['target_f']:g} F ({d['label']}: {d['reason']}){assumed}")
     if r.intent == "heating_estimate":
         z = home.zone_reading(zone)
         if z["room_f"] is None:
@@ -157,8 +161,16 @@ def handle(text: str, home: SafeHome, house: dict, log_path, decide: Optional[Ca
     t0 = clock()
     rid = pathlog.new_id()
     r = route(text, house, decide)
+    pending = None
     if r.path == "fallback":
         outcome, reply = "escalated", ""
+    elif r.intent == "close_up":
+        # Lock and arm happen only after the owner confirms: this step checks the perimeter and asks.
+        try:
+            status, reply, pending = departure.prepare(home, house, time.time())
+            outcome = {"needs_confirmation": "needs_confirmation", "stopped": "refused"}.get(status, "ok")
+        except Exception as e:                       # noqa: BLE001
+            outcome, reply = "error", f"Not done: the departure check failed ({type(e).__name__}). Nothing was locked."
     else:
         try:
             outcome, reply = _execute(r, home, house, model or {})
@@ -168,4 +180,5 @@ def handle(text: str, home: SafeHome, house: dict, log_path, decide: Optional[Ca
     logged = pathlog.append(log_path, pathlog.record(r.intent, r.path, ms, outcome, request=text, source=r.source,
                                                      reason=r.reason, request_id=rid))
     return {"id": rid, "path": r.path, "intent": r.intent, "source": r.source, "reason": r.reason,
-            "outcome": outcome, "reply": reply, "ms": int(round(ms)), "logged": logged, "slots": r.slots}
+            "outcome": outcome, "reply": reply, "ms": int(round(ms)), "logged": logged, "slots": r.slots,
+            **({"pending_departure": pending} if pending else {})}

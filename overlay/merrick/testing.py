@@ -47,6 +47,8 @@ class FakeHome:
             st["attributes"]["temperature"] = data["temperature"]
         elif service == "set_hvac_mode":
             st["state"] = data["hvac_mode"]
+        elif service in ("alarm_arm_away", "alarm_arm_home"):
+            st["state"] = "armed_away" if service == "alarm_arm_away" else "armed_home"
         elif service in ("turn_on", "turn_off", "lock", "unlock", "open_valve", "close_valve"):
             st["state"] = {"turn_on": "on", "turn_off": "off", "lock": "locked", "unlock": "unlocked",
                            "open_valve": "open", "close_valve": "closed"}[service]
