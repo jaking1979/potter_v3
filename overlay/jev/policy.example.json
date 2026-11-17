@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "_comment": "The one place that says which model does which kind of work. Copy to policy.json and replace every REPLACE_ value; a policy that still contains one is refused. Model ids are written exactly as the caller needs them (OpenClaw 'provider/model' refs for agent work; the decision endpoint's own id for decision classes).",
+  "defaultClass": "chat",
+  "classes": {
+    "chat": {
+      "description": "The main conversation.",
+      "model": "REPLACE_WITH_MAIN_MODEL",
+      "fallbacks": ["REPLACE_WITH_MAIN_FALLBACK"],
+      "maxCostUsd": 0.5,
+      "timeoutMs": 120000
+    },
+    "job_turn": {
+      "description": "Scheduled agent turns. Every job names this class; none inherits a session default.",
+      "model": "REPLACE_WITH_JOB_MODEL",
+      "fallbacks": ["REPLACE_WITH_JOB_FALLBACK"],
+      "maxCostUsd": 0.25,
+      "timeoutMs": 300000
+    },
+    "worker": {
+      "description": "Delegated sub-tasks.",
+      "model": "REPLACE_WITH_WORKER_MODEL",
+      "fallbacks": [],
+      "maxCostUsd": 0.1,
+      "timeoutMs": 120000
+    },
+    "local_small": {
+      "description": "Small bounded tasks on the local tier; falls back to a cloud model when that machine is asleep.",
+      "model": "REPLACE_WITH_LOCAL_MODEL",
+      "fallbacks": ["REPLACE_WITH_CLOUD_FALLBACK_FOR_LOCAL"],
+      "maxCostUsd": 0.02,
+      "timeoutMs": 60000
+    },
+    "decision": {
+      "description": "Typed decisions (choice, score, yes/no) on the decision endpoint.",
+      "model": "REPLACE_WITH_DECISION_MODEL",
+      "fallbacks": [],
+      "maxCostUsd": 0.001,
+      "timeoutMs": 10000
+    },
+    "kg_curation": {
+      "description": "The knowledge graph curator's decisions (6-hourly command job).",
+      "model": "REPLACE_WITH_DECISION_MODEL",
+      "fallbacks": [],
+      "maxCostUsd": 0.001,
+      "timeoutMs": 20000
+    }
+  }
+}

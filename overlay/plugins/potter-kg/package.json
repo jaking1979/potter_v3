@@ -1,0 +1,10 @@
+{
+  "name": "potter-kg",
+  "version": "3.0.0",
+  "description": "Potter knowledge graph: typed entities, relations and provenance in one plugin-owned SQLite file.",
+  "type": "module",
+  "private": true,
+  "openclaw": { "extensions": ["./index.js"] },
+  "scripts": { "test": "node --test", "curate": "node scripts/kg-curate.mjs" },
+  "peerDependencies": { "openclaw": ">=2026.11.0" }
+}

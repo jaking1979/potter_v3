@@ -1,0 +1,9 @@
+{
+  "name": "potter-jev",
+  "version": "3.0.0",
+  "description": "Potter's decision layer: one model policy file, a pure chooser, a thin decision client and content-free telemetry.",
+  "type": "module",
+  "private": true,
+  "exports": { ".": "./index.js" },
+  "scripts": { "test": "node --test" }
+}
