@@ -184,7 +184,7 @@ if [ -n "${OPENAI_VOICE_KEY:-}" ]; then
 fi
 
 if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
-  say "Joining your tailnet and enabling Potter's funnel"
+  say "Joining your tailnet (Potter's web app is reachable from your own devices only)"
   command -v tailscale >/dev/null 2>&1 || { curl -fsSL https://tailscale.com/install.sh | sh >/dev/null; }
   # Userspace networking: works in an unprivileged container with no changes to the Proxmox host (as v2 does).
   mkdir -p /etc/default; printf 'PORT="41641"\nFLAGS="--tun=userspace-networking"\n' > /etc/default/tailscaled
@@ -195,7 +195,9 @@ if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
   fi
   sleep 3
   tailscale up --authkey "$TAILSCALE_AUTHKEY" --hostname "${POTTER_TS_HOSTNAME:-potter-v3}" --accept-dns=false >/dev/null
-  oc config set gateway.tailscale.mode funnel >/dev/null
+  # serve = only devices on your tailnet can open Potter (the security audit flags a public funnel as critical).
+  # POTTER_TS_MODE=funnel opens it to the internet, for a service that must call Potter from outside.
+  oc config set gateway.tailscale.mode "${POTTER_TS_MODE:-serve}" >/dev/null
 fi
 
 # Notion is always registered (sign-in happens later from chat); Composio and Home Assistant when given.
@@ -212,9 +214,10 @@ if os.environ.get("COMPOSIO_API_KEY") or os.environ.get("COMPOSIO_MCP_URL"):
         c["headers"] = {"x-consumer-api-key": os.environ["COMPOSIO_API_KEY"]}
     servers["composio"] = c
 if os.environ.get("HA_URL"):
-    # Home Assistant's built-in MCP server (state and control).
+    # Home Assistant's built-in MCP server (Settings > Devices & services > Model Context Protocol Server).
+    # /api/mcp is its streamable HTTP endpoint; /mcp_server/sse is the older SSE one.
     servers["homeassistant"] = {"transport": "streamable-http",
-                                "url": os.environ["HA_URL"].rstrip("/") + "/mcp_server/sse",
+                                "url": os.environ["HA_URL"].rstrip("/") + "/api/mcp",
                                 "headers": {"Authorization": "Bearer " + os.environ["HA_TOKEN"]}}
 json.dump({"mcp": {"servers": servers}}, open(sys.argv[1], "w"))
 PY
@@ -245,7 +248,21 @@ KG_DB="$KG_DB" python3 -c 'import json,os,sys; json.dump({"plugins":{"entries":{
 q oc config patch --file "$kp"; rm -f "$kp"
 # Model policy (ratified T28): one file says which model does which work. It replaces OpenClaw's default
 # (openrouter/auto, open-ended routing) with the validated candidates, and every agent job names its model.
-[ -f "$WS/state/model-policy.json" ] || cp "$REPO/overlay/jev/policy.json" "$WS/state/model-policy.json"
+# A policy still equal to the one shipped last time is replaced by the new one; a policy the owner (or Potter on the
+# owner's instruction) has edited is left alone.
+# Fingerprints of policies shipped before the .shipped copy existed (an install from then has no copy to compare with).
+OLD_SHIPPED_POLICIES="5b98a1beba3f17f60937ff86f4e6cf08887d0ebcd80594a8edfa6016f1f72daf"
+policy_is_shipped() {
+  [ -f "$WS/state/model-policy.shipped.json" ] && cmp -s "$WS/state/model-policy.json" "$WS/state/model-policy.shipped.json" && return 0
+  case " $OLD_SHIPPED_POLICIES " in *" $(sha256sum "$WS/state/model-policy.json" | cut -c1-64) "*) return 0;; esac
+  return 1
+}
+if [ ! -f "$WS/state/model-policy.json" ] || policy_is_shipped; then
+  cp "$REPO/overlay/jev/policy.json" "$WS/state/model-policy.json"
+elif ! cmp -s "$WS/state/model-policy.json" "$REPO/overlay/jev/policy.json"; then
+  warn "state/model-policy.json was edited, so the new default policy was not applied (it is in overlay/jev/policy.json)"
+fi
+cp "$REPO/overlay/jev/policy.json" "$WS/state/model-policy.shipped.json"
 apply_models() {
   local mp; mp="$(mktemp --suffix=.json5)"
   python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --patch "$mp" --agents "$1" \
@@ -479,6 +496,10 @@ if os.path.exists(p):
     json.dump(reg, open(p, "w"), indent=1)
 PY
 fi
+
+# OpenClaw creates its own "Proactive check" job at onboarding, before any working key exists, and it then fails on
+# every run ("no recorded inference account"). Potter's schedule watchdog and evening check-in already cover it.
+potter-cron off "Proactive check (potter)" >/dev/null 2>&1 || true
 
 say "Adding the schedule watchdog (tells you when any job fails or does not run)"
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"

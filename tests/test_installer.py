@@ -201,6 +201,19 @@ class Installer(unittest.TestCase):
         base = (ROOT / "overlay/config.base.json5").read_text()
         self.assertIn('commands: { ownerAllowFrom: ["@@OWNER_TELEGRAM_ID@@"] }', base)
 
+    def test_tailnet_only_by_default_and_home_assistant_mcp_uses_its_http_endpoint(self):
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        self.assertIn('gateway.tailscale.mode "${POTTER_TS_MODE:-serve}"', boot)
+        self.assertNotIn("gateway.tailscale.mode funnel", boot)
+        self.assertIn('"/api/mcp"', boot)
+        self.assertNotIn("/mcp_server/sse\",", boot)
+
+    def test_an_unedited_policy_is_refreshed_and_openclaws_own_check_is_off(self):
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        self.assertIn("model-policy.shipped.json", boot)
+        self.assertIn("policy_is_shipped", boot)
+        self.assertIn('potter-cron off "Proactive check (potter)"', boot)
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 
