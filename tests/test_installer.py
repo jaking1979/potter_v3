@@ -244,6 +244,14 @@ class Installer(unittest.TestCase):
         self.assertNotIn("state/quality-control/", rule)
         self.assertIn("state/qc/", rule)
 
+    def test_update_script_is_safe_to_run_from_inside_potter(self):
+        u = (ROOT / "install/update.sh").read_text()
+        self.assertIn("--check", u)
+        self.assertIn("nohup bash -c 'sleep 8; systemctl restart potter-gateway'", u)    # report first, restart after
+        self.assertIn('new["standingGrants"] = old.get("standingGrants")', u)            # keeps the owner's grants
+        self.assertNotIn("PERSONAL-INDEX", u)                                            # never rewrites the index
+        self.assertTrue((ROOT / "overlay/workspace/skills/update-potter/SKILL.md").exists())
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 
