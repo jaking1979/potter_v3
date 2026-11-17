@@ -155,9 +155,13 @@ import json, os
 p = "/etc/potter/handover.json"
 reg = json.load(open(p)) if os.path.exists(p) else {"crons": [], "apps": [], "secrets_needed": []}
 owners = [e.strip() for e in os.environ.get("OWNER_EMAILS", "").split(",") if e.strip()]
-reg.setdefault("crons", []).append({"name": "potter-mail-intake", "enabled": False,
+def once(kind, entry):                      # a rerun must not list the same item twice
+    lst = reg.setdefault(kind, [])
+    if not any(e.get("name") == entry["name"] for e in lst):
+        lst.append(entry)
+once("crons", {"name": "potter-mail-intake", "enabled": False,
     "purpose": "reads new mail in Potter's inbox (newsletters, forwards); off until the old listener is stopped"})
-reg.setdefault("channels", []).append({"name": "agentmail", "enabled": False,
+once("channels", {"name": "agentmail", "enabled": False,
     "enable": "openclaw config set channels.agentmail.allowFrom '" + json.dumps(owners) + "' --strict-json",
     "disable": "openclaw config set channels.agentmail.allowFrom '[]' --strict-json",
     "purpose": "email to Potter's own inbox (standby = no sender allowed)"})
@@ -461,11 +465,13 @@ import json, os
 p = "/etc/potter/handover.json"
 os.makedirs("/etc/potter", exist_ok=True)
 reg = json.load(open(p)) if os.path.exists(p) else {"crons": [], "apps": [], "secrets_needed": []}
-reg.setdefault("crons", []).append({"name": "potter-merrick-tick", "enabled": False,
-    "purpose": "runs Merrick's scheduled thermostat changes; off until the old assistant stops controlling the house"})
+have = {c.get("name") for c in reg.setdefault("crons", [])}
+add = [{"name": "potter-merrick-tick", "enabled": False,
+        "purpose": "runs Merrick's scheduled thermostat changes; off until the old assistant stops controlling the house"}]
 if not os.environ.get("MERRICK_READY"):
-    for n in ("potter-merrick-cold-watch", "potter-merrick-collect"):
-        reg["crons"].append({"name": n, "enabled": False, "purpose": "needs Merrick's house file first"})
+    add += [{"name": n, "enabled": False, "purpose": "needs Merrick's house file first"}
+            for n in ("potter-merrick-cold-watch", "potter-merrick-collect")]
+reg["crons"] += [a for a in add if a["name"] not in have]
 json.dump(reg, open(p, "w"), indent=1)
 PY
 fi

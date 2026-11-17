@@ -1,4 +1,5 @@
 """Installer scripts: syntax, input validation, overlay rendering. No network, no OpenClaw needed."""
+import sys
 import os
 import subprocess
 import tempfile
@@ -218,6 +219,30 @@ class Installer(unittest.TestCase):
         idx = (ROOT / "overlay/workspace/rules/INDEX.md").read_text()
         for f in (ROOT / "overlay/workspace/rules/global").glob("*.md"):
             self.assertIn(f"`global/{f.name}`", idx, f.name)
+
+    def test_a_rerun_lists_each_standby_item_once(self):
+        import json
+        import os
+        import re
+        import tempfile
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        blocks = [b for b in re.findall(r"python3 - <<'PY'\n(.*?)\nPY", boot, re.S)
+                  if "handover.json" in b and ("once(" in b or "potter-merrick-tick" in b)]
+        self.assertEqual(len(blocks), 2)
+        with tempfile.TemporaryDirectory() as d:
+            reg = os.path.join(d, "h.json")
+            for _ in range(3):
+                for b in blocks:
+                    code = b.replace("/etc/potter/handover.json", reg).replace('os.makedirs("/etc/potter", exist_ok=True)', "")
+                    subprocess.run([sys.executable, "-c", code], check=True, env={**os.environ, "OWNER_EMAILS": "a@example.com"})
+            r = json.load(open(reg))
+            names = [c["name"] for c in r["crons"] + r.get("channels", [])]
+            self.assertEqual(len(names), len(set(names)), names)
+
+    def test_quality_control_rule_names_the_real_folders(self):
+        rule = (ROOT / "overlay/workspace/rules/global/quality-control.md").read_text()
+        self.assertNotIn("state/quality-control/", rule)
+        self.assertIn("state/qc/", rule)
 
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
