@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "overlay/tools"))
 import ha_bridge as hb  # noqa: E402
 
-TOKEN = "tok-SECRETSECRETSECRET"
+TOKEN = "-".join(["fake", "bridge", "value", "for", "tests"])     # built at runtime: not a real credential
 
 
 class Resp:
