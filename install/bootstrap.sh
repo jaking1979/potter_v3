@@ -90,11 +90,13 @@ PY
   rm -f "$am"
   if [ -n "${AGENTMAIL_INBOX:-}" ]; then
     mkdir -p /etc/potter
-    OWNER_EMAILS="${OWNER_EMAILS:-}" python3 - <<'PY'
+    OWNER_EMAILS="${OWNER_EMAILS:-},${CO_OWNER_EMAILS:-}" python3 - <<'PY'
 import json, os
 p = "/etc/potter/handover.json"
 reg = json.load(open(p)) if os.path.exists(p) else {"crons": [], "apps": [], "secrets_needed": []}
 owners = [e.strip() for e in os.environ.get("OWNER_EMAILS", "").split(",") if e.strip()]
+reg.setdefault("crons", []).append({"name": "potter-mail-intake", "enabled": False,
+    "purpose": "reads new mail in Potter's inbox (newsletters, forwards); off until the old listener is stopped"})
 reg.setdefault("channels", []).append({"name": "agentmail", "enabled": False,
     "enable": "openclaw config set channels.agentmail.allowFrom '" + json.dumps(owners) + "' --strict-json",
     "disable": "openclaw config set channels.agentmail.allowFrom '[]' --strict-json",
@@ -250,6 +252,18 @@ mkdir -p /etc/potter
   echo "Next: open Telegram, message your bot, and say hello. Ask Potter to connect anything that is missing."
 } > /etc/potter/final-note.txt
 chmod 600 /etc/potter/final-note.txt
+if [ -n "${AGENTMAIL_INBOX:-}" ]; then
+  say "Scheduling mail intake (standby) and urgent-mail delivery"
+  # Reads the same inbox as an older assistant's listener, so it starts OFF until you say "take over email".
+  q oc cron add --name potter-mail-intake --declaration-key potter-mail-intake --every 10m --agent potter \
+     --session isolated --no-deliver --timeout-seconds 300 --disabled \
+     --message "Run the mail-intake skill. Output nothing."
+  mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
+  q oc cron add --name potter-urgent-deliver --declaration-key potter-urgent-deliver --every 5m --no-deliver \
+     --timeout-seconds 60 \
+     --command "python3 $POTTER_HOME/tools/urgent_deliver.py --to $OWNER_TELEGRAM_ID --tz $TIMEZONE --queue $WS/state/urgent-mail-queue.jsonl --openclaw 'openclaw ${OC_PROFILE_FLAG[*]:-}'"
+fi
+
 say "Adding the schedule watchdog (tells you when any job fails or does not run)"
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
 oc cron add --name potter-schedule-watch --declaration-key potter-schedule-watch --every 15m --no-deliver \

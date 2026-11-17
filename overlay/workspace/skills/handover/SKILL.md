@@ -10,7 +10,8 @@ Standby is not a limit on you: it is a one-line switch the owner flips by asking
 
 State lives in `/etc/potter/handover.json` (crons and apps, each with `enabled`) and `/etc/potter/import-report.json`.
 
-**"What's in standby?"** Read the registry and list each item with a one-line purpose and whether it is on.
+**"What's in standby?"** Read the registry and `openclaw cron list --all` (disabled jobs are hidden without
+`--all`), and list each item with a one-line purpose and whether it is on.
 
 **"Take over X":**
 1. Ask once: "Has v2 stopped doing X?" (the owner can stop it by telling v2). Do not enable until they say yes.

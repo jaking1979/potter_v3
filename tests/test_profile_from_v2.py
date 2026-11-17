@@ -82,7 +82,8 @@ class Profile(unittest.TestCase):
 
     def test_old_paths_are_rewritten_and_the_wall_id_is_redacted_everywhere(self):
         email = (self.ws / "rules/domains/email.md").read_text()
-        self.assertEqual(email, "Check prompts/x.md and state/y.md")
+        self.assertTrue(email.endswith("Check prompts/x.md and state/y.md"))
+        self.assertIn("`rules/global/` describes how v3 does it and wins", email)
         self.assertEqual((self.ws / "learnings/ERRORS.md").read_text(), "see learnings/CORRECTIONS.md")
         blob = "".join(p.read_text() for p in self.ws.rglob("*.md"))
         self.assertNotIn(XID, blob)
@@ -121,7 +122,7 @@ class Profile(unittest.TestCase):
         ws2.mkdir()
         rep = pf.apply(self.zip, ws2, self.tmp / "s2")
         self.assertIn("rules/domains/email.md", rep["active_files"])
-        self.assertEqual((ws2 / "rules/domains/email.md").read_text(), "Check prompts/x.md and state/y.md")
+        self.assertTrue((ws2 / "rules/domains/email.md").read_text().endswith("Check prompts/x.md and state/y.md"))
 
     def test_ids_are_only_taken_from_lines_about_the_wall(self):
         self.assertEqual(pf.excluded_ids([f"database {OTHER} holds tasks", f"never touch the EHR page {XID}"]), [XID])

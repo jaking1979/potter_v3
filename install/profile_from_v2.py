@@ -163,6 +163,9 @@ def apply(zpath: Path, workspace: Path, state_dir: Path) -> dict:
             body = rewrite(text, plan["old_ws"].rstrip("/") + "/", ids)
             if not f["active"]:
                 body = "> Reference only: how the previous assistant did this. Not an active rule.\n\n" + body
+            elif f["dest"].startswith("rules/"):
+                body = ("> Your preferences and boundaries in this file stand. Where it describes HOW something is run "
+                        "(services, scripts, schedules), `rules/global/` describes how v3 does it and wins.\n\n" + body)
             out.write_text(body, encoding="utf-8")
             if f["active"]:
                 active.add(f["dest"])

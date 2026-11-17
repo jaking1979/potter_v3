@@ -15,7 +15,11 @@ Step 1b DONE: machinery rules rewritten generically (overlay/workspace: AGENTS.m
 rules/global/{permissions,communication,memory,retrieval,verification,schedules}.md, learnings/, state/compiling-doc.md).
 Personal rules are built at install by install/profile_from_v2.py from a schema /2 export (26 active files, 133
 reference files on Josh's real export; wall id found, redacted, and added to guardrails). Full sandbox install with the
-real export: health check passes. Next: step 2 (email on the AgentMail plugin: urgent rule + listener logic as a skill).
+real export: health check passes. Step 2 DONE (email): AgentMail channel for owner + co-owner conversations (standby until handover); quarantined
+mail-intake skill + job (every 10m, isolated, no delivery, standby); overlay/tools/urgent_deliver.py (model-free,
+quiet hours, marks delivered only after a successful send; 8 tests); rules/global/email-pipeline.md. Sandbox: jobs
+created as designed, failed send leaves item queued and exits 1. Not proven: real mail, real Telegram send.
+Next: step 3 (Morning Brief with v2's real inputs + ONE recurring evening check-in + compiling doc capture).
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

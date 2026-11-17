@@ -11,6 +11,7 @@ index points to and delete the other.
 | "Remember this", a correction, a preference, "you forgot", where to store something | `global/memory.md` |
 | Finding information, "where is", reading before answering | `global/retrieval.md` |
 | Finishing work, "are you sure", claiming something is done | `global/verification.md` |
+| How email is run: Potter's inbox, conversations, intake, urgent items, sending | `global/email-pipeline.md` |
 | Creating, changing or debugging any scheduled job, monitor or reminder | `global/schedules.md` |
 
 ## Stores outside rules/
@@ -19,6 +20,7 @@ index points to and delete the other.
 | Past mistakes and their prevention rules | `learnings/ERRORS.md`, `learnings/CORRECTIONS.md` |
 | Open decisions waiting on the owner | `learnings/OPEN_QUESTIONS.md` |
 | Daily working memory for the Morning Brief | `state/compiling-doc.md` |
+| Urgent mail waiting for delivery (written by mail-intake, sent by a program) | `state/urgent-mail-queue.jsonl` |
 | Standby / handover of jobs from an older assistant | `/etc/potter/handover.json` (see the `handover` skill) |
 
 ## Personal rules (domains, projects, people, preferences)

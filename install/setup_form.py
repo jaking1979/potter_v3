@@ -40,7 +40,8 @@ FIELDS = [
     ("COMPOSIO_MCP_URL", "Composio MCP URL (optional)", "Gives Potter your Google, Todoist and other connected apps. Leave blank to add it later from chat.", "secret", False, ""),
     ("AGENTMAIL_API_KEY", "AgentMail API key (optional)", "For Potter's own email inbox. Leave blank to add it later from chat.", "secret", False, ""),
     ("AGENTMAIL_INBOX", "AgentMail inbox address (optional)", "Potter's own email address, like potter@agentmail.to. With it, incoming mail from your addresses reaches Potter (starts in standby).", "text", False, ""),
-    ("OWNER_EMAILS", "Your email addresses (optional)", "Comma-separated. Only mail from these addresses can talk to Potter by email.", "text", False, ""),
+    ("OWNER_EMAILS", "Your email addresses (optional)", "Comma-separated. Mail from these addresses can talk to Potter by email.", "text", False, ""),
+    ("CO_OWNER_EMAILS", "Co-owner email addresses (optional)", "Comma-separated. People Potter also answers by email (for example a spouse). They cannot change Potter's settings.", "text", False, ""),
     ("EXCLUDED_IDS", "Pages Potter must never touch (optional)", "Comma-separated ids, for example a Notion page id. Any tool call that mentions one is blocked outright.", "text", False, ""),
     ("OLLAMA_URL", "Ollama address on your Mac (optional)", "For the local model tier (Potter Local). The Mac's Tailscale address and port, like http://macbook.your-tailnet.ts.net:11434. Leave blank to add later.", "text", False, ""),
     ("OPENAI_VOICE_KEY", "OpenAI API key for voice (optional)", "Turns on voice talk in the web app. Set a spend limit on this key in OpenAI first. Leave blank to skip voice.", "secret", False, ""),
@@ -85,6 +86,9 @@ def validate(v: dict) -> dict[str, str]:
         err["AGENTMAIL_INBOX"] = "That does not look like an email address."
     if owners and not all(re.fullmatch(email, e.strip()) for e in owners.split(",")):
         err["OWNER_EMAILS"] = "Use email addresses separated by commas."
+    co = v.get("CO_OWNER_EMAILS", "").strip()
+    if co and not all(re.fullmatch(email, e.strip()) for e in co.split(",")):
+        err["CO_OWNER_EMAILS"] = "Use email addresses separated by commas."
     if inbox and not owners and "OWNER_EMAILS" not in err:
         err["OWNER_EMAILS"] = "Add at least one of your addresses, or nobody will be allowed to email Potter."
     if inbox and not v.get("AGENTMAIL_API_KEY", "").strip():
