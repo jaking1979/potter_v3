@@ -73,6 +73,7 @@ if [ "$MODE" = proxmox ]; then
   fi
   run pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates python3 xz-utils whiptail git"
   say "Copying the installer into the container"
+  run bash -c "git -C '$REPO' log -1 --format=%h > '$REPO/.potter-rev' 2>/dev/null || true"   # the version, without .git
   run tar -C "$REPO" --exclude=.git -czf /tmp/potter-src.tgz .
   run pct push "$CTID" /tmp/potter-src.tgz /root/potter-src.tgz
   run pct exec "$CTID" -- bash -c "mkdir -p /opt/potter/src && tar -xzf /root/potter-src.tgz -C /opt/potter/src"
