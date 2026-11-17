@@ -200,8 +200,11 @@ if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
   sleep 3
   tailscale up --authkey "$TAILSCALE_AUTHKEY" --hostname "${POTTER_TS_HOSTNAME:-potter-v3}" --accept-dns=false >/dev/null
   # serve = only devices on your tailnet can open Potter (the security audit flags a public funnel as critical).
-  # POTTER_TS_MODE=funnel opens it to the internet, for a service that must call Potter from outside.
-  oc config set gateway.tailscale.mode "${POTTER_TS_MODE:-serve}" >/dev/null
+  # POTTER_TS_MODE=funnel opens it to the internet (any browser, anywhere; still behind the password and per-device
+  # approval). The owner's choice is remembered in /etc/potter/remote-access, so a rerun or update keeps it.
+  TS_MODE="${POTTER_TS_MODE:-$(cat /etc/potter/remote-access 2>/dev/null || echo serve)}"
+  mkdir -p /etc/potter; printf '%s\n' "$TS_MODE" > /etc/potter/remote-access
+  oc config set gateway.tailscale.mode "$TS_MODE" >/dev/null
 fi
 
 # Notion is always registered (sign-in happens later from chat); Composio and Home Assistant when given.

@@ -28,6 +28,8 @@ check "guardrails plugin loaded"                   bash -c "openclaw ${OC_PROFIL
 check "Merrick wired (if Home Assistant was set up)"  bash -c "[ ! -f \"$SECRETS_DIR/ha.env\" ] || { [ \"\$(stat -c %a \"$SECRETS_DIR/ha.env\")\" = 600 ] && command -v merrick >/dev/null && openclaw ${OC_PROFILE_FLAG[*]:-} cron list --all --json 2>/dev/null | grep -q potter-merrick-cold-watch; }"
 check "schedule watchdog scheduled"                 bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list --all --json 2>/dev/null | grep -q potter-schedule-watch"
 check "morning-brief skill present"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} skills list --agent potter 2>/dev/null | grep -q morning-brief"
-check "security audit: 0 critical findings"       bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} security audit 2>&1 | grep -q 'Summary: 0 critical'"
+# A public Funnel is reported critical by the audit; when the owner chose it (/etc/potter/remote-access = funnel),
+# that one finding is expected and every OTHER critical finding still fails the check.
+check "security audit: no critical findings (an owner-chosen funnel excepted)" bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} security audit 2>&1 | python3 '$HERE/audit_ok.py'"
 echo
 [ "$fails" = 0 ] && { echo "All checks passed."; exit 0; } || { echo "$fails check(s) failed."; exit 1; }

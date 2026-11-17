@@ -204,7 +204,8 @@ class Installer(unittest.TestCase):
 
     def test_tailnet_only_by_default_and_home_assistant_mcp_uses_its_http_endpoint(self):
         boot = (ROOT / "install/bootstrap.sh").read_text()
-        self.assertIn('gateway.tailscale.mode "${POTTER_TS_MODE:-serve}"', boot)
+        self.assertIn('TS_MODE="${POTTER_TS_MODE:-$(cat /etc/potter/remote-access 2>/dev/null || echo serve)}"', boot)
+        self.assertIn('oc config set gateway.tailscale.mode "$TS_MODE"', boot)               # the owner's choice is kept
         self.assertNotIn("gateway.tailscale.mode funnel", boot)
         self.assertIn('"/api/mcp"', boot)
         self.assertNotIn("/mcp_server/sse\",", boot)
