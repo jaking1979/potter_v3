@@ -17,6 +17,9 @@
     // Potter can add connections and change its own settings from chat without a separate approval step.
     openclaw: { autoApproveChanges: true },
   },
+  // The owner may use owner-only tools (inspecting and changing scheduled jobs, config). Without this, Potter refuses
+  // the owner's own "look at that automation" with a policy block.
+  commands: { ownerAllowFrom: ["@@OWNER_TELEGRAM_ID@@"] },
   channels: {
     telegram: {
       enabled: true,

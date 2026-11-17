@@ -197,6 +197,10 @@ class Installer(unittest.TestCase):
         self.assertIn('[ -n "$RERUN" ] || die "OpenClaw onboarding failed"', boot)
         self.assertIn("models auth logout", boot)
 
+    def test_the_owner_is_named_for_owner_only_tools(self):
+        base = (ROOT / "overlay/config.base.json5").read_text()
+        self.assertIn('commands: { ownerAllowFrom: ["@@OWNER_TELEGRAM_ID@@"] }', base)
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 
