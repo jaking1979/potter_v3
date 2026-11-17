@@ -62,6 +62,8 @@ oc config patch --file "$patch" --dry-run >/dev/null
 oc config patch --file "$patch" >/dev/null; rm -f "$patch"
 WS="$(oc config get agents.entries.potter.workspace | tr -d '"')"
 [ -d "$WS" ] || die "agent workspace not found"
+for d in rules learnings state; do mkdir -p "$WS/$d"; cp -rn "$REPO/overlay/workspace/$d/." "$WS/$d/"; done
+cp "$REPO/overlay/workspace/AGENTS.md" "$WS/AGENTS.md"
 for f in IDENTITY.md SOUL.md USER.md; do
   render_overlay "$REPO/overlay/workspace/$f" "$WS/$f"
 done
@@ -216,23 +218,17 @@ fi
 for i in $(seq 1 60); do oc health >/dev/null 2>&1 && break; sleep 2; [ "$i" = 60 ] && die "gateway did not become healthy"; done
 
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ]; then
-  say "Importing your Potter v2 export (everything starts in standby until you say take over)"
-  mkdir -p "$POTTER_HOME/apps" /etc/potter
-  python3 "$HERE/import_v2.py" apply "$POTTER_V2_BUNDLE" --workspace "$WS" --apps-dir "$POTTER_HOME/apps" \
-      --state-dir /etc/potter --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" \
-      --systemd-dir /etc/systemd/system --run-installs > /etc/potter/import-report.json
-  if [ -f /etc/potter/mcp-import.json ]; then
-    oc config patch --file /etc/potter/mcp-import.json >/dev/null || warn "some imported connections need attention"
-  fi
-  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
-  # apps the bundle marked safe to run alongside v2 start now; the rest wait for "take over"
-  python3 - <<'PY'
-import json, subprocess
-reg = json.load(open("/etc/potter/handover.json"))
-for a in reg["apps"]:
-    if a["enabled"] and a.get("service"):
-        subprocess.run(["systemctl", "enable", "--now", f"potter-app-{a['name']}.service"], capture_output=True)
-PY
+  say "Building your personal profile from the v2 export (rules, preferences, lessons; no machinery is copied)"
+  mkdir -p /etc/potter
+  python3 "$HERE/profile_from_v2.py" apply "$POTTER_V2_BUNDLE" --workspace "$WS" --state-dir /etc/potter \
+      > /etc/potter/profile-report.json || die "the v2 export could not be used (see the message above)"
+  # Hard-wall ids named in your own rules are added to the guardrails automatically.
+  xp="$(mktemp --suffix=.json5)"
+  EXCLUDED_IDS="${EXCLUDED_IDS:-}" python3 -c 'import json,os,sys
+ids=[x.strip() for x in os.environ["EXCLUDED_IDS"].split(",") if x.strip()]
+ids+= [i for i in json.load(open("/etc/potter/excluded-ids.json")) if i not in ids]
+json.dump({"plugins":{"entries":{"potter-guardrails":{"config":{"excludedIds":ids}}}}}, open(sys.argv[1],"w"))' "$xp"
+  q oc config patch --file "$xp" --replace-path plugins.entries.potter-guardrails.config.excludedIds; rm -f "$xp"
   shred -u "$POTTER_V2_BUNDLE" 2>/dev/null || rm -f "$POTTER_V2_BUNDLE"
 fi
 

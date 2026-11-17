@@ -11,10 +11,11 @@ Installer defaults now: first free ID from 211, hostname potter-v3, 12 GB disk, 
 space and memory checks, no edits to host container config, Tailscale userspace. Potter Local lives on the MacBook M1 (Josh): Ollama there over Tailscale (form field OLLAMA_URL); Mac = desktop
 workspace, to be paired as an OpenClaw node. Mac is always on and Ollama listens on the LAN (address given by Josh in chat; entered on the form, not stored here).
 Not built: the Mac node pairing step.
-Step 1b plan: rules split in two. (a) machinery rules (routing index, permissions, verification, memory routing, QC,
-schedule rules) rewritten generically in overlay/workspace/rules. (b) Josh's personal rules/preferences/profile are
-NOT stored in this repo: install/profile_from_v2.py builds them at install from the v2 export upload.
-Next: step 1b - rewrite Potter's rules tree (deduplicated) from v2's rules/ and AGENTS.md.
+Step 1b DONE: machinery rules rewritten generically (overlay/workspace: AGENTS.md pointer-only, rules/INDEX.md,
+rules/global/{permissions,communication,memory,retrieval,verification,schedules}.md, learnings/, state/compiling-doc.md).
+Personal rules are built at install by install/profile_from_v2.py from a schema /2 export (26 active files, 133
+reference files on Josh's real export; wall id found, redacted, and added to guardrails). Full sandbox install with the
+real export: health check passes. Next: step 2 (email on the AgentMail plugin: urgent rule + listener logic as a skill).
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

@@ -139,8 +139,16 @@ def check_bundle(data: bytes) -> str:
     import zipfile
     sys.path.insert(0, str(HERE))
     import import_v2
+    import profile_from_v2
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as z:
+            try:
+                schema = profile_from_v2.read_manifest(z).get("schema")
+            except import_v2.BundleError:
+                schema = None
+            if schema == profile_from_v2.SCHEMA2:
+                profile_from_v2.build_plan(z)
+                return ""
             plan = import_v2.build_plan(z)
     except (import_v2.BundleError, zipfile.BadZipFile) as e:
         return f"That file is not a usable v2 export: {e}"
@@ -161,8 +169,8 @@ def render_form(token: str, errors: dict[str, str], values: dict) -> str:
             f'<div class="help">{html.escape(help_)}</div>{msg}')
     rows.append('<label for="V2_BUNDLE">Potter v2 export file <span>optional</span></label>'
                 '<input id="V2_BUNDLE" name="V2_BUNDLE" type="file" accept=".zip">'
-                '<div class="help">The zip your v2 Potter makes when you paste it the export message. It brings v2\'s rules, '
-                'prompts, schedules and apps into v3. Leave empty to install without it.</div>' +
+                '<div class="help">The zip your v2 Potter makes when you paste it the export message. It gives v3 your personal rules, '
+                'preferences and past lessons (v3\'s own machinery is not copied from v2). Leave empty to install without it.</div>' +
                 (f'<div class="err">{html.escape(errors["V2_BUNDLE"])}</div>' if "V2_BUNDLE" in errors else ""))
     return PAGE.format(body=f'<form method="post" enctype="multipart/form-data" action="/submit?t={token}">' + "".join(rows) +
                        '<button type="submit">Install Potter</button></form>',

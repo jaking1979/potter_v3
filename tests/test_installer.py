@@ -89,7 +89,7 @@ class Installer(unittest.TestCase):
 
     def test_settings_service_and_v2_import_are_wired_into_bootstrap(self):
         text = (ROOT / "install/bootstrap.sh").read_text()
-        for needle in ("potter-settings.service", "import_v2.py", "--run-installs", "standby"):
+        for needle in ("potter-settings.service", "profile_from_v2.py", "excluded-ids.json", "no machinery is copied"):
             self.assertIn(needle, text)
 
     def test_watchdog_is_installed_and_every_potter_job_has_a_timeout(self):
@@ -114,6 +114,18 @@ class Installer(unittest.TestCase):
         self.assertNotIn("/etc/pve/lxc", text)                 # no edits to host container config
         self.assertNotIn("pct reboot", text)
         self.assertIn("--tun=userspace-networking", (ROOT / "install/bootstrap.sh").read_text())
+
+    def test_rule_tree_has_one_file_per_topic_and_agents_only_points(self):
+        ws = ROOT / "overlay/workspace"
+        idx = (ws / "rules/INDEX.md").read_text()
+        for f in ("permissions", "communication", "memory", "retrieval", "verification", "schedules"):
+            self.assertTrue((ws / f"rules/global/{f}.md").exists(), f)
+            self.assertIn(f"`global/{f}.md`", idx)
+        self.assertIn("<!-- PERSONAL-INDEX", idx)
+        agents = (ws / "AGENTS.md").read_text()
+        self.assertLess(len(agents.splitlines()), 25)
+        self.assertNotIn("/home/", "".join(p.read_text() for p in (ws / "rules").rglob("*.md")) + agents)
+        self.assertIn("never \"quiet\"", (ws / "state/compiling-doc.md").read_text())
 
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())

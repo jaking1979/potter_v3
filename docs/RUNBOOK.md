@@ -1,7 +1,7 @@
 # Install Potter v3 (one page)
 
-**First, in Telegram (no terminal):** paste the message in `docs/V2_EXPORT_PROMPT.md` to your v2 Potter and save the
-zip it sends back.
+**First, in Telegram (no terminal):** download your v2 export repo as a zip (GitHub: Code -> Download ZIP on
+`potter-v2-export`), or ask v2 to send `potter-v2-export.zip`. It supplies your personal rules and preferences.
 
 **Before you start (by Nov 24):** a Telegram bot token (@BotFather, /newbot) and your numeric Telegram user ID;
 an OpenRouter key with a credit limit; optional: Composio MCP URL (read-only connections), AgentMail key, OpenAI
