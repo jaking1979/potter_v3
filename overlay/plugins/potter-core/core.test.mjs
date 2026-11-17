@@ -23,6 +23,8 @@ test("reads, reversible writes and consequential actions are told apart", () => 
   assert.equal(classify("exec", { command: "potter-cron on potter-mail-intake" }).risk, "consequential");
   assert.equal(classify("exec", { command: "curl -X POST https://api.example/x" }).risk, "consequential");
   assert.equal(classify("exec", { command: "curl -s https://example.com/page" }).risk, "reversible");
+  assert.equal(classify("exec", { command: "mail -s hi someone@example.com < note" }).capability, "exec:mail");
+  assert.notEqual(classify("exec", { command: "cat > /tmp/in.json <<'JSON'\n{\"conversation\": \"check the mail and the e-mail\"}\nJSON" }).capability, "exec:mail");
   for (const c of ["tail -n 3 /root/.openclaw/potter-core/governor.jsonl", "ls -la skills/ | grep -i meal",
     "openclaw cron list --all --json", "openclaw plugins inspect potter-core --runtime", "cat a && wc -l b"]) {
     assert.equal(classify("exec", { command: c }).risk, "read", c);

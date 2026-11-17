@@ -67,6 +67,17 @@ test("one director failing still meets; fewer than two does not", async () => {
   assert.equal(two.status, "failed");
 });
 
+test("an empty reply or an error is recorded with its reason, and content parts are read", async () => {
+  const empty = async (body) => body.messages[0].content.startsWith("You are an independent") && body.model.includes("gemini")
+    ? { status: 200, json: { choices: [{ message: { content: null }, finish_reason: "length" }] } }
+    : body.messages[0].content.startsWith("You are an independent") && body.model.includes("claude")
+      ? { status: 200, json: { choices: [{ message: { content: [{ type: "text", text: JSON.stringify(MEMO) }] } }] } }
+      : fakePost()(body);
+  const out = await runMeeting({ conversation: "x" }, { key: "k", post: empty });
+  assert.equal(out.status, "ok");                                                   // Claude's parts were read
+  assert.ok(out.participation.some((p) => p.includes("google: did not answer (empty_reply (finish_reason length))")), out.participation.join("|"));
+});
+
 test("redaction and report checks", () => {
   assert.equal(redact("api_key: abc123 and 4111 1111 1111 1111"), "api_key: [REDACTED] and [REDACTED]");
   assert.deepEqual(missingHeadings(REPORT), []);

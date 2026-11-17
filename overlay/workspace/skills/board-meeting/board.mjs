@@ -70,9 +70,19 @@ function seats(policyPath) {
 }
 
 /** One OpenRouter chat call. Returns {ok, text, ms, cost, error}. `post` is injectable for tests. */
-export async function chat(model, system, user, { key, maxTokens = 2000, timeoutMs = 120000, post } = {}) {
+// Reasoning models (Claude, Gemini Pro) spend part of max_tokens thinking; too small a budget returns no text at all.
+// Budgets are generous and reasoning is kept moderate; the reply text can come as a string or as content parts.
+export function replyText(json) {
+  const c = json?.choices?.[0]?.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((p) => (typeof p === "string" ? p : p?.text ?? "")).join("");
+  return null;
+}
+
+export async function chat(model, system, user, { key, maxTokens = 8000, timeoutMs = 240000, post } = {}) {
   const t0 = Date.now();
-  const body = { model: model.replace(/^openrouter\//, ""), max_tokens: maxTokens, messages: [{ role: "system", content: system }, { role: "user", content: user }] };
+  const body = { model: model.replace(/^openrouter\//, ""), max_tokens: maxTokens, reasoning: { effort: "medium" },
+    messages: [{ role: "system", content: system }, { role: "user", content: user }] };
   try {
     const res = post ? await post(body) : await (async () => {
       const ac = new AbortController(); const tm = setTimeout(() => ac.abort(), timeoutMs);
@@ -82,8 +92,15 @@ export async function chat(model, system, user, { key, maxTokens = 2000, timeout
         return { status: r.status, json: await r.json().catch(() => null) };
       } finally { clearTimeout(tm); }
     })();
-    const text = res?.json?.choices?.[0]?.message?.content;
-    if (res.status !== 200 || typeof text !== "string") return { ok: false, ms: Date.now() - t0, error: `http_${res.status}` };
+    const text = replyText(res?.json);
+    if (res.status !== 200) {
+      const why = String(res?.json?.error?.message ?? "").replace(/sk-[A-Za-z0-9_-]+/g, "(key)").slice(0, 160);
+      return { ok: false, ms: Date.now() - t0, error: `http_${res.status}${why ? ": " + why : ""}` };
+    }
+    if (!text || !text.trim()) {
+      const fin = res?.json?.choices?.[0]?.finish_reason ?? "none";
+      return { ok: false, ms: Date.now() - t0, error: `empty_reply (finish_reason ${fin})` };
+    }
     return { ok: true, text, ms: Date.now() - t0, cost: res.json?.usage?.cost ?? null };
   } catch (e) {
     return { ok: false, ms: Date.now() - t0, error: e?.name === "AbortError" ? "timeout" : "network" };
@@ -98,11 +115,14 @@ export async function runMeeting(input, { key, policyPath, runsDir, full = false
     appendFileSync(join(runsDir, `${run_id}.jsonl`), JSON.stringify({ ts: new Date().toISOString(), run_id, ...row }) + "\n", { mode: 0o600 });
   };
   const { chair, directors } = seats(policyPath);
+  const errors = new Map();
+  const lastError = (seat) => errors.get(`director-${seat}`) ?? "unknown";
   const call = async (role, model, system, user, maxTokens) => {
     for (let attempt = 1; attempt <= 2; attempt++) {
       const r = await chat(model, system, user, { key, maxTokens, post });
       record({ event: "call", role, model, attempt, outcome: r.ok ? "success" : r.error, ms: r.ms, cost: r.cost ?? null });
       if (r.ok) return r;
+      errors.set(role, r.error);
     }
     return null;
   };
@@ -118,7 +138,7 @@ export async function runMeeting(input, { key, policyPath, runsDir, full = false
     }
     const sys = REF("board-packet-schema.md") + "\n\n" + REF("privacy-rules.md");
     const user = (input.question ? `Board question: ${redact(input.question)}\n\n` : "") + "Conversation:\n" + redact(raw).slice(0, 40000);
-    const r = await call("chair-packet", chair, sys, user, 2500);
+    const r = await call("chair-packet", chair, sys, user, 6000);
     if (!r) return { status: "failed", reason: "the chair could not prepare the packet", run_id };
     let obj;
     try { obj = extract(r.text); } catch { return { status: "failed", reason: "the chair's packet was not JSON", run_id }; }
@@ -135,12 +155,15 @@ export async function runMeeting(input, { key, policyPath, runsDir, full = false
 
   const prompt = REF("director-prompt.md") + "\n\nBoard packet:\n" + JSON.stringify(packet);
   const results = await Promise.all(directors.map(async (d) => {
-    const r = await call(`director-${d.seat}`, d.model, "You are an independent board director.", prompt, 1800);
-    if (!r) return { seat: d.seat, ok: false };
-    try { return { seat: d.seat, ok: true, memorandum: normalize(extract(r.text), memoShape) }; } catch { return { seat: d.seat, ok: false }; }
+    const r = await call(`director-${d.seat}`, d.model, "You are an independent board director.", prompt, 8000);
+    if (!r) return { seat: d.seat, ok: false, why: lastError(d.seat) };
+    try { return { seat: d.seat, ok: true, memorandum: normalize(extract(r.text), memoShape) }; } catch {
+      record({ event: "call", role: `director-${d.seat}`, model: d.model, attempt: 0, outcome: "not_json" });
+      return { seat: d.seat, ok: false, why: "answer was not JSON" };
+    }
   }));
   const ok = results.filter((x) => x.ok);
-  const participation = results.map((x) => `${x.seat}: ${x.ok ? "answered" : "did not answer"}`);
+  const participation = results.map((x) => `${x.seat}: ${x.ok ? "answered" : "did not answer (" + (x.why ?? "unknown") + ")"}`);
   if (ok.length < 2) return { status: "failed", reason: "fewer than two directors answered", participation, run_id };
 
   const anon = anonymize(ok);
@@ -148,10 +171,10 @@ export async function runMeeting(input, { key, policyPath, runsDir, full = false
   // The chair sees only how many answered: never which maker is behind which memorandum.
   const evalUser = `Board packet:\n${JSON.stringify(packet)}\n\nMemoranda:\n${JSON.stringify(anon.memoranda)}\n\n` +
     `Participation: ${ok.length} of ${results.length} directors answered.`;
-  let report = (await call("chair-report", chair, REF("chair-evaluation-rubric.md"), evalUser, 3000))?.text ?? "";
+  let report = (await call("chair-report", chair, REF("chair-evaluation-rubric.md"), evalUser, 8000))?.text ?? "";
   if (missingHeadings(report).length) {
     report = (await call("chair-report-repair", chair, REF("chair-evaluation-rubric.md"),
-      evalUser + `\n\nYour previous report was missing: ${missingHeadings(report).join(", ")}. Return the full report with every heading.`, 3000))?.text ?? report;
+      evalUser + `\n\nYour previous report was missing: ${missingHeadings(report).join(", ")}. Return the full report with every heading.`, 8000))?.text ?? report;
   }
   if (!report) return { status: "failed", reason: "the chair did not return a report", participation, run_id };
   if (full) report += "\n\n## Memoranda\n" + anon.memoranda.map((m) => `### ${m.label}\n${JSON.stringify(m.memorandum, null, 1)}`).join("\n");

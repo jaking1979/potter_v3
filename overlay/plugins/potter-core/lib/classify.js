@@ -32,7 +32,7 @@ const EXEC_RULES = [
   [/\bsystemctl\s+(stop|disable|mask|restart)\b/, "exec:systemctl", "consequential", "normal"],
   [/\bgit\s+push\b/, "exec:git-push", "consequential", "normal"],
   [/\bcurl\b[^|;&]*(-X\s*(POST|PUT|PATCH|DELETE)\b|--data\b|--data-binary\b|\s-d\s|--form\b|\s-F\s)/i, "exec:http-write", "consequential", "normal"],
-  [/\b(sendmail|mailx?)\b/, "exec:mail", "consequential", "normal"],
+  [/(^|[;&|(]\s*)(sudo\s+)?(sendmail|mailx?|mutt)\s/, "exec:mail", "consequential", "normal"],   // as a command, not a word in text
 ];
 
 // A shell line that only looks: every command in it is a reader, and nothing is written, moved or removed.

@@ -20,8 +20,14 @@ json.dump({
 }, open(sys.argv[1], "w"))
 PY
   if q oc config patch --file "$m"; then
-    oc memory index --force --agent potter >/dev/null 2>&1 || warn "memory index could not be rebuilt now; it rebuilds on the next search"
-    echo "memory search: embeddings on, your files indexed"
+    local out; out="$(oc memory index --force --agent potter 2>&1)" && \
+      out="$(oc memory status --agent potter 2>&1)"
+    if grep -q "Vector search: paused\|Index identity:" <<<"$out" || ! grep -q "Indexed:" <<<"$out"; then
+      # say exactly what stopped it (never the key: only OpenClaw's own message lines)
+      echo "memory search: configured, but the index did not rebuild: $(grep -v -i -E "deprecat|^\[secrets\]" <<<"$out" | grep -i -E "error|fail|index identity|paused|refused|401|402|403|404" | head -2 | sed 's/sk-[A-Za-z0-9_-]*/(key)/g' | tr '\n' ' ')"
+    else
+      echo "memory search: embeddings on, $(grep -o 'Indexed: [^·]*' <<<"$out" | head -1)"
+    fi
   else
     warn "memory search could not be configured"
   fi
