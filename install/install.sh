@@ -59,13 +59,23 @@ if [ "$MODE" = proxmox ]; then
   run pct create "$CTID" "local:vztmpl/$tmpl" --hostname "$CT_NAME" --cores "$CT_CORES" --memory "$CT_MEM" \
       --rootfs "$CT_STORE:$CT_DISK" --net0 "name=eth0,bridge=$CT_BRIDGE,ip=dhcp" --unprivileged 1 \
       --features nesting=1 --onboot 1 --start 1
-  run sleep 8
+  # Wait for the container to get a network address (DHCP can take a while) instead of a fixed pause.
+  ct_ip=""
+  if [ -z "$DRY" ]; then
+    for _ in $(seq 1 60); do
+      ct_ip="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}' || true)"
+      [ -n "$ct_ip" ] && break
+      sleep 2
+    done
+    [ -n "$ct_ip" ] || die "container $CTID has no network address after 2 minutes (check bridge $CT_BRIDGE and DHCP)"
+  else
+    echo "DRY: wait up to 2 minutes for container $CTID to get a network address"
+  fi
   run pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates python3 xz-utils whiptail git"
   say "Copying the installer into the container"
   run tar -C "$REPO" --exclude=.git -czf /tmp/potter-src.tgz .
   run pct push "$CTID" /tmp/potter-src.tgz /root/potter-src.tgz
   run pct exec "$CTID" -- bash -c "mkdir -p /opt/potter/src && tar -xzf /root/potter-src.tgz -C /opt/potter/src"
-  ct_ip="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')"
   say "Opening the setup page. Visit the address it prints in your browser."
   run pct exec "$CTID" -- bash -c "cd /opt/potter/src && POTTER_FORM_URL_HOST='${ct_ip:-<container-ip>}' python3 install/setup_form.py"
   run pct exec "$CTID" -- bash -c "cd /opt/potter/src && ./install/verify_host.sh"
