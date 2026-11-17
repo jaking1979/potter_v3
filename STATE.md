@@ -38,8 +38,11 @@ WIRED (2026-11-17): install/jobs.json + install/add_jobs.py create 19 jobs (KG c
 trading, monthly scoring in standby); potter-kg plugin installed and loaded; model policy, monitor config and a blank
 mandate placed. Sandbox install with the real export: 25 Potter jobs (10 on, 15 standby), health check passes; KG
 curator, QC recorder/recheck run clean; trading gate refuses the blank mandate as designed.
-NEXT: (1) line-by-line review of the builders' code; (2) monitor config from the export (v2's real sources);
-(3) model policy from v2's live settings (asked of v2; not yet answered); (4) dry run on the real Proxmox host.
+MONITORS (fe6227b): install/monitors_from_v2.py builds state/monitors/config.json from the export (7 city, 17 local,
+1 wine, 9 deal feeds on the real export); bootstrap takes a quiet first reading, then the 4 fetch jobs run; digests
+stay standby. Gaps: 3 businesses list no website, 2 deal blogs have no known feed; city pages report changes from run 2.
+NEXT: (1) line-by-line review of the builders' code; (2) model policy from v2's live settings (asked of v2; not yet
+answered); (3) dry run on the real Proxmox host.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 
