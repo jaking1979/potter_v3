@@ -30,28 +30,28 @@ class Apply(unittest.TestCase):
         self.runner = runner
 
     def test_app_env_is_private_replaces_and_restarts_the_app(self):
-        self.assertEqual(sp.apply_secret("TOKEN_A", "v1", {"kind": "app_env", "app": "alpha-bot"}, self.runner, self.state), "")
-        self.assertEqual(sp.apply_secret("TOKEN_A", "v2", {"kind": "app_env", "app": "alpha-bot"}, self.runner, self.state), "")
-        f = self.state / "env/alpha-bot.env"
+        self.assertEqual(sp.apply_secret("TOKEN_A", "v1", {"kind": "app_env", "app": "trader-bot"}, self.runner, self.state), "")
+        self.assertEqual(sp.apply_secret("TOKEN_A", "v2", {"kind": "app_env", "app": "trader-bot"}, self.runner, self.state), "")
+        f = self.state / "env/trader-bot.env"
         self.assertEqual(f.read_text(), "TOKEN_A=v2\n")
         self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(f.parent.stat().st_mode), 0o700)
-        self.assertEqual(self.calls[-1], ("cmd", ["systemctl", "try-restart", "potter-app-alpha-bot.service"]))
-        self.assertTrue(sp.secret_status("TOKEN_A", {"kind": "app_env", "app": "alpha-bot"}, self.state))
-        self.assertFalse(sp.secret_status("OTHER", {"kind": "app_env", "app": "alpha-bot"}, self.state))
+        self.assertEqual(self.calls[-1], ("cmd", ["systemctl", "try-restart", "potter-app-trader-bot.service"]))
+        self.assertTrue(sp.secret_status("TOKEN_A", {"kind": "app_env", "app": "trader-bot"}, self.state))
+        self.assertFalse(sp.secret_status("OTHER", {"kind": "app_env", "app": "trader-bot"}, self.state))
 
     def test_mcp_and_global_targets_patch_openclaw_and_clean_up_the_patch_file(self):
-        sp.apply_secret("RH_KEY", "abc", {"kind": "mcp_env", "server": "robinhood"}, self.runner, self.state)
-        sp.apply_secret("RH_TOKEN", "tok", {"kind": "mcp_header", "server": "robinhood", "header": "Authorization",
+        sp.apply_secret("RH_KEY", "abc", {"kind": "mcp_env", "server": "brokerage"}, self.runner, self.state)
+        sp.apply_secret("RH_TOKEN", "tok", {"kind": "mcp_header", "server": "brokerage", "header": "Authorization",
                                             "prefix": "Bearer "}, self.runner, self.state)
         sp.apply_secret("SOME_KEY", "z", {"kind": "openclaw_env"}, self.runner, self.state)
-        self.assertEqual(self.calls[0][1], {"mcp": {"servers": {"robinhood": {"env": {"RH_KEY": "abc"}}}}})
-        self.assertEqual(self.calls[1][1]["mcp"]["servers"]["robinhood"]["headers"], {"Authorization": "Bearer tok"})
+        self.assertEqual(self.calls[0][1], {"mcp": {"servers": {"brokerage": {"env": {"RH_KEY": "abc"}}}}})
+        self.assertEqual(self.calls[1][1]["mcp"]["servers"]["brokerage"]["headers"], {"Authorization": "Bearer tok"})
         self.assertEqual(self.calls[2][1], {"env": {"SOME_KEY": "z"}})
         self.assertEqual([p for p in self.state.iterdir() if p.name.startswith(".patch")], [])
 
     def test_bad_inputs_are_refused_without_echoing_the_value(self):
-        t = {"kind": "app_env", "app": "alpha-bot"}
+        t = {"kind": "app_env", "app": "trader-bot"}
         S = "SENTINEL9x"
         for name, val, tgt in (("lower", S, t), ("OK_NAME", "", t), ("OK_NAME", S + "\nmore", t), ("OK_NAME", S * 600, t),
                                ("OK_NAME", S, {"kind": "app_env", "app": "../x"}),
@@ -89,7 +89,7 @@ class Server(unittest.TestCase):
         self.addCleanup(self._t.cleanup)
         self.state = Path(self._t.name)
         (self.state / "handover.json").write_text(json.dumps({"secrets_needed": [
-            {"name": "ROBINHOOD_TOKEN", "used_by": "alpha-bot", "how_to_get": "From your Robinhood developer page."}]}))
+            {"name": "BROKER_TOKEN", "used_by": "trader-bot", "how_to_get": "From your Brokerage developer page."}]}))
         self.calls = []
         self.auth = sp.Auth("pw-123456")
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), sp.make_handler(self.auth, self.state, lambda c: self.calls.append(c) or 0))
@@ -110,26 +110,26 @@ class Server(unittest.TestCase):
     def test_page_requires_login_and_wrong_password_is_refused(self):
         s, _, body = self.curl(f"http://127.0.0.1:{self.port}/")
         self.assertIn("Potter password", body)
-        self.assertNotIn("ROBINHOOD_TOKEN", body)
+        self.assertNotIn("BROKER_TOKEN", body)
         s, _, _ = self.curl("-X", "POST", f"http://127.0.0.1:{self.port}/login", "-d", "pw=nope")
         self.assertEqual(s, 403)
-        s, _, _ = self.curl("-X", "POST", f"http://127.0.0.1:{self.port}/save", "-d", "ROBINHOOD_TOKEN=x")
+        s, _, _ = self.curl("-X", "POST", f"http://127.0.0.1:{self.port}/save", "-d", "BROKER_TOKEN=x")
         self.assertEqual(s, 403)
         self.assertFalse((self.state / "env").exists())
 
     def test_signed_in_user_saves_a_secret_that_is_never_shown_back(self):
         cookie = self.login()
         _, _, body = self.curl("-H", f"Cookie: {cookie}", f"http://127.0.0.1:{self.port}/")
-        self.assertIn("ROBINHOOD_TOKEN", body)
+        self.assertIn("BROKER_TOKEN", body)
         self.assertIn("not set", body)
         s, _, body = self.curl("-H", f"Cookie: {cookie}", "-X", "POST", f"http://127.0.0.1:{self.port}/save",
-                               "-d", "ROBINHOOD_TOKEN=supersecretvalue123")
+                               "-d", "BROKER_TOKEN=supersecretvalue123")
         self.assertIn("saved", body)
         self.assertNotIn("supersecretvalue123", body)
         _, _, body = self.curl("-H", f"Cookie: {cookie}", f"http://127.0.0.1:{self.port}/")
         self.assertIn("(set;", body)
         self.assertNotIn("supersecretvalue123", body)
-        self.assertEqual((self.state / "env/alpha-bot.env").read_text(), "ROBINHOOD_TOKEN=supersecretvalue123\n")
+        self.assertEqual((self.state / "env/trader-bot.env").read_text(), "BROKER_TOKEN=supersecretvalue123\n")
 
     def test_unknown_names_are_ignored(self):
         cookie = self.login()

