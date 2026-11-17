@@ -188,6 +188,15 @@ class Installer(unittest.TestCase):
         self.assertIn("--skip-health", boot[boot.index("oc onboard"):boot.index("oc onboard") + 600])
         self.assertIn('echo $! > "$POTTER_HOME/gateway.pid"', boot)
 
+    def test_a_rerun_uses_the_new_openrouter_key(self):
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        paste = boot.index("models auth paste-api-key --provider openrouter --profile-id openrouter:default")
+        self.assertLess(boot.index("oc onboard"), paste)
+        self.assertLess(paste, boot.index('say "Starting the gateway"'))      # sign-in commands need it stopped
+        self.assertIn('printf \'%s\\n\' "$OPENROUTER_KEY" | oc models auth paste-api-key', boot)   # stdin, not argv
+        self.assertIn('[ -n "$RERUN" ] || die "OpenClaw onboarding failed"', boot)
+        self.assertIn("models auth logout", boot)
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 

@@ -75,10 +75,33 @@ else
 fi
 
 say "Onboarding OpenClaw (non-interactive)"
-oc onboard --non-interactive --accept-risk --flow manual --mode local \
+# A rerun finds OpenClaw already set up: onboarding then parks a changed key as an inactive replacement and exits
+# with an error. That is expected; the next step puts the key in place and the key check below proves it.
+RERUN=""; oc config file >/dev/null 2>&1 && [ -s "$(oc config file 2>/dev/null)" ] && RERUN=1
+if ! oc onboard --non-interactive --accept-risk --flow manual --mode local \
    --auth-choice openrouter-api-key --openrouter-api-key "$OPENROUTER_KEY" \
    --gateway-bind loopback --gateway-auth password --gateway-password "$GATEWAY_PASSWORD" --agent-name Potter \
-   --no-install-daemon --skip-health >/dev/null
+   --no-install-daemon --skip-health >/dev/null; then
+  [ -n "$RERUN" ] || die "OpenClaw onboarding failed"
+fi
+# On a rerun, onboarding keeps the earlier key active and parks a new one as an inactive replacement. The key from
+# this run always goes into the default sign-in (through stdin, never the command line), which also clears any
+# cooldown the old key caused; parked replacements from earlier attempts are removed.
+printf '%s\n' "$OPENROUTER_KEY" | oc models auth paste-api-key --provider openrouter --profile-id openrouter:default \
+  --agent potter >/dev/null 2>&1 || die "the OpenRouter key could not be saved"
+python3 - "$(oc models auth list --provider openrouter --agent potter --json 2>/dev/null)" <<'PY' | while read -r stale; do
+import json, sys
+text = sys.argv[1]
+try:
+    d = json.JSONDecoder().raw_decode(text, text.index("{"))[0]
+except ValueError:
+    d = {}
+for p in d.get("profiles") or []:
+    if p.get("id") != "openrouter:default":
+        print(p["id"])
+PY
+  q oc models auth logout "$stale" --agent potter --yes
+done
 
 say "Applying the Potter overlay"
 export OWNER_NAME TIMEZONE OWNER_TELEGRAM_ID SECRETS_DIR
@@ -324,7 +347,6 @@ if [ -z "${POTTER_SKIP_NET_CHECKS:-}" ]; then
   say "Checking that OpenRouter accepts the key for Potter's models"
   # One real call per configured model. A refused key, no credit or a model OpenRouter does not offer stops here
   # with OpenRouter's own reason, before anything is scheduled (the setup page keeps your entries for a retry).
-  oc models auth activate openrouter:default --agent potter >/dev/null 2>&1 || true
   probe="$(oc models status --agent potter --probe --probe-provider openrouter --probe-timeout 45000 --json 2>/dev/null || true)"
   why="$(printf '%s' "$probe" | python3 "$HERE/probe_result.py")"
   [ -z "$why" ] || die "OpenRouter did not accept the request: $why. Check the key, its credit and its limit on openrouter.ai, then press Install again."
