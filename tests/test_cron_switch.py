@@ -38,6 +38,9 @@ class Switch(unittest.TestCase):
         self.assertEqual(f.calls[1], ["openclaw", "--profile", "t", "cron", "enable", "id-1"])
         self.assertEqual(f.calls[2][-2:], ["enable", "id-2"])                 # declaration key works too
         self.assertEqual(self.go(["off", "potter-x"], Fake(JOBS))[1].strip(), "potter-x: off")
+        f = Fake(JOBS)
+        self.assertEqual(self.go(["remove", "potter-fetch-wine"], f), (0, "potter-fetch-wine: removed\n"))
+        self.assertEqual(f.calls[1][-3:], ["cron", "rm", "id-1"])
 
     def test_unknown_ambiguous_and_failed_jobs_are_reported_and_fail(self):
         code, out = self.go(["on", "nope", "dup", "potter-fetch-wine"], Fake(JOBS, fail_ids={"id-1"}))

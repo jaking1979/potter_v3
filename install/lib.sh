@@ -17,6 +17,10 @@ q() { local out; if ! out="$("$@" 2>&1)"; then printf '%s\n' "$out" >&2; return 
 install_plugin() {
   local src="$1" id="$2"; shift 2
   local out; out="$(openclaw "${OC_PROFILE_FLAG[@]}" plugins install "$src" --accept-capabilities "$@" 2>&1)" || true
+  # A second run (a retry after a failed install) finds the plugin already there: reinstall it in place.
+  if printf '%s' "$out" | grep -q "plugin already exists"; then
+    out="$(openclaw "${OC_PROFILE_FLAG[@]}" plugins install "$src" --accept-capabilities --force "$@" 2>&1)" || true
+  fi
   printf '%s' "$out" | grep -q "Installed plugin: $id" || { printf '%s\n' "$out" >&2; die "plugin $id did not install"; }
   q oc plugins enable "$id"
 }

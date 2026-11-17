@@ -145,6 +145,61 @@ class Server(unittest.TestCase):
         self.assertIn("hunter2", j["final"])
         self.assertEqual(self.req("POST", f"/submit?t={self.token}", body)[0], 403)   # second submit refused
 
+    def wait_done(self):
+        for _ in range(100):
+            if self.state.done:
+                return
+            time.sleep(0.05)
+
+    def test_a_mistake_never_means_retyping_keys(self):
+        # First try: every key filled in, one plain field wrong.
+        s, page, _ = self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode({**GOOD, "BRIEF_TIME": "99:99"}))
+        self.assertEqual(s, 400)
+        self.assertNotIn(GOOD["TELEGRAM_TOKEN"], page)                   # keys are never shown back
+        self.assertIn("Saved. Leave blank to keep it.", page)
+        self.assertIn('value="Josh"', page)                               # plain fields come back filled in
+        # Second try: fix the one field, leave every key blank.
+        blank = {**GOOD, "BRIEF_TIME": "08:30", "TELEGRAM_TOKEN": "", "OPENROUTER_KEY": ""}
+        s, _, _ = self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode(blank))
+        self.assertEqual(s, 303)
+        self.wait_done()
+        env = self.out.read_text()
+        self.assertIn(f"POTTER_TELEGRAM_TOKEN={GOOD['TELEGRAM_TOKEN']}", env)
+        self.assertIn(f"POTTER_OPENROUTER_KEY={GOOD['OPENROUTER_KEY']}", env)
+
+    def test_a_rejected_key_is_not_kept(self):
+        self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode({**GOOD, "OPENROUTER_KEY": "nope"}))
+        s, page, _ = self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode({**GOOD, "OPENROUTER_KEY": ""}))
+        self.assertEqual(s, 400)
+        self.assertIn("Model API key (OpenRouter) is required.", page)
+
+    def test_a_failed_install_shows_the_form_again_with_everything_kept_and_can_be_retried(self):
+        script = Path(self._t.name) / "fail_once.sh"
+        flag = Path(self._t.name) / "failed-once"
+        script.write_text("#!/bin/bash\n"
+                          f"env | grep ^POTTER_ | sort > {self.out}\n"
+                          f"if [ ! -f {flag} ]; then touch {flag}; echo 'Telegram rejected that bot token'; exit 1; fi\n"
+                          "echo done\n")
+        script.chmod(0o755)
+        self.state.bootstrap = [str(script)]
+        self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode(GOOD))
+        self.wait_done()
+        self.assertFalse(self.state.ok)
+        s, page, _ = self.req("GET", f"/?t={self.token}")
+        self.assertEqual(s, 200)
+        self.assertIn("The install stopped: Telegram rejected that bot token", page)
+        self.assertIn("Saved. Leave blank to keep it.", page)
+        self.assertNotIn(GOOD["TELEGRAM_TOKEN"], page)
+        retry = {**GOOD, "TELEGRAM_TOKEN": "987654321:BBBBBBBBBBBBBBBBBBBBBBBB", "OPENROUTER_KEY": ""}
+        s, _, _ = self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode(retry))
+        self.assertEqual(s, 303)
+        self.wait_done()
+        self.assertTrue(self.state.ok)
+        env = self.out.read_text()
+        self.assertIn("POTTER_TELEGRAM_TOKEN=987654321:BBBBBBBBBBBBBBBBBBBBBBBB", env)   # the fixed key is used
+        self.assertIn(f"POTTER_OPENROUTER_KEY={GOOD['OPENROUTER_KEY']}", env)            # the others are kept
+        self.assertEqual(self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode(GOOD))[0], 403)
+
     def post_multipart(self, fields, filename=None, filedata=None):
         cmd = ["curl", "-sS", "-i", "-m", "20", "-X", "POST", f"http://127.0.0.1:{self.port}/submit?t={self.token}"]
         for k, v in fields.items():

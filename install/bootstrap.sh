@@ -9,6 +9,9 @@ REPO="$(cd "$HERE/.." && pwd)"
 . "$HERE/lib.sh"
 
 [ "$(id -u)" = 0 ] || die "run as root"
+# Do not trust the PATH this was started with (pct exec and the setup form can hand over a minimal one): the
+# commands installed below live in these folders.
+export PATH="$POTTER_HOME/openclaw/bin:$POTTER_HOME/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 need_cmd curl; need_cmd python3; need_cmd tar
 
 collect_inputs
@@ -38,8 +41,18 @@ export PATH="$POTTER_HOME/node/bin:$PATH"
 
 say "Installing OpenClaw (${POTTER_OPENCLAW_VERSION:-latest})"
 npm install -g --prefix "$POTTER_HOME/openclaw" "openclaw@${POTTER_OPENCLAW_VERSION:-latest}" --allow-scripts=openclaw >/dev/null
+# npm 11.19 runs OpenClaw's own setup script when it is allowed but then skips linking the command (found on a real
+# install). Link it from the package's declared entry point when npm did not.
+OC_PKG="$POTTER_HOME/openclaw/lib/node_modules/openclaw"
+if [ ! -x "$POTTER_HOME/openclaw/bin/openclaw" ]; then
+  oc_entry="$(python3 -c 'import json,sys; b=json.load(open(sys.argv[1]))["bin"]; print(b if isinstance(b,str) else b["openclaw"])' "$OC_PKG/package.json")" \
+    || die "OpenClaw installed without a command entry point"
+  mkdir -p "$POTTER_HOME/openclaw/bin"
+  ln -sf "$OC_PKG/$oc_entry" "$POTTER_HOME/openclaw/bin/openclaw"
+fi
 ln -sf "$POTTER_HOME/openclaw/bin/openclaw" /usr/local/bin/openclaw
-openclaw --version
+hash -r
+openclaw --version || die "OpenClaw was installed but its command does not run"
 
 say "Saving secrets (root-only)"
 umask 077; mkdir -p "$SECRETS_DIR"
@@ -268,6 +281,16 @@ else
   nohup openclaw "${OC_PROFILE_FLAG[@]}" gateway run >"${POTTER_HOME}/gateway.log" 2>&1 &
 fi
 for i in $(seq 1 60); do oc health >/dev/null 2>&1 && break; sleep 2; [ "$i" = 60 ] && die "gateway did not become healthy"; done
+# "Healthy" comes before the Potter agent has finished preparing (a fresh gateway, or a retry over an earlier run).
+# Wait until it accepts a job: add a switched-off probe job, then remove it.
+for i in $(seq 1 60); do
+  if oc cron add --name potter-ready-probe --declaration-key potter-ready-probe --every 1h --agent potter --session isolated \
+       --no-deliver --disabled --timeout-seconds 60 --message probe >/dev/null 2>&1; then
+    python3 "$REPO/overlay/tools/cron_switch.py" remove potter-ready-probe --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" >/dev/null 2>&1 || true
+    break
+  fi
+  sleep 2; [ "$i" = 60 ] && die "the Potter agent did not finish starting (run: openclaw doctor --fix, then press Install again)"
+done
 
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ]; then
   say "Building your personal profile from the v2 export (rules, preferences, lessons; no machinery is copied)"

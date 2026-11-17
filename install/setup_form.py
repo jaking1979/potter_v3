@@ -169,20 +169,23 @@ def check_bundle(data: bytes) -> str:
     return ""
 
 
-def render_form(token: str, errors: dict[str, str], values: dict) -> str:
-    rows = []
+def render_form(token: str, errors: dict[str, str], values: dict, saved: frozenset = frozenset(),
+                banner: str = "", bundle_saved: bool = False) -> str:
+    rows = [f'<div class="err" role="alert">{html.escape(banner)}</div>'] if banner else []
     for key, label, help_, kind, required, default in FIELDS:
         val = "" if kind == "secret" else html.escape(values.get(key, default))
         msg = f'<div class="err">{html.escape(errors[key])}</div>' if key in errors else ""
+        ph = ' placeholder="Saved. Leave blank to keep it."' if kind == "secret" and key in saved and key not in errors else ""
         rows.append(
             f'<label for="{key}">{html.escape(label)}{"" if required else " <span>optional</span>"}</label>'
-            f'<input id="{key}" name="{key}" type="{"password" if kind == "secret" else "text"}" value="{val}" '
+            f'<input id="{key}" name="{key}" type="{"password" if kind == "secret" else "text"}" value="{val}"{ph} '
             f'autocomplete="off" spellcheck="false">'
             f'<div class="help">{html.escape(help_)}</div>{msg}')
     rows.append('<label for="V2_BUNDLE">Potter v2 export file <span>optional</span></label>'
                 '<input id="V2_BUNDLE" name="V2_BUNDLE" type="file" accept=".zip">'
                 '<div class="help">The zip your v2 Potter makes when you paste it the export message. It gives v3 your personal rules, '
-                'preferences and past lessons (v3\'s own machinery is not copied from v2). Leave empty to install without it.</div>' +
+                'preferences and past lessons (v3\'s own machinery is not copied from v2). Leave empty to install without it.' +
+                (' <b>Already uploaded; leave empty to keep it.</b>' if bundle_saved else '') + '</div>' +
                 (f'<div class="err">{html.escape(errors["V2_BUNDLE"])}</div>' if "V2_BUNDLE" in errors else ""))
     return PAGE.format(body=f'<form method="post" enctype="multipart/form-data" action="/submit?t={token}">' + "".join(rows) +
                        '<button type="submit">Install Potter</button></form>',
@@ -221,7 +224,31 @@ class State:
         self.done = self.ok = False
         self.final = ""
         self.secrets: list[str] = []
+        self.kept: dict[str, str] = {}          # what was entered, in memory only, so a mistake never means retyping
+        self.kept_upload: bytes | None = None
         self.lock = threading.Lock()
+
+    def merge(self, form: dict) -> dict:
+        """A blank key field keeps the key entered earlier (the page never shows saved keys back)."""
+        out = dict(form)
+        for k in SECRET_KEYS:
+            if not str(out.get(k, "")).strip() and self.kept.get(k):
+                out[k] = self.kept[k]
+        return out
+
+    def keep(self, form: dict, errors: dict) -> None:
+        for k, *_ in FIELDS:
+            v = str(form.get(k, "")).strip()
+            if k not in errors and v:
+                self.kept[k] = v
+            elif k in errors and k in SECRET_KEYS:
+                self.kept.pop(k, None)           # a rejected key is not kept
+
+    def failure(self) -> str:
+        for line in reversed(self.log):
+            if line.strip():
+                return line.strip()[:300]
+        return "the installer stopped"
 
     def scrub(self, line: str) -> str:
         for s in self.secrets:
@@ -277,12 +304,20 @@ def make_handler(state: State):
                 with state.lock:
                     return self._send(200, json.dumps({"log": "\n".join(state.log[-200:]), "done": state.done,
                                                        "ok": state.ok, "final": state.final}), "application/json")
-            if state.submitted:
+            if state.submitted and not (state.done and not state.ok):
                 return self._send(200, PAGE.format(title="Installing Potter", body=PROGRESS))
-            return self._send(200, render_form(state.token, {}, {}))
+            return self._send(200, self.form_page({}))
+
+        def form_page(self, errors: dict, form: dict | None = None) -> str:
+            failed = state.submitted and state.done and not state.ok
+            banner = (f"The install stopped: {state.failure()} Everything you entered is still here. Fix what the "
+                      "message points to and press Install again.") if failed else ""
+            return render_form(state.token, errors, form if form is not None else state.kept,
+                               frozenset(k for k in SECRET_KEYS if state.kept.get(k)), banner, state.kept_upload is not None)
 
         def do_POST(self):
-            if not self._authorized() or urllib.parse.urlparse(self.path).path != "/submit" or state.submitted:
+            retry = state.submitted and state.done and not state.ok
+            if not self._authorized() or urllib.parse.urlparse(self.path).path != "/submit" or (state.submitted and not retry):
                 return self._send(403, "Forbidden", "text/plain")
             n = int(self.headers.get("Content-Length") or 0)
             ctype = self.headers.get("Content-Type", "")
@@ -294,14 +329,21 @@ def make_handler(state: State):
                 form, upload = parse_multipart(ctype, raw)
             else:
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode(), keep_blank_values=True).items()}
+            form = state.merge(form)
             errors = validate(form)
             if upload:
                 msg = check_bundle(upload)
                 if msg:
                     errors["V2_BUNDLE"] = msg
+                else:
+                    state.kept_upload = upload
+            upload = upload if upload and "V2_BUNDLE" not in errors else state.kept_upload
+            state.keep(form, errors)
             if errors:
-                return self._send(400, render_form(state.token, errors, form))
-            state.submitted = True
+                return self._send(400, self.form_page(errors, form))
+            with state.lock:
+                state.submitted, state.done, state.ok, state.log, state.final = True, False, False, [], ""
+                state.started = time.time()              # a retry gets a fresh half hour
             env = to_env(form)
             if upload:
                 BUNDLE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -326,8 +368,8 @@ def main(argv: list[str]) -> int:
     shown = os.environ.get("POTTER_FORM_URL_HOST") or "<this-container-address>"
     print(f"\nOpen this page in your browser to set up Potter:\n  http://{shown}:{port}/?t={token}\n", flush=True)
     srv.timeout = 1
-    while time.time() - state.started < LIFETIME_S and not state.done:
-        srv.handle_request()
+    while time.time() - state.started < LIFETIME_S and not (state.done and state.ok):
+        srv.handle_request()                     # a failed install keeps the page open for a fix and a retry
     # Linger briefly so the browser can read the final status.
     end = time.time() + 60
     while state.done and time.time() < end:

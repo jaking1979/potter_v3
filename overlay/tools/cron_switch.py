@@ -2,7 +2,7 @@
 """Switch a scheduled job on or off by its NAME. OpenClaw's own enable/disable take the job's id, which nobody
 remembers; this looks the id up from the full job list (disabled jobs included) and then calls the real command.
 
-  cron_switch.py on|off NAME [NAME ...] [--openclaw "openclaw --profile x"]
+  cron_switch.py on|off|remove NAME [NAME ...] [--openclaw "openclaw --profile x"]
 
 Prints one line per job: "<name>: on", "<name>: off", or "<name>: not found" / "<name>: FAILED <reason>".
 Exit 0 only when every named job ended in the requested state.
@@ -27,7 +27,7 @@ def jobs(oc: list[str], run=subprocess.run) -> list[dict]:
 
 def main(argv: list[str], run=subprocess.run, out=sys.stdout) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("state", choices=("on", "off"))
+    ap.add_argument("state", choices=("on", "off", "remove"))
     ap.add_argument("names", nargs="+")
     ap.add_argument("--openclaw", default="openclaw")
     ns = ap.parse_args(argv)
@@ -44,10 +44,11 @@ def main(argv: list[str], run=subprocess.run, out=sys.stdout) -> int:
             print(f"{name}: {'not found' if not hits else 'ambiguous (several jobs have this name)'}", file=out)
             ok = False
             continue
-        r = run(oc + ["cron", "enable" if ns.state == "on" else "disable", str(hits[0]["id"])],
+        verb = {"on": "enable", "off": "disable", "remove": "rm"}[ns.state]
+        r = run(oc + ["cron", verb, str(hits[0]["id"])],
                 capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
-            print(f"{name}: {ns.state}", file=out)
+            print(f"{name}: {'removed' if ns.state == 'remove' else ns.state}", file=out)
         else:
             ok = False
             print(f"{name}: FAILED {(r.stderr or r.stdout).strip().splitlines()[-1:] or ['']}", file=out)
