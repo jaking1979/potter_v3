@@ -66,6 +66,7 @@ for f in IDENTITY.md SOUL.md USER.md; do
   render_overlay "$REPO/overlay/workspace/$f" "$WS/$f"
 done
 rm -f "$WS/BOOTSTRAP.md"
+cp "$REPO/overlay/workspace/avatar.svg" "$WS/avatar.svg"
 mkdir -p "$WS/skills"; cp -r "$REPO/overlay/workspace/skills/." "$WS/skills/"
 
 if [ -n "${OPENAI_VOICE_KEY:-}" ]; then

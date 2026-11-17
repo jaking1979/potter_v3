@@ -46,7 +46,7 @@ class Installer(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
     def test_overlay_locks_the_agent_down(self):
-        text = (ROOT / "overlay/config.base.json5").read_text()
+        text = (ROOT / "overlay/config.base.json5").read_text(encoding="utf-8")
         for needle in ('dmPolicy: "allowlist"', 'groupPolicy: "disabled"', '"gateway"', 'mode: "ask"',
                        "enabled: false", "telemetry"):
             self.assertIn(needle, text)
@@ -57,7 +57,7 @@ class Installer(unittest.TestCase):
         self.assertIn("read-only", text)
 
     def test_delegated_changes_need_approval_in_overlay(self):
-        self.assertIn("autoApproveChanges: false", (ROOT / "overlay/config.base.json5").read_text())
+        self.assertIn("autoApproveChanges: false", (ROOT / "overlay/config.base.json5").read_text(encoding="utf-8"))
 
     def test_agentmail_starts_without_any_sending_tool(self):
         text = (ROOT / "install/bootstrap.sh").read_text()
@@ -80,6 +80,12 @@ class Installer(unittest.TestCase):
 
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
+
+    def test_branding_is_configured_and_avatar_ships(self):
+        text = (ROOT / "overlay/config.base.json5").read_text(encoding="utf-8")
+        for needle in ("seamColor", 'avatar: "avatar.svg"', 'themeMode: "system"'):
+            self.assertIn(needle, text)
+        self.assertTrue((ROOT / "overlay/workspace/avatar.svg").read_text().startswith("<svg"))
 
     def test_no_secret_shapes_in_overlay(self):
         import re

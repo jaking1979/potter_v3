@@ -5,7 +5,10 @@
   telemetry: { enabled: false },
   agents: {
     defaults: { userTimezone: "@@TIMEZONE@@" },
+    entries: { potter: { identity: { name: "Potter", emoji: "🧠", avatar: "avatar.svg" } } },
   },
+  // Potter look: accent color, follows the device's light/dark setting.
+  ui: { seamColor: "#1F5FD1", prefs: { themeMode: "system" } },
   // Outward and control-plane tools are off for the agent; host commands need a human approval.
   // Capabilities are switched on one at a time with `potter switch on <capability>`.
   tools: {

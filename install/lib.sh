@@ -38,13 +38,13 @@ ask() {
 render_overlay() {
   python3 - "$1" "$2" <<'PY'
 import os, re, sys
-src = open(sys.argv[1]).read()
+src = open(sys.argv[1], encoding="utf-8").read()
 def sub(m):
     key = m.group(1)
     if key not in os.environ:
         sys.exit(f"unfilled placeholder @@{key}@@")
     return os.environ[key]
-open(sys.argv[2], "w").write(re.sub(r"@@([A-Z_]+)@@", sub, src))
+open(sys.argv[2], "w", encoding="utf-8").write(re.sub(r"@@([A-Z_]+)@@", sub, src))
 PY
 }
 
