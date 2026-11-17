@@ -42,6 +42,7 @@ FIELDS = [
     ("AGENTMAIL_INBOX", "AgentMail inbox address (optional)", "Potter's own email address, like potter@agentmail.to. With it, incoming mail from your addresses reaches Potter (starts in standby).", "text", False, ""),
     ("OWNER_EMAILS", "Your email addresses (optional)", "Comma-separated. Mail from these addresses can talk to Potter by email.", "text", False, ""),
     ("CO_OWNER_EMAILS", "Co-owner email addresses (optional)", "Comma-separated. People Potter also answers by email (for example a spouse). They cannot change Potter's settings.", "text", False, ""),
+    ("WORK_CALENDAR", "Work calendar address (optional)", "Used only for busy/free times, so the evening check-in lands about 20 minutes after your last session. Leave blank for a 6pm check-in.", "text", False, ""),
     ("EXCLUDED_IDS", "Pages Potter must never touch (optional)", "Comma-separated ids, for example a Notion page id. Any tool call that mentions one is blocked outright.", "text", False, ""),
     ("OLLAMA_URL", "Ollama address on your Mac (optional)", "For the local model tier (Potter Local). The Mac's Tailscale address and port, like http://macbook.your-tailnet.ts.net:11434. Leave blank to add later.", "text", False, ""),
     ("OPENAI_VOICE_KEY", "OpenAI API key for voice (optional)", "Turns on voice talk in the web app. Set a spend limit on this key in OpenAI first. Leave blank to skip voice.", "secret", False, ""),
@@ -93,6 +94,9 @@ def validate(v: dict) -> dict[str, str]:
         err["OWNER_EMAILS"] = "Add at least one of your addresses, or nobody will be allowed to email Potter."
     if inbox and not v.get("AGENTMAIL_API_KEY", "").strip():
         err["AGENTMAIL_API_KEY"] = "An inbox needs the AgentMail API key."
+    wc = v.get("WORK_CALENDAR", "").strip()
+    if wc and not re.fullmatch(email, wc):
+        err["WORK_CALENDAR"] = "A calendar address looks like an email address."
     ex = v.get("EXCLUDED_IDS", "").strip()
     if ex and not all(re.fullmatch(r"[A-Za-z0-9-]{16,64}", x.strip()) for x in ex.split(",")):
         err["EXCLUDED_IDS"] = "Each id should be 16 or more letters and digits (dashes are fine)."

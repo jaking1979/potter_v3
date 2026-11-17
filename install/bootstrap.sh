@@ -264,6 +264,12 @@ if [ -n "${AGENTMAIL_INBOX:-}" ]; then
      --command "python3 $POTTER_HOME/tools/urgent_deliver.py --to $OWNER_TELEGRAM_ID --tz $TIMEZONE --queue $WS/state/urgent-mail-queue.jsonl --openclaw 'openclaw ${OC_PROFILE_FLAG[*]:-}'"
 fi
 
+say "Scheduling the evening check-in (one recurring job)"
+mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
+q oc cron add --name potter-evening-nudge --declaration-key potter-evening-nudge --cron "*/10 15-21 * * 1-5" \
+   --tz "$TIMEZONE" --exact --no-deliver --timeout-seconds 120 \
+   --command "python3 $POTTER_HOME/tools/evening_nudge.py --to $OWNER_TELEGRAM_ID --tz $TIMEZONE --state $WS/state/evening-nudge.json --calendar '${WORK_CALENDAR:-}' --openclaw 'openclaw ${OC_PROFILE_FLAG[*]:-}'"
+
 say "Adding the schedule watchdog (tells you when any job fails or does not run)"
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
 oc cron add --name potter-schedule-watch --declaration-key potter-schedule-watch --every 15m --no-deliver \

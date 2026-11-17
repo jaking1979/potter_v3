@@ -19,7 +19,11 @@ real export: health check passes. Step 2 DONE (email): AgentMail channel for own
 mail-intake skill + job (every 10m, isolated, no delivery, standby); overlay/tools/urgent_deliver.py (model-free,
 quiet hours, marks delivered only after a successful send; 8 tests); rules/global/email-pipeline.md. Sandbox: jobs
 created as designed, failed send leaves item queued and exits 1. Not proven: real mail, real Telegram send.
-Next: step 3 (Morning Brief with v2's real inputs + ONE recurring evening check-in + compiling doc capture).
+Step 3 DONE: morning-brief skill with v2's real inputs (family calendar, task reconciliation, weather, compiling doc,
+archive+reset that KEEPS state signals; unknown state is never Quiet); evening-checkin skill (shutdown ritual + silent
+capture); overlay/tools/evening_nudge.py = ONE recurring command job (*/10 15-21 weekdays), last work session + 20 min
+via Composio CLI if present, else 18:00; 7 tests; sandbox install passes. Not proven: a real brief or check-in with a model.
+Steps 5-9 being built in parallel by subagents (new files only); main session integrates and wires.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

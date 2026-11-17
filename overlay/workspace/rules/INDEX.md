@@ -20,6 +20,7 @@ index points to and delete the other.
 | Past mistakes and their prevention rules | `learnings/ERRORS.md`, `learnings/CORRECTIONS.md` |
 | Open decisions waiting on the owner | `learnings/OPEN_QUESTIONS.md` |
 | Daily working memory for the Morning Brief | `state/compiling-doc.md` |
+| Evening check-in nudge record (sent today?) | `state/evening-nudge.json` |
 | Urgent mail waiting for delivery (written by mail-intake, sent by a program) | `state/urgent-mail-queue.jsonl` |
 | Standby / handover of jobs from an older assistant | `/etc/potter/handover.json` (see the `handover` skill) |
 
