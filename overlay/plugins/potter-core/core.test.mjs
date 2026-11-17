@@ -112,6 +112,8 @@ test("the table finds the domains and the plan points at rules, skills and apps"
   assert.match(t, /homeassistant/);
   assert.match(planText(["email"]), /rules\/global\/email-pipeline\.md/);
   assert.equal(planText([]), "");
+  assert.deepEqual(tableDomains("What should I order for dinner?"), ["food"]);
+  assert.match(planText(["food"]), /preferences\/food-wine\.md/);
 });
 
 test("Jev decides only when the table finds nothing, and a slow or broken Jev never blocks", async () => {
@@ -127,6 +129,8 @@ test("Jev decides only when the table finds nothing, and a slow or broken Jev ne
   const p4 = await plan("what should I do about the Hendricks situation", { decide: async () => { throw new Error("x"); } });
   assert.deepEqual(p4.domains, []);
   assert.deepEqual(jevDomains({ house: { choice: "true", probabilities: { true: 0.8 } } }), ["house"]);
+  assert.deepEqual(jevDomains({ money: { noul: 0.83 }, email: { noul: 0.2 } }), ["money"]);            // v2's endpoint
+  assert.deepEqual(jevDomains({ local: { probabilityTrue: 0.91 }, brief: { probabilityTrue: 0.5 } }), ["local"]);
 });
 
 test("the owner's words are found inside a prompt with channel context", () => {

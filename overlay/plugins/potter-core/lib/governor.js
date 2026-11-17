@@ -22,6 +22,9 @@ export const DOMAINS = [
     servers: [], skills: [], rules: ["global/verification.md"] },
   { id: "local", re: /\b(this weekend|concerts?|shows?|what'?s on|things to do|events (near|around|in)|margaretville|catskills)\b/i,
     servers: [], skills: ["events-digest", "local-monitor"], rules: [] },
+  { id: "food", re: /\b(dinner|lunch|breakfast|eat|eating|restaurants?|takeout|take-out|delivery|order (food|in|out)|cook(ing)?|recipes?|meal ?plan|meals?|groceries|grocery|wine)\b/i,
+    servers: ["composio", "notion"], skills: ["meal-plan"], rules: [],
+    hint: "Read preferences/food-wine.md (the owner's food and wine preferences) before suggesting anything." },
   { id: "brief", re: /\b(brief|my day|today|tonight|tomorrow|this week|plan for)\b/i,
     servers: ["composio"], skills: ["morning-brief", "evening-checkin"], rules: ["global/retrieval.md"] },
 ];
@@ -55,9 +58,12 @@ export function jevDomains(answers = {}, min = 0.7) {
   return DOMAINS.map((d) => d.id).filter((id) => {
     const a = answers[id];
     if (!a || typeof a !== "object") return false;
+    // Jev answers yes/no as a probability: { noul } (v2's endpoint) or { probabilityTrue } (OpenClaw's service).
+    const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    const p = num(a.noul) ?? num(a.probabilityTrue) ?? num(a.probabilities?.true);
+    if (p !== null) return p >= min;
     const yes = a.value === true || a.choice === "true" || a.answer === true;
-    const conf = typeof a.confidence === "number" ? a.confidence : (a.probabilities?.true ?? 0);
-    return yes && conf >= min;
+    return yes && (num(a.confidence) ?? 0) >= min;
   });
 }
 

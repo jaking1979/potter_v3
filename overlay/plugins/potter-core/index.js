@@ -34,21 +34,27 @@ function decisionModel(policyPath) {
   }
 }
 
+// Jev with the owner's key, directly (the request format v2 used). OpenClaw's own decision service is used only when
+// there is no key, and any failure there is a "no answer", never an exception into the turn.
 function jevDecider(api, cfg) {
-  const evaluate = api.runtime?.decisions?.evaluate;
-  if (typeof evaluate === "function") {
-    return async ({ purpose, state, questions }) => {
-      const o = await evaluate.call(api.runtime.decisions, { state, questions }, { purpose, rubricVersion: "1", timeoutMs: 2500 });
-      return o?.status === "ok" ? { ok: true, answers: o.result?.answers ?? {} } : { ok: false, reason: o?.reason ?? o?.status };
+  const key = envFile(cfg.jevEnvFile || "/etc/potter/secrets/jev.env").OPENROUTER_API_KEY;
+  if (key) {
+    const client = createDecisionClient({ apiKey: key, fetchImpl: globalThis.fetch });
+    const model = decisionModel(cfg.policyPath || "");
+    return async ({ state, questions }) => {
+      const o = await client.ask({ model, state, questions, timeoutMs: 2500 });
+      return o.ok ? { ok: true, answers: o.answers } : { ok: false, reason: o.kind + (o.status ? `:${o.status}` : "") };
     };
   }
-  const key = envFile(cfg.jevEnvFile || "/etc/potter/secrets/jev.env").OPENROUTER_API_KEY;
-  if (!key) return undefined;
-  const client = createDecisionClient({ apiKey: key, fetchImpl: globalThis.fetch });
-  const model = decisionModel(cfg.policyPath || "");
-  return async ({ state, questions }) => {
-    const o = await client.ask({ model, state, questions, timeoutMs: 2500 });
-    return o.ok ? { ok: true, answers: o.answers } : { ok: false, reason: o.kind };
+  const evaluate = api.runtime?.decisions?.evaluate;
+  if (typeof evaluate !== "function") return undefined;
+  return async ({ purpose, state, questions }) => {
+    try {
+      const o = await evaluate.call(api.runtime.decisions, { state, questions }, { purpose, rubricVersion: "1", timeoutMs: 2500 });
+      return o?.status === "ok" ? { ok: true, answers: o.result?.answers ?? {} } : { ok: false, reason: o?.reason ?? o?.status };
+    } catch (e) {
+      return { ok: false, reason: e?.name ?? "host-decision-error" };
+    }
   };
 }
 
