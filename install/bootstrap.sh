@@ -102,6 +102,16 @@ PY
   fi
 fi
 
+if [ -n "${OLLAMA_URL:-}" ]; then
+  say "Pointing the local model tier at Ollama on your Mac"
+  op="$(mktemp --suffix=.json5)"
+  OLLAMA_URL="$OLLAMA_URL" python3 -c 'import json,os,sys
+json.dump({"models":{"providers":{"ollama":{"baseUrl":os.environ["OLLAMA_URL"].rstrip("/"),"api":"ollama","models":[]}}}}, open(sys.argv[1],"w"))' "$op"
+  q oc config patch --file "$op"; rm -f "$op"
+  # Reachability is reported, not required: the Mac may be asleep during install.
+  curl -fsS -m 8 "${OLLAMA_URL%/}/api/tags" >/dev/null 2>&1 || warn "Ollama did not answer at that address right now; the local tier will work once the Mac is reachable."
+fi
+
 if [ -n "${OPENAI_VOICE_KEY:-}" ]; then
   say "Turning on voice talk"
   vp="$(mktemp --suffix=.json5)"

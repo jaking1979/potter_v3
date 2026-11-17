@@ -42,6 +42,7 @@ FIELDS = [
     ("AGENTMAIL_INBOX", "AgentMail inbox address (optional)", "Potter's own email address, like potter@agentmail.to. With it, incoming mail from your addresses reaches Potter (starts in standby).", "text", False, ""),
     ("OWNER_EMAILS", "Your email addresses (optional)", "Comma-separated. Only mail from these addresses can talk to Potter by email.", "text", False, ""),
     ("EXCLUDED_IDS", "Pages Potter must never touch (optional)", "Comma-separated ids, for example a Notion page id. Any tool call that mentions one is blocked outright.", "text", False, ""),
+    ("OLLAMA_URL", "Ollama address on your Mac (optional)", "For the local model tier (Potter Local). The Mac's Tailscale address and port, like http://macbook.your-tailnet.ts.net:11434. Leave blank to add later.", "text", False, ""),
     ("OPENAI_VOICE_KEY", "OpenAI API key for voice (optional)", "Turns on voice talk in the web app. Set a spend limit on this key in OpenAI first. Leave blank to skip voice.", "secret", False, ""),
     ("HA_URL", "Home Assistant address (optional)", "For example http://homeassistant.local:8123. Read-only home status.", "text", False, ""),
     ("HA_TOKEN", "Home Assistant token (optional)", "A long-lived token for a dedicated Potter user you create in Home Assistant.", "secret", False, ""),
@@ -91,6 +92,9 @@ def validate(v: dict) -> dict[str, str]:
     ex = v.get("EXCLUDED_IDS", "").strip()
     if ex and not all(re.fullmatch(r"[A-Za-z0-9-]{16,64}", x.strip()) for x in ex.split(",")):
         err["EXCLUDED_IDS"] = "Each id should be 16 or more letters and digits (dashes are fine)."
+    ol = v.get("OLLAMA_URL", "").strip()
+    if ol and (not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d{2,5})?/?", ol) or ol.rstrip("/").endswith("/v1")):
+        err["OLLAMA_URL"] = "Use the plain address and port, like http://macbook.your-tailnet.ts.net:11434 (no /v1)."
     ov = v.get("OPENAI_VOICE_KEY", "").strip()
     if ov and not re.fullmatch(r"sk-[A-Za-z0-9_-]{20,}", ov):
         err["OPENAI_VOICE_KEY"] = "OpenAI keys start with sk-."

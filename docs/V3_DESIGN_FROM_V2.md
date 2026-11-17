@@ -33,7 +33,7 @@ designed out. Source: `jaking1979/potter-v2-export` (schema 2), read-only.
 | Finance: Alpha Bot daily run, Robinhood MCP, financial monitor + Tuesday digest, LLM monthly scoring | agent-turn crons + scripts | - | same jobs, standby until handover; mandate file is the authority |
 | Monitors and digests (Brooklyn events, Margaretville, weekend plans, wine price, Eames reply, CMC:Coach weekly) | crons + scripts | timeouts; some dead | one "monitor" pattern: command job fetches, skill judges, silent unless actionable |
 | Quality control (recorder, verifier, hourly recheck) | python + crons | - | kept; extended to check every schedule's last run |
-| Local/offline tier (`potter-local`, Ollama) | second agent on a local model | - | kept if the new container gets Ollama (needs RAM; decide at install) |
+| Local tier (`potter-local`) and desktop workspace | Ollama + agent on the MacBook M1 | - | **Josh, 2026-11-17: Potter Local lives on the MacBook M1, always.** v3 reaches the Mac's Ollama over Tailscale (native URL, not /v1); the Mac is also Potter's desktop workspace, paired as an OpenClaw node (companion app). The OptiPlex container runs no local model. If the Mac is asleep, local-tier work falls back to the cloud model and says so. |
 | Docs-consult gate, OpenClaw docs index | generated index + rule | skipped twice | regenerate the index for 2026.11 at install; gate as a hook |
 | Guest Potter, NotebookLM, board meeting, meal plan skills | skills/state | partly planned only | carried as skills; not wired to schedules until asked |
 
