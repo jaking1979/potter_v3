@@ -20,6 +20,8 @@ check "bot token file is root-only (600)"          bash -c "[ \"\$(stat -c %a '$
 check "secrets dir is root-only (700)"             bash -c "[ \"\$(stat -c %a '$SECRETS_DIR')\" = 700 ]"
 check "no model or bot key inside openclaw.json"   bash -c "! grep -q -E 'sk-or-|[0-9]{6,}:[A-Za-z0-9_-]{20,}' \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config file)\""
 check "openclaw.json is root-only (600)"           bash -c "[ \"\$(stat -c %a \"\$(openclaw ${OC_PROFILE_FLAG[*]:-} config file)\")\" = 600 ]"
+check "main model set by the policy (not openrouter/auto)" bash -c "m=\$(openclaw ${OC_PROFILE_FLAG[*]:-} config get agents.defaults.model.primary | tr -d '\"'); [ -n \"\$m\" ] && [ \"\${m##*/}\" != auto ]"
+check "page-checking jobs: one state folder each"  bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list --all --json 2>/dev/null | python3 -c 'import json,re,sys; d=json.load(sys.stdin); j=d.get(\"jobs\",d); s=[re.search(r\"--state-dir (\\S+)\",json.dumps(x)) for x in j if \"potter-fetch-\" in x.get(\"name\",\"\")]; s=[m.group(1) for m in s if m]; sys.exit(0 if len(s)==len(set(s)) else 1)'"
 check "Morning Brief job scheduled"                bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} cron list --all --json 2>/dev/null | grep -q potter-morning-brief"
 check "guardrails plugin loaded"                   bash -c "openclaw ${OC_PROFILE_FLAG[*]:-} plugins inspect potter-guardrails --runtime 2>/dev/null | grep -q before_tool_call"
 check "Merrick wired (if Home Assistant was set up)"  bash -c "[ ! -f \"$SECRETS_DIR/ha.env\" ] || { [ \"\$(stat -c %a \"$SECRETS_DIR/ha.env\")\" = 600 ] && command -v merrick >/dev/null && openclaw ${OC_PROFILE_FLAG[*]:-} cron list --all --json 2>/dev/null | grep -q potter-merrick-cold-watch; }"
