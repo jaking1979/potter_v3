@@ -80,6 +80,10 @@ fi
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
 echo "merrick: Jev decider wired"
 
+# 2b. memory search, with the key already saved for Jev (no key is re-entered)
+. "$HERE/memory_search.sh"
+potter_memory_search "$(sed -n 's/^OPENROUTER_API_KEY=//p' "$SECRETS_DIR/jev.env" 2>/dev/null)"
+
 # 3. shipped skills and global rules (personal rules and the index's personal rows are not touched)
 for s in "$REPO/overlay/workspace/skills/"*/; do n="$(basename "$s")"; mkdir -p "$WS/skills/$n"; cp -r "$s". "$WS/skills/$n/"; done
 cp "$REPO/overlay/workspace/rules/global/"*.md "$WS/rules/global/"

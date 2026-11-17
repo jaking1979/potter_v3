@@ -252,6 +252,14 @@ class Installer(unittest.TestCase):
         self.assertNotIn("PERSONAL-INDEX", u)                                            # never rewrites the index
         self.assertTrue((ROOT / "overlay/workspace/skills/update-potter/SKILL.md").exists())
 
+    def test_memory_search_uses_a_key_file_and_indexes_the_owners_files(self):
+        m = (ROOT / "install/memory_search.sh").read_text()
+        self.assertIn('"source": "file", "provider": "potterkeys", "id": "value"', m)        # never the key itself
+        for p in ("preferences", "rules", "learnings", "reference"):
+            self.assertIn(f'"{p}"', m)
+        self.assertIn('potter_memory_search "$OPENROUTER_KEY"', (ROOT / "install/bootstrap.sh").read_text())
+        self.assertIn("jev.env", (ROOT / "install/update.sh").read_text())
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 

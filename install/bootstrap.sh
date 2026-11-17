@@ -393,6 +393,9 @@ json.dump({"plugins":{"entries":{"potter-guardrails":{"config":{"excludedIds":id
 fi
 
 
+say "Turning on memory search (embeddings through OpenRouter; your preferences and rules indexed)"
+. "$HERE/memory_search.sh"; potter_memory_search "$OPENROUTER_KEY"
+
 say "Scheduling the Morning Brief"
 HH="${BRIEF_TIME%:*}"; MM="${BRIEF_TIME#*:}"
 oc cron add --name potter-morning-brief --declaration-key potter-morning-brief \
