@@ -106,6 +106,15 @@ class Installer(unittest.TestCase):
         self.assertIn("install_plugin \"$gdir\" potter-guardrails --force", boot)
         self.assertNotIn("plugins install", boot)
 
+    def test_proxmox_step_protects_the_host(self):
+        text = (ROOT / "install/install.sh").read_text()
+        for needle in ("qm status", "free_id=211", "pvesm status", "MemAvailable", "pveam list local",
+                       "debian-13-standard"):
+            self.assertIn(needle, text)
+        self.assertNotIn("/etc/pve/lxc", text)                 # no edits to host container config
+        self.assertNotIn("pct reboot", text)
+        self.assertIn("--tun=userspace-networking", (ROOT / "install/bootstrap.sh").read_text())
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 

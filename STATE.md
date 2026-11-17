@@ -5,6 +5,10 @@ bootstrap + verify. Merrick diagnosis and design in the design doc. Step 1a done
 docs-consult gate, config write guard; 6 node tests; loads in OpenClaw 2026.11 with before_tool_call registered),
 installed by bootstrap, checked by verify_host (19 checks pass in sandbox). Plugin installs are now verified, not assumed.
 Not proven: a live model turn being blocked (sandbox has no model key).
+Host pre-flight (Josh's host session, read-only, 2026-11-17): PVE 9.2.3; vmbr0; local-lvm 18.9 GB free; ~10 GB RAM
+available; IDs 100 (HAOS VM), 200, 210 (v2) in use; Debian 13 template present; v2 runs Tailscale in userspace mode.
+Installer defaults now: first free ID from 211, hostname potter-v3, 12 GB disk, 4 GB RAM, local Debian 13 template,
+space and memory checks, no edits to host container config, Tailscale userspace. No local Ollama on this host (RAM/disk).
 Next: step 1b - rewrite Potter's rules tree (deduplicated) from v2's rules/ and AGENTS.md.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)

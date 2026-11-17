@@ -112,7 +112,13 @@ fi
 if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
   say "Joining your tailnet and enabling Potter's funnel"
   command -v tailscale >/dev/null 2>&1 || { curl -fsSL https://tailscale.com/install.sh | sh >/dev/null; }
-  tailscaled --state=/var/lib/tailscale/tailscaled.state >/dev/null 2>&1 &
+  # Userspace networking: works in an unprivileged container with no changes to the Proxmox host (as v2 does).
+  mkdir -p /etc/default; printf 'PORT="41641"\nFLAGS="--tun=userspace-networking"\n' > /etc/default/tailscaled
+  if command -v systemctl >/dev/null 2>&1 && [ -z "${POTTER_NO_DAEMON:-}" ]; then
+    systemctl enable tailscaled >/dev/null 2>&1; systemctl restart tailscaled
+  else
+    tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state >/dev/null 2>&1 &
+  fi
   sleep 3
   tailscale up --authkey "$TAILSCALE_AUTHKEY" --hostname "${POTTER_TS_HOSTNAME:-potter-v3}" --accept-dns=false >/dev/null
   oc config set gateway.tailscale.mode funnel >/dev/null

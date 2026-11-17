@@ -29,26 +29,37 @@ BANNER
 
 if [ "$MODE" = proxmox ]; then
   need_cmd pct; need_cmd pveam
-  ask CTID      "Container ID (unused number, e.g. 210)"        "210"
-  ask CT_NAME   "Container hostname"                             "potter"
+  # First unused ID from 211 up (IDs can belong to containers OR virtual machines).
+  free_id=211; while pct status "$free_id" >/dev/null 2>&1 || qm status "$free_id" >/dev/null 2>&1; do free_id=$((free_id+1)); done
+  ask CTID      "Container ID (an unused number)"               "$free_id"
+  ask CT_NAME   "Container hostname"                             "potter-v3"
   ask CT_STORE  "Storage for the container disk"                 "local-lvm"
   ask CT_BRIDGE "Network bridge"                                 "vmbr0"
-  ask CT_DISK   "Disk size in GB"                                "32"
+  ask CT_DISK   "Disk size in GB (OpenClaw + Potter need about 8)" "12"
   ask CT_MEM    "Memory in MB"                                   "4096"
   ask CT_CORES  "CPU cores"                                      "2"
   [[ "$CTID" =~ ^[0-9]+$ ]] || die "container ID must be a number"
-  pct status "$CTID" >/dev/null 2>&1 && die "container $CTID already exists; choose another ID"
+  { pct status "$CTID" >/dev/null 2>&1 || qm status "$CTID" >/dev/null 2>&1; } && die "ID $CTID is already in use; choose another"
+  [[ "$CT_DISK" =~ ^[0-9]+$ && "$CT_MEM" =~ ^[0-9]+$ && "$CT_CORES" =~ ^[0-9]+$ ]] || die "disk, memory and cores must be numbers"
+  # Refuse to over-fill the host: check free space on the chosen storage and free memory.
+  free_gb="$(pvesm status 2>/dev/null | awk -v s="$CT_STORE" '$1==s {printf "%d", $6/1024/1024}')"
+  [ -n "$free_gb" ] || die "storage $CT_STORE not found (see: pvesm status)"
+  [ "$free_gb" -ge $((CT_DISK + 2)) ] || die "storage $CT_STORE has ${free_gb} GB free; a ${CT_DISK} GB disk needs $((CT_DISK + 2)). Pick a smaller disk or another storage."
+  avail_mb="$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)"
+  [ "$avail_mb" -ge "$CT_MEM" ] || die "only ${avail_mb} MB of memory is available on this host; ${CT_MEM} MB was requested."
   say "Finding a Debian template"
-  tmpl="$(pveam available --section system 2>/dev/null | awk '/debian-12-standard/ {print $2}' | sort | tail -1)"
-  [ -n "$tmpl" ] || die "no Debian 12 template listed by pveam"
-  run pveam download local "$tmpl" || true
+  # Prefer one already downloaded (Debian 13, then 12); otherwise download the newest Debian 13.
+  tmpl="$(pveam list local 2>/dev/null | awk '{print $1}' | sed 's#.*vztmpl/##' | grep -E '^debian-1[32]-standard' | sort -V | tail -1)"
+  if [ -z "$tmpl" ]; then
+    tmpl="$(pveam available --section system 2>/dev/null | awk '{print $2}' | grep -E '^debian-13-standard.*amd64' | sort -V | tail -1)"
+    [ -n "$tmpl" ] || die "no Debian template found (pveam update, then retry)"
+    run pveam download local "$tmpl"
+  fi
   say "Creating container $CTID"
   run pct create "$CTID" "local:vztmpl/$tmpl" --hostname "$CT_NAME" --cores "$CT_CORES" --memory "$CT_MEM" \
       --rootfs "$CT_STORE:$CT_DISK" --net0 "name=eth0,bridge=$CT_BRIDGE,ip=dhcp" --unprivileged 1 \
       --features nesting=1 --onboot 1 --start 1
-  run bash -c "printf 'lxc.cgroup2.devices.allow: c 10:200 rwm\nlxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file\n' >> /etc/pve/lxc/$CTID.conf"
-  run pct reboot "$CTID"
-  run sleep 10
+  run sleep 8
   run pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates python3 xz-utils whiptail git"
   say "Copying the installer into the container"
   run tar -C "$REPO" --exclude=.git -czf /tmp/potter-src.tgz .
