@@ -33,7 +33,11 @@ export function decide(cls, trust, cfg = {}) {
   let out;
   if (risk === "forbidden") out = { action: "block", reason: "forbidden: locks, alarms and water valves are never operated by a tool call" };
   else if (risk === "read") out = { action: "allow", reason: "read", receipt: false };
-  else if (risk === "reversible") out = { action: "allow", reason: trust === "owner" || trust === "schedule" ? "reversible" : "reversible, untrusted origin" };
+  // Receipts are for actions on the outside world (Decision Log 17); Potter's own reversible housekeeping is not
+  // receipted when the owner or a scheduled job started it, only when its origin is not proven.
+  else if (risk === "reversible") out = trust === "owner" || trust === "schedule"
+    ? { action: "allow", reason: "reversible", receipt: false }
+    : { action: "allow", reason: "reversible, untrusted origin" };
   else if (trust === "owner") out = severity === "high" ? { action: "approve", reason: "high-stakes action: the owner taps Approve" } : { action: "allow", reason: "the owner asked directly" };
   else if (trust === "schedule" && severity !== "high" && grantCovers(cfg.standingGrants, capability)) out = { action: "allow", reason: "standing grant" };
   else out = { action: "approve", reason: trust === "schedule" ? "scheduled job without a standing grant" : "not started by the owner" };

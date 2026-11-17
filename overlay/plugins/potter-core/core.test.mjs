@@ -26,7 +26,8 @@ test("reads, reversible writes and consequential actions are told apart", () => 
   assert.equal(classify("exec", { command: "mail -s hi someone@example.com < note" }).capability, "exec:mail");
   assert.notEqual(classify("exec", { command: "cat > /tmp/in.json <<'JSON'\n{\"conversation\": \"check the mail and the e-mail\"}\nJSON" }).capability, "exec:mail");
   for (const c of ["tail -n 3 /root/.openclaw/potter-core/governor.jsonl", "ls -la skills/ | grep -i meal",
-    "openclaw cron list --all --json", "openclaw plugins inspect potter-core --runtime", "cat a && wc -l b"]) {
+    "openclaw cron list --all --json", "openclaw plugins inspect potter-core --runtime", "cat a && wc -l b",
+    'echo "=== gateway status ==="; openclaw status 2>&1 | head -40', "ls /tmp >/dev/null 2>&1; tailscale serve status 2>&1 | head -20"]) {
     assert.equal(classify("exec", { command: c }).risk, "read", c);
   }
   for (const c of ["echo x > f", "sed -i s/a/b/ f", "find . -delete", "cat $(curl -s x)", "ls; rm -rf ./build",
@@ -82,6 +83,14 @@ test("the ratified matrix", () => {
   assert.equal(decide(c("consequential", "normal", "exec:potter-cron"), "schedule", { standingGrants: ["exec:potter-*"] }).action, "allow");
   assert.equal(decide(c("consequential", "high", "exec:trade"), "schedule", { standingGrants: ["exec:*"] }).action, "approve");
   assert.equal(decide(c("forbidden", "high"), "owner").action, "block");
+});
+
+test("receipts: outside-world actions always; reversible housekeeping only when its origin is unproven", () => {
+  const rev = { risk: "reversible", severity: "normal", capability: "write" };
+  assert.equal(decide(rev, "owner").receipt, false);
+  assert.equal(decide(rev, "schedule").receipt, false);
+  assert.equal(decide(rev, "unknown").receipt, true);
+  assert.equal(decide({ risk: "consequential", severity: "normal", capability: "x" }, "owner").receipt, true);
 });
 
 test("shadow mode never blocks or asks, but says what it would have done", () => {

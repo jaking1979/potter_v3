@@ -39,11 +39,14 @@ const EXEC_RULES = [
 const READERS = new Set("cat head tail ls ll grep egrep rg find wc stat du df ps pgrep which whereis echo printf pwd date jq sort uniq cut tr awk sed file id uname hostname uptime free env printenv basename dirname realpath readlink diff cmp test true".split(" "));
 const WRITES = /(^|[^<>&|])>{1,2}|\btee\b|\bsed\s+(-[a-z]*i|--in-place)|\bfind\b[^|;&]*\s-(delete|exec)\b|\bawk\b[^|;&]*system\(/;
 export function readOnlyShell(cmd) {
-  const c = String(cmd ?? "").trim();
+  // Redirects that only merge or discard output (2>&1, >/dev/null, 2>/dev/null, &>/dev/null) write nothing.
+  const c = String(cmd ?? "").trim().replace(/\s*(\d|&)?>>?\s*(&\d|\/dev\/null)/g, " ");
   if (!c || WRITES.test(c) || /[`]|\$\(/.test(c)) return false;
   const parts = c.split(/\s*(?:\|\||&&|\||;)\s*/).filter(Boolean);
   return parts.every((p) => {
     const w = p.replace(/^(sudo|env|time|nice)\s+/, "").split(/\s+/);
+    if (w[0] === "tailscale") return /^(status|serve status|funnel status|ip|version)\b/.test(w.slice(1).join(" "));
+    if (w[0] === "systemctl" || w[0] === "journalctl") return w[0] === "journalctl" || /^(status|is-active|is-enabled|list-units|show)\b/.test(w[1] ?? "");
     if (w[0] === "openclaw") return /\b(list|get|status|show|inspect|runs|health|--version|--help)\b/.test(p) && !/\b(set|patch|unset|add|rm|edit|enable|disable|run|install|restart|stop|start|approve|delete)\b/.test(p.replace(/\bruns\b/, ""));
     return READERS.has(w[0]);
   });
