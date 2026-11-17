@@ -12,8 +12,9 @@ The owner does not use a terminal. You make the change; they approve it.
 2. Never ask for a secret in chat and never repeat one. If a key or token is needed, send the owner to the
    Potter settings page (secrets form), and wait. If a service uses OAuth, start the login
    flow and send the owner the sign-in link.
-3. Make the change yourself (you have the full toolset): add the MCP server or skill, then tell the owner in one
-   line what you added.
+3. Make the change yourself (you have the full toolset): add the MCP server, skill or plugin, then tell the owner in
+   one line what you added. A new plugin must also be added to `plugins.allow` (the plugin trust list), or it will not
+   load; check with `openclaw plugins list` and `openclaw security audit`.
 4. Probe it, run one harmless read to prove it works, and report PASS or the exact error.
 5. External actions still follow the v2 rule: show the draft or action and get a yes before it goes out.
 6. Do not touch other people's accounts, the clinical/EHR space, or the CMC mailbox.

@@ -14,7 +14,10 @@ State lives in `/etc/potter/handover.json` (crons and apps, each with `enabled`)
 
 **"Take over X":**
 1. Ask once: "Has v2 stopped doing X?" (the owner can stop it by telling v2). Do not enable until they say yes.
-2. Crons: `openclaw cron enable <name>`. Apps: `systemctl enable --now potter-app-<name>.service`.
+2. Crons: `openclaw cron enable <name>`. Apps: `systemctl enable --now potter-app-<name>.service`. Email: the
+   AgentMail channel is registered under `channels` in the registry; run the command in its `enable` field (it
+   sets who may email Potter), then `openclaw plugins reload agentmail` and send a test mail from an allowed address.
+   Hand back: run its `disable` command.
 3. Update `enabled` in the registry, run one safe check (cron status, service status), and report ON or the exact error.
 4. If a secret is still missing for that item, send the owner to the settings page for it. Never ask for it in chat.
 

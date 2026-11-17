@@ -18,7 +18,8 @@ import setup_form as sf  # noqa: E402
 GOOD = {"OWNER_NAME": "Josh", "TIMEZONE": "America/New_York", "BRIEF_TIME": "08:30",
         "OWNER_TELEGRAM_ID": "8411191583", "TELEGRAM_TOKEN": "123456789:AAAAAAAAAAAAAAAAAAAAAAAA",
         "OPENROUTER_KEY": "sk-or-v1-abcdefghijklmnop1234", "COMPOSIO_MCP_URL": "", "AGENTMAIL_API_KEY": "",
-        "OPENAI_VOICE_KEY": "", "HA_URL": "", "HA_TOKEN": "", "TAILSCALE_AUTHKEY": ""}
+        "AGENTMAIL_INBOX": "", "OWNER_EMAILS": "", "OPENAI_VOICE_KEY": "", "HA_URL": "", "HA_TOKEN": "",
+        "TAILSCALE_AUTHKEY": ""}
 
 
 class Validate(unittest.TestCase):
@@ -29,7 +30,7 @@ class Validate(unittest.TestCase):
         bad = {**GOOD, "OWNER_NAME": "<script>", "TIMEZONE": "Mars/Base", "BRIEF_TIME": "25:00",
                "OWNER_TELEGRAM_ID": "12", "TELEGRAM_TOKEN": "SECRETSECRET", "OPENROUTER_KEY": "nope",
                "COMPOSIO_MCP_URL": "http://x", "AGENTMAIL_API_KEY": "x", "TAILSCALE_AUTHKEY": "abc",
-               "OPENAI_VOICE_KEY": "pk-1", "HA_URL": "ftp://x", "HA_TOKEN": "t"}
+               "OPENAI_VOICE_KEY": "pk-1", "HA_URL": "ftp://x", "HA_TOKEN": "t", "AGENTMAIL_INBOX": "nope", "OWNER_EMAILS": "bad"}
         err = sf.validate(bad)
         self.assertEqual(set(err), set(bad))
         self.assertNotIn("SECRETSECRET", " ".join(err.values()))
@@ -43,6 +44,15 @@ class Validate(unittest.TestCase):
         self.assertEqual(sf.validate({**GOOD, "HA_URL": "http://homeassistant.local:8123", "HA_TOKEN": "a" * 30}), {})
         self.assertIn("HA_TOKEN", sf.validate({**GOOD, "HA_URL": "http://homeassistant.local:8123"}))
         self.assertIn("HA_URL", sf.validate({**GOOD, "HA_TOKEN": "a" * 30}))
+
+    def test_agentmail_inbox_needs_key_and_owner_addresses(self):
+        ok = {**GOOD, "AGENTMAIL_API_KEY": "am_" + "a" * 20, "AGENTMAIL_INBOX": "potter@agentmail.to",
+              "OWNER_EMAILS": "josh@example.com, j2@example.org"}
+        self.assertEqual(sf.validate(ok), {})
+        self.assertIn("OWNER_EMAILS", sf.validate({**ok, "OWNER_EMAILS": ""}))
+        self.assertIn("AGENTMAIL_API_KEY", sf.validate({**ok, "AGENTMAIL_API_KEY": ""}))
+        self.assertIn("AGENTMAIL_INBOX", sf.validate({**ok, "AGENTMAIL_INBOX": "x"}))
+        self.assertIn("OWNER_EMAILS", sf.validate({**ok, "OWNER_EMAILS": "a@b.co, nope"}))
 
     def test_voice_key_shape(self):
         self.assertEqual(sf.validate({**GOOD, "OPENAI_VOICE_KEY": "sk-" + "a" * 30}), {})

@@ -56,6 +56,19 @@ class Installer(unittest.TestCase):
         text = (ROOT / "overlay/workspace/skills/connect-apps/SKILL.md").read_text()
         self.assertIn("Never ask for a secret in chat", text)
 
+    def test_agentmail_uses_the_official_plugin_and_its_channel_starts_in_standby(self):
+        text = (ROOT / "install/bootstrap.sh").read_text()
+        for needle in ("clawhub:@agentmail/agentmail", "plugins enable agentmail", '"enabled": True',
+                       '"dmPolicy": "allowlist"', '"allowFrom": []', "channels.agentmail.allowFrom"):
+            self.assertIn(needle, text)
+        self.assertNotIn("agentmail-mcp", text)
+
+    def test_plugin_trust_list_is_pinned_and_new_plugins_are_told_to_join_it(self):
+        text = (ROOT / "install/bootstrap.sh").read_text()
+        self.assertIn("--replace-path plugins.allow", text)
+        self.assertIn('p.get("origin") == "bundled"', text)
+        self.assertIn("plugins.allow", (ROOT / "overlay/workspace/skills/connect-apps/SKILL.md").read_text())
+
     def test_connectors_are_not_filtered(self):
         text = (ROOT / "install/bootstrap.sh").read_text()
         self.assertNotIn("toolFilter", text)

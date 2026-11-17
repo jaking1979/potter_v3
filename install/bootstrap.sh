@@ -69,6 +69,40 @@ rm -f "$WS/BOOTSTRAP.md"
 cp "$REPO/overlay/workspace/avatar.svg" "$WS/avatar.svg"
 mkdir -p "$WS/skills"; cp -r "$REPO/overlay/workspace/skills/." "$WS/skills/"
 
+if [ -n "${AGENTMAIL_API_KEY:-}" ]; then
+  say "Installing the official AgentMail plugin (Potter's own inbox)"
+  oc plugins install clawhub:@agentmail/agentmail >/dev/null
+  oc plugins enable agentmail >/dev/null
+  am="$(mktemp --suffix=.json5)"
+  AGENTMAIL_API_KEY="$AGENTMAIL_API_KEY" AGENTMAIL_INBOX="${AGENTMAIL_INBOX:-}" OWNER_EMAILS="${OWNER_EMAILS:-}" python3 - "$am" <<'PY'
+import json, os, sys
+key = os.environ["AGENTMAIL_API_KEY"]
+cfg = {"plugins": {"entries": {"agentmail": {"enabled": True, "config": {"apiKey": key}}}}}
+if os.environ.get("AGENTMAIL_INBOX"):
+    # The mail channel shares a feed with v2's listener, so it starts in STANDBY: an empty allowFrom denies every
+    # sender, which keeps the plugin and its CLI skill working. "take over email" sets allowFrom to the owner.
+    cfg["channels"] = {"agentmail": {"enabled": True, "apiKey": key, "inboxId": os.environ["AGENTMAIL_INBOX"],
+                                     "dmPolicy": "allowlist", "allowFrom": []}}
+json.dump(cfg, open(sys.argv[1], "w"))
+PY
+  oc config patch --file "$am" --dry-run >/dev/null && oc config patch --file "$am" >/dev/null
+  rm -f "$am"
+  if [ -n "${AGENTMAIL_INBOX:-}" ]; then
+    mkdir -p /etc/potter
+    OWNER_EMAILS="${OWNER_EMAILS:-}" python3 - <<'PY'
+import json, os
+p = "/etc/potter/handover.json"
+reg = json.load(open(p)) if os.path.exists(p) else {"crons": [], "apps": [], "secrets_needed": []}
+owners = [e.strip() for e in os.environ.get("OWNER_EMAILS", "").split(",") if e.strip()]
+reg.setdefault("channels", []).append({"name": "agentmail", "enabled": False,
+    "enable": "openclaw config set channels.agentmail.allowFrom '" + json.dumps(owners) + "' --strict-json",
+    "disable": "openclaw config set channels.agentmail.allowFrom '[]' --strict-json",
+    "purpose": "email to Potter's own inbox (standby = no sender allowed)"})
+json.dump(reg, open(p, "w"), indent=1)
+PY
+  fi
+fi
+
 if [ -n "${OPENAI_VOICE_KEY:-}" ]; then
   say "Turning on voice talk"
   vp="$(mktemp --suffix=.json5)"
@@ -85,17 +119,14 @@ if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
   oc config set gateway.tailscale.mode funnel >/dev/null
 fi
 
-if [ -n "${COMPOSIO_MCP_URL:-}" ] || [ -n "${AGENTMAIL_API_KEY:-}" ] || [ -n "${HA_URL:-}" ]; then
+if [ -n "${COMPOSIO_MCP_URL:-}" ] || [ -n "${HA_URL:-}" ]; then
   say "Connecting MCP servers"
   mcp="$(mktemp --suffix=.json5)"
-  COMPOSIO_MCP_URL="${COMPOSIO_MCP_URL:-}" AGENTMAIL_API_KEY="${AGENTMAIL_API_KEY:-}" HA_URL="${HA_URL:-}" HA_TOKEN="${HA_TOKEN:-}" python3 - "$mcp" <<'PY'
+  COMPOSIO_MCP_URL="${COMPOSIO_MCP_URL:-}" HA_URL="${HA_URL:-}" HA_TOKEN="${HA_TOKEN:-}" python3 - "$mcp" <<'PY'
 import json, os, sys
 servers = {}
 if os.environ.get("COMPOSIO_MCP_URL"):
     servers["composio"] = {"transport": "streamable-http", "url": os.environ["COMPOSIO_MCP_URL"]}
-if os.environ.get("AGENTMAIL_API_KEY"):
-    servers["agentmail"] = {"command": "npx", "args": ["-y", "agentmail-mcp"],
-                            "env": {"AGENTMAIL_API_KEY": os.environ["AGENTMAIL_API_KEY"]}}
 if os.environ.get("HA_URL"):
     # Home Assistant's built-in MCP server (state and control).
     servers["homeassistant"] = {"transport": "streamable-http",
@@ -106,6 +137,15 @@ PY
   oc config patch --file "$mcp" --dry-run >/dev/null && oc config patch --file "$mcp" >/dev/null
   rm -f "$mcp"
 fi
+
+say "Pinning the plugin trust list (bundled plugins plus the ones just installed)"
+pa="$(mktemp --suffix=.json5)"
+oc plugins list --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+ids = sorted({p["id"] for p in d["plugins"] if p.get("origin") == "bundled" or p.get("enabled")})
+json.dump({"plugins": {"allow": ids}}, open(sys.argv[1], "w"))' "$pa"
+oc config patch --file "$pa" --replace-path plugins.allow >/dev/null && rm -f "$pa"
 
 say "Starting the gateway"
 if [ -z "${POTTER_NO_DAEMON:-}" ] && command -v systemctl >/dev/null 2>&1; then

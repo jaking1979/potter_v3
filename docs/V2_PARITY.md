@@ -12,7 +12,7 @@ v2 hands the real files over (docs/V2_EXPORT_PROMPT.md); the installer puts them
 | Daily check-in, evening review (silent stress/busy capture), capture protocol, article capture, interest wiki | v2 rules and prompts | arrives with the export |
 | Knowledge graph (potter-kg) + Jev curator every 6 hours | app + cron | arrives with the export |
 | Merrick V1 home specialist (thermal learning, HVAC plans) + Home Assistant | app + HA connection (full state and control) | HA connection built; Merrick with export |
-| Email: AgentMail listener, Gmail (jaking1979), compiler into the compiling doc | AgentMail MCP (built), listener app and Gmail via Composio | MCP built; listener with export |
+| Email: AgentMail listener, Gmail (jaking1979), compiler into the compiling doc | official AgentMail plugin (email channel + CLI skill, standby until "take over email"), Gmail via Composio, v2's listener logic from the export | plugin built; listener logic with export |
 | Alpha Bot trading loop, Robinhood MCP (79 tools) | app + MCP + secrets on the settings page | arrives with the export; starts in standby |
 | Event and market monitors (Brooklyn events, Margaretville, financial digests) | apps + crons | arrives with the export |
 | Nightly QC recorder, verifier, recheck | crons + scripts | arrives with the export |
