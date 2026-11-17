@@ -14,7 +14,9 @@ real /home/josh paths), 5 MCP servers, 20 app folders, 3 agents (main, potter-lo
 (potter-guardrails, potter-kg), primary model local Ollama. Problems: a live Telegram token in history; apps/ regrouping
 broke command paths (my prompt's fault). Follow-up for v2: docs/V2_EXPORT_FOLLOWUP.md (schema /2, mirrored tree).
 Done: cron_commands() translates inventory/cron.json (real export: 29 kept = 5 run at install, 16 standby, 8 off in v2;
-41 expired one-shots and 6 built-ins skipped). Waiting on Josh: paste the follow-up to v2; model decision (Ollama?).
+41 expired one-shots and 6 built-ins skipped). Schema /2 export received @3951253 (mirrored tree, 3 agents, 2 plugins, 9 dependency dirs, units). It leaked a Composio
+API key (tree/home/josh/.composio/user_data.json): docs/V2_EXPORT_FOLLOWUP2.md asks v2 to recreate the repo and add
+inventory/models.json. Model decision (Josh): mirror v2's model setup incl. the Jev decider (lib/jev in the tree).
 Next (after the /2 export): importer v2 reads the mirrored tree, recreates /home/josh paths, agents, plugins, services.
 
 ## Current direction (Josh, 2026-11-16) - supersedes the standalone-service plan
