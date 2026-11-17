@@ -15,9 +15,19 @@ def problems(data) -> str:
     return "; ".join(bad)[:400]
 
 
+def parse(text: str):
+    """The JSON object in the output, even when log lines are printed before or after it."""
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(text or ""):
+        if ch == "{":
+            try:
+                obj, _ = dec.raw_decode(text, i)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and ("auth" in obj or "results" in obj):
+                return obj
+    return None
+
+
 if __name__ == "__main__":
-    try:
-        d = json.loads(sys.stdin.read() or "null")
-    except ValueError:
-        d = None
-    print(problems(d))
+    print(problems(parse(sys.stdin.read())))

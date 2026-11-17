@@ -223,13 +223,14 @@ class Server(unittest.TestCase):
 
     def test_good_v2_bundle_upload_is_saved_private_and_passed_on(self):
         sf.BUNDLE_PATH = Path(self._t.name) / "saved.zip"
-        s, _ = self.post_multipart(GOOD, "bundle.zip", self.good_bundle())
+        bundle = self.good_bundle()                       # built once: a zip carries its build time
+        s, _ = self.post_multipart(GOOD, "bundle.zip", bundle)
         self.assertEqual(s, 303)
         for _ in range(100):
             if self.state.done:
                 break
             time.sleep(0.05)
-        self.assertEqual(sf.BUNDLE_PATH.read_bytes(), self.good_bundle())
+        self.assertEqual(sf.BUNDLE_PATH.read_bytes(), bundle)
         self.assertEqual(stat.S_IMODE(sf.BUNDLE_PATH.stat().st_mode), 0o600)
         self.assertIn("POTTER_V2_BUNDLE=" + str(sf.BUNDLE_PATH), self.out.read_text())
 
@@ -248,8 +249,31 @@ class Server(unittest.TestCase):
         self.assertNotIn("POTTER_V2_BUNDLE", sf.to_env(GOOD))
 
     def test_expired_page_is_forbidden(self):
-        self.state.started = time.time() - sf.LIFETIME_S - 1
+        self.state.deadline = time.time() - 1
         self.assertEqual(self.req("GET", f"/?t={self.token}")[0], 403)
+
+    def test_entries_survive_a_closed_page_in_a_root_only_draft_and_go_when_the_install_succeeds(self):
+        draft = Path(self._t.name) / "draft.json"
+        self.state.draft = draft
+        self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode({**GOOD, "BRIEF_TIME": "99:99"}))
+        self.assertEqual(stat.S_IMODE(draft.stat().st_mode), 0o600)
+        again = sf.State("other", [], draft)                               # the page was closed and started again
+        self.assertEqual(again.kept["TELEGRAM_TOKEN"], GOOD["TELEGRAM_TOKEN"])
+        self.assertEqual(again.kept["OWNER_NAME"], "Josh")
+        self.assertNotIn("BRIEF_TIME", again.kept)                         # the wrong value was not kept
+        self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode(GOOD))
+        self.wait_done()
+        self.assertTrue(self.state.ok)
+        self.assertFalse(draft.exists())
+
+    def test_a_failed_install_keeps_the_page_open_for_hours(self):
+        script = Path(self._t.name) / "fail.sh"
+        script.write_text("#!/bin/bash\necho broken; exit 1\n")
+        script.chmod(0o755)
+        self.state.bootstrap = [str(script)]
+        self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode(GOOD))
+        self.wait_done()
+        self.assertGreater(self.state.deadline - time.time(), 3 * 60 * 60)
 
 
 if __name__ == "__main__":

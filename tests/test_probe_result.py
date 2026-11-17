@@ -28,6 +28,11 @@ class Probe(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertIn("nothing readable", r.stdout)
 
+    def test_log_lines_around_the_json_are_ignored(self):
+        raw = ('\x1b[33m[state/agent-db]\x1b[39m receipt {written}\n' + json.dumps(wrap([{"model": "m", "error": "402 no credit"}]))
+               + "\n(node:1) DeprecationWarning: x\n")
+        self.assertEqual(pr.problems(pr.parse(raw)), "m: None (402 no credit)")
+
     def test_the_policy_uses_v41_flash(self):
         pol = json.loads((ROOT / "overlay/jev/policy.json").read_text())
         self.assertEqual(pol["classes"]["chat"]["model"], "openrouter/deepseek/deepseek-v4.1-flash")

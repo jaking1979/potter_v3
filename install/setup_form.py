@@ -26,6 +26,8 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 LIFETIME_S = 30 * 60
+RETRY_WINDOW_S = 4 * 60 * 60     # after a failed install the page stays open this long for a fix and a retry
+DRAFT_PATH = Path(os.environ.get("POTTER_SETUP_DRAFT", "/root/.potter-setup-draft.json"))
 MAX_BUNDLE = 150 * 1024 * 1024
 BUNDLE_PATH = Path(os.environ.get("POTTER_V2_BUNDLE_PATH", "/root/v2-export.zip"))
 
@@ -216,10 +218,11 @@ if(j.final){{document.getElementById('log').textContent+='\\n\\n'+j.final}}retur
 
 
 class State:
-    def __init__(self, token: str, bootstrap: list[str]):
-        self.token, self.bootstrap = token, bootstrap
+    def __init__(self, token: str, bootstrap: list[str], draft: Path | None = None):
+        self.token, self.bootstrap, self.draft = token, bootstrap, draft
         self.submitted = False
         self.started = time.time()
+        self.deadline = self.started + LIFETIME_S
         self.log: list[str] = []
         self.done = self.ok = False
         self.final = ""
@@ -227,6 +230,52 @@ class State:
         self.kept: dict[str, str] = {}          # what was entered, in memory only, so a mistake never means retyping
         self.kept_upload: bytes | None = None
         self.lock = threading.Lock()
+        self._load_draft()
+
+    # The draft: what was entered, root-only (600) inside this container, so a closed or restarted page never means
+    # typing everything again. The same keys are stored in this container once Potter is installed; the draft is
+    # deleted when the install succeeds.
+    def _load_draft(self) -> None:
+        if not self.draft or not self.draft.exists():
+            return
+        try:
+            d = json.loads(self.draft.read_text())
+        except (OSError, ValueError):
+            return
+        names = {k for k, *_ in FIELDS}
+        self.kept = {k: str(v) for k, v in (d.get("fields") or {}).items() if k in names and str(v).strip()}
+        if d.get("bundle") and BUNDLE_PATH.exists():
+            try:
+                self.kept_upload = BUNDLE_PATH.read_bytes()
+            except OSError:
+                pass
+
+    def save_draft(self) -> None:
+        if not self.draft:
+            return
+        try:
+            self.draft.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.draft.with_name(self.draft.name + ".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"fields": self.kept, "bundle": self.kept_upload is not None}, fh)
+            os.replace(tmp, self.draft)
+        except OSError:
+            pass
+
+    def drop_draft(self) -> None:
+        if self.draft:
+            try:
+                self.draft.unlink()
+            except OSError:
+                pass
+
+    def keep_upload(self, data: bytes) -> None:
+        self.kept_upload = data
+        BUNDLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(BUNDLE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
 
     def merge(self, form: dict) -> dict:
         """A blank key field keeps the key entered earlier (the page never shows saved keys back)."""
@@ -243,6 +292,7 @@ class State:
                 self.kept[k] = v
             elif k in errors and k in SECRET_KEYS:
                 self.kept.pop(k, None)           # a rejected key is not kept
+        self.save_draft()
 
     def failure(self) -> str:
         for line in reversed(self.log):
@@ -270,6 +320,10 @@ class State:
                 self.log.append(f"installer failed to start: {type(e).__name__}")
         with self.lock:
             self.ok, self.done = rc == 0, True
+            if self.ok:
+                self.drop_draft()
+            else:
+                self.deadline = time.time() + RETRY_WINDOW_S
             marker = Path(os.environ.get("POTTER_FINAL_NOTE", "/etc/potter/final-note.txt"))
             if self.ok and marker.exists():
                 self.final = marker.read_text()
@@ -283,7 +337,7 @@ def make_handler(state: State):
         def _authorized(self) -> bool:
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             given = (q.get("t") or [""])[0]
-            return hmac.compare_digest(given, state.token) and time.time() - state.started < LIFETIME_S
+            return hmac.compare_digest(given, state.token) and time.time() < state.deadline
 
         def _send(self, code: int, body: str, ctype="text/html; charset=utf-8"):
             data = body.encode()
@@ -336,20 +390,20 @@ def make_handler(state: State):
                 if msg:
                     errors["V2_BUNDLE"] = msg
                 else:
-                    state.kept_upload = upload
+                    state.keep_upload(upload)
             upload = upload if upload and "V2_BUNDLE" not in errors else state.kept_upload
             state.keep(form, errors)
             if errors:
                 return self._send(400, self.form_page(errors, form))
             with state.lock:
                 state.submitted, state.done, state.ok, state.log, state.final = True, False, False, [], ""
-                state.started = time.time()              # a retry gets a fresh half hour
+                state.started = time.time()
+                state.deadline = state.started + LIFETIME_S
             env = to_env(form)
             if upload:
-                BUNDLE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(BUNDLE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(upload)
+                if state.kept_upload is not upload or not BUNDLE_PATH.exists():
+                    state.keep_upload(upload)
+                state.save_draft()
                 env["POTTER_V2_BUNDLE"] = str(BUNDLE_PATH)
             state.secrets = [env[f"POTTER_{k}"] for k in SECRET_KEYS]
             threading.Thread(target=state.run, args=(env,), daemon=True).start()
@@ -363,12 +417,12 @@ def main(argv: list[str]) -> int:
     port = int(os.environ.get("POTTER_FORM_PORT", "8788"))
     host = os.environ.get("POTTER_FORM_HOST", "0.0.0.0")
     token = secrets.token_urlsafe(24)
-    state = State(token, [str(HERE / "bootstrap.sh")])
+    state = State(token, [str(HERE / "bootstrap.sh")], DRAFT_PATH)
     srv = http.server.ThreadingHTTPServer((host, port), make_handler(state))
     shown = os.environ.get("POTTER_FORM_URL_HOST") or "<this-container-address>"
     print(f"\nOpen this page in your browser to set up Potter:\n  http://{shown}:{port}/?t={token}\n", flush=True)
     srv.timeout = 1
-    while time.time() - state.started < LIFETIME_S and not (state.done and state.ok):
+    while time.time() < state.deadline and not (state.done and state.ok):
         srv.handle_request()                     # a failed install keeps the page open for a fix and a retry
     # Linger briefly so the browser can read the final status.
     end = time.time() + 60
