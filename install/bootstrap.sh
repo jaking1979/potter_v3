@@ -102,6 +102,18 @@ for p in d.get("profiles") or []:
 PY
   q oc models auth logout "$stale" --agent potter --yes
 done
+if [ -z "${POTTER_SKIP_NET_CHECKS:-}" ]; then
+  say "Checking that OpenRouter accepts the key for Potter's models"
+  # One real call per configured model, made while the gateway is stopped (the check refuses to run beside it). A refused key, no credit or a model OpenRouter does not offer stops here
+  # with OpenRouter's own reason, before anything is scheduled (the setup page keeps your entries for a retry).
+  probe="$(oc models status --agent potter --probe --probe-provider openrouter --probe-timeout 45000 --json 2>&1 || true)"
+  why="$(printf '%s' "$probe" | python3 "$HERE/probe_result.py")"
+  case "$why" in
+    "") ;;
+    REFUSED:*) die "OpenRouter refused the request (${why#REFUSED: }). Check the key, its credit and its limit on openrouter.ai, then press Install again." ;;
+    *) warn "the OpenRouter check could not be read (${why#UNCLEAR: }); going on. If Potter does not answer on Telegram, ask for: openclaw models status --probe" ;;
+  esac
+fi
 
 say "Applying the Potter overlay"
 export OWNER_NAME TIMEZONE OWNER_TELEGRAM_ID SECRETS_DIR
@@ -343,14 +355,6 @@ json.dump({"plugins":{"entries":{"potter-guardrails":{"config":{"excludedIds":id
   POTTER_V2_BUNDLE_COPY="$POTTER_V2_BUNDLE"       # still needed for Merrick's house file; removed at the end
 fi
 
-if [ -z "${POTTER_SKIP_NET_CHECKS:-}" ]; then
-  say "Checking that OpenRouter accepts the key for Potter's models"
-  # One real call per configured model. A refused key, no credit or a model OpenRouter does not offer stops here
-  # with OpenRouter's own reason, before anything is scheduled (the setup page keeps your entries for a retry).
-  probe="$(oc models status --agent potter --probe --probe-provider openrouter --probe-timeout 45000 --json 2>/dev/null || true)"
-  why="$(printf '%s' "$probe" | python3 "$HERE/probe_result.py")"
-  [ -z "$why" ] || die "OpenRouter did not accept the request: $why. Check the key, its credit and its limit on openrouter.ai, then press Install again."
-fi
 
 say "Scheduling the Morning Brief"
 HH="${BRIEF_TIME%:*}"; MM="${BRIEF_TIME#*:}"

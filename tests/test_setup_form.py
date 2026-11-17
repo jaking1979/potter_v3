@@ -70,6 +70,54 @@ class Validate(unittest.TestCase):
         self.assertIn('type="password"', page)
 
 
+class FakeNet:
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def __call__(self, method, url, headers, body=None, timeout=20):
+        self.calls.append(url)
+        for part, ans in self.answers.items():
+            if part in url:
+                return ans
+        return 200, "{}"
+
+
+class LiveChecks(unittest.TestCase):
+    V = {**GOOD, "AGENTMAIL_API_KEY": "am_keykeykeykeykeykey", "HA_URL": "http://ha.example:8123",
+         "HA_TOKEN": "tokentokentokentokentoken"}
+
+    def test_good_keys_pass(self):
+        self.assertEqual(sf.live_check(self.V, FakeNet({})), {})
+
+    def test_each_refusal_lands_on_its_own_field_without_echoing_the_key(self):
+        net = FakeNet({"api.telegram.org": (401, '{"ok":false,"description":"Unauthorized"}'),
+                       "openrouter.ai": (401, '{"error":{"message":"No auth credentials found"}}'),
+                       "agentmail.to": (403, '{"message":"Forbidden"}'),
+                       "ha.example": (401, "")})
+        err = sf.live_check(self.V, net)
+        self.assertEqual(set(err), {"TELEGRAM_TOKEN", "OPENROUTER_KEY", "AGENTMAIL_API_KEY", "HA_TOKEN"})
+        self.assertIn("No auth credentials found", err["OPENROUTER_KEY"])
+        self.assertIn("management key", err["OPENROUTER_KEY"])
+        for msg in err.values():
+            self.assertNotIn(GOOD["OPENROUTER_KEY"], msg)
+            self.assertNotIn(GOOD["TELEGRAM_TOKEN"], msg)
+
+    def test_no_credit_and_unreachable_home_assistant_are_explained(self):
+        err = sf.live_check(self.V, FakeNet({"openrouter.ai": (402, '{"error":{"message":"Insufficient credits"}}'),
+                                             "ha.example": (0, "URLError")}))
+        self.assertIn("no credit", err["OPENROUTER_KEY"])
+        self.assertIn("IP address", err["HA_URL"])
+
+    def test_an_unreachable_service_does_not_block(self):
+        self.assertEqual(sf.live_check({**GOOD}, FakeNet({"openrouter.ai": (0, "TimeoutError"),
+                                                          "api.telegram.org": (0, "URLError")})), {})
+
+    def test_failed_install_message_points_at_a_field(self):
+        self.assertEqual(sf.failure_field("xx OpenRouter refused the request (401)"), "OPENROUTER_KEY")
+        self.assertEqual(sf.failure_field("xx Telegram rejected that bot token"), "TELEGRAM_TOKEN")
+        self.assertIsNone(sf.failure_field("disk full"))
+
+
 class Server(unittest.TestCase):
     def setUp(self):
         self._t = tempfile.TemporaryDirectory()
@@ -85,6 +133,7 @@ class Server(unittest.TestCase):
         self.addCleanup(os.environ.pop, "POTTER_FINAL_NOTE", None)
         self.token = "tok123"
         self.state = sf.State(self.token, [str(script)])
+        self.state.live = None                                   # no network in tests; live checks tested below
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), sf.make_handler(self.state))
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
@@ -265,6 +314,27 @@ class Server(unittest.TestCase):
         self.wait_done()
         self.assertTrue(self.state.ok)
         self.assertFalse(draft.exists())
+
+    def test_a_wrong_key_is_caught_on_the_page_before_anything_runs(self):
+        self.state.live = lambda v: {"OPENROUTER_KEY": "OpenRouter refused this key (no)."}
+        s, page, _ = self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode(GOOD))
+        self.assertEqual(s, 400)
+        self.assertIn("OpenRouter refused this key", page)
+        self.assertFalse(self.state.submitted)
+        self.assertFalse(self.out.exists())                     # the installer never started
+        self.assertNotIn("OPENROUTER_KEY", self.state.kept)      # the refused key is not kept
+        self.assertIn("TELEGRAM_TOKEN", self.state.kept)         # the others are
+
+    def test_a_failed_install_marks_the_field_to_fix(self):
+        script = Path(self._t.name) / "fail_or.sh"
+        script.write_text("#!/bin/bash\necho 'xx OpenRouter refused the request (402 no credit)'; exit 1\n")
+        script.chmod(0o755)
+        self.state.bootstrap = [str(script)]
+        self.req("POST", f"/submit?t={self.token}", urllib.parse.urlencode(GOOD))
+        self.wait_done()
+        s, page, _ = self.req("GET", f"/?t={self.token}")
+        i = page.index('id="OPENROUTER_KEY"')
+        self.assertIn("Enter it again", page[i:i + 700])
 
     def test_a_failed_install_keeps_the_page_open_for_hours(self):
         script = Path(self._t.name) / "fail.sh"

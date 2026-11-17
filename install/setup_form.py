@@ -126,6 +126,96 @@ def validate(v: dict) -> dict[str, str]:
     return err
 
 
+# ---- live checks: each key is tried against its service when Install is pressed, so a wrong key is a field to
+# re-enter on this page, not an install that stops halfway. Only a clear refusal blocks; an unreachable service
+# does not (the install will try again), except Home Assistant, whose address must be reachable from here.
+def _http(method: str, url: str, headers: dict, body: bytes | None = None, timeout: int = 20) -> tuple[int, str]:
+    """One request through curl (the installer's only network tool). The URL, headers and body go to curl on stdin
+    as a config file, so no key ever appears on a command line. Returns (status, body); status 0 = not reached."""
+    import tempfile
+
+    def q(v: str) -> str:
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    cfg = [f"url = {q(url)}", f"request = {q(method)}", "silent", f"max-time = {int(timeout)}",
+           'write-out = "\\n%{http_code}"', f"header = {q('User-Agent: potter-setup')}"]
+    cfg += [f"header = {q(f'{k}: {v}')}" for k, v in headers.items()]
+    tmp = None
+    if body is not None:
+        fd, tmp = tempfile.mkstemp(prefix="potter-setup-")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(body)
+        cfg.append(f"data-binary = {q('@' + tmp)}")
+    try:
+        r = subprocess.run(["curl", "--config", "-"], input="\n".join(cfg) + "\n", capture_output=True, text=True,
+                           timeout=timeout + 10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 0, type(e).__name__
+    finally:
+        if tmp:
+            os.unlink(tmp)
+    text, _, code = r.stdout.rpartition("\n")
+    return (int(code) if code.isdigit() else 0), text[:65536]
+
+
+def _reason(text: str) -> str:
+    try:
+        d = json.loads(text)
+        e = d.get("error") if isinstance(d, dict) else None
+        msg = (e.get("message") if isinstance(e, dict) else e) or d.get("description") or d.get("message")
+    except (ValueError, AttributeError):
+        msg = None
+    msg = re.sub(r"sk-or-[A-Za-z0-9_-]+|\d{5,12}:[A-Za-z0-9_-]{20,}", "(key)", str(msg or text or "no answer"))
+    return msg.strip()[:160]
+
+
+LIVE_MODEL = "deepseek/deepseek-v4.1-flash"     # the policy's default model; one 1-token call proves the key works
+
+
+def live_check(v: dict, http=_http) -> dict[str, str]:
+    err: dict[str, str] = {}
+    tg = v.get("TELEGRAM_TOKEN", "").strip()
+    if tg:
+        code, text = http("GET", f"https://api.telegram.org/bot{tg}/getMe", {})
+        if code in (401, 404):
+            err["TELEGRAM_TOKEN"] = "Telegram does not know this bot token. Copy it again from @BotFather."
+    ok = v.get("OPENROUTER_KEY", "").strip()
+    if ok:
+        body = json.dumps({"model": LIVE_MODEL, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 1}).encode()
+        code, text = http("POST", "https://openrouter.ai/api/v1/chat/completions",
+                          {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}, body)
+        if code in (401, 403):
+            err["OPENROUTER_KEY"] = (f"OpenRouter refused this key ({_reason(text)}). Use a regular API key from "
+                                     "openrouter.ai/settings/keys, not a management key.")
+        elif code == 402:
+            err["OPENROUTER_KEY"] = f"OpenRouter says this key has no credit left ({_reason(text)}). Add credit or raise its limit."
+        elif code == 404:
+            err["OPENROUTER_KEY"] = f"OpenRouter accepted the key but not Potter's model ({_reason(text)})."
+    am = v.get("AGENTMAIL_API_KEY", "").strip()
+    if am:
+        code, text = http("GET", "https://api.agentmail.to/v0/inboxes", {"Authorization": f"Bearer {am}"})
+        if code in (401, 403):
+            err["AGENTMAIL_API_KEY"] = f"AgentMail refused this key ({_reason(text)})."
+    ha, ht = v.get("HA_URL", "").strip().rstrip("/"), v.get("HA_TOKEN", "").strip()
+    if ha and ht:
+        code, text = http("GET", f"{ha}/api/", {"Authorization": f"Bearer {ht}"}, timeout=10)
+        if code == 0:
+            err["HA_URL"] = ("Potter's container cannot reach this address. Use Home Assistant's IP address, like "
+                             "http://<its IP address>:8123 (.local names often do not work inside a container).")
+        elif code in (401, 403):
+            err["HA_TOKEN"] = "Home Assistant refused this token. Create a new long-lived token and paste it again."
+    return err
+
+
+# A failed install names what failed; this puts the message on the field to fix.
+FAILURE_FIELDS = (("OpenRouter", "OPENROUTER_KEY"), ("Telegram", "TELEGRAM_TOKEN"), ("Home Assistant", "HA_TOKEN"),
+                  ("AgentMail", "AGENTMAIL_API_KEY"), ("Tailscale", "TAILSCALE_AUTHKEY"), ("Composio", "COMPOSIO_API_KEY"))
+
+
+def failure_field(message: str) -> str | None:
+    return next((f for word, f in FAILURE_FIELDS if word.lower() in (message or "").lower()), None)
+
+
 def to_env(v: dict) -> dict[str, str]:
     return {f"POTTER_{k}": str(v.get(k, "")).strip() for k, *_ in FIELDS}
 
@@ -230,6 +320,7 @@ class State:
         self.kept: dict[str, str] = {}          # what was entered, in memory only, so a mistake never means retyping
         self.kept_upload: bytes | None = None
         self.lock = threading.Lock()
+        self.live = None if os.environ.get("POTTER_SKIP_NET_CHECKS") else live_check
         self._load_draft()
 
     # The draft: what was entered, root-only (600) inside this container, so a closed or restarted page never means
@@ -366,6 +457,9 @@ def make_handler(state: State):
             failed = state.submitted and state.done and not state.ok
             banner = (f"The install stopped: {state.failure()} Everything you entered is still here. Fix what the "
                       "message points to and press Install again.") if failed else ""
+            field = failure_field(state.failure()) if failed else None
+            if field and field not in errors:
+                errors = {**errors, field: "This is what the install could not use. Enter it again (or a new one)."}
             return render_form(state.token, errors, form if form is not None else state.kept,
                                frozenset(k for k in SECRET_KEYS if state.kept.get(k)), banner, state.kept_upload is not None)
 
@@ -385,6 +479,8 @@ def make_handler(state: State):
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode(), keep_blank_values=True).items()}
             form = state.merge(form)
             errors = validate(form)
+            if not errors and state.live:
+                errors = state.live(form)            # wrong keys are fixed here, before anything is installed
             if upload:
                 msg = check_bundle(upload)
                 if msg:
