@@ -138,14 +138,19 @@ if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
   oc config set gateway.tailscale.mode funnel >/dev/null
 fi
 
-if [ -n "${COMPOSIO_MCP_URL:-}" ] || [ -n "${HA_URL:-}" ]; then
+# Notion is always registered (sign-in happens later from chat); Composio and Home Assistant when given.
+if true; then
   say "Connecting MCP servers"
   mcp="$(mktemp --suffix=.json5)"
-  COMPOSIO_MCP_URL="${COMPOSIO_MCP_URL:-}" HA_URL="${HA_URL:-}" HA_TOKEN="${HA_TOKEN:-}" python3 - "$mcp" <<'PY'
+  COMPOSIO_MCP_URL="${COMPOSIO_MCP_URL:-}" COMPOSIO_API_KEY="${COMPOSIO_API_KEY:-}" HA_URL="${HA_URL:-}" HA_TOKEN="${HA_TOKEN:-}" python3 - "$mcp" <<'PY'
 import json, os, sys
 servers = {}
-if os.environ.get("COMPOSIO_MCP_URL"):
-    servers["composio"] = {"transport": "streamable-http", "url": os.environ["COMPOSIO_MCP_URL"]}
+servers["notion"] = {"transport": "streamable-http", "url": "https://mcp.notion.com/mcp", "auth": "oauth"}
+if os.environ.get("COMPOSIO_API_KEY") or os.environ.get("COMPOSIO_MCP_URL"):
+    c = {"transport": "streamable-http", "url": os.environ.get("COMPOSIO_MCP_URL") or "https://connect.composio.dev/mcp"}
+    if os.environ.get("COMPOSIO_API_KEY"):
+        c["headers"] = {"x-consumer-api-key": os.environ["COMPOSIO_API_KEY"]}
+    servers["composio"] = c
 if os.environ.get("HA_URL"):
     # Home Assistant's built-in MCP server (state and control).
     servers["homeassistant"] = {"transport": "streamable-http",

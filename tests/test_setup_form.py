@@ -17,7 +17,7 @@ import setup_form as sf  # noqa: E402
 
 GOOD = {"OWNER_NAME": "Josh", "TIMEZONE": "America/New_York", "BRIEF_TIME": "08:30",
         "OWNER_TELEGRAM_ID": "8411191583", "TELEGRAM_TOKEN": "123456789:AAAAAAAAAAAAAAAAAAAAAAAA",
-        "OPENROUTER_KEY": "sk-or-v1-abcdefghijklmnop1234", "COMPOSIO_MCP_URL": "", "AGENTMAIL_API_KEY": "",
+        "OPENROUTER_KEY": "sk-or-v1-abcdefghijklmnop1234", "COMPOSIO_API_KEY": "", "COMPOSIO_MCP_URL": "", "AGENTMAIL_API_KEY": "",
         "AGENTMAIL_INBOX": "", "OWNER_EMAILS": "", "CO_OWNER_EMAILS": "", "WORK_CALENDAR": "", "EXCLUDED_IDS": "", "OLLAMA_URL": "", "OPENAI_VOICE_KEY": "", "HA_URL": "", "HA_TOKEN": "",
         "TAILSCALE_AUTHKEY": ""}
 
@@ -29,7 +29,7 @@ class Validate(unittest.TestCase):
     def test_each_bad_field_is_reported_without_echoing_the_value(self):
         bad = {**GOOD, "OWNER_NAME": "<script>", "TIMEZONE": "Mars/Base", "BRIEF_TIME": "25:00",
                "OWNER_TELEGRAM_ID": "12", "TELEGRAM_TOKEN": "SECRETSECRET", "OPENROUTER_KEY": "nope",
-               "COMPOSIO_MCP_URL": "http://x", "AGENTMAIL_API_KEY": "x", "TAILSCALE_AUTHKEY": "abc",
+               "COMPOSIO_API_KEY": "x", "COMPOSIO_MCP_URL": "http://x", "AGENTMAIL_API_KEY": "x", "TAILSCALE_AUTHKEY": "abc",
                "OPENAI_VOICE_KEY": "pk-1", "HA_URL": "ftp://x", "HA_TOKEN": "t", "AGENTMAIL_INBOX": "nope", "OWNER_EMAILS": "bad", "CO_OWNER_EMAILS": "x", "WORK_CALENDAR": "nope", "EXCLUDED_IDS": "short", "OLLAMA_URL": "http://mac:11434/v1"}
         err = sf.validate(bad)
         self.assertEqual(set(err), set(bad))

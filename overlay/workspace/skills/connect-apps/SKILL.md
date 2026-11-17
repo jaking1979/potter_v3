@@ -9,6 +9,7 @@ The owner does not use a terminal. You make the change; they approve it.
 1. Find out what is needed. Prefer, in order: (a) the owner's Composio connection (it already carries Google,
    Todoist and many others; check its tools first), (b) an existing MCP server or OpenClaw skill for the app,
    (c) a ClawHub skill. Say which you chose and why in one line.
+   Notion is pre-registered: sign the owner in with `openclaw mcp login notion` and send them the link it prints.
 2. Never ask for a secret in chat and never repeat one. If a key or token is needed, send the owner to the
    Potter settings page (secrets form), and wait. If a service uses OAuth, start the login
    flow and send the owner the sign-in link.

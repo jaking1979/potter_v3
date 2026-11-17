@@ -150,6 +150,13 @@ class Installer(unittest.TestCase):
         ev = (ROOT / "overlay/workspace/skills/evening-checkin/SKILL.md").read_text()
         self.assertIn("carried forward, not reset", ev)
 
+    def test_connections_notion_always_composio_with_header_key(self):
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        for needle in ('"https://mcp.notion.com/mcp", "auth": "oauth"', '"x-consumer-api-key"',
+                       "https://connect.composio.dev/mcp"):
+            self.assertIn(needle, boot)
+        self.assertIn("openclaw mcp login notion", (ROOT / "overlay/workspace/skills/connect-apps/SKILL.md").read_text())
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 

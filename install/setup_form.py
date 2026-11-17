@@ -37,7 +37,8 @@ FIELDS = [
     ("OWNER_TELEGRAM_ID", "Your Telegram user ID", "A number. Message @userinfobot on Telegram to see yours.", "text", True, ""),
     ("TELEGRAM_TOKEN", "Telegram bot token", "From @BotFather: send /newbot, copy the token it gives you.", "secret", True, ""),
     ("OPENROUTER_KEY", "Model API key (OpenRouter)", "Create a key named potter-v3 and set its credit limit before pasting it here.", "secret", True, ""),
-    ("COMPOSIO_MCP_URL", "Composio MCP URL (optional)", "Gives Potter your Google, Todoist and other connected apps. Leave blank to add it later from chat.", "secret", False, ""),
+    ("COMPOSIO_API_KEY", "Composio API key (optional)", "Gives Potter the apps you connected in Composio (Google, Todoist and others). From the Composio dashboard. Leave blank to add it later.", "secret", False, ""),
+    ("COMPOSIO_MCP_URL", "Composio MCP address (optional)", "Leave blank to use Composio's standard address. Only fill this in if Composio gave you a personal MCP address.", "text", False, ""),
     ("AGENTMAIL_API_KEY", "AgentMail API key (optional)", "For Potter's own email inbox. Leave blank to add it later from chat.", "secret", False, ""),
     ("AGENTMAIL_INBOX", "AgentMail inbox address (optional)", "Potter's own email address, like potter@agentmail.to. With it, incoming mail from your addresses reaches Potter (starts in standby).", "text", False, ""),
     ("OWNER_EMAILS", "Your email addresses (optional)", "Comma-separated. Mail from these addresses can talk to Potter by email.", "text", False, ""),
@@ -77,6 +78,9 @@ def validate(v: dict) -> dict[str, str]:
     mcp = v.get("COMPOSIO_MCP_URL", "").strip()
     if mcp and not re.fullmatch(r"https://[A-Za-z0-9.-]+(/[^\s]*)?", mcp):
         err["COMPOSIO_MCP_URL"] = "That should be an https:// address."
+    ck = v.get("COMPOSIO_API_KEY", "").strip()
+    if ck and not re.fullmatch(r"[A-Za-z0-9_.-]{16,}", ck):
+        err["COMPOSIO_API_KEY"] = "That does not look like a Composio key."
     am = v.get("AGENTMAIL_API_KEY", "").strip()
     if am and not re.fullmatch(r"[A-Za-z0-9_.-]{16,}", am):
         err["AGENTMAIL_API_KEY"] = "That does not look like an AgentMail key."
