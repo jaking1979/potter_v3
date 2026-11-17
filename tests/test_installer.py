@@ -87,6 +87,12 @@ class Installer(unittest.TestCase):
             self.assertIn(needle, text)
         self.assertTrue((ROOT / "overlay/workspace/avatar.svg").read_text().startswith("<svg"))
 
+    def test_gateway_runs_as_our_own_restarting_service(self):
+        text = (ROOT / "install/bootstrap.sh").read_text()
+        for needle in ("potter-gateway.service", "Restart=always", "WantedBy=multi-user.target",
+                       "systemctl enable --now", "--no-install-daemon"):
+            self.assertIn(needle, text)
+
     def test_no_secret_shapes_in_overlay(self):
         import re
         for p in (ROOT / "overlay").rglob("*"):

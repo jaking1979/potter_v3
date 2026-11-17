@@ -53,7 +53,7 @@ say "Onboarding OpenClaw (non-interactive)"
 oc onboard --non-interactive --accept-risk --flow manual --mode local \
    --auth-choice openrouter-api-key --openrouter-api-key "$OPENROUTER_KEY" \
    --gateway-bind loopback --gateway-auth password --gateway-password "$GATEWAY_PASSWORD" --agent-name Potter \
-   $([ -n "${POTTER_NO_DAEMON:-}" ] && echo --no-install-daemon || echo --install-daemon) >/dev/null
+   --no-install-daemon >/dev/null
 
 say "Applying the Potter overlay"
 export OWNER_NAME TIMEZONE OWNER_TELEGRAM_ID SECRETS_DIR
@@ -114,10 +114,29 @@ PY
 fi
 
 say "Starting the gateway"
-if [ -n "${POTTER_NO_DAEMON:-}" ]; then
-  nohup openclaw "${OC_PROFILE_FLAG[@]}" gateway run >"${POTTER_HOME}/gateway.log" 2>&1 &
+if [ -z "${POTTER_NO_DAEMON:-}" ] && command -v systemctl >/dev/null 2>&1; then
+  # Our own unit: starts at boot, restarts on failure. Independent of OpenClaw's per-user daemon installer.
+  cat > /etc/systemd/system/potter-gateway.service <<UNIT
+[Unit]
+Description=Potter (OpenClaw gateway)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=$POTTER_HOME/node/bin:$POTTER_HOME/openclaw/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/root
+ExecStart=$POTTER_HOME/openclaw/bin/openclaw gateway run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now potter-gateway.service >/dev/null
 else
-  oc gateway restart >/dev/null 2>&1 || oc daemon start >/dev/null 2>&1 || true
+  nohup openclaw "${OC_PROFILE_FLAG[@]}" gateway run >"${POTTER_HOME}/gateway.log" 2>&1 &
 fi
 for i in $(seq 1 60); do oc health >/dev/null 2>&1 && break; sleep 2; [ "$i" = 60 ] && die "gateway did not become healthy"; done
 
