@@ -1,0 +1,206 @@
+{
+ "_readme": "Every scheduled job for the knowledge graph, monitors, quality control and finance. Placeholders: {POTTER_HOME} {WS} {TZ} {TO} {OC} {KG_DB}. standby=true: created switched off and listed for handover (it messages the owner, acts on a shared account, or needs configuration first). Schedules and time zones follow the previous assistant's jobs.",
+ "jobs": [
+  {
+   "name": "potter-kg-curate",
+   "cron": "0 */6 * * *",
+   "tz": "UTC",
+   "kind": "command",
+   "timeout": 300,
+   "standby": false,
+   "command": "node {POTTER_HOME}/plugins/potter-kg/scripts/kg-curate.mjs --db {KG_DB} --apply",
+   "purpose": "knowledge graph clean-up (deterministic part; model decisions once a model policy is set)"
+  },
+  {
+   "name": "potter-qc-recorder",
+   "cron": "30 0 * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 1800,
+   "standby": false,
+   "command": "python3 {POTTER_HOME}/tools/qc/recorder.py --sessions {SESSIONS} --state {WS}/state/qc --tz {TZ}",
+   "purpose": "records yesterday's claims of finished work"
+  },
+  {
+   "name": "potter-qc-verifier",
+   "cron": "0 1 * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 600,
+   "standby": false,
+   "command": "python3 {POTTER_HOME}/tools/qc/verifier.py --state {WS}/state/qc --workspace {WS} --mode verify --tz {TZ} --to {TO} --openclaw '{OC}'",
+   "purpose": "checks those claims and every schedule; one message only when something does not hold up"
+  },
+  {
+   "name": "potter-qc-recheck",
+   "cron": "5 * * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 300,
+   "standby": false,
+   "command": "python3 {POTTER_HOME}/tools/qc/verifier.py --state {WS}/state/qc --workspace {WS} --mode recheck --tz {TZ} --openclaw '{OC}'",
+   "purpose": "closes open QC items once the evidence appears"
+  },
+  {
+   "name": "potter-fetch-city-events",
+   "cron": "45 7 * * 1-5",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 180,
+   "standby": true,
+   "command": "python3 {POTTER_HOME}/tools/monitors/city_events.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors",
+   "purpose": "fetches city event listings (needs the monitor config)"
+  },
+  {
+   "name": "potter-fetch-local",
+   "cron": "30 16 * * 4",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 300,
+   "standby": true,
+   "command": "python3 {POTTER_HOME}/tools/monitors/local_monitor.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors",
+   "purpose": "fetches local news and businesses (needs the monitor config)"
+  },
+  {
+   "name": "potter-fetch-wine",
+   "cron": "40 9 1 * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 300,
+   "standby": true,
+   "command": "python3 {POTTER_HOME}/tools/monitors/wine_price.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors",
+   "purpose": "fetches wine prices (needs the monitor config)"
+  },
+  {
+   "name": "potter-fetch-feeds",
+   "cron": "30 5 * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 300,
+   "standby": true,
+   "command": "python3 {POTTER_HOME}/tools/monitors/feed_scan.py --config {WS}/state/monitors/config.json --state-dir {WS}/state/monitors",
+   "purpose": "fetches financial deal feeds (needs the monitor config)"
+  },
+  {
+   "name": "potter-weekend-digest",
+   "cron": "30 15 * * 4,5",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 600,
+   "standby": true,
+   "deliver": true,
+   "message": "Run the events-digest skill for the weekend preview. Reply with the digest only, or nothing.",
+   "purpose": "weekend events preview"
+  },
+  {
+   "name": "potter-local-monitor",
+   "cron": "0 17 * * 4",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 600,
+   "standby": true,
+   "deliver": true,
+   "message": "Run the local-monitor skill. Reply with the update only, or nothing.",
+   "purpose": "weekly local update"
+  },
+  {
+   "name": "potter-wine-watch",
+   "cron": "0 10 1 * *",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 300,
+   "standby": true,
+   "deliver": true,
+   "message": "Run the wine-watch skill. Reply only if a price is worth acting on.",
+   "purpose": "monthly wine price check"
+  },
+  {
+   "name": "potter-reply-monitor",
+   "cron": "0 */2 * * *",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 300,
+   "standby": true,
+   "deliver": true,
+   "message": "Run the reply-monitor skill. Reply only if an awaited reply arrived.",
+   "purpose": "watches for an awaited email reply"
+  },
+  {
+   "name": "potter-financial-scan",
+   "cron": "0 6 * * *",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 600,
+   "standby": true,
+   "deliver": false,
+   "message": "Run the financial-scan skill. Output nothing.",
+   "purpose": "daily deals scan (silent, feeds the Tuesday digest)"
+  },
+  {
+   "name": "potter-financial-digest",
+   "cron": "0 9 * * 2",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 600,
+   "standby": true,
+   "deliver": true,
+   "message": "Run the financial-digest skill. Reply with the digest only, or nothing.",
+   "purpose": "Tuesday financial digest"
+  },
+  {
+   "name": "potter-weekly-business-brief",
+   "cron": "0 9 * * 1",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 600,
+   "standby": true,
+   "deliver": true,
+   "message": "Run the weekly-business-brief skill. Reply with the brief only.",
+   "purpose": "Monday business brief"
+  },
+  {
+   "name": "potter-kg-progress-gate",
+   "cron": "0 9 * * 1",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 300,
+   "standby": true,
+   "deliver": true,
+   "message": "Run the kg-progress-gate skill. Reply only if a decision is needed.",
+   "purpose": "weekly knowledge-graph progress check"
+  },
+  {
+   "name": "potter-workspace-health",
+   "cron": "0 9 1 1,4,7,10 *",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 900,
+   "standby": false,
+   "deliver": true,
+   "message": "Run the workspace-health-check skill. Reply with findings only, or nothing.",
+   "purpose": "quarterly workspace health check"
+  },
+  {
+   "name": "potter-daily-trading",
+   "cron": "0 17 * * 1-5",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 900,
+   "standby": true,
+   "deliver": false,
+   "message": "Run the trading-run skill. The gate is: python3 {POTTER_HOME}/tools/trading_precheck.py check --mandate trading/MANDATE.md --kill-switch trading/STOP --log trading/logs/trading-run.jsonl --record (run from your workspace). If it refuses, send the one-line refusal and stop.",
+   "purpose": "the trading loop under its written mandate"
+  },
+  {
+   "name": "potter-llm-monthly-status",
+   "cron": "0 18 * * 5",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 300,
+   "standby": true,
+   "deliver": true,
+   "message": "Report the monthly model-scoring status from trading/monthly-scoring. Reply with the status only.",
+   "purpose": "monthly scoring status (off in the old assistant too)"
+  }
+ ]
+}

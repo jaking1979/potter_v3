@@ -171,6 +171,23 @@ ids=[x.strip() for x in os.environ["EXCLUDED_IDS"].split(",") if x.strip()]
 json.dump({"plugins":{"entries":{"potter-guardrails":{"enabled":True,"config":{"excludedIds":ids}}}}}, open(sys.argv[1],"w"))' "$gp"
 oc config patch --file "$gp" >/dev/null; rm -rf "$gp" "$gdir"
 
+say "Installing the knowledge graph, monitors, quality control and finance tools"
+mkdir -p "$POTTER_HOME/tools" "$POTTER_HOME/plugins" "$WS/state/qc" "$WS/state/monitors" "$WS/trading"
+cp -r "$REPO/overlay/tools/." "$POTTER_HOME/tools/"
+rm -rf "$POTTER_HOME/plugins/potter-kg" "$POTTER_HOME/jev"
+cp -r "$REPO/overlay/plugins/potter-kg" "$POTTER_HOME/plugins/potter-kg"; rm -rf "$POTTER_HOME/plugins/potter-kg/tests"
+cp -r "$REPO/overlay/jev" "$POTTER_HOME/jev"; rm -f "$POTTER_HOME/jev/"*.test.mjs
+STATE_DIR="$(dirname "$(oc config file)")"
+KG_DB="$STATE_DIR/potter-kg/potter-kg.sqlite"; mkdir -p "$STATE_DIR/potter-kg"
+install_plugin "$POTTER_HOME/plugins/potter-kg" potter-kg --force
+kp="$(mktemp --suffix=.json5)"
+KG_DB="$KG_DB" python3 -c 'import json,os,sys; json.dump({"plugins":{"entries":{"potter-kg":{"enabled":True,"config":{"dbPath":os.environ["KG_DB"]}}}}}, open(sys.argv[1],"w"))' "$kp"
+q oc config patch --file "$kp"; rm -f "$kp"
+# Model policy: a starting file with placeholders. Potter fills it once the owner's model choices are confirmed.
+[ -f "$WS/state/model-policy.json" ] || cp "$REPO/overlay/jev/policy.example.json" "$WS/state/model-policy.json"
+[ -f "$WS/state/monitors/config.json" ] || cp "$REPO/overlay/tools/monitors/config.example.json" "$WS/state/monitors/config.example.json"
+[ -f "$WS/trading/MANDATE.md" ] || cp "$REPO/overlay/workspace/skills/trading-run/MANDATE.template.md" "$WS/trading/MANDATE.md"
+
 say "Pinning the plugin trust list (bundled plugins plus the ones just installed)"
 pa="$(mktemp --suffix=.json5)"
 oc plugins list --json 2>/dev/null | python3 -c '
@@ -328,6 +345,14 @@ if not os.environ.get("MERRICK_READY"):
 json.dump(reg, open(p, "w"), indent=1)
 PY
 fi
+
+say "Scheduling the knowledge graph, monitors, quality control and finance jobs"
+mkdir -p /etc/potter
+python3 "$HERE/add_jobs.py" --jobs "$HERE/jobs.json" --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" \
+   --set POTTER_HOME="$POTTER_HOME" --set WS="$WS" --set TZ="$TIMEZONE" --set TO="$OWNER_TELEGRAM_ID" \
+   --set KG_DB="$KG_DB" --set SESSIONS="$STATE_DIR/agents/potter/sessions" \
+   --set OC="openclaw ${OC_PROFILE_FLAG[*]:-}" --handover /etc/potter/handover.json >/dev/null \
+   || warn "some jobs could not be created; run verify_host.sh and ask Potter to fix them"
 
 say "Adding the schedule watchdog (tells you when any job fails or does not run)"
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"

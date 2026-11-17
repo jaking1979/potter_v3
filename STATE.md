@@ -34,9 +34,12 @@ Steps 5-9 CODE DONE, NOT WIRED (built by parallel builders, tests pass, not yet 
 - Trading pre-checks (overlay/tools/trading_precheck.py, 29 tests) + trading-run skill. No trading logic ported.
 - notifier/lint.py now skips overlay/ (owner's decision, 2026-11-17).
 Wiring notes exist only for merrick and qc-finance (docs/wiring/). Three builders stopped at the usage limit.
-NEXT: (1) review each builder's code; (2) write wiring for kg-jev and monitors; (3) wire agents, plugins and jobs into
-install/bootstrap.sh + verify_host.sh with standby where v2 also acts; (4) Home Assistant bridge: DONE (overlay/tools/ha_bridge.py, 8 tests incl. Merrick -> bridge -> local HA-shaped server);
-(5) full sandbox install. Open decisions for Josh are in docs/wiring/merrick.md (away-hold value, departure, model).
+WIRED (2026-11-17): install/jobs.json + install/add_jobs.py create 19 jobs (KG curator, QC x3 on; monitors, digests,
+trading, monthly scoring in standby); potter-kg plugin installed and loaded; model policy, monitor config and a blank
+mandate placed. Sandbox install with the real export: 25 Potter jobs (10 on, 15 standby), health check passes; KG
+curator, QC recorder/recheck run clean; trading gate refuses the blank mandate as designed.
+NEXT: (1) line-by-line review of the builders' code; (2) monitor config from the export (v2's real sources);
+(3) model policy from v2's live settings (asked of v2; not yet answered); (4) dry run on the real Proxmox host.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 
