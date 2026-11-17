@@ -185,6 +185,13 @@ KG_DB="$KG_DB" python3 -c 'import json,os,sys; json.dump({"plugins":{"entries":{
 q oc config patch --file "$kp"; rm -f "$kp"
 # Model policy: a starting file with placeholders. Potter fills it once the owner's model choices are confirmed.
 [ -f "$WS/state/model-policy.json" ] || cp "$REPO/overlay/jev/policy.example.json" "$WS/state/model-policy.json"
+MONITORS_READY=""
+if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then
+  # Your sources (venues, papers, shops, wine, deal blogs) come from the export; they are never stored in the repo.
+  python3 "$HERE/monitors_from_v2.py" "$POTTER_V2_BUNDLE" "$WS/state/monitors/config.json" >/dev/null && MONITORS_READY=1 \
+    || warn "monitor sources could not be read from the export; ask Potter to set up the monitors"
+fi
+[ -f "$WS/state/monitors/config.json" ] && MONITORS_READY=1
 [ -f "$WS/state/monitors/config.json" ] || cp "$REPO/overlay/tools/monitors/config.example.json" "$WS/state/monitors/config.example.json"
 [ -f "$WS/trading/MANDATE.md" ] || cp "$REPO/overlay/workspace/skills/trading-run/MANDATE.template.md" "$WS/trading/MANDATE.md"
 
@@ -353,6 +360,25 @@ python3 "$HERE/add_jobs.py" --jobs "$HERE/jobs.json" --openclaw "openclaw ${OC_P
    --set KG_DB="$KG_DB" --set SESSIONS="$STATE_DIR/agents/potter/sessions" \
    --set OC="openclaw ${OC_PROFILE_FLAG[*]:-}" --handover /etc/potter/handover.json >/dev/null \
    || warn "some jobs could not be created; run verify_host.sh and ask Potter to fix them"
+if [ -n "$MONITORS_READY" ]; then
+  # Fetchers only read public pages and message no one: with sources in place they start now. A first quiet run
+  # records what is already listed, so the first real run reports only what is new.
+  for m in city_events local_monitor wine_price feed_scan; do
+    python3 "$POTTER_HOME/tools/monitors/$m.py" --config "$WS/state/monitors/config.json" \
+      --state-dir "$WS/state/monitors" --baseline >/dev/null 2>&1 || warn "monitor $m could not take its first reading"
+  done
+  for j in potter-fetch-city-events potter-fetch-local potter-fetch-wine potter-fetch-feeds; do
+    q oc cron enable "$j" || warn "could not switch on $j"
+  done
+  python3 - <<'PY'
+import json, os
+p = "/etc/potter/handover.json"
+if os.path.exists(p):
+    reg = json.load(open(p))
+    reg["crons"] = [c for c in reg.get("crons", []) if not c.get("name", "").startswith("potter-fetch-")]
+    json.dump(reg, open(p, "w"), indent=1)
+PY
+fi
 
 say "Adding the schedule watchdog (tells you when any job fails or does not run)"
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"

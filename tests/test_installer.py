@@ -169,6 +169,14 @@ class Installer(unittest.TestCase):
         self.assertIn("merrick confirm-departure", skill)
         self.assertIn("ONLY when the owner's own next message", skill)
 
+    def test_monitor_sources_come_from_the_export_and_only_fetchers_start(self):
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        self.assertIn("monitors_from_v2.py", boot)
+        self.assertIn("--baseline", boot)
+        enabled = boot[boot.index('for j in potter-fetch-city-events'):boot.index("done", boot.index('for j in potter-fetch-city-events'))]
+        self.assertNotIn("digest", enabled)
+        self.assertNotIn("trading", enabled)
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 
