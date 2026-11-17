@@ -118,6 +118,13 @@ LOG+=("$(potter_memory_search "$(sed -n 's/^OPENROUTER_API_KEY=//p' "$SECRETS_DI
 for s in "$REPO/overlay/workspace/skills/"*/; do n="$(basename "$s")"; mkdir -p "$WS/skills/$n"; cp -r "$s". "$WS/skills/$n/"; done
 cp "$REPO/overlay/workspace/rules/global/"*.md "$WS/rules/global/"
 step "skills and global rules: refreshed"
+# USER.md still the empty template, but v2's profile is in the workspace as reference (an install from before the
+# importer made it live): promote it, without the reference banner. An owner-edited USER.md is never replaced.
+if [ -z "$PROFILE_ZIP" ] && [ -f "$WS/reference/v2/USER.md" ] && [ "$(grep -c . "$WS/USER.md" 2>/dev/null || echo 0)" -le 3 ]; then
+  cp "$WS/USER.md" "$WS/USER.md.template-backup" 2>/dev/null || true
+  sed '1{/^> Reference only/d}' "$WS/reference/v2/USER.md" | sed '1{/^$/d}' > "$WS/USER.md"
+  step "profile: USER.md now holds your v2 profile ($(grep -c . "$WS/USER.md") lines)"
+fi
 if [ -n "$PROFILE_ZIP" ] && [ -f "$PROFILE_ZIP" ]; then
   python3 "$HERE/profile_from_v2.py" apply "$PROFILE_ZIP" --workspace "$WS" --state-dir /etc/potter > /etc/potter/profile-report.json \
     && step "profile: re-imported from your v2 export ($(python3 -c 'import json;print(len(json.load(open("/etc/potter/profile-report.json"))["active_files"]))') personal files, including USER.md)" \
