@@ -1,0 +1,80 @@
+{
+  "id": "potter-core",
+  "name": "Potter Core",
+  "description": "Potter v3: action control with owner approvals and hash-chained receipts; context governor; System-One fast path for house requests.",
+  "version": "3.2.0",
+  "contracts": {},
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": [
+          "enforce",
+          "shadow"
+        ]
+      },
+      "stateDir": {
+        "type": "string"
+      },
+      "agents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "ownerIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "standingGrants": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "approvalTimeoutMs": {
+        "type": "number"
+      },
+      "jevEnvFile": {
+        "type": "string"
+      },
+      "policyPath": {
+        "type": "string"
+      },
+      "governor": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "jev": {
+            "type": "boolean"
+          },
+          "timeoutMs": {
+            "type": "number"
+          }
+        }
+      },
+      "fastPath": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "merrick": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

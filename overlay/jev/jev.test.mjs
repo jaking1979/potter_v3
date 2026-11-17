@@ -307,3 +307,24 @@ test("createDecider: with a key and a policy it decides within the policy and wr
   assert.doesNotMatch(readFileSync(log, "utf8"), /env-key/);
   assert.throws(() => createDecider({ env: { OPENROUTER_API_KEY: "k" }, policyPath: EXAMPLE }), /placeholder/);
 });
+
+// ---------------------------------------------------------------- Merrick's Jev decider (v3.2)
+import { INTENTS as MERRICK_INTENTS, questions as merrickQuestions, toRoute } from "./merrick-decide.mjs";
+import { readFileSync as _rf } from "node:fs";
+
+test("Merrick's Jev decider knows exactly the router's intents", () => {
+  const py = _rf(new URL("../merrick/router.py", import.meta.url), "utf8");
+  const listed = py.match(/INTENTS = \(([^)]*)\)/s)[1].match(/"([a-z_]+)"/g).map((s) => s.slice(1, -1));
+  assert.deepEqual(Object.keys(MERRICK_INTENTS).sort(), listed.sort());
+});
+
+test("Merrick's decider turns Jev's answer into a route, or nothing", () => {
+  assert.deepEqual(toRoute({ intent: { choice: "house_status", confidence: 0.92 }, zone: { choice: "none" } }),
+    { intent: "house_status", confidence: 0.92, zone: null });
+  assert.deepEqual(toRoute({ intent: { choice: "check_temperature", probabilities: { check_temperature: 0.8 } }, zone: { choice: "den" } }),
+    { intent: "check_temperature", confidence: 0.8, zone: "den" });
+  assert.equal(toRoute({ intent: { choice: "make_coffee", confidence: 1 } }), null);
+  assert.equal(toRoute({}), null);
+  const q = merrickQuestions(["family_room", "den"]);
+  assert.deepEqual(Object.keys(q.zone.criteria), ["family_room", "den", "none"]);
+});

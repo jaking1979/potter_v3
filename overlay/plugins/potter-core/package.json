@@ -1,0 +1,15 @@
+{
+  "name": "potter-core",
+  "version": "3.2.0",
+  "description": "Potter v3 control and brain layer.",
+  "type": "module",
+  "private": true,
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.11.0"
+  }
+}

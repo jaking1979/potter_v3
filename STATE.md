@@ -46,7 +46,11 @@ out (fixed); QC verified claims on one shared word (now two); 'lock up' refused 
 MODELS: policy.json from ratified T28 + v2's production models; installer replaced openrouter/auto; KG curator now
 calls Jev through a root-only key file. Known trading-gate limits: per_order approval is the agent's flag, and the
 capital limit is per run, not cumulative (trading stays standby).
-NEXT: (1) dry run on the real Proxmox host; (2) Mac node pairing; (3) scheduled away-hold application.
+LIVE (2026-11-17): installed on the real host (CT 211); 20/20 health checks; tailnet-only; DeepSeek V4.1 Flash.
+v3 CORE (docs/V3_CORE.md): potter-core plugin = v3.1 Control (classify/decide/approve, hash-chained receipts,
+/receipts) + v3.2 Brain (Context Governor plan, Merrick fast path without the model, Merrick+Jev). Sandbox: plugin
+loads with 4 hooks + command; house request answered by the fast path in 1.9 s with no model; governor plan logged.
+NEXT: deploy potter-core to CT 211 and test with the real key; v3.3 model broker; v3.4 memory; v3.5 durability.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

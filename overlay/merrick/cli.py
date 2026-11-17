@@ -98,7 +98,7 @@ def cmd_ask(ns) -> int:
     state, house = _state(ns), _house(ns)
     home = SafeHome(_client(ns), house)
     out = fastpath.handle(ns.text, home, house, state / "path-log.jsonl",
-                          decide=_decider(ns.decide_cmd) if ns.decide_cmd else None,
+                          decide=_decider(ns.decide_cmd or os.environ.get("MERRICK_DECIDE_CMD", "")) if (ns.decide_cmd or os.environ.get("MERRICK_DECIDE_CMD")) else None,
                           model=_load(state / "model.json", {}))
     if out.get("pending_departure"):
         with _locked(state):

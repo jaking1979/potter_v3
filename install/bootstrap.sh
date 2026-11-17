@@ -250,6 +250,22 @@ install_plugin "$POTTER_HOME/plugins/potter-kg" potter-kg --force
 kp="$(mktemp --suffix=.json5)"
 KG_DB="$KG_DB" python3 -c 'import json,os,sys; json.dump({"plugins":{"entries":{"potter-kg":{"enabled":True,"config":{"dbPath":os.environ["KG_DB"]}}}}}, open(sys.argv[1],"w"))' "$kp"
 q oc config patch --file "$kp"; rm -f "$kp"
+
+say "Installing Potter Core (v3.1 control: approvals and receipts; v3.2 brain: context governor and fast path)"
+cdir="$(mktemp -d)"; cp -r "$REPO/overlay/plugins/potter-core/"{index.js,lib,openclaw.plugin.json,package.json} "$cdir/"
+install_plugin "$cdir" potter-core --force
+pcp="$(mktemp --suffix=.json5)"
+OWNER_TELEGRAM_ID="$OWNER_TELEGRAM_ID" WS="$WS" SECRETS_DIR="$SECRETS_DIR" STATE_DIR="$STATE_DIR" python3 -c '
+import json, os, sys
+cfg = {"mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"],
+       "ownerIds": [os.environ["OWNER_TELEGRAM_ID"]], "standingGrants": [],
+       "stateDir": os.path.join(os.environ["STATE_DIR"], "potter-core"),
+       "jevEnvFile": os.path.join(os.environ["SECRETS_DIR"], "jev.env"),
+       "policyPath": os.path.join(os.environ["WS"], "state", "model-policy.json"),
+       "governor": {"enabled": True, "jev": True, "timeoutMs": 2500}, "fastPath": {"enabled": True, "merrick": "merrick"}}
+json.dump({"plugins": {"entries": {"potter-core": {"enabled": True, "hooks": {"allowConversationAccess": True}, "config": cfg}}}},
+          open(sys.argv[1], "w"))' "$pcp"
+q oc config patch --file "$pcp" --replace-path plugins.entries.potter-core.config; rm -f "$pcp"; rm -rf "$cdir"
 # Model policy (ratified T28): one file says which model does which work. It replaces OpenClaw's default
 # (openrouter/auto, open-ended routing) with the validated candidates, and every agent job names its model.
 # A policy still equal to the one shipped last time is replaced by the new one; a policy the owner (or Potter on the
@@ -434,6 +450,9 @@ if [ -n "${HA_URL:-}" ]; then
 export MERRICK_STATE_DIR="$MWS/state"
 export MERRICK_HOUSE="$MWS/state/house.json"
 export MERRICK_HA_CMD="python3 $POTTER_HOME/tools/ha_bridge.py --env $SECRETS_DIR/ha.env"
+# Jev for requests Merrick's own table does not recognise (one fast decision before any slow reasoning).
+export MERRICK_DECIDE_CMD="node $POTTER_HOME/jev/merrick-decide.mjs"
+export POTTER_JEV_ENV="$SECRETS_DIR/jev.env" POTTER_MODEL_POLICY="$WS/state/model-policy.json"
 exec python3 -B "$POTTER_HOME/merrick" "\$@"
 WRAP
   chmod 755 /usr/local/bin/merrick
