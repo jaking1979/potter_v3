@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "_comment": "Potter's model policy (ratified T28: Potter-owned selection from validated candidates, hard cost ceilings, no open-ended outside routing such as openrouter/auto). Candidates are the models the previous assistant ran in production: DeepSeek V4 Flash as the default worker, V4 Pro for escalation, Gemini Flash as the fallback, Gemma 4 on the owner's Mac for small local work, and Jev for typed decisions. install/apply_models.py writes the agent classes into OpenClaw; to change a model, edit this file and run that script (or ask Potter).",
+  "defaultClass": "chat",
+  "classes": {
+    "chat": {
+      "description": "The main conversation.",
+      "model": "openrouter/deepseek/deepseek-v4-flash",
+      "fallbacks": ["openrouter/google/gemini-3.8-flash"],
+      "maxCostUsd": 0.5,
+      "timeoutMs": 120000
+    },
+    "job_turn": {
+      "description": "Scheduled agent turns. Every agent job names this class; none inherits a session default.",
+      "model": "openrouter/deepseek/deepseek-v4-flash",
+      "fallbacks": ["openrouter/google/gemini-3.8-flash"],
+      "maxCostUsd": 0.25,
+      "timeoutMs": 300000
+    },
+    "worker": {
+      "description": "Delegated sub-tasks.",
+      "model": "openrouter/deepseek/deepseek-v4-flash",
+      "fallbacks": ["openrouter/google/gemini-3.8-flash"],
+      "maxCostUsd": 0.1,
+      "timeoutMs": 120000
+    },
+    "escalation": {
+      "description": "Hard reasoning, used only when the owner asks or a worker is out of its depth.",
+      "model": "openrouter/deepseek/deepseek-v4-pro",
+      "fallbacks": ["openrouter/deepseek/deepseek-v4-flash"],
+      "maxCostUsd": 1.0,
+      "timeoutMs": 300000
+    },
+    "merrick": {
+      "description": "The house specialist's reasoning path (the fast path needs no model).",
+      "model": "openrouter/deepseek/deepseek-v4-flash",
+      "fallbacks": ["openrouter/google/gemini-3.8-flash"],
+      "maxCostUsd": 0.1,
+      "timeoutMs": 90000
+    },
+    "local_small": {
+      "description": "Small bounded tasks on the owner's Mac; falls back to the cloud when the Mac is asleep, and says so.",
+      "model": "ollama/gemma4:e2b-it-qat",
+      "fallbacks": ["openrouter/deepseek/deepseek-v4-flash"],
+      "maxCostUsd": 0.02,
+      "timeoutMs": 60000
+    },
+    "decision": {
+      "description": "Typed decisions (choice, score, yes/no) on the decision endpoint.",
+      "model": "~typesafe/jev-latest",
+      "fallbacks": [],
+      "maxCostUsd": 0.001,
+      "timeoutMs": 10000
+    },
+    "kg_curation": {
+      "description": "The knowledge graph curator's decisions (6-hourly command job).",
+      "model": "~typesafe/jev-latest",
+      "fallbacks": [],
+      "maxCostUsd": 0.001,
+      "timeoutMs": 20000
+    }
+  }
+}

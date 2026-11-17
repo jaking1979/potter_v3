@@ -41,6 +41,7 @@ def argv_for(job: dict, values: dict, agent: str = "potter") -> list[str]:
         a += ["--command", fill(job["command"], values), "--no-deliver"]
     elif job["kind"] == "agent":
         a += ["--agent", agent, "--session", "isolated", "--message", fill(job["message"], values)]
+        a += shlex.split(values.get("JOB_MODEL_ARGS", ""))     # every agent job names its model (policy job_turn)
         a += (["--channel", "telegram", "--to", values["TO"], "--announce"] if job.get("deliver") else ["--no-deliver"])
     else:
         raise ValueError(f"{job['name']}: unknown kind")

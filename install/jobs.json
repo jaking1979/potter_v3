@@ -8,8 +8,8 @@
    "kind": "command",
    "timeout": 300,
    "standby": false,
-   "command": "node {POTTER_HOME}/plugins/potter-kg/scripts/kg-curate.mjs --db {KG_DB} --apply",
-   "purpose": "knowledge graph clean-up (deterministic part; model decisions once a model policy is set)"
+   "command": "potter-kg-curate --db {KG_DB} --apply",
+   "purpose": "knowledge graph clean-up; connection checks ask Jev under the model policy"
   },
   {
    "name": "potter-qc-recorder",

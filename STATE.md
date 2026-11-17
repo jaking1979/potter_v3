@@ -41,8 +41,12 @@ curator, QC recorder/recheck run clean; trading gate refuses the blank mandate a
 MONITORS (fe6227b): install/monitors_from_v2.py builds state/monitors/config.json from the export (7 city, 17 local,
 1 wine, 9 deal feeds on the real export); bootstrap takes a quiet first reading, then the 4 fetch jobs run; digests
 stay standby. Gaps: 3 businesses list no website, 2 deal blogs have no known feed; city pages report changes from run 2.
-NEXT: (1) line-by-line review of the builders' code; (2) model policy from v2's live settings (asked of v2; not yet
-answered); (3) dry run on the real Proxmox host.
+REVIEW (51cdd1b + this commit): monitors had one shared state folder (fixed: one per skill); seen page lines aged
+out (fixed); QC verified claims on one shared word (now two); 'lock up' refused (now starts the departure check).
+MODELS: policy.json from ratified T28 + v2's production models; installer replaced openrouter/auto; KG curator now
+calls Jev through a root-only key file. Known trading-gate limits: per_order approval is the agent's flag, and the
+capital limit is per run, not cumulative (trading stays standby).
+NEXT: (1) dry run on the real Proxmox host; (2) Mac node pairing; (3) scheduled away-hold application.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

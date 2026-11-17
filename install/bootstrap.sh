@@ -183,8 +183,29 @@ install_plugin "$POTTER_HOME/plugins/potter-kg" potter-kg --force
 kp="$(mktemp --suffix=.json5)"
 KG_DB="$KG_DB" python3 -c 'import json,os,sys; json.dump({"plugins":{"entries":{"potter-kg":{"enabled":True,"config":{"dbPath":os.environ["KG_DB"]}}}}}, open(sys.argv[1],"w"))' "$kp"
 q oc config patch --file "$kp"; rm -f "$kp"
-# Model policy: a starting file with placeholders. Potter fills it once the owner's model choices are confirmed.
-[ -f "$WS/state/model-policy.json" ] || cp "$REPO/overlay/jev/policy.example.json" "$WS/state/model-policy.json"
+# Model policy (ratified T28): one file says which model does which work. It replaces OpenClaw's default
+# (openrouter/auto, open-ended routing) with the validated candidates, and every agent job names its model.
+[ -f "$WS/state/model-policy.json" ] || cp "$REPO/overlay/jev/policy.json" "$WS/state/model-policy.json"
+apply_models() {
+  local mp; mp="$(mktemp --suffix=.json5)"
+  python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --patch "$mp" --agents "$1" \
+    && q oc config patch --file "$mp" --replace-path agents.defaults.models \
+    || warn "the model policy could not be applied; ask Potter to check state/model-policy.json"
+  rm -f "$mp"
+}
+apply_models potter
+# Command jobs that ask Jev (the knowledge graph curator) need the model key outside the gateway: a root-only file.
+mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"; umask 077
+printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_KEY" > "$SECRETS_DIR/jev.env"; chmod 600 "$SECRETS_DIR/jev.env"
+umask 022
+cat > /usr/local/bin/potter-kg-curate <<WRAP
+#!/bin/sh
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+exec node "$POTTER_HOME/plugins/potter-kg/scripts/kg-curate.mjs" --decider "$POTTER_HOME/jev/index.js" \
+  --policy "$WS/state/model-policy.json" --telemetry "$WS/state/jev-telemetry.jsonl" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-kg-curate
+read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then
   # Your sources (venues, papers, shops, wine, deal blogs) come from the export; they are never stored in the repo.
@@ -267,7 +288,7 @@ say "Scheduling the Morning Brief"
 HH="${BRIEF_TIME%:*}"; MM="${BRIEF_TIME#*:}"
 oc cron add --name potter-morning-brief --declaration-key potter-morning-brief \
    --cron "$((10#$MM)) $((10#$HH)) * * 1-5" --tz "$TIMEZONE" --exact --agent potter \
-   --channel telegram --to "$OWNER_TELEGRAM_ID" --announce --timeout-seconds 600 \
+   --channel telegram --to "$OWNER_TELEGRAM_ID" --announce --timeout-seconds 600 "${JOB_MODEL_ARGS[@]}" \
    --message "Run the morning-brief skill and reply with the brief only." >/dev/null
 
 ui_host="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)"
@@ -285,7 +306,7 @@ if [ -n "${AGENTMAIL_INBOX:-}" ]; then
   say "Scheduling mail intake (standby) and urgent-mail delivery"
   # Reads the same inbox as an older assistant's listener, so it starts OFF until you say "take over email".
   q oc cron add --name potter-mail-intake --declaration-key potter-mail-intake --every 10m --agent potter \
-     --session isolated --no-deliver --timeout-seconds 300 --disabled \
+     --session isolated --no-deliver --timeout-seconds 300 --disabled "${JOB_MODEL_ARGS[@]}" \
      --message "Run the mail-intake skill. Output nothing."
   mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
   q oc cron add --name potter-urgent-deliver --declaration-key potter-urgent-deliver --every 5m --no-deliver \
@@ -327,6 +348,7 @@ WRAP
   mp="$(mktemp --suffix=.json5)"
   printf '{ agents: { entries: { potter: { subagents: { allowAgents: ["merrick"] } } } } }' > "$mp"
   q oc config patch --file "$mp"; rm -f "$mp"
+  apply_models potter,merrick
   OCF="openclaw ${OC_PROFILE_FLAG[*]:-}"
   # Reads only: on from day one (duplicate cold alerts are possible until the old assistant's watcher is stopped).
   q oc cron add --name potter-merrick-cold-watch --declaration-key potter-merrick-cold-watch --cron "0 */2 * * *" \
@@ -358,7 +380,7 @@ mkdir -p /etc/potter
 python3 "$HERE/add_jobs.py" --jobs "$HERE/jobs.json" --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" \
    --set POTTER_HOME="$POTTER_HOME" --set WS="$WS" --set TZ="$TIMEZONE" --set TO="$OWNER_TELEGRAM_ID" \
    --set KG_DB="$KG_DB" --set SESSIONS="$STATE_DIR/agents/potter/sessions" \
-   --set OC="openclaw ${OC_PROFILE_FLAG[*]:-}" --handover /etc/potter/handover.json >/dev/null \
+   --set OC="openclaw ${OC_PROFILE_FLAG[*]:-}" --set JOB_MODEL_ARGS="${JOB_MODEL_ARGS[*]:-}" --handover /etc/potter/handover.json >/dev/null \
    || warn "some jobs could not be created; run verify_host.sh and ask Potter to fix them"
 if [ -n "$MONITORS_READY" ]; then
   # Fetchers only read public pages and message no one: with sources in place they start now. A first quiet run
