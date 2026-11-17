@@ -9,7 +9,11 @@ A finding blocks only if it breaks a ratified invariant on Linux / Python 3.12; 
 ## 2026-11-17 reset (Josh): v3 = everything v2 does, no lockdown
 Unlocked overlay (full toolset, v2's rules as behavior), v2 export importer (install/import_v2.py), setup-form upload,
 settings page for secrets (install/settings_page.py), handover skill, docs/V2_PARITY.md, docs/V2_EXPORT_PROMPT.md.
-Waiting on: Josh pastes the export prompt to v2 and uploads the zip. Then: fix whatever the importer reports.
+v2 export received (jaking1979/potter-v2-export @d5362bc, read-only): 76 crons (27 enabled; 45 are shell-command jobs at
+real /home/josh paths), 5 MCP servers, 20 app folders, 3 agents (main, potter-local, merrick), 2 own plugins
+(potter-guardrails, potter-kg), primary model local Ollama. Problems: a live Telegram token in history; apps/ regrouping
+broke command paths (my prompt's fault). Follow-up for v2: docs/V2_EXPORT_FOLLOWUP.md (schema /2, mirrored tree).
+Next: importer v2 reads inventory/cron.json + mirrored tree, recreates /home/josh paths, agents, plugins, services.
 
 ## Current direction (Josh, 2026-11-16) - supersedes the standalone-service plan
 Build on a FRESH OpenClaw in its own new Proxmox container (never v2's infrastructure). Reuse
