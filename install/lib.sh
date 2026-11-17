@@ -57,6 +57,7 @@ collect_inputs() {
   ask OPENROUTER_KEY    "Model API key (OpenRouter, with a spend cap set)"  "" secret
   ask BRIEF_TIME        "Morning Brief time, 24h HH:MM (weekdays)"          "08:30"
   COMPOSIO_MCP_URL="${POTTER_COMPOSIO_MCP_URL:-}"; AGENTMAIL_API_KEY="${POTTER_AGENTMAIL_API_KEY:-}"; TAILSCALE_AUTHKEY="${POTTER_TAILSCALE_AUTHKEY:-}"
+  OPENAI_VOICE_KEY="${POTTER_OPENAI_VOICE_KEY:-}"; HA_URL="${POTTER_HA_URL:-}"; HA_TOKEN="${POTTER_HA_TOKEN:-}"
   [[ "$OWNER_TELEGRAM_ID" =~ ^[0-9]{4,15}$ ]] || die "Telegram user ID must be a number"
   [[ "$BRIEF_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "brief time must be HH:MM"
   python3 -c "import zoneinfo,sys; zoneinfo.ZoneInfo(sys.argv[1])" "$TIMEZONE" || die "unknown time zone"

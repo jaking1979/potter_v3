@@ -64,6 +64,23 @@ class Installer(unittest.TestCase):
         for needle in ('"*send*"', '"*reply*"', '"*forward*"', '"*delete*"', "toolFilter"):
             self.assertIn(needle, text)
 
+    def test_read_only_skills_say_so(self):
+        base = ROOT / "overlay/workspace/skills"
+        for name in ("home-status", "inbox-triage"):
+            text = (base / name / "SKILL.md").read_text().lower()
+            self.assertIn("read-only", text, name)
+        self.assertIn("never the cmc mailbox", (base / "inbox-triage/SKILL.md").read_text().lower())
+        self.assertIn("clinical", (base / "inbox-triage/SKILL.md").read_text().lower())
+        for name in ("why-and-cost", "morning-brief", "connect-apps", "home-status", "inbox-triage"):
+            self.assertTrue((base / name / "SKILL.md").read_text().startswith("---\nname: " + name), name)
+
+    def test_home_assistant_exposes_only_the_state_tool(self):
+        text = (ROOT / "install/bootstrap.sh").read_text()
+        self.assertIn('"include": ["GetLiveContext"]', text)
+
+    def test_runbook_exists_and_names_the_one_terminal_step(self):
+        self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
+
     def test_no_secret_shapes_in_overlay(self):
         import re
         for p in (ROOT / "overlay").rglob("*"):

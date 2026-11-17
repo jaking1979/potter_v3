@@ -35,6 +35,9 @@ FIELDS = [
     ("OPENROUTER_KEY", "Model API key (OpenRouter)", "Create a key named potter-v3 and set its credit limit before pasting it here.", "secret", True, ""),
     ("COMPOSIO_MCP_URL", "Composio MCP URL (optional)", "Gives Potter your Google, Todoist and other connected apps. Leave blank to add it later from chat.", "secret", False, ""),
     ("AGENTMAIL_API_KEY", "AgentMail API key (optional)", "For Potter's own email inbox. Leave blank to add it later from chat.", "secret", False, ""),
+    ("OPENAI_VOICE_KEY", "OpenAI API key for voice (optional)", "Turns on voice talk in the web app. Set a spend limit on this key in OpenAI first. Leave blank to skip voice.", "secret", False, ""),
+    ("HA_URL", "Home Assistant address (optional)", "For example http://homeassistant.local:8123. Read-only home status.", "text", False, ""),
+    ("HA_TOKEN", "Home Assistant token (optional)", "A long-lived token for a dedicated Potter user you create in Home Assistant.", "secret", False, ""),
     ("TAILSCALE_AUTHKEY", "Tailscale auth key (optional)", "Joins this container to your tailnet and sets up Potter's funnel. Create it in the Tailscale admin page.", "secret", False, ""),
 ]
 SECRET_KEYS = {k for k, _, _, kind, _, _ in FIELDS if kind == "secret"}
@@ -67,6 +70,17 @@ def validate(v: dict) -> dict[str, str]:
     am = v.get("AGENTMAIL_API_KEY", "").strip()
     if am and not re.fullmatch(r"[A-Za-z0-9_.-]{16,}", am):
         err["AGENTMAIL_API_KEY"] = "That does not look like an AgentMail key."
+    ov = v.get("OPENAI_VOICE_KEY", "").strip()
+    if ov and not re.fullmatch(r"sk-[A-Za-z0-9_-]{20,}", ov):
+        err["OPENAI_VOICE_KEY"] = "OpenAI keys start with sk-."
+    ha = v.get("HA_URL", "").strip()
+    if ha and not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d{2,5})?/?", ha):
+        err["HA_URL"] = "Use an address like http://homeassistant.local:8123."
+    ht = v.get("HA_TOKEN", "").strip()
+    if bool(ha) != bool(ht):
+        err["HA_TOKEN" if ha else "HA_URL"] = "Fill in both the Home Assistant address and token, or neither."
+    elif ht and not re.fullmatch(r"[A-Za-z0-9_.-]{20,}", ht):
+        err["HA_TOKEN"] = "That does not look like a Home Assistant token."
     ts = v.get("TAILSCALE_AUTHKEY", "").strip()
     if ts and not re.fullmatch(r"tskey-[A-Za-z0-9-]{10,}", ts):
         err["TAILSCALE_AUTHKEY"] = "Tailscale keys start with tskey-."

@@ -68,6 +68,13 @@ done
 rm -f "$WS/BOOTSTRAP.md"
 mkdir -p "$WS/skills"; cp -r "$REPO/overlay/workspace/skills/." "$WS/skills/"
 
+if [ -n "${OPENAI_VOICE_KEY:-}" ]; then
+  say "Turning on voice talk"
+  vp="$(mktemp --suffix=.json5)"
+  OPENAI_VOICE_KEY="$OPENAI_VOICE_KEY" python3 -c 'import json,os,sys; json.dump({"talk":{"realtime":{"provider":"openai","providers":{"openai":{"apiKey":os.environ["OPENAI_VOICE_KEY"]}}}}}, open(sys.argv[1],"w"))' "$vp"
+  oc config patch --file "$vp" >/dev/null; rm -f "$vp"
+fi
+
 if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
   say "Joining your tailnet and enabling Potter's funnel"
   command -v tailscale >/dev/null 2>&1 || { curl -fsSL https://tailscale.com/install.sh | sh >/dev/null; }
@@ -77,10 +84,10 @@ if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
   oc config set gateway.tailscale.mode funnel >/dev/null
 fi
 
-if [ -n "${COMPOSIO_MCP_URL:-}" ] || [ -n "${AGENTMAIL_API_KEY:-}" ]; then
+if [ -n "${COMPOSIO_MCP_URL:-}" ] || [ -n "${AGENTMAIL_API_KEY:-}" ] || [ -n "${HA_URL:-}" ]; then
   say "Connecting MCP servers"
   mcp="$(mktemp --suffix=.json5)"
-  COMPOSIO_MCP_URL="${COMPOSIO_MCP_URL:-}" AGENTMAIL_API_KEY="${AGENTMAIL_API_KEY:-}" python3 - "$mcp" <<'PY'
+  COMPOSIO_MCP_URL="${COMPOSIO_MCP_URL:-}" AGENTMAIL_API_KEY="${AGENTMAIL_API_KEY:-}" HA_URL="${HA_URL:-}" HA_TOKEN="${HA_TOKEN:-}" python3 - "$mcp" <<'PY'
 import json, os, sys
 servers = {}
 if os.environ.get("COMPOSIO_MCP_URL"):
@@ -92,6 +99,13 @@ if os.environ.get("AGENTMAIL_API_KEY"):
                             "env": {"AGENTMAIL_API_KEY": os.environ["AGENTMAIL_API_KEY"]},
                             "toolFilter": {"exclude": ["*send*", "*reply*", "*forward*", "*delete*", "*create*",
                                                        "*update*", "*remove*", "*draft*"]}}
+if os.environ.get("HA_URL"):
+    # Home Assistant's built-in MCP server. Read-only: only the live-state tool is exposed; every control
+    # intent (turn on/off, set, open/close) stays hidden.
+    servers["homeassistant"] = {"transport": "streamable-http",
+                                "url": os.environ["HA_URL"].rstrip("/") + "/mcp_server/sse",
+                                "headers": {"Authorization": "Bearer " + os.environ["HA_TOKEN"]},
+                                "toolFilter": {"include": ["GetLiveContext"]}}
 json.dump({"mcp": {"servers": servers}}, open(sys.argv[1], "w"))
 PY
   oc config patch --file "$mcp" --dry-run >/dev/null && oc config patch --file "$mcp" >/dev/null

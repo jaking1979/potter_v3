@@ -24,6 +24,8 @@ bootstrap -> verify_host: 14/14 PASS. Proxmox container creation is written but 
 Added (Josh: no terminal; Composio/AgentMail MCPs; OptiPlex on Tailscale with funnel): browser setup form
 (install/setup_form.py), Composio + AgentMail as mcp.servers, Tailscale join + funnel, password auth, connect-apps skill,
 approval-gated config changes from chat (docs/CHAT_SETUP.md). Tests: 10 form + 9 installer, full gate green.
+Added 2026-11-17: skills why-and-cost, home-status, inbox-triage; Home Assistant (state-only tool) and voice (OpenAI
+realtime) fields in the form; docs/RUNBOOK.md. Sandbox install with every option: verify_host 16/16, all 5 skills ready.
 Next: Potter UI branding + Today
 dashboard, voice (talk mode) config, connectors, phone, payments, memory. See docs/BUILD_PLAN.md.
 
