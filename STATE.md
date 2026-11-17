@@ -23,7 +23,17 @@ Step 3 DONE: morning-brief skill with v2's real inputs (family calendar, task re
 archive+reset that KEEPS state signals; unknown state is never Quiet); evening-checkin skill (shutdown ritual + silent
 capture); overlay/tools/evening_nudge.py = ONE recurring command job (*/10 15-21 weekdays), last work session + 20 min
 via Composio CLI if present, else 18:00; 7 tests; sandbox install passes. Not proven: a real brief or check-in with a model.
-Steps 5-9 being built in parallel by subagents (new files only); main session integrates and wires.
+Step 4 DONE: Composio by API-key header, Notion pre-registered (OAuth from chat), job tool rule.
+Steps 5-9 CODE DONE, NOT WIRED (built by parallel builders, tests pass, not yet reviewed line by line by the main session):
+- Merrick (overlay/merrick, overlay/workspace-merrick, 121 tests). Cannot reach Home Assistant: needs a bridge command.
+- KG plugin (overlay/plugins/potter-kg, 51 node tests) + Jev layer (overlay/jev, 24 node tests; policy has placeholders).
+- Monitors (overlay/tools/monitor_lib.py + monitors/, 45 tests) + 10 skills. QC (overlay/tools/qc, 39 tests).
+- Trading pre-checks (overlay/tools/trading_precheck.py, 29 tests) + trading-run skill. No trading logic ported.
+- notifier/lint.py now skips overlay/ (owner's decision, 2026-11-17).
+Wiring notes exist only for merrick and qc-finance (docs/wiring/). Three builders stopped at the usage limit.
+NEXT: (1) review each builder's code; (2) write wiring for kg-jev and monitors; (3) wire agents, plugins and jobs into
+install/bootstrap.sh + verify_host.sh with standby where v2 also acts; (4) Home Assistant bridge for Merrick;
+(5) full sandbox install. Open decisions for Josh are in docs/wiring/merrick.md (away-hold value, departure, model).
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

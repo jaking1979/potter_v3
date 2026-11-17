@@ -1,0 +1,42 @@
+{
+  "_readme": "Copy to <workspace>/state/monitors/config.json and replace every placeholder. Nothing here is real. docs/wiring/monitors.md says where the previous assistant kept each real value.",
+  "city_events": {
+    "window_days": 90,
+    "sources": [
+      {"id": "venue-a", "name": "Example Venue", "url": "https://venue.example/events", "area": "Neighbourhood A"},
+      {"id": "street-b", "name": "Example Street Calendar", "url": "https://street.example/calendar", "area": "Neighbourhood B",
+       "pattern": "<h3 class=\"event-title\"><a href=\"(?P<url>[^\"]+)\">(?P<title>[^<]+)</a></h3>\\s*<span class=\"event-date\">(?P<date>[^<]+)</span>",
+       "exclude_titles": "view all|private event"}
+    ]
+  },
+  "local_monitor": {
+    "window_days": 60,
+    "max_per_source": 15,
+    "sources": [
+      {"id": "paper-a", "name": "Example Local Paper", "url": "https://paper.example/news", "kind": "news", "mode": "links",
+       "keywords": ["town name", "zoning", "short-term rental", "public hearing"]},
+      {"id": "village", "name": "Example Village Site", "url": "https://village.example/news", "kind": "news", "mode": "links"},
+      {"id": "cafe-a", "name": "Example Cafe", "url": "https://cafe.example/", "kind": "business", "mode": "page"},
+      {"id": "shop-a", "name": "Example Ski Shop", "url": "https://shop.example/", "kind": "seasonal", "mode": "page"},
+      {"id": "region-events", "name": "Example Regional Calendar", "url": "https://region.example/events", "kind": "events", "mode": "events"}
+    ],
+    "search_queries": ["\"Town Name\" news", "\"County Name\" short-term rental"]
+  },
+  "wine_watch": {
+    "items": [
+      {"id": "wine-a", "name": "Example Pinot Noir 2021", "alert_below": 0.0,
+       "pages": [{"retailer": "Example Retailer", "url": "https://wine.example/product/example-pinot-noir-2021"}]}
+    ],
+    "offer_pages": [
+      {"id": "offers-a", "name": "Example Card Offers Roundup", "url": "https://offers.example/wine", "terms": ["statement credit", "cash back"]}
+    ],
+    "search_queries": ["Example Pinot Noir 2021 price"]
+  },
+  "financial_feeds": {
+    "max_age_days": 14,
+    "max_per_feed": 30,
+    "feeds": [
+      {"id": "blog-a", "name": "Example Deals Blog", "url": "https://blog.example/feed/", "priority": "high"}
+    ]
+  }
+}

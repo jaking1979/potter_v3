@@ -111,7 +111,9 @@ def scan(root: str | Path, *, allow: Iterable[str] = ()) -> list[Finding]:
     findings: list[Finding] = []
     for p in sorted(root.rglob("*.py")):
         rel = p.relative_to(root)
-        if rel.parts and rel.parts[0] in (".git",):
+        # "overlay" is Potter v3's product code, which runs on the OpenClaw host (monitors fetch web pages). This
+        # lint guards the legacy Python runtime's send path, not that code. Exempted by the owner, 2026-11-17.
+        if rel.parts and rel.parts[0] in (".git", "overlay"):
             continue
         exempt = (rel.parts[0] in EXEMPT_DIRS) or str(rel) in allowed
         findings += scan_source(p.read_text(encoding="utf-8"), str(rel), exempt=exempt)
