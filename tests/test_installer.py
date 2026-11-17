@@ -214,6 +214,11 @@ class Installer(unittest.TestCase):
         self.assertIn("policy_is_shipped", boot)
         self.assertIn('potter-cron off "Proactive check (potter)"', boot)
 
+    def test_every_global_rule_file_is_in_the_index(self):
+        idx = (ROOT / "overlay/workspace/rules/INDEX.md").read_text()
+        for f in (ROOT / "overlay/workspace/rules/global").glob("*.md"):
+            self.assertIn(f"`global/{f.name}`", idx, f.name)
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 

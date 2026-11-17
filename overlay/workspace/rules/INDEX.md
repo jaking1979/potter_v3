@@ -13,16 +13,19 @@ index points to and delete the other.
 | Finishing work, "are you sure", claiming something is done | `global/verification.md` |
 | How email is run: Potter's inbox, conversations, intake, urgent items, sending | `global/email-pipeline.md` |
 | Creating, changing or debugging any scheduled job, monitor or reminder | `global/schedules.md` |
+| Claims of finished work, the nightly checks, follow-ups the checker opened | `global/quality-control.md` |
 
 ## Stores outside rules/
+Files marked *(first use)* do not exist until the program that writes them first runs; their absence is normal.
+
 | Information | Store |
 |---|---|
 | Past mistakes and their prevention rules | `learnings/ERRORS.md`, `learnings/CORRECTIONS.md` |
 | Open decisions waiting on the owner | `learnings/OPEN_QUESTIONS.md` |
 | Daily working memory for the Morning Brief | `state/compiling-doc.md` |
-| Evening check-in nudge record (sent today?) | `state/evening-nudge.json` |
-| Urgent mail waiting for delivery (written by mail-intake, sent by a program) | `state/urgent-mail-queue.jsonl` |
-| Standby / handover of jobs from an older assistant | `/etc/potter/handover.json` (see the `handover` skill) |
+| Evening check-in nudge record (sent today?) | `state/evening-nudge.json` *(first use)* |
+| Urgent mail waiting for delivery (written by mail-intake, sent by a program) | `state/urgent-mail-queue.jsonl` *(first use)* |
+| Standby / handover of jobs from an older assistant | `/etc/potter/handover.json` *(only when a v2 export was imported; see the `handover` skill)* |
 
 ## Personal rules (domains, projects, people, preferences)
 <!-- PERSONAL-INDEX: filled in at install from the owner's profile. Add rows here as new rules are created. -->
