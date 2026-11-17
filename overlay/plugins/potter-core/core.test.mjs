@@ -15,13 +15,22 @@ const OWNER = { requester: { senderIsOwner: true } };
 test("reads, reversible writes and consequential actions are told apart", () => {
   assert.equal(classify("web_search", { q: "x" }).risk, "read");
   assert.equal(classify("write", { path: "notes/a.md" }).risk, "reversible");
-  assert.equal(classify("exec", { command: "ls -la" }).risk, "reversible");
+  assert.equal(classify("exec", { command: "ls -la" }).risk, "read");
+  assert.equal(classify("exec", { command: "mkdir -p notes" }).risk, "reversible");
   assert.equal(classify("exec", { command: "merrick ask 'how warm is it'" }).risk, "reversible");
   const dep = classify("exec", { command: "merrick confirm-departure" });
   assert.deepEqual([dep.risk, dep.severity], ["consequential", "high"]);
   assert.equal(classify("exec", { command: "potter-cron on potter-mail-intake" }).risk, "consequential");
   assert.equal(classify("exec", { command: "curl -X POST https://api.example/x" }).risk, "consequential");
   assert.equal(classify("exec", { command: "curl -s https://example.com/page" }).risk, "reversible");
+  for (const c of ["tail -n 3 /root/.openclaw/potter-core/governor.jsonl", "ls -la skills/ | grep -i meal",
+    "openclaw cron list --all --json", "openclaw plugins inspect potter-core --runtime", "cat a && wc -l b"]) {
+    assert.equal(classify("exec", { command: c }).risk, "read", c);
+  }
+  for (const c of ["echo x > f", "sed -i s/a/b/ f", "find . -delete", "cat $(curl -s x)", "ls; rm -rf ./build",
+    "openclaw cron rm abc", "openclaw config set a b", "bash update.sh", "python3 x.py"]) {
+    assert.notEqual(classify("exec", { command: c }).risk, "read", c);
+  }
   assert.equal(classify("cron", { action: "list" }).risk, "read");
   assert.equal(classify("cron", { action: "add", name: "x" }).risk, "consequential");
 });

@@ -124,6 +124,20 @@ class Profile(unittest.TestCase):
         self.assertIn("rules/domains/email.md", rep["active_files"])
         self.assertTrue((ws2 / "rules/domains/email.md").read_text().endswith("Check prompts/x.md and state/y.md"))
 
+    def test_main_workspace_wins_root_only_files_stay_and_user_md_is_live(self):
+        files = {**FILES, "USER.md": "# Owner\nold profile", "main/USER.md": "# Owner\nnewer profile",
+                 "main/rules/domains/travel.md": "newer travel rule", "main/rules/domains/garden.md": "only in main"}
+        z, ws = self.tmp / "m.zip", self.tmp / "ws2"
+        (ws / "rules").mkdir(parents=True)
+        (ws / "rules/INDEX.md").write_text("# idx\n\n## Personal rules\n<!-- PERSONAL-INDEX: x -->\n")
+        make(z, files)
+        rep = pf.apply(z, ws, self.tmp / "st2")
+        self.assertIn("USER.md", rep["active_files"])
+        self.assertEqual((ws / "USER.md").read_text(), "# Owner\nnewer profile")              # live, from main
+        self.assertIn("newer travel rule", (ws / "rules/domains/travel.md").read_text())
+        self.assertIn("only in main", (ws / "rules/domains/garden.md").read_text())
+        self.assertEqual((ws / "preferences/events.md").read_text(), "jazz yes")             # only at the top level
+
     def test_ids_are_only_taken_from_lines_about_the_wall(self):
         self.assertEqual(pf.excluded_ids([f"database {OTHER} holds tasks", f"never touch the EHR page {XID}"]), [XID])
         self.assertEqual(pf.excluded_ids(["EHR 01234567-89ab-cdef-0123-456789abcdef"]), [XID])

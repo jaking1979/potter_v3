@@ -28,6 +28,7 @@ WALL = re.compile(r"EHR|hard wall|excluded", re.I)
 SKIP_ACTIVE = {"rules/projects/potter-v2-rebuild.md"}            # about rebuilding v2 itself
 # v2 path (relative to its workspace) -> (v3 path, active?)
 ROUTES = [
+    (re.compile(r"^USER\.md$"), lambda m, p: "USER.md", True),             # who the owner is: live, not reference
     (re.compile(r"^rules/(people|domains|projects)/[^/]+\.md$"), lambda m, p: p, True),
     (re.compile(r"^preferences/.+\.md$"), lambda m, p: p, True),
     (re.compile(r"^rules/global/communication\.md$"), lambda m, p: "rules/personal/communication-style.md", True),
@@ -117,13 +118,21 @@ def build_plan(z: zipfile.ZipFile) -> dict:
     names = z.namelist()
     ws = find_workspace(names)
     old_ws = "/" + ws[ws.index("home/"):] if "home/" in ws else "/" + ws
-    files, skipped = [], []
+    # v2's main agent worked in workspace/main/; the top level holds older copies plus files only it has (such as
+    # preferences/). Both are read; for a file in both, main's (the live one) wins.
+    chosen, skipped = {}, []
     for n in names:
         if not n.startswith(ws) or n.endswith("/"):
             continue
-        rel = n[len(ws):]
-        if rel.startswith(("main/", "merrick/")) or "/." in "/" + rel and not rel.startswith(".learnings/"):
-            continue                                              # other agents' workspaces and hidden dirs
+        rel, prio = n[len(ws):], 0
+        if rel.startswith("main/"):
+            rel, prio = rel[len("main/"):], 1
+        if rel.startswith(("merrick/", "main/")) or "/." in "/" + rel and not rel.startswith(".learnings/"):
+            continue                                              # Merrick's workspace and hidden dirs
+        if rel not in chosen or prio > chosen[rel][1]:
+            chosen[rel] = (n, prio)
+    files = []
+    for rel, (n, prio) in sorted(chosen.items()):
         dest, active = route(rel)
         if dest is None:
             continue

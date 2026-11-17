@@ -247,7 +247,10 @@ class Installer(unittest.TestCase):
     def test_update_script_is_safe_to_run_from_inside_potter(self):
         u = (ROOT / "install/update.sh").read_text()
         self.assertIn("--check", u)
-        self.assertIn("nohup bash -c 'sleep 8; systemctl restart potter-gateway'", u)    # report first, restart after
+        self.assertIn("systemd-run", u)                                                  # never inside Potter's turn
+        self.assertIn("systemctl stop potter-gateway", u)                                # offline-only steps work
+        self.assertIn("api.telegram.org/bot%s/sendMessage", u)                           # reports without a model
+        self.assertIn("--profile", u)
         self.assertIn('new["standingGrants"] = old.get("standingGrants")', u)            # keeps the owner's grants
         self.assertNotIn("PERSONAL-INDEX", u)                                            # never rewrites the index
         self.assertTrue((ROOT / "overlay/workspace/skills/update-potter/SKILL.md").exists())

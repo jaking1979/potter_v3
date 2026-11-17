@@ -35,6 +35,20 @@ const EXEC_RULES = [
   [/\b(sendmail|mailx?)\b/, "exec:mail", "consequential", "normal"],
 ];
 
+// A shell line that only looks: every command in it is a reader, and nothing is written, moved or removed.
+const READERS = new Set("cat head tail ls ll grep egrep rg find wc stat du df ps pgrep which whereis echo printf pwd date jq sort uniq cut tr awk sed file id uname hostname uptime free env printenv basename dirname realpath readlink diff cmp test true".split(" "));
+const WRITES = /(^|[^<>&|])>{1,2}|\btee\b|\bsed\s+(-[a-z]*i|--in-place)|\bfind\b[^|;&]*\s-(delete|exec)\b|\bawk\b[^|;&]*system\(/;
+export function readOnlyShell(cmd) {
+  const c = String(cmd ?? "").trim();
+  if (!c || WRITES.test(c) || /[`]|\$\(/.test(c)) return false;
+  const parts = c.split(/\s*(?:\|\||&&|\||;)\s*/).filter(Boolean);
+  return parts.every((p) => {
+    const w = p.replace(/^(sudo|env|time|nice)\s+/, "").split(/\s+/);
+    if (w[0] === "openclaw") return /\b(list|get|status|show|inspect|runs|health|--version|--help)\b/.test(p) && !/\b(set|patch|unset|add|rm|edit|enable|disable|run|install|restart|stop|start|approve|delete)\b/.test(p.replace(/\bruns\b/, ""));
+    return READERS.has(w[0]);
+  });
+}
+
 function str(v) {
   return typeof v === "string" ? v : "";
 }
@@ -74,6 +88,7 @@ export function classify(toolName, params = {}, opts = {}) {
     for (const [re, capability, risk, severity] of EXEC_RULES) {
       if (re.test(cmd)) return { capability, risk, severity, target: cmd.slice(0, 80) };
     }
+    if (readOnlyShell(cmd)) return { capability: "exec:read", risk: "read", severity: "normal", target: cmd.slice(0, 80) };
     return { capability: "exec", risk: "reversible", severity: "normal", target: cmd.slice(0, 80) };
   }
 
