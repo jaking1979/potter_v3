@@ -180,6 +180,14 @@ class Installer(unittest.TestCase):
         self.assertNotIn("digest", enabled)
         self.assertNotIn("trading", enabled)
 
+    def test_a_rerun_keeps_the_gateway_password_and_stops_the_old_gateway_first(self):
+        boot = (ROOT / "install/bootstrap.sh").read_text()
+        keep = boot.index('if [ -s "$SECRETS_DIR/gateway.password" ]')
+        self.assertLess(keep, boot.index('GATEWAY_PASSWORD="$(python3'))           # an existing password wins
+        self.assertLess(boot.index("systemctl stop potter-gateway.service"), boot.index("oc onboard"))
+        self.assertIn("--skip-health", boot[boot.index("oc onboard"):boot.index("oc onboard") + 600])
+        self.assertIn('echo $! > "$POTTER_HOME/gateway.pid"', boot)
+
     def test_runbook_exists_and_names_the_one_terminal_step(self):
         self.assertIn("only terminal step", (ROOT / "docs/RUNBOOK.md").read_text())
 

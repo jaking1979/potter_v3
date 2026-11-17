@@ -59,14 +59,26 @@ umask 077; mkdir -p "$SECRETS_DIR"
 printf '%s' "$TELEGRAM_TOKEN" > "$SECRETS_DIR/telegram.token"
 chmod 700 "$SECRETS_DIR"; chmod 600 "$SECRETS_DIR/telegram.token"
 
-GATEWAY_PASSWORD="$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')"
-printf '%s' "$GATEWAY_PASSWORD" > "$SECRETS_DIR/gateway.password"; chmod 600 "$SECRETS_DIR/gateway.password"
+# A rerun (retry after a failed install) keeps the password of the first run: the gateway, the settings page and
+# the owner's browser already use it.
+if [ -s "$SECRETS_DIR/gateway.password" ]; then
+  GATEWAY_PASSWORD="$(cat "$SECRETS_DIR/gateway.password")"
+else
+  GATEWAY_PASSWORD="$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')"
+  printf '%s' "$GATEWAY_PASSWORD" > "$SECRETS_DIR/gateway.password"; chmod 600 "$SECRETS_DIR/gateway.password"
+fi
+# A gateway left running by an earlier attempt is stopped; it is started again, with this run's settings, below.
+if [ -z "${POTTER_NO_DAEMON:-}" ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl stop potter-gateway.service >/dev/null 2>&1 || true
+else
+  if [ -s "$POTTER_HOME/gateway.pid" ]; then kill "$(cat "$POTTER_HOME/gateway.pid")" >/dev/null 2>&1 || true; sleep 2; fi
+fi
 
 say "Onboarding OpenClaw (non-interactive)"
 oc onboard --non-interactive --accept-risk --flow manual --mode local \
    --auth-choice openrouter-api-key --openrouter-api-key "$OPENROUTER_KEY" \
    --gateway-bind loopback --gateway-auth password --gateway-password "$GATEWAY_PASSWORD" --agent-name Potter \
-   --no-install-daemon >/dev/null
+   --no-install-daemon --skip-health >/dev/null
 
 say "Applying the Potter overlay"
 export OWNER_NAME TIMEZONE OWNER_TELEGRAM_ID SECRETS_DIR
@@ -279,6 +291,7 @@ UNIT
   systemctl enable --now potter-settings.service >/dev/null
 else
   nohup openclaw "${OC_PROFILE_FLAG[@]}" gateway run >"${POTTER_HOME}/gateway.log" 2>&1 &
+  echo $! > "$POTTER_HOME/gateway.pid"
 fi
 for i in $(seq 1 60); do oc health >/dev/null 2>&1 && break; sleep 2; [ "$i" = 60 ] && die "gateway did not become healthy"; done
 # "Healthy" comes before the Potter agent has finished preparing (a fresh gateway, or a retry over an earlier run).
