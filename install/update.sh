@@ -54,6 +54,23 @@ json.dump({"plugins": {"allow": ids}}, open(sys.argv[1], "w"))' "$a"
 q oc config patch --file "$a" --replace-path plugins.allow; rm -f "$a"
 echo "potter-core: installed and configured"
 
+# 1b. model policy: replaced only if it is still a shipped one (an edited policy is the owner's and is kept)
+OLD_SHIPPED="$(sed -n 's/^OLD_SHIPPED_POLICIES="\(.*\)"$/\1/p' "$HERE/bootstrap.sh")"
+P="$WS/state/model-policy.json"
+if [ -f "$P" ] && ! cmp -s "$P" "$REPO/overlay/jev/policy.json"; then
+  h="$(sha256sum "$P" | cut -c1-64)"
+  if { [ -f "$WS/state/model-policy.shipped.json" ] && cmp -s "$P" "$WS/state/model-policy.shipped.json"; } || \
+     case " $OLD_SHIPPED " in *" $h "*) true;; *) false;; esac; then
+    cp "$REPO/overlay/jev/policy.json" "$P"; cp "$REPO/overlay/jev/policy.json" "$WS/state/model-policy.shipped.json"
+    m="$(mktemp --suffix=.json5)"
+    python3 "$HERE/apply_models.py" "$P" --patch "$m" --agents potter$(oc agents list 2>/dev/null | grep -q merrick && echo ,merrick) \
+      && q oc config patch --file "$m" --replace-path agents.defaults.models
+    rm -f "$m"; echo "model policy: updated to the shipped version"
+  else
+    echo "model policy: yours was edited, kept as it is (the new default is overlay/jev/policy.json)"
+  fi
+fi
+
 # 2. Jev for Merrick
 mkdir -p "$POTTER_HOME/jev"; cp "$REPO/overlay/jev/"{client.js,policy.js,telemetry.js,index.js,merrick-decide.mjs} "$POTTER_HOME/jev/"
 if [ -f /usr/local/bin/merrick ] && ! grep -q MERRICK_DECIDE_CMD /usr/local/bin/merrick; then

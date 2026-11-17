@@ -271,7 +271,7 @@ q oc config patch --file "$pcp" --replace-path plugins.entries.potter-core.confi
 # A policy still equal to the one shipped last time is replaced by the new one; a policy the owner (or Potter on the
 # owner's instruction) has edited is left alone.
 # Fingerprints of policies shipped before the .shipped copy existed (an install from then has no copy to compare with).
-OLD_SHIPPED_POLICIES="5b98a1beba3f17f60937ff86f4e6cf08887d0ebcd80594a8edfa6016f1f72daf"
+OLD_SHIPPED_POLICIES="5b98a1beba3f17f60937ff86f4e6cf08887d0ebcd80594a8edfa6016f1f72daf f486a762959e31278abab1749baed8b9e0d2eabb932c7c013ce4983ca5af1320"
 policy_is_shipped() {
   [ -f "$WS/state/model-policy.shipped.json" ] && cmp -s "$WS/state/model-policy.json" "$WS/state/model-policy.shipped.json" && return 0
   case " $OLD_SHIPPED_POLICIES " in *" $(sha256sum "$WS/state/model-policy.json" | cut -c1-64) "*) return 0;; esac

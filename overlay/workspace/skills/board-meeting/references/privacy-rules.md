@@ -1,0 +1,3 @@
+# Privacy gate
+
+Before any model sees source conversation, remove passwords, tokens, credentials, authentication codes, secrets, account/card numbers, unnecessary private identifiers, and explicitly restricted information. EHR and identifiable client/patient material are a hard stop and must never be processed or transmitted. Redact the packet again before directors receive it. If useful context still requires unusually sensitive personal, clinical, employment, legal, or financial information, show the proposed redacted packet and obtain approval. Never send raw conversation to directors.
