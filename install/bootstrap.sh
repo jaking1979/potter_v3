@@ -306,6 +306,14 @@ exec node "$POTTER_HOME/plugins/potter-kg/scripts/kg-curate.mjs" --decider "$POT
   --policy "$WS/state/model-policy.json" --telemetry "$WS/state/jev-telemetry.jsonl" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-curate
+# Knowledge-graph eval: how well the decision model sees the links in a graph (read-only; owner-run).
+cat > /usr/local/bin/potter-kg-eval <<WRAP
+#!/bin/sh
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+exec node "$REPO/overlay/plugins/potter-kg/scripts/kg-eval.mjs" --decider "$POTTER_HOME/jev/index.js" \
+  --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-kg-eval
 read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then

@@ -118,6 +118,15 @@ fi
 [ -d "$POTTER_HOME/merrick" ] && { rm -rf "$POTTER_HOME/merrick"; cp -r "$REPO/overlay/merrick" "$POTTER_HOME/merrick"; rm -f "$POTTER_HOME/merrick/testing.py"; }
 mkdir -p "$POTTER_HOME/tools"; cp "$REPO/overlay/tools/"*.py "$POTTER_HOME/tools/"
 step "merrick: Jev decider wired"
+# Knowledge-graph eval: how well the decision model sees the links in a graph (read-only; owner-run).
+cat > /usr/local/bin/potter-kg-eval <<WRAP
+#!/bin/sh
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+exec node "$REPO/overlay/plugins/potter-kg/scripts/kg-eval.mjs" --decider "$POTTER_HOME/jev/index.js" \
+  --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-kg-eval
+step "kg eval: potter-kg-eval ready"
 
 # 2b. memory search, with the key already saved for Jev (no key is re-entered)
 . "$HERE/memory_search.sh"
