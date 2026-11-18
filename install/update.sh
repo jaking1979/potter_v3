@@ -141,7 +141,7 @@ zdr="$(python3 "$HERE/zdr_check.py" "$WS/state/model-policy.json" --embedding op
 [ -n "$zdr" ] && step "WARNING, zero data retention: $zdr" || step "zero data retention: every model Potter uses has a ZDR provider"
 
 # 2. Jev for Merrick
-mkdir -p "$POTTER_HOME/jev"; cp "$REPO/overlay/jev/"{client.js,policy.js,telemetry.js,index.js,merrick-decide.mjs} "$POTTER_HOME/jev/"
+mkdir -p "$POTTER_HOME/jev"; cp "$REPO/overlay/jev/"{client.js,policy.js,telemetry.js,index.js,merrick-decide.mjs,house-ideas.mjs} "$POTTER_HOME/jev/"
 if [ -f /usr/local/bin/merrick ] && ! grep -q MERRICK_DECIDE_CMD /usr/local/bin/merrick; then
   sed -i "/^exec /i export MERRICK_DECIDE_CMD=\"node $POTTER_HOME/jev/merrick-decide.mjs\"\nexport POTTER_JEV_ENV=$SECRETS_DIR/jev.env\nexport POTTER_MODEL_POLICY=$WS/state/model-policy.json" /usr/local/bin/merrick
 fi
@@ -251,6 +251,12 @@ exec node "$POTTER_HOME/eval/t1.mjs" "\$cmd" --dir "$WS/state/t1" --decider "$PO
   --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-t1
+cat > /usr/local/bin/potter-house-ideas <<WRAP
+#!/bin/sh
+# Filter the week's house ideas with Jev (stdin: evidence, existing, ideas as JSON). Prints kept and dropped.
+POTTER_JEV_ENV="$SECRETS_DIR/jev.env" POTTER_MODEL_POLICY="$WS/state/model-policy.json" exec node "$POTTER_HOME/jev/house-ideas.mjs"
+WRAP
+chmod 755 /usr/local/bin/potter-house-ideas
 step "vault: potter-vault installed ($([ -f "$SECRETS_DIR/vault.env" ] && echo connected || echo "not connected yet: potter-vault-setup"))"
 step "kg tools: potter-kg-eval and potter-kg-import ready"
 

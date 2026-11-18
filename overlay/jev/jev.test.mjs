@@ -328,3 +328,15 @@ test("Merrick's decider turns Jev's answer into a route, or nothing", () => {
   const q = merrickQuestions(["family_room", "den"]);
   assert.deepEqual(Object.keys(q.zone.criteria), ["family_room", "den", "none"]);
 });
+
+test("house ideas: only supported, clearly safe and new ideas survive", async () => {
+  const { filter, keep } = await import("./house-ideas.mjs");
+  assert.equal(keep({ supported: { noul: 0.9 }, safe: { noul: 0.95 }, is_new: { noul: 0.9 } }), null);
+  assert.equal(keep({ supported: { noul: 0.9 }, safe: { noul: 0.8 }, is_new: { noul: 0.9 } }), "not clearly safe");
+  assert.equal(keep({ supported: { noul: 0.4 }, safe: { noul: 0.99 }, is_new: { noul: 0.9 } }), "not supported by the data yet");
+  const ideas = [{ title: "Later preheat", what: "start 2.5 h before arrival" }, { title: "Unlock door on arrival", what: "unlock" }];
+  const decide = async ({ state }) => ({ ok: true, answers: { supported: { noul: 0.9 }, is_new: { noul: 0.9 }, safe: { noul: /unlock/i.test(state.idea.what) ? 0.1 : 0.97 } } });
+  const r = await filter({ ideas, evidence: { ready: [] }, existing: [] }, decide);
+  assert.deepEqual(r.kept.map((i) => i.title), ["Later preheat"]);
+  assert.deepEqual(r.dropped, [{ title: "Unlock door on arrival", why: "not clearly safe" }]);
+});

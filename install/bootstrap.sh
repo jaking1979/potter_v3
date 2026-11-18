@@ -387,6 +387,12 @@ exec node "$POTTER_HOME/eval/t1.mjs" "\$cmd" --dir "$WS/state/t1" --decider "$PO
   --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-t1
+cat > /usr/local/bin/potter-house-ideas <<WRAP
+#!/bin/sh
+# Filter the week's house ideas with Jev (stdin: evidence, existing, ideas as JSON). Prints kept and dropped.
+POTTER_JEV_ENV="$SECRETS_DIR/jev.env" POTTER_MODEL_POLICY="$WS/state/model-policy.json" exec node "$POTTER_HOME/jev/house-ideas.mjs"
+WRAP
+chmod 755 /usr/local/bin/potter-house-ideas
 read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then

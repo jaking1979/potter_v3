@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import budget, coldwatch, departure, fastpath, intentions, pathlog, thermal
-from .ha import SafeHome
+from .ha import SafeHome, num
 from .habridge import BridgeHomeAssistant
 
 
@@ -180,8 +180,10 @@ def cmd_collect(ns) -> int:
     temps = {name: home.value(s.get("entity", "")) for name, s in (house.get("sensors") or {}).items()}
     for zid, z in house["zones"].items():
         temps["zone:" + zid] = home.zone_reading(zid)["room_f"]
+    w = home.read(house.get("weather_entity") or "") or {}
+    outdoor = num((w.get("attributes") or {}).get("temperature"))       # for insights: how weather changes the house
     with open(state / "room-snapshots.jsonl", "a") as fh:
-        fh.write(json.dumps({"ts": now.isoformat(), "temps": temps}) + "\n")
+        fh.write(json.dumps({"ts": now.isoformat(), "temps": temps, "outdoor_f": outdoor}) + "\n")
     failed = 0
     with _locked(state):
         model = _load(state / "model.json", {})
@@ -229,6 +231,14 @@ def cmd_shadow_report(ns) -> int:
     since = time.time() - ns.days * 86400
     rep = shadow.report(shadow.read(_state(ns) / "shadow.jsonl", since))
     print(json.dumps(rep, indent=1) if ns.json else shadow.render(rep, ns.days))
+    return 0
+
+
+def cmd_insights(ns) -> int:
+    """What the collected data supports, and what is still waiting for enough data. Reads files only."""
+    from . import insights
+    rep = insights.analyse(_state(ns), _house(ns))
+    print(json.dumps(rep, indent=1) if ns.json else insights.render(rep))
     return 0
 
 
@@ -306,6 +316,7 @@ def main(argv: list[str]) -> int:
         p.set_defaults(fn=fn)
     sub.add_parser("collect").set_defaults(fn=cmd_collect)
     sub.add_parser("shadow").set_defaults(fn=cmd_shadow)
+    p = sub.add_parser("insights"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_insights)
     p = sub.add_parser("shadow-report"); p.add_argument("--days", type=int, default=7)
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_shadow_report)
     sub.add_parser("confirm-departure").set_defaults(fn=cmd_confirm_departure)

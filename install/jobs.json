@@ -296,6 +296,18 @@
    "command": "merrick shadow",
    "requires_cmd": "merrick",
    "purpose": "house dry-run: records what v3 would hold each zone at (read-only), for the switch-over decision"
+  },
+  {
+   "name": "potter-house-insights",
+   "cron": "41 10 * * 6",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 900,
+   "standby": false,
+   "deliver": true,
+   "requires_cmd": "merrick",
+   "message": "Run the house-insights skill. If nothing is ready, send the one-line progress only on the first Saturday of the month; otherwise output nothing.",
+   "purpose": "weekly: what the house data supports (only once there is enough of it), plus Jev-checked automation ideas"
   }
  ]
 }
