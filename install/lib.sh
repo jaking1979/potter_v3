@@ -25,6 +25,19 @@ install_plugin() {
   q oc plugins enable "$id"
 }
 
+# install_plugin_if_changed SRC ID [args]: reinstall only when the plugin's files changed since the last install.
+install_plugin_if_changed() {
+  local src="$1" id="$2"; shift 2
+  local stamp_dir="${POTTER_HOME:-/opt/potter}/.plugin-stamps"; mkdir -p "$stamp_dir"
+  local sum; sum="$(cd "$src" && find . -type f ! -path './tests/*' ! -name '*.test.mjs' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)"
+  if [ -f "$stamp_dir/$id" ] && [ "$(cat "$stamp_dir/$id")" = "$sum" ] && oc plugins inspect "$id" >/dev/null 2>&1; then
+    PLUGIN_SKIPPED=1; return 0
+  fi
+  PLUGIN_SKIPPED=""
+  install_plugin "$src" "$id" "$@"
+  echo "$sum" > "$stamp_dir/$id"
+}
+
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
 # ask VAR "Prompt" [default] [secret]  - whiptail box when a terminal is available, plain prompt otherwise.

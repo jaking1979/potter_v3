@@ -145,6 +145,21 @@ Before the main model thinks, the governor builds its working context instead of
   patterns, forecast accuracy, one change for next week. Says so when there is not enough evidence.
 - New vocabulary: entity type `pattern`, predicate `has_pattern`.
 
+## v3.11 Vault (potter-vault 1.0.0)
+
+- The owner chooses what Potter may use: items in a "Potter" collection of a self-hosted Vaultwarden, read by
+  Potter's own account (server-enforced scope). Setup: docs/VAULT_SETUP.md; `potter-vault-setup` serves a one-time
+  form that checks the key and password and writes a root-only file.
+- A value never enters the model's context: the model writes `{{vault:<item>#<field>}}`; the plugin substitutes the
+  value into the tool call at the last moment, only for browser and request tools (shells, messages, files, memory,
+  Notion and email are blocked), only for items authorized in the last 15 minutes. Values are scrubbed from tool
+  results and the model's own messages before they are stored. `vault_send_to_owner` sends a value straight to the
+  owner's chat.
+- Approval: cards always; logins unless the item's notes say `potter:auto`. Audit: names and purposes, never values.
+- Checked in a real OpenClaw 2026.11: the plugin loads with before_tool_call (priority 10, after potter-core's
+  control), tool_result_persist and before_message_write.
+- Updates reinstall a plugin only when its files changed (each install runs OpenClaw and npm; memory).
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.

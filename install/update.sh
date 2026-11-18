@@ -56,7 +56,7 @@ fi
 
 # 1. potter-core plugin
 d="$(mktemp -d)"; cp -r "$REPO/overlay/plugins/potter-core/"{index.js,lib,openclaw.plugin.json,package.json} "$d/"
-install_plugin "$d" potter-core --force; rm -rf "$d"
+install_plugin_if_changed "$d" potter-core --force; rm -rf "$d"
 p="$(mktemp --suffix=.json5)"
 POTTER_TZ="$(oc config get agents.defaults.userTimezone 2>/dev/null | tr -d '"' || echo UTC)" python3 - "$id" "$C" "$WS" "$SECRETS_DIR" "$p" <<'PY'
 import json, os, sys
@@ -105,7 +105,7 @@ step "potter-core: installed and configured"
 rm -rf "$POTTER_HOME/plugins/potter-kg"; mkdir -p "$POTTER_HOME/plugins"
 cp -r "$REPO/overlay/plugins/potter-kg" "$POTTER_HOME/plugins/potter-kg"; rm -rf "$POTTER_HOME/plugins/potter-kg/tests"
 kgcfg="$(oc config get plugins.entries.potter-kg.config 2>/dev/null || echo '{}')"
-install_plugin "$POTTER_HOME/plugins/potter-kg" potter-kg --force
+install_plugin_if_changed "$POTTER_HOME/plugins/potter-kg" potter-kg --force
 kp="$(mktemp --suffix=.json5)"
 python3 - "$kgcfg" "$C/potter-kg/potter-kg.sqlite" "$kp" <<'PY'
 import json, sys
@@ -221,6 +221,28 @@ exec node "$POTTER_HOME/cos/mail-watch.mjs" --doc "$WS/state/compiling-doc.md" -
   --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-mail-watch
+# Potter's vault: the plugin (tools say "not set up" until the owner connects a vault) and its setup command.
+rm -rf "$POTTER_HOME/plugins/potter-vault"; mkdir -p "$POTTER_HOME/plugins"
+cp -r "$REPO/overlay/plugins/potter-vault" "$POTTER_HOME/plugins/potter-vault"; rm -rf "$POTTER_HOME/plugins/potter-vault/tests"
+install_plugin_if_changed "$POTTER_HOME/plugins/potter-vault" potter-vault --force
+vp="$(mktemp --suffix=.json5)"
+OWNER="$id" SECRETS="$SECRETS_DIR" VSTATE="$C/potter-vault" python3 -c 'import json,os,sys; json.dump({"plugins":{"entries":{"potter-vault":{"enabled":True,"hooks":{"allowConversationAccess":True},"config":{"envFile":os.path.join(os.environ["SECRETS"],"vault.env"),"ownerTarget":os.environ["OWNER"],"stateDir":os.environ["VSTATE"]}}}}}, open(sys.argv[1],"w"))' "$vp"
+q oc config patch --file "$vp"; rm -f "$vp"
+cp "$REPO/install/vault_form.py" "$POTTER_HOME/tools/vault_form.py"
+cat > /usr/local/bin/potter-vault-setup <<WRAP
+#!/bin/sh
+# One time: connect Potter's own Vaultwarden account. Prints a link to a one-time form; the form closes itself.
+command -v bw >/dev/null 2>&1 || { npm install -g --silent @bitwarden/cli >/dev/null 2>&1; [ -x "\$(npm root -g)/@bitwarden/cli/build/bw.js" ] && ln -sf "\$(npm root -g)/@bitwarden/cli/build/bw.js" /usr/local/bin/bw; }
+command -v bw >/dev/null 2>&1 || { echo "Could not install the Bitwarden CLI (npm install -g @bitwarden/cli)." >&2; exit 1; }
+host="\$(hostname -I 2>/dev/null | cut -d' ' -f1)"
+systemctl stop potter-vault-form 2>/dev/null; rm -f /run/potter-vault-form.out
+systemd-run --unit=potter-vault-form --collect --quiet -p RuntimeMaxSec=1800 -p StandardOutput=file:/run/potter-vault-form.out \
+  python3 "$POTTER_HOME/tools/vault_form.py" --out "$SECRETS_DIR/vault.env" --host-label "\$host"
+sleep 2; chmod 600 /run/potter-vault-form.out 2>/dev/null; cat /run/potter-vault-form.out
+echo "(The form closes itself when done, or after 30 minutes.)"
+WRAP
+chmod 755 /usr/local/bin/potter-vault-setup
+step "vault: potter-vault installed ($([ -f "$SECRETS_DIR/vault.env" ] && echo connected || echo "not connected yet: potter-vault-setup"))"
 step "kg tools: potter-kg-eval and potter-kg-import ready"
 
 # 2b. memory search, with the key already saved for Jev (no key is re-entered)

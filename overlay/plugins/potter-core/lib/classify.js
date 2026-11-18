@@ -17,7 +17,9 @@ export function words(name) {
 const PROTECTED_HOME = /(lock|alarm|arm|disarm|valve|water|garage|siren|security)/i;
 
 const READ_TOOLS = new Set(["read", "web_search", "web_fetch", "memory_search", "memory_get", "sessions_history",
-  "session_status", "agents_list", "image", "pdf"]);
+  "session_status", "agents_list", "image", "pdf",
+  // potter-vault gates its own tools (owner approval for cards and unmarked logins) and never returns a value
+  "vault_list", "vault_authorize", "vault_send_to_owner"]);
 const REVERSIBLE_TOOLS = new Set(["write", "edit", "apply_patch", "sessions_spawn", "sessions_send", "sessions_yield",
   "sessions_create", "process", "canvas", "tts", "browser", "nodes"]);
 

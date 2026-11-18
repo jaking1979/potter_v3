@@ -149,3 +149,8 @@ test("expired facts are never recalled; old temporary ones are flagged; facts ca
   assert.ok(f.some((x) => x.text.includes("Lemon Cake") && x.text.includes("(as of 2026-01-01; may have changed)")));
   assert.ok(f.filter((x) => x.kind === "relation").every((x) => /\|/.test(x.key)));
 });
+
+test("vault tools are gated by potter-vault itself, so potter-core does not ask twice", async () => {
+  const { classify } = await import("./lib/classify.js");
+  for (const t of ["vault_list", "vault_authorize", "vault_send_to_owner"]) assert.equal(classify(t, {}).risk, "read", t);
+});
