@@ -98,3 +98,20 @@ test("a changed graph file is noticed", () => {
   utimesSync(path, new Date(), new Date(Date.now() + 5000));
   assert.ok(stale(g));
 });
+
+test("file passages are judged in the same request: irrelevant ones are dropped; without Jev all are kept", async () => {
+  const g = loadGraph(graphFile());
+  const passages = [{ path: "learnings/ERRORS.md", head: "Log lines", text: "How to read a log line." },
+    { path: "preferences/ski.md", head: "Race days", text: "Race days start at 7." }];
+  const judge = async ({ state, questions }) => ({ ok: true, answers: Object.fromEntries(Object.keys(questions).map((k) => {
+    const i = Number(k.slice(1));
+    return [k, { noul: /Race days|Skiing/.test(state.facts[i]) ? 0.9 : 0.1 }];
+  })) });
+  const r = await recall({ graph: g, text: "When is Mia's race?", decide: judge, passages });
+  assert.deepEqual(r.passagesKept.map((h) => h.path), ["preferences/ski.md"]);
+  assert.equal(r.passagesConsidered, 2);
+  const noGraph = await recall({ graph: null, text: "When is the race?", decide: judge, passages });
+  assert.deepEqual(noGraph.passagesKept.map((h) => h.path), ["preferences/ski.md"]);   // works without a graph
+  const noJev = await recall({ graph: g, text: "When is Mia's race?", passages });
+  assert.equal(noJev.passagesKept.length, 2);
+});

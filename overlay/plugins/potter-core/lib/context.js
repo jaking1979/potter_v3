@@ -169,13 +169,14 @@ export function ruleTexts(ws, rules, budget) {
 /**
  * @returns { context, sources: [{path, head, score}], chars }
  */
-export function assemble({ text, rules = [], expand = [], index, ws, now, tz, budget = 7000 }) {
+export function assemble({ text, rules = [], expand = [], index, ws, now, tz, budget = 7000, hits: given }) {
   const parts = [];
   const sources = [];
   const st = ws ? stateBlock(ws, { now, tz }) : "";
   if (st) parts.push("## Your situation now\n" + st);
   let left = budget - st.length;
-  const hits = index ? search(index, [text, ...expand].join(" "), 4, { boost: names(text) }) : [];
+  // `given`: passages already judged relevant (Jev); otherwise the search's own best matches.
+  const hits = given ?? (index ? search(index, [text, ...expand].join(" "), 4, { boost: names(text) }) : []);
   const recall = [];
   for (const h of hits) {
     const t = h.text.replace(SECRETISH, "(secret)");

@@ -165,13 +165,17 @@ export function render(kept, { budget = 2500 } = {}) {
 }
 
 /** The whole read path. `decide({purpose, state, questions})` is optional. */
-export async function recall({ graph, text, decide, timeoutMs = 2500, budget = 2500 }) {
+// `passages`: file search hits to judge in the same request (re-ranking: a cheap search makes the shortlist,
+// Jev decides what reaches the model). Returned as `passagesKept`. Without Jev, every passage is kept.
+export async function recall({ graph, text, decide, timeoutMs = 2500, budget = 2500, passages = [] }) {
   const t0 = Date.now();
-  const none = (extra = {}) => ({ context: "", entities: [], considered: 0, kept: [], source: "none", ms: Date.now() - t0, ...extra });
-  if (!graph || !String(text ?? "").trim()) return none();
-  const matched = match(graph, text);
-  if (!matched.length) return none();
-  const facts = candidates(graph, matched);
+  const none0 = (extra = {}) => ({ context: "", entities: [], considered: 0, kept: [], passagesKept: [], source: "none", ms: Date.now() - t0, ...extra });
+  const none = (extra = {}) => none0({ passagesKept: passages, ...extra });
+  if (!String(text ?? "").trim()) return none();
+  const matched = graph ? match(graph, text) : [];
+  const kgFacts = matched.length ? candidates(graph, matched) : [];
+  const files = passages.map((h) => ({ text: `${h.path}${h.head ? " — " + h.head : ""}: ${String(h.text).slice(0, 400)}`, kind: "file", hit: h }));
+  const facts = [...kgFacts, ...files].map((f, i) => ({ ...f, i }));
   if (!facts.length) return none({ entities: matched.map((m) => m.id) });
   let answers = null, error = null;
   if (decide) {
@@ -183,7 +187,11 @@ export async function recall({ graph, text, decide, timeoutMs = 2500, budget = 2
       if (out?.ok) answers = out.answers; else error = out?.reason ?? "no answer";
     } catch (e) { error = e?.name ?? "error"; }
   }
-  const s = select(facts, answers);
-  return { context: render(s.kept, { budget }), entities: matched.map((m) => m.id), considered: facts.length,
-    kept: s.kept, source: s.source, ms: Date.now() - t0, ...(error ? { error } : {}) };
+  const s = select(facts.filter((f) => f.kind !== "file"), answers);
+  const fileJudged = answers && files.length && facts.some((f) => f.kind === "file" && p(answers[`f${f.i}`]) !== null);
+  const passagesKept = fileJudged
+    ? facts.filter((f) => f.kind === "file" && (p(answers[`f${f.i}`]) ?? 0) >= 0.5).map((f) => f.hit)
+    : passages;
+  return { context: render(s.kept, { budget }), entities: matched.map((m) => m.id), considered: kgFacts.length,
+    kept: s.kept, passagesConsidered: files.length, passagesKept, source: answers ? "jev" : s.source, ms: Date.now() - t0, ...(error ? { error } : {}) };
 }

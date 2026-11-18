@@ -1,6 +1,6 @@
 {
   "name": "potter-core",
-  "version": "3.7.0",
+  "version": "3.7.1",
   "description": "Potter v3 control and brain layer.",
   "type": "module",
   "private": true,

@@ -12,6 +12,7 @@ import { classify } from "./lib/classify.js";
 import { decide, trustOf } from "./lib/control.js";
 import { tryHouse } from "./lib/fastpath.js";
 import { plan, requestText, tableDomains } from "./lib/governor.js";
+import { names, search } from "./lib/context.js";
 import { createDecisionClient } from "./lib/jev-client.js";
 import { append, recent, verify } from "./lib/receipts.js";
 import { chooseClass, costOf, loadClasses, recordSpend, spentToday, toOverride } from "./lib/broker.js";
@@ -217,11 +218,18 @@ export default definePluginEntry({
       api.on("before_prompt_build", async (event, ctx) => {
         if (ctx?.agentId && !agents.has(ctx.agentId)) return;
         const text = requestText(event);
-        // The plan and the graph read run at the same time: the graph adds no wait.
+        // File search shortlist (keyword table domains only: the Jev plan is not back yet), judged by Jev in the
+        // same request as the graph facts. The plan and that request run at the same time: no added wait.
+        let shortlist = [];
+        try {
+          const idx = getIndex();
+          const ex = [...new Set(tableDomains(text).flatMap((id) => DOMAINS.find((d) => d.id === id)?.recall ?? []))];
+          if (idx && text.trim()) shortlist = search(idx, [text, ...ex].join(" "), 4, { boost: names(text) });
+        } catch { shortlist = []; }
         const [p, kg] = await Promise.all([
           plan(text, { decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500 }),
-          recall({ graph: getGraph(), text, decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500, budget: cfg.kg?.budget ?? 2500 })
-            .catch(() => ({ context: "", entities: [], considered: 0, kept: [], source: "error", ms: 0 })),
+          recall({ graph: getGraph(), text, decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500, budget: cfg.kg?.budget ?? 2500, passages: shortlist })
+            .catch(() => ({ context: "", entities: [], considered: 0, kept: [], passagesKept: shortlist, source: "error", ms: 0 })),
         ]);
         let wc = { context: "", sources: [], chars: 0 };
         const t0 = Date.now();
@@ -229,11 +237,12 @@ export default definePluginEntry({
           const doms = p.domains.map((id) => DOMAINS.find((d) => d.id === id)).filter(Boolean);
           const rules = [...new Set(doms.flatMap((d) => d.rules ?? []))];
           const expand = [...new Set(doms.flatMap((d) => d.recall ?? []))];
-          wc = assemble({ text, rules, expand, index: getIndex(), ws, tz: cfg.timezone || "UTC", budget: cfg.brain?.budget ?? 7000 });
+          wc = assemble({ text, rules, expand, index: getIndex(), ws, tz: cfg.timezone || "UTC", budget: cfg.brain?.budget ?? 7000, hits: kg.passagesKept });
         } catch { /* a failure means no working context, never a blocked turn */ }
         log(govLog, { kind: "plan", domains: p.domains, source: p.source, ms: p.latencyMs, chars: text.length, error: p.error ?? null,
           context_chars: wc.chars, recalled: wc.sources.map((x) => x.path), build_ms: Date.now() - t0,
           kg_entities: kg.entities, kg_considered: kg.considered, kg_kept: kg.kept.length, kg_source: kg.source, kg_ms: kg.ms,
+          files_considered: shortlist.length, files_kept: kg.passagesKept?.length ?? 0,
           kg_error: kg.error ?? null });
         const out = [p.context, kg.context, wc.context].filter(Boolean).join("\n\n");
         return out ? { prependContext: out } : undefined;

@@ -94,6 +94,8 @@ Before the main model thinks, the governor builds its working context instead of
   recall is 87% on high-confidence links and 47% on medium ones, so the misses sit in weak links. v2's yes/no kept
   100% precision; the structured link-type Choice beat v2's flat one (58.6% vs 55%). Per-predicate yes/no ranking
   was worse (44%) and is not used. The connection check now uses v2's yes/no plus the structured Choice.
+- 3.7.1: the file search's shortlist goes into the same Jev request; passages Jev judges irrelevant are dropped
+  (re-ranking). Logged: `files_considered`, `files_kept`.
 - `potter-kg-import`: adds another graph (v2's copy) to the live one; never overwrites; tags the source; skips
   clinical material.
 
