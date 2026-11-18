@@ -23,6 +23,11 @@ class Cos(unittest.TestCase):
         self.assertIn('"potter-cos-score"', jobs)
         self.assertIn('"potter-week-review"', jobs)
         self.assertIn('"potter-mail-watch"', jobs)
+        self.assertIn('"potter-travel-watch"', jobs)
+        for f in ("install/bootstrap.sh", "install/update.sh"):
+            t = (ROOT / f).read_text()
+            self.assertIn("/usr/local/bin/potter-travel", t, f)
+            self.assertIn('--travel-inbox "$WS/state/travel/travel-inbox.jsonl"', t, f)
         self.assertNotIn('"potter-mail-observe"', jobs)
 
     def test_nothing_personal(self):

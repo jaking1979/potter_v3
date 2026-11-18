@@ -26,6 +26,8 @@ Manual Captures. `[not yet captured]` means unknown. Unknown is never "quiet".
   owner (a preheat or arrival plan to confirm, a hold, a question Merrick asked, an alert) goes under NEEDS
   RESPONSE with the deadline ("go/no-go today, or I hold the vacancy plan").
 - **Email:** the Email Digest section of the compiling doc, plus any dated items carried in Open Loops.
+- **Travel:** `potter-travel list --days 3`. A trip today or tomorrow goes in MUST-DO with times and the confirmation
+  code; a change since yesterday goes in WHAT CHANGED.
 - **Weather:** only if it changes a decision today, for the places in the owner's profile.
 
 Required sources: compiling doc, calendar, tasks, house, email. The brief ALWAYS ends with one line

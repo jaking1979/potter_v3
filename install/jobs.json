@@ -308,6 +308,26 @@
    "requires_cmd": "merrick",
    "message": "Run the house-insights skill. If nothing is ready, send the one-line progress only on the first Saturday of the month; otherwise output nothing.",
    "purpose": "weekly: what the house data supports (only once there is enough of it), plus Jev-checked automation ideas"
+  },
+  {
+   "name": "potter-travel-capture",
+   "cron": "18,48 * * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 300,
+   "standby": false,
+   "command": "potter-travel capture",
+   "purpose": "reads booking and change emails into trips (every fact checked against the email)"
+  },
+  {
+   "name": "potter-travel-watch",
+   "cron": "*/15 * * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 120,
+   "standby": false,
+   "command": "potter-travel watch",
+   "purpose": "check-in and leave-for-the-airport reminders on time; live flight status with an AeroAPI key"
   }
  ]
 }

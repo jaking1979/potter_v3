@@ -7,7 +7,7 @@
 //   node mail-watch.mjs --doc <compiling-doc.md> --state <json> --decider <module> --policy <file> [--report]
 // env: AGENTMAIL_API_KEY, AGENTMAIL_INBOX, OPENROUTER_API_KEY (for Jev)
 // Exit codes: 0 done (also: nothing new); 2 bad arguments; 3 not configured; 4 AgentMail unreachable.
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -45,6 +45,8 @@ export function classifyRequest(batch) {
       },
     };
     questions[`bulk_${i}`] = { type: "noul", instructions: { question: `Is \`messages[${i}]\` a newsletter, marketing or automated notice?` } };
+    questions[`travel_${i}`] = { type: "noul", instructions: { question: `Is \`messages[${i}]\` a confirmation, change or cancellation of the owner's own flight, hotel, train or car booking?`,
+      focus: "Not a fare sale or travel newsletter." } };
   });
   return { state: { messages: batch.map((m) => ({ from: m.from, subject: m.subject, preview: m.preview, received: m.ts })) }, questions };
 }
@@ -54,8 +56,9 @@ const p = (a) => (typeof a?.noul === "number" ? a.noul : typeof a?.probabilityTr
 export function decideBatch(batch, answers = {}) {
   return batch.map((m, i) => {
     const act = p(answers[`act_${i}`]), bulk = p(answers[`bulk_${i}`]);
+    const travel = p(answers[`travel_${i}`]);
     const where = act === null ? "skip" : act >= 0.7 && (bulk ?? 0) < 0.8 ? "loop" : act >= 0.4 && (bulk ?? 0) < 0.5 ? "digest" : "skip";
-    return { ...m, act, bulk, where };
+    return { ...m, act, bulk, where, travel: travel !== null && travel >= 0.7 };
   });
 }
 
@@ -69,7 +72,16 @@ export function addUnder(doc, heading, lines) {
   return doc.slice(0, end) + fresh.join("\n") + "\n" + doc.slice(end);
 }
 
-export async function run({ apiKey, inbox, decide, docPath, statePath, fetchImpl, now = new Date(), firstDays = 3 }) {
+/** The full text of one message (a read: nothing about the message changes). */
+export async function getText({ apiKey, inbox, id, fetchImpl = globalThis.fetch }) {
+  const r = await fetchImpl(`${API}/inboxes/${encodeURIComponent(inbox)}/messages/${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${apiKey}` } });
+  if (!r.ok) return null;
+  const m = await r.json();
+  const html = String(m.html ?? "").replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ");
+  return [m.subject, m.extracted_text ?? m.text ?? html].filter(Boolean).join("\n").replace(/[ \t]+/g, " ").slice(0, 20000);
+}
+
+export async function run({ apiKey, inbox, decide, docPath, statePath, fetchImpl, now = new Date(), firstDays = 3, travelInbox = null }) {
   const st = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { after: new Date(now - firstDays * 86400000).toISOString(), seen: [] };
   const got = await listMessages({ apiKey, inbox, fetchImpl });
   if (!got.ok) return { ok: false, reason: got.reason };
@@ -94,6 +106,16 @@ export async function run({ apiKey, inbox, decide, docPath, statePath, fetchImpl
     const t = `${docPath}.tmp`; writeFileSync(t, doc); renameSync(t, docPath);
   }
   rec.loops = loops.length; rec.digest = digest.length;
+  // Bookings and changes go to the travel watcher (potter-travel capture) with their full text.
+  rec.travel = 0;
+  if (travelInbox) {
+    for (const m of decided.filter((x) => x.travel)) {
+      const text = await getText({ apiKey, inbox, id: m.id, fetchImpl });
+      if (!text) continue;
+      appendFileSync(travelInbox, JSON.stringify({ id: m.id, text }) + "\n", { mode: 0o600 });
+      rec.travel++;
+    }
+  }
   for (const m of decided) seen.add(m.id);
   const newest = decided.map((m) => m.ts).filter(Boolean).sort().pop();
   const next = { after: newest && newest > st.after && !rec.error ? newest : st.after, seen: [...seen].slice(-500) };
@@ -105,14 +127,15 @@ export async function main(argv, env = process.env, io = { out: (s) => process.s
   let a;
   try {
     a = parseArgs({ args: argv, options: { doc: { type: "string" }, state: { type: "string" }, decider: { type: "string" }, policy: { type: "string" },
-      report: { type: "boolean", default: false } } }).values;
+      report: { type: "boolean", default: false }, "travel-inbox": { type: "string" } } }).values;
   } catch (e) { io.err(`potter-mail-watch: ${e.message}\n`); return 2; }
   if (!a.doc || !a.state || !a.decider || !a.policy) { io.err("potter-mail-watch: --doc, --state, --decider and --policy are required\n"); return 2; }
   if (!env.AGENTMAIL_API_KEY || !env.AGENTMAIL_INBOX) { io.err("potter-mail-watch: AgentMail is not configured\n"); return 3; }
   const mod = await import(pathToFileURL(resolve(a.decider)).href);
   const decide = mod.createDecider({ env, policyPath: a.policy, taskClass: "decision" });
   if (!decide) { io.err("potter-mail-watch: no decider (model key or policy missing)\n"); return 3; }
-  const rec = await run({ apiKey: env.AGENTMAIL_API_KEY, inbox: env.AGENTMAIL_INBOX, decide, docPath: resolve(a.doc), statePath: resolve(a.state) });
+  const rec = await run({ apiKey: env.AGENTMAIL_API_KEY, inbox: env.AGENTMAIL_INBOX, decide, docPath: resolve(a.doc), statePath: resolve(a.state),
+    travelInbox: a["travel-inbox"] ? resolve(a["travel-inbox"]) : null });
   if (!rec.ok) { io.err(`potter-mail-watch: AgentMail ${rec.reason}\n`); return 4; }
   if (a.report) io.out(JSON.stringify(rec) + "\n");
   return 0;

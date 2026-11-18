@@ -217,10 +217,20 @@ cat > /usr/local/bin/potter-mail-watch <<WRAP
 #!/bin/sh
 [ -f "$SECRETS_DIR/agentmail.env" ] || { echo "potter-mail-watch: AgentMail is not configured" >&2; exit 3; }
 set -a; . "$SECRETS_DIR/jev.env"; . "$SECRETS_DIR/agentmail.env"; set +a
-exec node "$POTTER_HOME/cos/mail-watch.mjs" --doc "$WS/state/compiling-doc.md" --state "$WS/state/mail-watch.json" \
+exec node "$POTTER_HOME/cos/mail-watch.mjs" --doc "$WS/state/compiling-doc.md" --state "$WS/state/mail-watch.json" --travel-inbox "$WS/state/travel/travel-inbox.jsonl" \
   --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-mail-watch
+mkdir -p "$WS/state/travel"; chmod 700 "$WS/state/travel"
+cat > /usr/local/bin/potter-travel <<WRAP
+#!/bin/sh
+# Trips from booking emails; reminders and (with an AeroAPI key in aeroapi.env) live flight status.
+set -a; . "$SECRETS_DIR/jev.env"; [ -f "$SECRETS_DIR/aeroapi.env" ] && . "$SECRETS_DIR/aeroapi.env"; set +a
+cmd="\$1"; [ \$# -gt 0 ] && shift
+exec node "$POTTER_HOME/cos/travel.mjs" "\$cmd" --dir "$WS/state/travel" --policy "$WS/state/model-policy.json" \
+  --to "$id" --tz "$(oc config get agents.defaults.userTimezone 2>/dev/null | tr -d '"' || echo America/New_York)" --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-travel
 # Potter's vault: the plugin (tools say "not set up" until the owner connects a vault) and its setup command.
 rm -rf "$POTTER_HOME/plugins/potter-vault"; mkdir -p "$POTTER_HOME/plugins"
 cp -r "$REPO/overlay/plugins/potter-vault" "$POTTER_HOME/plugins/potter-vault"; rm -rf "$POTTER_HOME/plugins/potter-vault/tests"

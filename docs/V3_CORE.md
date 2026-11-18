@@ -203,6 +203,18 @@ Before the main model thinks, the governor builds its working context instead of
   screenshot the confirmation, close the tab; stop at CAPTCHAs and unknown 2FA; never poll a site faster than once
   a minute. T1 gains competitor-bar tasks (web errands, travel, background work).
 
+## v3.13 Travel watcher (overlay/cos/travel.mjs)
+
+- The mail watcher's Jev request gains one question per message (a booking, change or cancellation of the owner's
+  own travel?); those messages' full text (read with GET only) goes to the travel inbox.
+- `potter-travel capture` (every 30 minutes): a cheap model extracts segments with a JSON schema; a segment is kept
+  only if its flight number and airports appear in the email (codes not found are blanked). New, changed and
+  cancelled bookings are merged; a change or cancellation is sent to the owner at once.
+- `potter-travel watch` (every 15 minutes, code): check-in open (24 h before) and leave for the airport (3 h before),
+  each once, in the departure airport's time zone; with a FlightAware AeroAPI key, live status from 12 h before:
+  cancellation, delays of 20 minutes or more, gate. Trips are forgotten three days after.
+- The brief lists trips in the next three days. `travel` skill: list, add a forwarded booking, check in as a web task.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.
