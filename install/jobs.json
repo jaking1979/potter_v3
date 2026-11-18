@@ -285,6 +285,17 @@
    "standby": false,
    "command": "potter-mail-watch",
    "purpose": "lists the shared inbox without changing it (another assistant owns it); Jev flags what needs the owner for the brief"
+  },
+  {
+   "name": "potter-merrick-shadow",
+   "cron": "9,39 * * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 120,
+   "standby": false,
+   "command": "merrick shadow",
+   "requires_cmd": "merrick",
+   "purpose": "house dry-run: records what v3 would hold each zone at (read-only), for the switch-over decision"
   }
  ]
 }

@@ -215,6 +215,23 @@ def cmd_collect(ns) -> int:
     return 1 if failed else 0
 
 
+def cmd_shadow(ns) -> int:
+    """One read-only observation of what v3 would do (the house dry-run). Never writes to Home Assistant."""
+    from . import shadow
+    state, house = _state(ns), _house(ns)
+    rec = shadow.observe(SafeHome(_client(ns), house), house)
+    shadow.append(state / "shadow.jsonl", rec)
+    return 0
+
+
+def cmd_shadow_report(ns) -> int:
+    from . import shadow
+    since = time.time() - ns.days * 86400
+    rep = shadow.report(shadow.read(_state(ns) / "shadow.jsonl", since))
+    print(json.dumps(rep, indent=1) if ns.json else shadow.render(rep, ns.days))
+    return 0
+
+
 def cmd_tick(ns) -> int:
     state, house = _state(ns), _house(ns)
     with _locked(state):
@@ -288,6 +305,9 @@ def main(argv: list[str]) -> int:
         p = sub.add_parser(name); p.add_argument("--to"); p.add_argument("--dry-run", action="store_true")
         p.set_defaults(fn=fn)
     sub.add_parser("collect").set_defaults(fn=cmd_collect)
+    sub.add_parser("shadow").set_defaults(fn=cmd_shadow)
+    p = sub.add_parser("shadow-report"); p.add_argument("--days", type=int, default=7)
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_shadow_report)
     sub.add_parser("confirm-departure").set_defaults(fn=cmd_confirm_departure)
     p = sub.add_parser("intend"); p.add_argument("--description", required=True)
     p.add_argument("--due", required=True, help="ISO time with zone"); p.add_argument("--zone", required=True)

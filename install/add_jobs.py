@@ -11,6 +11,7 @@ import argparse
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -72,6 +73,8 @@ def main(argv: list[str]) -> int:
             return 1
         jobs = [j for j in jobs if j["name"] not in have]
     for job in jobs:
+        if job.get("requires_cmd") and not ns.dry_run and not shutil.which(job["requires_cmd"]):
+            continue                                   # e.g. Merrick's jobs on an install without Home Assistant
         a = shlex.split(ns.openclaw) + argv_for(job, values)
         if ns.dry_run:
             print(" ".join(shlex.quote(x) for x in a))
