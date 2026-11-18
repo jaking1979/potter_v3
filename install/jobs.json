@@ -223,6 +223,17 @@
    "deliver": false,
    "message": "Run the notion-outbox skill. Output nothing unless an item keeps failing.",
    "purpose": "retries Notion writes that failed"
+  },
+  {
+   "name": "potter-mail-observe",
+   "cron": "13,43 * * * *",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 300,
+   "standby": false,
+   "deliver": false,
+   "message": "Run the mail-observe skill. Output nothing.",
+   "purpose": "reads the shared inbox without changing it (another assistant owns it) so the brief sees deadlines"
   }
  ]
 }

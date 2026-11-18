@@ -18,6 +18,8 @@ State lives in `/etc/potter/handover.json` (crons and apps, each with `enabled`)
 2. Crons: `potter-cron on <name>` (OpenClaw's own `cron enable` needs the id). Apps: `systemctl enable --now potter-app-<name>.service`. Email: the
    AgentMail channel is registered under `channels` in the registry; run the command in its `enable` field (it
    sets who may email Potter), then `openclaw plugins reload agentmail` and send a test mail from an allowed address.
+   For "take over email" also: `potter-cron off potter-mail-observe` (the read-only watcher) and
+   `potter-cron on potter-mail-intake`; never run both.
    Hand back: run its `disable` command.
 3. Update `enabled` in the registry, run one safe check (cron status, service status), and report ON or the exact error.
 4. If a secret is still missing for that item, send the owner to the settings page for it. Never ask for it in chat.

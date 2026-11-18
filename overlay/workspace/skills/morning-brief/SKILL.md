@@ -15,7 +15,9 @@ Manual Captures. `[not yet captured]` means unknown. Unknown is never "quiet".
 - **Family calendar:** today + 7 days from the calendar named in the owner's calendar rule. List today's events;
   flag prep-needed events 2-3 days ahead. If the read succeeded and there are none, say "no family events". If the
   read failed, say the calendar was unavailable.
-- **Tasks:** overdue, due today, due within 2 days. Up to 5 undated tasks, oldest
+- **Tasks** (Todoist through Composio: `composio__COMPOSIO_SEARCH_TOOLS` once for Todoist, keep its
+  `session_id`, then `composio__COMPOSIO_MULTI_EXECUTE_TOOL` with the slugs it returns, e.g. a filter of
+  `overdue | today | 2 days`; say "not connected" only if the search finds no Todoist connection): overdue, due today, due within 2 days. Up to 5 undated tasks, oldest
   first, never one asked in the last 7 days (record asked ids with dates in the compiling doc). Recently completed
   (last 2 days): count and notable names. Lists the owner's rules mark as seasonal or excluded are never itemized:
   at most one grouped line, in season.
