@@ -2,19 +2,34 @@
   "id": "potter-kg",
   "name": "Potter Knowledge Graph",
   "description": "Typed entities, relations and provenance for Potter. Owns one SQLite file and never touches OpenClaw's own tables.",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "contracts": {
-    "tools": ["kg_search", "kg_neighbors", "kg_path", "kg_context", "kg_source", "kg_add", "kg_stats", "kg_check_connection"]
+    "tools": [
+      "kg_search",
+      "kg_neighbors",
+      "kg_path",
+      "kg_context",
+      "kg_source",
+      "kg_add",
+      "kg_stats",
+      "kg_check_connection"
+    ]
   },
-  "activation": { "onStartup": true },
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "dbPath": { "type": "string",
-                  "description": "Absolute path of the graph's SQLite file. Default: <OpenClaw state dir>/potter-kg/potter-kg.sqlite." },
-      "decisionAgentId": { "type": "string",
-                           "description": "Agent whose decision model kg_check_connection uses. Default: the global decision model." }
+      "dbPath": {
+        "type": "string",
+        "description": "Absolute path of the graph's SQLite file. Default: <OpenClaw state dir>/potter-kg/potter-kg.sqlite."
+      },
+      "decisionAgentId": {
+        "type": "string",
+        "description": "Agent whose decision model kg_check_connection uses. Default: the global decision model."
+      }
     }
   }
 }

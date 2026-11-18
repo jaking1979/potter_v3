@@ -92,6 +92,24 @@ json.dump({"plugins": {"allow": ids}}, open(sys.argv[1], "w"))' "$a"
 q oc config patch --file "$a" --replace-path plugins.allow; rm -f "$a"
 step "potter-core: installed and configured"
 
+# 1a. potter-kg plugin (the graph file and its config are kept; only the code is replaced)
+rm -rf "$POTTER_HOME/plugins/potter-kg"; mkdir -p "$POTTER_HOME/plugins"
+cp -r "$REPO/overlay/plugins/potter-kg" "$POTTER_HOME/plugins/potter-kg"; rm -rf "$POTTER_HOME/plugins/potter-kg/tests"
+kgcfg="$(oc config get plugins.entries.potter-kg.config 2>/dev/null || echo '{}')"
+install_plugin "$POTTER_HOME/plugins/potter-kg" potter-kg --force
+kp="$(mktemp --suffix=.json5)"
+python3 - "$kgcfg" "$C/potter-kg/potter-kg.sqlite" "$kp" <<'PY'
+import json, sys
+try:
+    old = json.loads(sys.argv[1])
+except ValueError:
+    old = {}
+cfg = {"dbPath": sys.argv[2], **(old if isinstance(old, dict) else {})}
+json.dump({"plugins": {"entries": {"potter-kg": {"enabled": True, "config": cfg}}}}, open(sys.argv[3], "w"))
+PY
+q oc config patch --file "$kp"; rm -f "$kp"
+step "potter-kg: installed ($(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$REPO/overlay/plugins/potter-kg/openclaw.plugin.json"))"
+
 # 1b. model policy: replaced only if it is still a shipped one (an edited policy is the owner's and is kept)
 OLD_SHIPPED="$(sed -n 's/^OLD_SHIPPED_POLICIES="\(.*\)"$/\1/p' "$HERE/bootstrap.sh")"
 P="$WS/state/model-policy.json"
@@ -134,7 +152,7 @@ cat > /usr/local/bin/potter-kg-import <<WRAP
 exec node "$REPO/overlay/plugins/potter-kg/scripts/kg-import.mjs" --into "$C/potter-kg/potter-kg.sqlite" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-import
-step "kg eval: potter-kg-eval ready"
+step "kg tools: potter-kg-eval and potter-kg-import ready"
 
 # 2b. memory search, with the key already saved for Jev (no key is re-entered)
 . "$HERE/memory_search.sh"
