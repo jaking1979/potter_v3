@@ -50,3 +50,15 @@ export function decide(cls, trust, cfg = {}) {
 export function isEvalSession(ctx = {}) {
   return /(^|:)t1-eval-/.test(String(ctx.sessionKey ?? ""));
 }
+
+/** A sealed agent (the benchmark) may only read files inside its own workspace: no network, apps, graph tools or writes. */
+export function sealedRefusal(toolName, params = {}, root = "") {
+  const name = String(toolName ?? "");
+  if (name !== "read") return `${name || "this tool"} is not available`;
+  const p = String(params.path ?? params.file_path ?? params.file ?? "");
+  if (!p || !root) return "no file named";
+  const norm = (x) => x.replace(/\/+$/, "");
+  const full = p.startsWith("/") ? p : `${norm(root)}/${p}`;
+  if (full.includes("..") || !(full === norm(root) || full.startsWith(norm(root) + "/"))) return "that file is outside this agent's workspace";
+  return null;
+}

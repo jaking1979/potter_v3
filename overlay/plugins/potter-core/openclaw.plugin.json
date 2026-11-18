@@ -2,7 +2,7 @@
   "id": "potter-core",
   "name": "Potter Core",
   "description": "Potter v3: control with approvals and receipts; context governor and fast path; model broker and spend ledger; staged memory and responsibilities; once-only effects and the Notion outbox.",
-  "version": "3.14.1",
+  "version": "3.15.0",
   "contracts": {
     "tools": [
       "memory_stage",
@@ -168,6 +168,30 @@
             "type": "integer",
             "minimum": 500,
             "maximum": 10000
+          }
+        }
+      },
+      "agentProfiles": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "workspace": {
+              "type": "string"
+            },
+            "kgDbPath": {
+              "type": "string"
+            },
+            "kgOwner": {
+              "type": "string"
+            },
+            "now": {
+              "type": "string"
+            },
+            "brain": {
+              "type": "boolean"
+            }
           }
         }
       }

@@ -11,7 +11,7 @@ import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import { classify } from "./lib/classify.js";
 import { createGuard } from "./lib/browserguard.js";
 import { check as outboundCheck, isOutgoing, outgoingText } from "./lib/outbound.js";
-import { decide, isEvalSession, trustOf } from "./lib/control.js";
+import { decide, isEvalSession, sealedRefusal, trustOf } from "./lib/control.js";
 import { tryHouse } from "./lib/fastpath.js";
 import { plan, requestText, tableDomains } from "./lib/governor.js";
 import { names, search } from "./lib/context.js";
@@ -107,10 +107,23 @@ export default definePluginEntry({
     }
 
     // ---- v3.1 Control ----------------------------------------------------------------------------------------
+    // Sealed agents (the benchmark): own workspace, graph and clock; tools limited to reading their own files.
+    const profiles = cfg.agentProfiles ?? {};
+    for (const [id, p] of Object.entries(profiles)) if (p.brain !== false) agents.add(id);
+    const profileOf = (id) => {
+      const p = id && profiles[id];
+      return p ? { sealed: true, brain: p.brain !== false, ws: p.workspace, db: p.kgDbPath, owner: p.kgOwner, now: p.now ? new Date(p.now) : undefined }
+        : { sealed: false, ws, db: cfg.kg?.dbPath, owner: cfg.kg?.owner, now: undefined };
+    };
     const browser = createGuard();                 // v3.12: which browser clicks commit the owner to something
     api.on("before_tool_call", async (event, ctx) => {
       const cls = event?.toolName === "browser" ? browser.classify(ctx?.sessionKey, event?.params)
         : classify(event?.toolName, event?.params, { ownerIds });
+      const SP = profileOf(ctx?.agentId);
+      if (SP.sealed) {
+        const why = sealedRefusal(event?.toolName, event?.params, SP.ws);
+        if (why) return { block: true, blockReason: `${why} (benchmark: only this agent's own files; potter-core)` };
+      }
       if (isEvalSession(ctx) && cls.risk !== "read") {
         return { block: true, blockReason: "evaluation run: only reading is allowed; describe what you would do instead (potter-core)" };
       }
@@ -204,6 +217,7 @@ export default definePluginEntry({
     if (cfg.fastPath?.enabled !== false) {
       api.on("before_agent_reply", async (event, ctx) => {
         if (ctx?.agentId && !agents.has(ctx.agentId)) return;
+        if (profiles[ctx?.agentId]) return;          // sealed agents never reach the real house
         const text = requestText(event);
         if (!/^\s*confirm departure\b/i.test(text) && !tableDomains(text).includes("house")) return;
         const t0 = Date.now();
@@ -221,41 +235,47 @@ export default definePluginEntry({
     // ---- v3.2 Brain: Context Governor --------------------------------------------------------------------------
     if (cfg.governor?.enabled !== false) {
       // v3.6 Brain v1: the owner's files indexed once, rebuilt only when one changes (checked at most every 30 s).
-      let index = null, checked = 0;
-      const getIndex = () => {
-        if (!ws || cfg.brain?.enabled === false) return null;
+      // Per-agent profiles (the benchmark's sealed agents): their own workspace, graph and clock; nothing learned.
+      const indexes = new Map();
+      const getIndex = (w = ws) => {
+        if (!w || cfg.brain?.enabled === false) return null;
         const t = Date.now();
-        if (!index || (t - checked > 30000 && !fresh(index))) index = buildIndex(ws);
-        if (t - checked > 30000) checked = t;
-        return index;
+        let c = indexes.get(w);
+        if (!c || (t - c.checked > 30000 && !fresh(c.index))) c = { index: buildIndex(w), checked: t };
+        if (t - c.checked > 30000) c.checked = t;
+        indexes.set(w, c);
+        return c.index;
       };
       // The knowledge graph, read-only, reloaded when its file changes (checked at most every 30 s).
-      let graph = null, graphChecked = 0;
-      const getGraph = () => {
-        if (cfg.kg?.enabled === false || !cfg.kg?.dbPath || !existsSync(cfg.kg.dbPath)) return null;
+      const graphs = new Map();
+      const getGraph = (db = cfg.kg?.dbPath, owner = cfg.kg?.owner) => {
+        if (cfg.kg?.enabled === false || !db || !existsSync(db)) return null;
         const t = Date.now();
-        if (!graph || (t - graphChecked > 30000 && stale(graph))) {
-          try { graph = loadGraph(cfg.kg.dbPath, { owner: cfg.kg.owner }); } catch { graph = null; }
+        let c = graphs.get(db) ?? { graph: null, checked: 0 };
+        if (!c.graph || (t - c.checked > 30000 && stale(c.graph))) {
+          try { c.graph = loadGraph(db, { owner }); } catch { c.graph = null; }
         }
-        if (t - graphChecked > 30000) graphChecked = t;
-        return graph;
+        if (t - c.checked > 30000) c.checked = t;
+        graphs.set(db, c);
+        return c.graph;
       };
       api.on("before_prompt_build", async (event, ctx) => {
         if (ctx?.agentId && !agents.has(ctx.agentId)) return;
+        const P = profileOf(ctx?.agentId);
         const text = requestText(event);
         // The graph learns from what the owner says (processed by the potter-kg capture job).
-        const queued = cfg.kg?.capture !== false && Boolean(cfg.kg?.queuePath) && shouldQueue(text, ctx, ownerIds) && enqueueMessage(cfg.kg.queuePath, text, ctx ?? {});
+        const queued = !P.sealed && cfg.kg?.capture !== false && Boolean(cfg.kg?.queuePath) && shouldQueue(text, ctx, ownerIds) && enqueueMessage(cfg.kg.queuePath, text, ctx ?? {});
         // File search shortlist (keyword table domains only: the Jev plan is not back yet), judged by Jev in the
         // same request as the graph facts. The plan and that request run at the same time: no added wait.
         let shortlist = [];
         try {
-          const idx = getIndex();
+          const idx = getIndex(P.ws);
           const ex = [...new Set(tableDomains(text).flatMap((id) => DOMAINS.find((d) => d.id === id)?.recall ?? []))];
           if (idx && text.trim()) shortlist = search(idx, [text, ...ex].join(" "), 4, { boost: names(text) });
         } catch { shortlist = []; }
         const [p, kg] = await Promise.all([
           plan(text, { decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500 }),
-          recall({ graph: getGraph(), text, decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500, budget: cfg.kg?.budget ?? 2500, passages: shortlist })
+          recall({ graph: getGraph(P.db, P.owner), text, decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500, budget: cfg.kg?.budget ?? 2500, passages: shortlist })
             .catch(() => ({ context: "", entities: [], considered: 0, kept: [], passagesKept: shortlist, source: "error", ms: 0 })),
         ]);
         let wc = { context: "", sources: [], chars: 0 };
@@ -264,7 +284,7 @@ export default definePluginEntry({
           const doms = p.domains.map((id) => DOMAINS.find((d) => d.id === id)).filter(Boolean);
           const rules = [...new Set(doms.flatMap((d) => d.rules ?? []))];
           const expand = [...new Set(doms.flatMap((d) => d.recall ?? []))];
-          wc = assemble({ text, rules, expand, index: getIndex(), ws, tz: cfg.timezone || "UTC", budget: cfg.brain?.budget ?? 7000, hits: kg.passagesKept });
+          wc = assemble({ text, rules, expand, index: getIndex(P.ws), ws: P.ws, now: P.now, tz: cfg.timezone || "UTC", budget: cfg.brain?.budget ?? 7000, hits: kg.passagesKept });
         } catch { /* a failure means no working context, never a blocked turn */ }
         log(govLog, { kind: "plan", domains: p.domains, source: p.source, ms: p.latencyMs, chars: text.length, error: p.error ?? null,
           context_chars: wc.chars, recalled: wc.sources.map((x) => x.path), build_ms: Date.now() - t0,
@@ -272,7 +292,7 @@ export default definePluginEntry({
           files_considered: shortlist.length, files_kept: kg.passagesKept?.length ?? 0, kg_queued: queued, owner_turn: isOwnerTurn(ctx ?? {}, ownerIds), ctx_fields: ctxFields(ctx ?? {}),
           kg_error: kg.error ?? null });
         // Which graph facts were used: the freshness job asks about used facts that may have changed.
-        if (cfg.kg?.usagePath && kg.kept.some((f) => f.key)) {
+        if (!P.sealed && cfg.kg?.usagePath && kg.kept.some((f) => f.key)) {
           try {
             appendFileSync(cfg.kg.usagePath, kg.kept.filter((f) => f.key).map((f) => JSON.stringify({ ts: new Date().toISOString(), key: f.key })).join("\n") + "\n", { mode: 0o600 });
           } catch { /* usage is a hint, never a blocker */ }

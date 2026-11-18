@@ -400,6 +400,30 @@ exec node "$POTTER_HOME/eval/t1.mjs" "\$cmd" --dir "$WS/state/t1" --decider "$PO
 WRAP
 cp "$REPO/install/v2ref_workspace.py" "$POTTER_HOME/tools/"
 chmod 755 /usr/local/bin/potter-t1
+cat > /usr/local/bin/potter-bench <<WRAP
+#!/bin/sh
+# PotterBench: a fictional household, 30 tasks with answer keys, v3 against the flat-file design, both sealed.
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+B=/opt/potter/bench; OC="openclaw ${OC_PROFILE_FLAG[*]:-}"; cmd="\$1"; [ \$# -gt 0 ] && shift
+run() { node "$POTTER_HOME/eval/bench.mjs" "\$@" --root "\$B" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" --openclaw "\$OC"; }
+if [ "\$cmd" = setup ]; then
+  run setup --machinery "$POTTER_HOME/eval/bench-machinery" || exit 1
+  run seed --machinery "$POTTER_HOME/plugins/potter-kg/lib" || exit 1
+  # v3 learns the household the way it learns the owner: the real capture pipeline (Jev screen, extraction, checks)
+  node "$POTTER_HOME/plugins/potter-kg/scripts/kg-capture.mjs" --queue "\$B/messages-queue.jsonl" --db "\$B/bench.sqlite" \
+    --staged "\$B/bench-staged.jsonl" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" --owner person:sam-alder --report
+  for a in bench-v3 bench-v2; do \$OC agents list 2>/dev/null | grep -q "\$a" || \$OC agents add "\$a" --workspace "\$B/\${a#bench-}" --non-interactive >/dev/null; done
+  B="\$B" OCX="\$OC" python3 -c 'import json,os,subprocess,shlex,sys; oc=shlex.split(os.environ.get("OCX","openclaw")); b=os.environ["B"]; r=subprocess.run(oc+["config","get","plugins.entries.potter-core.config.agentProfiles"],capture_output=True,text=True).stdout; cur=json.loads(r) if r.strip().startswith("{") else {}; cur.update({"bench-v3":{"workspace":b+"/v3","kgDbPath":b+"/bench.sqlite","kgOwner":"person:sam-alder","now":"2027-03-10T13:00:00Z"},"bench-v2":{"workspace":b+"/v2","brain":False}}); subprocess.run(oc+["config","set","plugins.entries.potter-core.config.agentProfiles",json.dumps(cur),"--strict-json"],check=True)'
+  systemd-run --on-active=5 --collect --quiet systemctl restart potter-gateway 2>/dev/null || true
+  echo "PotterBench ready. The gateway restarts in a few seconds; then: potter-bench run"
+  exit 0
+fi
+[ "\$cmd" = run ] && set -- "\$@" --version "$(cat /opt/potter/src/.potter-rev 2>/dev/null)"
+run "\$cmd" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-bench
+rm -rf "$POTTER_HOME/eval/bench-machinery"; mkdir -p "$POTTER_HOME/eval/bench-machinery/rules"
+cp "$REPO/overlay/workspace/AGENTS.md" "$POTTER_HOME/eval/bench-machinery/"; cp -r "$REPO/overlay/workspace/rules/global" "$POTTER_HOME/eval/bench-machinery/rules/"
 # T1's v2 baseline: an agent built from v2's own files (from the import), asked by potter-t1; no channel reaches it.
 if [ -d "$WS/reference/v2" ]; then
   V2REF="$(dirname "$WS")/workspace-v2ref"

@@ -211,3 +211,16 @@ test("outgoing filter: card and SSN by code, the fuzzy kinds by Jev; vault refer
   assert.ok(isOutgoing("browser", { action: "act", kind: "type", text: "x" }, {}));
   assert.ok(!isOutgoing("browser", { action: "act", kind: "click" }, {}));
 });
+
+test("sealed benchmark agents may only read their own workspace", async () => {
+  const { sealedRefusal } = await import("./lib/control.js");
+  const root = "/opt/potter/bench/v3";
+  assert.equal(sealedRefusal("read", { path: "data/inbox.jsonl" }, root), null);
+  assert.equal(sealedRefusal("read", { path: "/opt/potter/bench/v3/USER.md" }, root), null);
+  assert.match(sealedRefusal("read", { path: "/root/.openclaw/workspace/USER.md" }, root), /outside/);
+  assert.match(sealedRefusal("read", { path: "../../workspace/USER.md" }, root), /outside/);
+  assert.match(sealedRefusal("read", { path: "/opt/potter/bench/v3-other/x" }, root), /outside/);
+  for (const t of ["kg_search", "composio__COMPOSIO_SEARCH_TOOLS", "web_search", "browser", "exec", "memory_search", "message"]) {
+    assert.match(sealedRefusal(t, {}, root), /not available/, t);
+  }
+});

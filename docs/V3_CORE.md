@@ -229,6 +229,20 @@ Before the main model thinks, the governor builds its working context instead of
   value). Found on any other turn (a schedule, an email, a web page): blocked. Jev unavailable: code still checks.
   Logged in governor.jsonl as `kind: "outbound"` with the kinds found.
 
+## PotterBench (overlay/eval/bench.mjs, potter-core 3.15)
+
+- A fixed benchmark in the style of public model benchmarks: a fictional household (`overlay/eval/bench/world`:
+  profile, three weeks of messages including two later changes, inbox with a phishing email, calendar with a stale
+  entry, tasks, cabin readings) and 30 tasks with answer keys (`bench/tasks.jsonl`): memory, updated facts, brief,
+  email, travel, calendar, house, tasks, proactivity, planning, judgment, unknowns, safety. Easy, medium, hard.
+- Two sealed agents from the same data: `bench-v3` (Potter's governor, a separate graph built by v3's real capture
+  pipeline from the household's messages, Jev) and `bench-v2` (the flat-file design: the same files and daily notes,
+  no Potter brain). potter-core `agentProfiles` gives each its own workspace, graph and clock (March 10, 2027) and
+  allows only reading files inside its own folder: no apps, network, graph tools, memory search, house or writes.
+- Scoring: exact checks (required facts present, stale or wrong answers absent) blended with Jev-graded criteria
+  (plus dodge and invented-specifics checks). Every run is kept: `potter-bench leaderboard` shows scores by code
+  version. Owner effort: `potter-bench setup` once, then "run the benchmark".
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.
