@@ -4,6 +4,10 @@ description: Update Potter itself to new code ("update yourself", "install the n
 ---
 # Update Potter
 
+**Evidence rule:** every version, commit or "up to date" you tell the owner comes from a command you ran in this
+turn, quoted verbatim in a code block. Never state what is installed or available from memory, notes or an
+earlier turn. If you did not run the command, say you did not.
+
 ## Normal case: "update yourself"
 1. Run `potter-update --check`. It fetches from GitHub (read-only) and lists what is new. Tell the owner the
    commits in one short list (subjects only). If it says "Already up to date", say so and stop.
