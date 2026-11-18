@@ -22,7 +22,7 @@ import { alreadyDone, effectKey, enqueue, inDoubt, isOutboxRetry } from "./lib/d
 import { buildTools } from "./lib/tools.js";
 import { assemble, buildIndex, fresh } from "./lib/context.js";
 import { loadGraph, recall, stale } from "./lib/kgrecall.js";
-import { enqueueMessage, shouldQueue } from "./lib/capturequeue.js";
+import { ctxFields, enqueueMessage, isOwnerTurn, shouldQueue } from "./lib/capturequeue.js";
 import { DOMAINS } from "./lib/governor.js";
 
 function escalationsToday(path) {
@@ -269,7 +269,7 @@ export default definePluginEntry({
         log(govLog, { kind: "plan", domains: p.domains, source: p.source, ms: p.latencyMs, chars: text.length, error: p.error ?? null,
           context_chars: wc.chars, recalled: wc.sources.map((x) => x.path), build_ms: Date.now() - t0,
           kg_entities: kg.entities, kg_considered: kg.considered, kg_kept: kg.kept.length, kg_source: kg.source, kg_ms: kg.ms,
-          files_considered: shortlist.length, files_kept: kg.passagesKept?.length ?? 0, kg_queued: queued, sender_known: Boolean(ctx?.senderId),
+          files_considered: shortlist.length, files_kept: kg.passagesKept?.length ?? 0, kg_queued: queued, owner_turn: isOwnerTurn(ctx ?? {}, ownerIds), ctx_fields: ctxFields(ctx ?? {}),
           kg_error: kg.error ?? null });
         // Which graph facts were used: the freshness job asks about used facts that may have changed.
         if (cfg.kg?.usagePath && kg.kept.some((f) => f.key)) {

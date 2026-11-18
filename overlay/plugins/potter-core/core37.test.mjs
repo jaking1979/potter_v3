@@ -123,7 +123,15 @@ test("only the owner's own messages are queued for the graph; jobs, strangers an
   assert.ok(shouldQueue(msg, { senderId: "12345" }, owner));
   assert.ok(shouldQueue(msg, { senderId: "telegram:12345" }, owner));
   assert.ok(!shouldQueue(msg, { senderId: "999" }, owner));
-  assert.ok(!shouldQueue(msg, {}, owner));                                        // unknown sender
+  assert.ok(!shouldQueue(msg, {}, owner));                                        // nothing known: never assumed
+  assert.ok(shouldQueue(msg, { channel: "telegram" }, owner));                    // owner-only channel, no sender id
+  assert.ok(shouldQueue(msg, { messageProvider: "telegram", chatId: "123" }, owner));
+  assert.ok(shouldQueue(msg, { chatId: "12345" }, owner));                       // DM chat id is the owner's id
+  assert.ok(shouldQueue(msg, { channelContext: { sender: { id: "12345" } } }, owner));
+  assert.ok(shouldQueue(msg, { requester: { senderIsOwner: true } }, owner));
+  assert.ok(!shouldQueue(msg, { channel: "telegram", senderId: "999" }, owner));  // a known non-owner stays out
+  assert.ok(!shouldQueue(msg, { channel: "agentmail" }, owner));
+  assert.ok(!shouldQueue(msg, { channel: "telegram", inputProvenance: { kind: "inter_session" } }, owner));
   assert.ok(!shouldQueue(msg, { senderId: "12345", jobId: "j1" }, owner));
   assert.ok(!shouldQueue(msg, { senderId: "12345", trigger: "heartbeat" }, owner));
   assert.ok(!shouldQueue("thanks!", { senderId: "12345" }, owner));
