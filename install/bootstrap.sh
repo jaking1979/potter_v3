@@ -393,6 +393,12 @@ cat > /usr/local/bin/potter-house-ideas <<WRAP
 POTTER_JEV_ENV="$SECRETS_DIR/jev.env" POTTER_MODEL_POLICY="$WS/state/model-policy.json" exec node "$POTTER_HOME/jev/house-ideas.mjs"
 WRAP
 chmod 755 /usr/local/bin/potter-house-ideas
+cp "$REPO/install/imessage_config.py" "$REPO/install/imessage_setup.sh" "$POTTER_HOME/tools/"
+cat > /usr/local/bin/potter-imessage-setup <<WRAP
+#!/bin/sh
+OPENCLAW="openclaw ${OC_PROFILE_FLAG[*]:-}" exec bash "$POTTER_HOME/tools/imessage_setup.sh" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-imessage-setup
 read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then

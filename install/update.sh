@@ -257,6 +257,12 @@ cat > /usr/local/bin/potter-house-ideas <<WRAP
 POTTER_JEV_ENV="$SECRETS_DIR/jev.env" POTTER_MODEL_POLICY="$WS/state/model-policy.json" exec node "$POTTER_HOME/jev/house-ideas.mjs"
 WRAP
 chmod 755 /usr/local/bin/potter-house-ideas
+cp "$REPO/install/imessage_config.py" "$REPO/install/imessage_setup.sh" "$POTTER_HOME/tools/"
+cat > /usr/local/bin/potter-imessage-setup <<WRAP
+#!/bin/sh
+OPENCLAW="openclaw ${OC_PROFILE_FLAG[*]:-}" exec bash "$POTTER_HOME/tools/imessage_setup.sh" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-imessage-setup
 step "vault: potter-vault installed ($([ -f "$SECRETS_DIR/vault.env" ] && echo connected || echo "not connected yet: potter-vault-setup"))"
 step "kg tools: potter-kg-eval and potter-kg-import ready"
 

@@ -176,6 +176,22 @@ Before the main model thinks, the governor builds its working context instead of
   contacted. `grade`: one Jev request per answer, one yes/no per criterion plus "dodges" and "invented specifics",
   composed in code (0-100, pass at 70). `report`: averages, per category, head to head.
 
+## House insights
+
+- `merrick insights` (code, read-only): detectors over the collected data, each declaring the evidence it needs
+  before it may say anything: preheat timing per outdoor band (5 heating runs in that band), heating while vacant
+  (7 vacant days), a zone that never reaches its setpoint (10 days), heating getting slower (4 weeks), repeated
+  manual requests (3), sensor gaps. Until then: "waiting for data" with progress. `collect` now records outdoor
+  temperature. Weekly `house-insights` skill: findings with numbers; ideas from a strong model on the evidence pack
+  only, filtered by Jev (`potter-house-ideas`: supported by the data, clearly safe, new); adopted ideas measured.
+
+## Channels: iMessage
+
+- iMessage through the always-on Mac: Messages under a separate macOS user with Potter's own Apple ID, reached by
+  SSH (`potter-imessage-setup key | connect`). Only the owner's handles can direct Potter; groups need a mention;
+  sending to anyone but the owner asks the owner (potter-core). `messaging` skill: channel choice and contacts.
+  docs/IMESSAGE_SETUP.md.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.
