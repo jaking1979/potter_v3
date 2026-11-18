@@ -127,6 +127,22 @@ Before the main model thinks, the governor builds its working context instead of
   are logged to `kg-usage.jsonl` so freshness knows what is used.
 - Broker log fields renamed: `escalation_today_usd` (what the cap counts), `escalation_cap_usd`, `day_total_usd`.
 
+## v3.10 Chief-of-staff loop (overlay/cos, potter-kg 3.3.0 vocabulary)
+
+- Morning: the brief commits to a forecast (the day's shape and 2-4 checkable predictions: must-dos expected done,
+  items expected to slip) and writes `state/forecasts/<date>.json`; one "Forecast:" line in the brief, citing
+  patterns from the graph.
+- Evening: the check-in adds what actually happened (facts, the owner's words) and the day's real shape. At most
+  one question about the forecast; never graded aloud.
+- `potter-cos-score` (nightly 23:07): Jev judges each prediction against the evening record (came true? mentioned?
+  not mentioned = unknown, never a miss). Code turns outcomes into patterns with evidence and confidence: items
+  that keep slipping, weekdays that run packed or light, and the calibration of Potter's own forecasts. Patterns
+  are `pattern:*` entities linked to the owner by `has_pattern`; recall brings them to every relevant turn;
+  a pattern that loses its evidence is archived.
+- `week-review` (Sunday 18:17): the week against the forecasts, what kept slipping with a fix to choose, the
+  patterns, forecast accuracy, one change for next week. Says so when there is not enough evidence.
+- New vocabulary: entity type `pattern`, predicate `has_pattern`.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.

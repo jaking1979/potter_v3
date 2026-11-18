@@ -56,7 +56,7 @@ effects + in-doubt list + Notion outbox. Sandbox: 6 hooks, 8 tools, 2 new jobs, 
 v3.6 Brain v1 (docs/V3_CORE.md): working context assembled per request (local recall + domain rules + state,
 7000-char budget). 7 node tests; recall checked against the real v2 export (wine, events, family, house, trading).
 KG + Jev (docs/V3_CORE.md v3.7): eval run live on v2's graph (copy at /root/v2-kg on CT 211, 1,254 entities,
-3,815 relations); graph read on every request; importer. v3.8 (KG write path, capability map, mail-observe) and v3.9 (staleness) built. NEXT: deploy; check kg_queued/sender_known; read-path eval;
+3,815 relations); graph read on every request; importer. v3.8 (KG write path, capability map, mail-observe) v3.9 (staleness) and v3.10 (chief-of-staff loop: forecast, evening record, Jev scoring, patterns in the graph, week review) built. NEXT: deploy; check kg_queued/sender_known; read-path eval;
 staleness; house dry-run then cutover after Thanksgiving; chief-of-staff loop; T1 eval vs v2.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)

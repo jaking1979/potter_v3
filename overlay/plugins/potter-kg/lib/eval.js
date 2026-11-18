@@ -38,6 +38,7 @@ export const PREDICATE_GUIDE = {
     examples: ["the owner prefers Pinot Noir", "a child prefers the window seat"] },
   avoids: { what: "a person dislikes, avoids or cannot have b", examples: ["a family member avoids shellfish"] },
   responsible_for: { what: "a person handles or owns b (a chore, a system, a duty)", examples: ["the owner is responsible for winterizing the cabin"] },
+  has_pattern: { what: "a person shows a recurring pattern b, learned from how their days actually went", examples: ["the owner: errands slip on packed days"] },
 };
 
 // ---------- sampling (deterministic: a seed, not Math.random) ----------

@@ -173,6 +173,14 @@ exec node "$POTTER_HOME/plugins/potter-kg/scripts/kg-freshness.mjs" --db "$C/pot
   --usage "$C/potter-core/kg-usage.jsonl" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-freshness
+mkdir -p "$WS/state/forecasts"; rm -rf "$POTTER_HOME/cos"; cp -r "$REPO/overlay/cos" "$POTTER_HOME/cos"; rm -f "$POTTER_HOME/cos/"*.test.mjs
+cat > /usr/local/bin/potter-cos-score <<WRAP
+#!/bin/sh
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+exec node "$POTTER_HOME/cos/score.mjs" --forecasts "$WS/state/forecasts" --db "$C/potter-kg/potter-kg.sqlite" \
+  --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-cos-score
 step "kg tools: potter-kg-eval and potter-kg-import ready"
 
 # 2b. memory search, with the key already saved for Jev (no key is re-entered)

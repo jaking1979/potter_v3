@@ -265,6 +265,27 @@
    "standby": false,
    "command": "potter-kg-freshness",
    "purpose": "archives expired graph facts and picks a few 'still true?' questions for the weekly review"
+  },
+  {
+   "name": "potter-cos-score",
+   "cron": "7 23 * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 600,
+   "standby": false,
+   "command": "potter-cos-score",
+   "purpose": "checks the morning's forecast against the evening record and keeps the owner's patterns in the graph"
+  },
+  {
+   "name": "potter-week-review",
+   "cron": "17 18 * * 0",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 600,
+   "standby": false,
+   "deliver": true,
+   "message": "Run the week-review skill.",
+   "purpose": "Sunday week in review: forecasts vs reality, what slipped, patterns"
   }
  ]
 }

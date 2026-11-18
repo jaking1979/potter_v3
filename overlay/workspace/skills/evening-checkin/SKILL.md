@@ -15,7 +15,16 @@ When the owner answers it, run this. Two to four exchanges. One question at a ti
 4. **Close.** One line: "You're clear. I've got N loops tracked and tomorrow's shape noted. It'll be in the morning
    brief. Done for the day."
 
+## The morning's forecast
+If `state/forecasts/<today>.json` exists, read its predictions before step 1. During the review, ask at most ONE
+question about it, only if the owner's account leaves the most important prediction unclear ("Did the pork loin
+order go in?"). Never read the forecast out or grade it aloud.
+
 ## Silent capture (after they sign off; never announce it)
+- **Forecast record:** add to `state/forecasts/<today>.json` (create it with just `date` if missing):
+  `"evening": {"text": "<2-6 plain sentences: what got done, what did not, what took longer, in the owner's own
+  words where possible>", "shape": "light|normal|packed"}`. Facts only, no interpretation. A separate program
+  checks each prediction against this text; do not mark predictions yourself.
 Edit `state/compiling-doc.md`:
 - **State Signals:** replace the three lines with today's stress, busy (one line of context if notable), and
   tomorrow's outlook (or "clear").

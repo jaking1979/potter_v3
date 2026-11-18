@@ -338,6 +338,14 @@ exec node "$POTTER_HOME/plugins/potter-kg/scripts/kg-freshness.mjs" --db "$KG_DB
   --usage "$STATE_DIR/potter-core/kg-usage.jsonl" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-freshness
+mkdir -p "$WS/state/forecasts"; rm -rf "$POTTER_HOME/cos"; cp -r "$REPO/overlay/cos" "$POTTER_HOME/cos"; rm -f "$POTTER_HOME/cos/"*.test.mjs
+cat > /usr/local/bin/potter-cos-score <<WRAP
+#!/bin/sh
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+exec node "$POTTER_HOME/cos/score.mjs" --forecasts "$WS/state/forecasts" --db "$KG_DB" \
+  --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-cos-score
 read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then

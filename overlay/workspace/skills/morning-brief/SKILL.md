@@ -50,6 +50,19 @@ complete. Never guess a source's contents.
 Title: "Owl Morning Brief - <date>". Task block (not in Light or Quiet, max 8 lines): confirm overdue items
 ("did you finish X?"), ask when undated ones should land, one line of what got done. Omit it when empty.
 
+## 3b. Forecast (every brief except Quiet)
+Commit to a read of the day, so the evening can check it. Use the patterns the knowledge graph gives you
+("What your knowledge graph says": "has a pattern: ...") and the calibration patterns about your own forecasts.
+- In the brief, one line: `Forecast: <shape: light / normal / packed>. Likely to slip: <item> (<why, citing a pattern
+  if there is one>).` Name at most two at-risk items. If a calibration pattern says your forecasts are often wrong,
+  say "low confidence" instead of hedging every item.
+- Silently write `state/forecasts/<today>.json`:
+  `{"date": "<today>", "shape": "light|normal|packed", "first_move": "<text>", "predictions": [`
+  `{"id": "p1", "claim": "<one checkable sentence>", "item": "<short name, reused verbatim from Open Loops or tasks>",`
+  `"type": "will_happen|at_risk", "confidence": "low|medium|high"}]}` with 2 to 4 predictions: the must-dos you
+  expect done (`will_happen`) and what you expect to slip (`at_risk`). Use the same `item` wording every day for the
+  same thing, so slips can be counted. Never overwrite a forecast file that already has an `evening` section.
+
 ## 4. After replying (silent)
 Copy `state/compiling-doc.md` to `state/archive/<today>.md`. Then reset it for the new day: clear Events, Email
 Digest, Manual Captures; KEEP State Signals and unfinished Open Loops (carried forward until replaced); put the

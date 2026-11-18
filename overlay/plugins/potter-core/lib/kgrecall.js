@@ -21,7 +21,7 @@ const PHRASE = {
   integrates_with: "integrates with", controls: "controls", accessed_by: "is accessed by", uses: "uses",
   depends_on: "depends on", runs: "runs", candidate_host_for: "is a candidate host for", located_in: "is located in",
   monitors: "monitors", married_to: "is married to", parent_of: "is a parent of",
-  prefers: "prefers", avoids: "avoids", responsible_for: "is responsible for",
+  prefers: "prefers", avoids: "avoids", responsible_for: "is responsible for", has_pattern: "has a pattern:",
 };
 const RANK = { high: 0, medium: 1, low: 2 };
 

@@ -3,7 +3,7 @@
 
 export const ENTITY_TYPES = [
   "person", "place", "project", "interest", "resource", "event", "decision",
-  "automation", "concept", "device", "system", "recipe",
+  "automation", "concept", "device", "system", "recipe", "pattern",
 ];
 
 // Each predicate reads "a <predicate> b". The text is the rubric a decision model sees.
@@ -35,6 +35,7 @@ export const PREDICATE_DEFINITIONS = {
   prefers: "a (a person) likes or prefers b",
   avoids: "a (a person) dislikes, avoids or cannot have b",
   responsible_for: "a (a person) is responsible for b (a chore, system or duty)",
+  has_pattern: "a (a person) shows recurring pattern b in how their days go",
 };
 
 export const PREDICATES = Object.keys(PREDICATE_DEFINITIONS);
