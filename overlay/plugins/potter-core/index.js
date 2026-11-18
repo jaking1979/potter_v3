@@ -18,6 +18,7 @@ import { chooseClass, costOf, loadClasses, recordSpend, spentToday, toOverride }
 import { alreadyDone, effectKey, enqueue, inDoubt, isOutboxRetry } from "./lib/durable.js";
 import { buildTools } from "./lib/tools.js";
 import { assemble, buildIndex, fresh } from "./lib/context.js";
+import { loadGraph, recall, stale } from "./lib/kgrecall.js";
 import { DOMAINS } from "./lib/governor.js";
 
 function escalationsToday(path) {
@@ -202,10 +203,26 @@ export default definePluginEntry({
         if (t - checked > 30000) checked = t;
         return index;
       };
+      // The knowledge graph, read-only, reloaded when its file changes (checked at most every 30 s).
+      let graph = null, graphChecked = 0;
+      const getGraph = () => {
+        if (cfg.kg?.enabled === false || !cfg.kg?.dbPath || !existsSync(cfg.kg.dbPath)) return null;
+        const t = Date.now();
+        if (!graph || (t - graphChecked > 30000 && stale(graph))) {
+          try { graph = loadGraph(cfg.kg.dbPath, { owner: cfg.kg.owner }); } catch { graph = null; }
+        }
+        if (t - graphChecked > 30000) graphChecked = t;
+        return graph;
+      };
       api.on("before_prompt_build", async (event, ctx) => {
         if (ctx?.agentId && !agents.has(ctx.agentId)) return;
         const text = requestText(event);
-        const p = await plan(text, { decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500 });
+        // The plan and the graph read run at the same time: the graph adds no wait.
+        const [p, kg] = await Promise.all([
+          plan(text, { decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500 }),
+          recall({ graph: getGraph(), text, decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500, budget: cfg.kg?.budget ?? 2500 })
+            .catch(() => ({ context: "", entities: [], considered: 0, kept: [], source: "error", ms: 0 })),
+        ]);
         let wc = { context: "", sources: [], chars: 0 };
         const t0 = Date.now();
         try {
@@ -215,8 +232,10 @@ export default definePluginEntry({
           wc = assemble({ text, rules, expand, index: getIndex(), ws, tz: cfg.timezone || "UTC", budget: cfg.brain?.budget ?? 7000 });
         } catch { /* a failure means no working context, never a blocked turn */ }
         log(govLog, { kind: "plan", domains: p.domains, source: p.source, ms: p.latencyMs, chars: text.length, error: p.error ?? null,
-          context_chars: wc.chars, recalled: wc.sources.map((x) => x.path), build_ms: Date.now() - t0 });
-        const out = [p.context, wc.context].filter(Boolean).join("\n\n");
+          context_chars: wc.chars, recalled: wc.sources.map((x) => x.path), build_ms: Date.now() - t0,
+          kg_entities: kg.entities, kg_considered: kg.considered, kg_kept: kg.kept.length, kg_source: kg.source, kg_ms: kg.ms,
+          kg_error: kg.error ?? null });
+        const out = [p.context, kg.context, wc.context].filter(Boolean).join("\n\n");
         return out ? { prependContext: out } : undefined;
       });
     }

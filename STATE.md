@@ -55,7 +55,9 @@ v3.3-3.5 (docs/V3_CORE.md): broker + spend ledger, staged memory + weekly review
 effects + in-doubt list + Notion outbox. Sandbox: 6 hooks, 8 tools, 2 new jobs, no duplicates, fast path 2 s.
 v3.6 Brain v1 (docs/V3_CORE.md): working context assembled per request (local recall + domain rules + state,
 7000-char budget). 7 node tests; recall checked against the real v2 export (wine, events, family, house, trading).
-NEXT: deploy 3.3-3.6 to CT 211; v3.7 chief-of-staff loop; v3.8 T1 eval vs v2; Mac node; device-approve button.
+KG + Jev (docs/V3_CORE.md v3.7): eval run live on v2's graph (copy at /root/v2-kg on CT 211, 1,254 entities,
+3,815 relations); graph read on every request; importer. NEXT: deploy + import on CT 211; read-path eval on real
+messages; KG write path (facts with source quotes, Jev checks); staleness; chief-of-staff loop; T1 eval vs v2.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

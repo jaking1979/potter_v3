@@ -54,7 +54,8 @@ p="$(mktemp --suffix=.json5)"
 POTTER_TZ="$(oc config get agents.defaults.userTimezone 2>/dev/null | tr -d '"' || echo UTC)" python3 - "$id" "$C" "$WS" "$SECRETS_DIR" "$p" <<'PY'
 import json, os, sys
 owner, state, ws, secrets, out = sys.argv[1:6]
-cfg = {"workspace": ws, "timezone": os.environ.get("POTTER_TZ", "UTC"), "brain": {"enabled": True, "budget": 7000}, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"], "ownerIds": [owner],
+cfg = {"workspace": ws, "timezone": os.environ.get("POTTER_TZ", "UTC"), "brain": {"enabled": True, "budget": 7000},
+       "kg": {"enabled": True, "dbPath": os.path.join(state, "potter-kg", "potter-kg.sqlite"), "budget": 2500}, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"], "ownerIds": [owner],
        "standingGrants": [], "stateDir": os.path.join(state, "potter-core"),
        "jevEnvFile": os.path.join(secrets, "jev.env"), "policyPath": os.path.join(ws, "state", "model-policy.json"),
        "governor": {"enabled": True, "jev": True, "timeoutMs": 2500}, "fastPath": {"enabled": True, "merrick": "merrick"},
@@ -75,6 +76,8 @@ new["standingGrants"] = old.get("standingGrants") or []
 new["mode"] = old.get("mode", new["mode"])
 if isinstance(old.get("brain"), dict):
     new["brain"] = {**new["brain"], **old["brain"]}
+if isinstance(old.get("kg"), dict):
+    new["kg"] = {**new["kg"], **old["kg"]}
 if isinstance(old.get("broker"), dict):
     new["broker"] = {**new["broker"], **old["broker"]}      # the owner's broker settings win
 json.dump({"plugins": {"entries": {"potter-core": {"config": new}}}}, open(sys.argv[1], "w"))
@@ -126,6 +129,11 @@ exec node "$REPO/overlay/plugins/potter-kg/scripts/kg-eval.mjs" --decider "$POTT
   --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-eval
+cat > /usr/local/bin/potter-kg-import <<WRAP
+#!/bin/sh
+exec node "$REPO/overlay/plugins/potter-kg/scripts/kg-import.mjs" --into "$C/potter-kg/potter-kg.sqlite" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-kg-import
 step "kg eval: potter-kg-eval ready"
 
 # 2b. memory search, with the key already saved for Jev (no key is re-entered)

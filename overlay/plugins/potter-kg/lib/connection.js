@@ -1,6 +1,14 @@
 // "Should these two entities be connected, and how?" as a typed decision. Pure: the decision call
 // itself is injected, so this file knows nothing about endpoints, keys or the SDK.
-import { PREDICATE_CRITERIA } from "./vocab.js";
+import { PREDICATE_DEFINITIONS } from "./vocab.js";
+import { PREDICATE_GUIDE } from "./eval.js";
+
+// The structured link-type Choice beat v2's flat definitions on the real graph (kg-eval, 2026-11-18:
+// first pick 58.6% vs 55%); the broad "related?" yes/no stays as v2 asked it (100% precision).
+export const PREDICATE_CHOICE = Object.fromEntries([
+  ...Object.entries(PREDICATE_GUIDE).map(([p, g]) => [p, { reads: PREDICATE_DEFINITIONS[p], ...g }]),
+  ["none", { what: "no listed type describes a direct relationship" }],
+]);
 
 /** OpenClaw's decision role calls a yes/no question "boolean"; the endpoint v2 called it "noul". */
 export function buildConnectionQuestions({ booleanType = "boolean" } = {}) {
@@ -15,8 +23,8 @@ export function buildConnectionQuestions({ booleanType = "boolean" } = {}) {
     },
     predicate: {
       type: "choice",
-      instructions: "Which predicate best captures the relationship between a and b?",
-      criteria: PREDICATE_CRITERIA,
+      instructions: { question: "Which relationship type best describes how `a` relates to `b`, read as \"a <type> b\"?" },
+      criteria: PREDICATE_CHOICE,
     },
   };
 }

@@ -82,6 +82,21 @@ Before the main model thinks, the governor builds its working context instead of
 - Logged per turn in governor.jsonl: `context_chars`, `recalled` (paths), `build_ms`.
 - Config: `brain.enabled`, `brain.budget`, `timezone` (from `agents.defaults.userTimezone`).
 
+## v3.7 Brain: the knowledge graph on every request (KG + Jev)
+
+- Read path (`lib/kgrecall.js`, run beside the plan in `before_prompt_build`, so it adds no wait): the graph file
+  is opened read-only and reloaded when it changes; names and aliases in the request are matched (longest first;
+  "I"/"my" adds the owner); their description and direct facts, strongest first, become candidates; one Jev request
+  asks one narrow yes/no per candidate ("does this fact help with this request?"); what passes is injected, with
+  medium/low-confidence facts marked "(unconfirmed)". Without Jev: high-confidence facts only.
+  Logged: `kg_entities`, `kg_considered`, `kg_kept`, `kg_source`, `kg_ms`.
+- Eval (`potter-kg-eval`, 2026-11-18, v2's graph, 260 pairs, $0.05): both designs recall 70% of existing links;
+  recall is 87% on high-confidence links and 47% on medium ones, so the misses sit in weak links. v2's yes/no kept
+  100% precision; the structured link-type Choice beat v2's flat one (58.6% vs 55%). Per-predicate yes/no ranking
+  was worse (44%) and is not used. The connection check now uses v2's yes/no plus the structured Choice.
+- `potter-kg-import`: adds another graph (v2's copy) to the live one; never overwrites; tags the source; skips
+  clinical material.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.

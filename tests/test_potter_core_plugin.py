@@ -24,7 +24,7 @@ class PotterCore(unittest.TestCase):
             self.assertIn(k, props)
 
     def test_node_tests_for_v33_to_v36_pass(self):
-        r = subprocess.run(["node", "--test", "core35.test.mjs", "core36.test.mjs"], cwd=D, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(["node", "--test", "core35.test.mjs", "core36.test.mjs", "core37.test.mjs"], cwd=D, capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-800:])
         self.assertIn("fail 0", r.stdout)
 
