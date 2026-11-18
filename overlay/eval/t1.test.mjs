@@ -8,7 +8,7 @@ import { main } from "./t1.mjs";
 
 const TASKS = { tasks: [
   { id: "brief1", category: "brief", prompt: "What does tomorrow look like?", criteria: ["Names tomorrow's calendar events", "Flags anything due"] },
-  { id: "food1", category: "food", prompt: "What wine with lamb on Friday?", criteria: ["Suggests a specific wine", "Fits the owner's stated taste"] },
+  { id: "food1", category: "food", prompt: "What wine with lamb on Friday?", criteria: ["Suggests a specific wine", "Fits the owner's stated taste"], new_info: true },
   { id: "bad", category: "x", prompt: "", criteria: ["x"] },
 ] };
 
@@ -54,6 +54,7 @@ test("run (actions blocked by the session name), v2 answers, grade and report en
   const text = out.pop();
   assert.match(text, /^T1 evaluation\. v3: 50\/100 avg, 1\/2 passed, 4s avg\. v2 \(baseline from v2's own files\): 0\/100 avg, 0\/2 passed/);
   assert.match(text, /Head to head on 2 tasks: v3 better 1, v2 better 0, even 1\./);
+  assert.match(text, /Known before the install \(1 tasks\): v3 100, v2 0\. Told to v3 since \(1 tasks; v2 baseline given the same messages as notes\): v3 0, v2 0\./);
   assert.ok(readFileSync(join(dir, "results.jsonl"), "utf8").includes('"system":"v2"'));
   assert.equal(await main(["report", "--dir", mkdtempSync(join(tmpdir(), "t1e-"))], {}, io), 3);
 });

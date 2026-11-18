@@ -13,6 +13,7 @@ export function cleanTasks(raw) {
     category: String(t?.category ?? "general").slice(0, 40),
     prompt: String(t?.prompt ?? "").trim().slice(0, 2000),
     criteria: (Array.isArray(t?.criteria) ? t.criteria : []).map((c) => String(c).trim()).filter(Boolean).slice(0, 8),
+    newInfo: t?.new_info === true || t?.newInfo === true,        // depends on something told to v3 after the install
   })).filter((t) => t.prompt && t.criteria.length);
 }
 
@@ -79,7 +80,12 @@ export function report(tasks, results) {
   const head = (sys) => new Map(by(sys).map((r) => [r.task, r.grade.score]));
   const v3 = head("v3"), v2 = head("v2");
   const both = [...v3.keys()].filter((k) => v2.has(k));
-  return { v3: line("v3"), v2: line("v2"), perCategory: perCat,
+  const group = (flag) => {
+    const ids = new Set(tasks.filter((t) => t.newInfo === flag).map((t) => t.id));
+    const avg = (sys) => { const rs = by(sys).filter((r) => ids.has(r.task)); return rs.length ? Math.round(sum(rs, (r) => r.grade.score) / rs.length) : null; };
+    return { tasks: ids.size, v3: avg("v3"), v2: avg("v2") };
+  };
+  return { v3: line("v3"), v2: line("v2"), perCategory: perCat, older: group(false), newSinceInstall: group(true),
     headToHead: both.length ? { tasks: both.length, v3Better: both.filter((k) => v3.get(k) > v2.get(k) + 10).length,
       v2Better: both.filter((k) => v2.get(k) > v3.get(k) + 10).length, even: both.filter((k) => Math.abs(v3.get(k) - v2.get(k)) <= 10).length } : null };
 }
@@ -87,6 +93,10 @@ export function report(tasks, results) {
 export function render(rep) {
   const s = (x) => (x ? `${x.avgScore}/100 avg, ${x.passed}/${x.n} passed${x.avgSeconds != null ? `, ${x.avgSeconds}s avg` : ""}` : "not run");
   const lines = [`T1 evaluation. v3: ${s(rep.v3)}. v2 (baseline from v2's own files): ${s(rep.v2)}.`];
+  if (rep.newSinceInstall?.tasks) {
+    lines.push(`Known before the install (${rep.older.tasks} tasks): v3 ${rep.older.v3 ?? "-"}, v2 ${rep.older.v2 ?? "-"}. ` +
+      `Told to v3 since (${rep.newSinceInstall.tasks} tasks; v2 baseline given the same messages as notes): v3 ${rep.newSinceInstall.v3 ?? "-"}, v2 ${rep.newSinceInstall.v2 ?? "-"}.`);
+  }
   if (rep.headToHead) lines.push(`Head to head on ${rep.headToHead.tasks} tasks: v3 better ${rep.headToHead.v3Better}, v2 better ${rep.headToHead.v2Better}, even ${rep.headToHead.even}.`);
   for (const c of rep.perCategory) lines.push(`- ${c.category}: v3 ${c.v3 ?? "-"}, v2 ${c.v2 ?? "-"}`);
   return lines.join("\n");

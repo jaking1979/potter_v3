@@ -16,7 +16,9 @@ judgment (a decision with trade-offs). Also 3 to 5 at the competitor bar (Instin
 ("book dinner Friday for 4", "cancel the subscription I don't use"), travel, and background work that reports only
 when it matters. In a run they stop before any committing click: grade the plan and how far it got.
 Each task: `id`, `category`, `prompt` (the owner's own words), 2 to 4 `criteria` (checkable statements about
-substance, never style).
+substance, never style), and `new_info`: true when the answer depends on something the owner told v3 after the
+install (the v2 baseline gets those same messages as daily notes before every run, so both have the same facts;
+the report scores the two groups separately). Aim for about a third `new_info` tasks.
 Send ALL of them in ONE message, grouped by category, numbered, criteria in short form. End with:
 "Reply 'ok', or 'drop 4 9', or 'change 12: <new wording>'." Apply the reply, write `state/t1/tasks.json` as
 `{"tasks": [...]}`, and confirm in one line. Never add tasks the owner did not see.

@@ -36,3 +36,27 @@ class V2Ref(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TellsTheBaseline(unittest.TestCase):
+    def test_owner_messages_since_install_become_daily_notes_jobs_and_evals_do_not(self):
+        import json as j
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; (ws / "reference/v2").mkdir(parents=True); (ws / "reference/v2/AGENTS.md").write_text("v2")
+            ses = Path(d) / "sessions"; ses.mkdir()
+            rows = [
+                {"type": "message", "timestamp": "2026-11-18T22:12:00Z", "message": {"role": "user", "content": [{"type": "text", "text": "Thanksgiving is Spanish this year: paella mixta."}]}},
+                {"type": "message", "timestamp": "2026-11-18T22:13:00Z", "message": {"role": "assistant", "content": "Noted."}},
+                {"timestamp": "2026-11-18T22:14:00Z", "role": "user", "content": "Run the morning-brief skill."},
+                {"timestamp": "2026-11-10T09:00:00Z", "role": "user", "content": "before the install"},
+            ]
+            (ses / "main.jsonl").write_text("\n".join(j.dumps(r) for r in rows))
+            (ses / "t1-eval-1-brief1.jsonl").write_text(j.dumps({"timestamp": "2026-11-18T23:00:00Z", "role": "user", "content": "eval question"}))
+            out = Path(d) / "v2ref"
+            r = v2ref_workspace.build(ws, out, ses, since="2026-11-17")
+            self.assertEqual(r["owner_messages"], 1)
+            note = (out / "memory/2026-11-18.md").read_text()
+            self.assertIn("22:12 The owner said: Thanksgiving is Spanish this year: paella mixta.", note)
+            self.assertNotIn("morning-brief", note)
+            self.assertNotIn("eval question", note)
+            self.assertFalse((out / "memory/2026-11-10.md").exists())

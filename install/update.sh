@@ -257,14 +257,17 @@ cat > /usr/local/bin/potter-t1 <<WRAP
 #!/bin/sh
 set -a; . "$SECRETS_DIR/jev.env"; set +a
 cmd="\$1"; [ \$# -gt 0 ] && shift
+# Before a run, the v2 baseline gets everything the owner has told v3 since the install (as daily notes).
+[ "\$cmd" = run ] && [ -d "$WS/reference/v2" ] && python3 "$POTTER_HOME/tools/v2ref_workspace.py" --from "$WS" --to "$(dirname "$WS")/workspace-v2ref" --sessions "$C/agents/potter/sessions" >/dev/null 2>&1
 exec node "$POTTER_HOME/eval/t1.mjs" "\$cmd" --dir "$WS/state/t1" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" \
   --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" "\$@"
 WRAP
+cp "$REPO/install/v2ref_workspace.py" "$POTTER_HOME/tools/"
 chmod 755 /usr/local/bin/potter-t1
 # T1's v2 baseline: an agent built from v2's own files (from the import), asked by potter-t1; no channel reaches it.
 if [ -d "$WS/reference/v2" ]; then
   V2REF="$(dirname "$WS")/workspace-v2ref"
-  python3 "$REPO/install/v2ref_workspace.py" --from "$WS" --to "$V2REF" >/dev/null 2>&1 \
+  python3 "$REPO/install/v2ref_workspace.py" --from "$WS" --to "$V2REF" --sessions "$C/agents/potter/sessions" >/dev/null 2>&1 \
     && { oc agents list 2>/dev/null | grep -q "potter-v2ref" || q oc agents add potter-v2ref --workspace "$V2REF" --non-interactive; } \
     && V2REF_OK=1
 fi
