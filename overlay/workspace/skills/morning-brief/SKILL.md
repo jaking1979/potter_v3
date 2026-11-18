@@ -15,12 +15,21 @@ Manual Captures. `[not yet captured]` means unknown. Unknown is never "quiet".
 - **Family calendar:** today + 7 days from the calendar named in the owner's calendar rule. List today's events;
   flag prep-needed events 2-3 days ahead. If the read succeeded and there are none, say "no family events". If the
   read failed, say the calendar was unavailable.
-- **Tasks** (if a task app is connected): overdue, due today, due within 2 days. Up to 5 undated tasks, oldest
+- **Tasks:** overdue, due today, due within 2 days. Up to 5 undated tasks, oldest
   first, never one asked in the last 7 days (record asked ids with dates in the compiling doc). Recently completed
   (last 2 days): count and notable names. Lists the owner's rules mark as seasonal or excluded are never itemized:
   at most one grouped line, in season.
+- **House** (Merrick): run `merrick intentions` and `merrick report --days 1`. Anything pending that needs the
+  owner (a preheat or arrival plan to confirm, a hold, a question Merrick asked, an alert) goes under NEEDS
+  RESPONSE with the deadline ("go/no-go today, or I hold the vacancy plan").
+- **Email:** the Email Digest section of the compiling doc, plus any dated items carried in Open Loops.
 - **Weather:** only if it changes a decision today, for the places in the owner's profile.
-For each source that is not connected or failed, one short line saying so. Never guess a source's contents.
+
+Required sources: compiling doc, calendar, tasks, house, email. The brief ALWAYS ends with one line
+`Couldn't see: <source> (<not connected | failed | empty: mail intake on standby>), ...` naming every required
+source that was not connected, failed, or is empty because its feed is off. Omit the line only when all five
+were read. "Not connected" is never a reason to stay silent about a source: silence makes a thin brief look
+complete. Never guess a source's contents.
 
 ## 3. Choose ONE format (first match wins)
 1. Stress yesterday high -> **Light**: "Today's essentials only." one calm line, up to 3 essentials with why, one
@@ -42,6 +51,9 @@ Title: "Owl Morning Brief - <date>". Task block (not in Light or Quiet, max 8 li
 Copy `state/compiling-doc.md` to `state/archive/<today>.md`. Then reset it for the new day: clear Events, Email
 Digest, Manual Captures; KEEP State Signals and unfinished Open Loops (carried forward until replaced); put the
 brief text under "Morning Brief Output" so later turns can see what was asked.
+Before clearing, MOVE every item that still needs the owner into Open Loops, one line each with its date:
+a deadline that has not passed, a reply or decision someone is waiting on, a quote or delivery stalled on the
+owner. Clearing a section must never drop a live deadline. Passed or resolved items are not carried.
 
 ## Rules
 Quiet days are fine; never manufacture urgency. Address the owner as "you". No preamble, no sign-off. Family and
