@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import { classify } from "./lib/classify.js";
-import { decide, trustOf } from "./lib/control.js";
+import { decide, isEvalSession, trustOf } from "./lib/control.js";
 import { tryHouse } from "./lib/fastpath.js";
 import { plan, requestText, tableDomains } from "./lib/governor.js";
 import { names, search } from "./lib/context.js";
@@ -107,6 +107,9 @@ export default definePluginEntry({
     // ---- v3.1 Control ----------------------------------------------------------------------------------------
     api.on("before_tool_call", async (event, ctx) => {
       const cls = classify(event?.toolName, event?.params, { ownerIds });
+      if (isEvalSession(ctx) && cls.risk !== "read") {
+        return { block: true, blockReason: "evaluation run: only reading is allowed; describe what you would do instead (potter-core)" };
+      }
       const trust = trustOf(ctx);
       let d = decide(cls, trust, cfg);
       const effect = cls.risk === "consequential" ? effectKey(event?.toolName, event?.params) : null;

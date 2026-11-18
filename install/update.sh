@@ -242,6 +242,15 @@ sleep 2; chmod 600 /run/potter-vault-form.out 2>/dev/null; cat /run/potter-vault
 echo "(The form closes itself when done, or after 30 minutes.)"
 WRAP
 chmod 755 /usr/local/bin/potter-vault-setup
+mkdir -p "$WS/state/t1"; chmod 700 "$WS/state/t1"; rm -rf "$POTTER_HOME/eval"; cp -r "$REPO/overlay/eval" "$POTTER_HOME/eval"; rm -f "$POTTER_HOME/eval/"*.test.mjs
+cat > /usr/local/bin/potter-t1 <<WRAP
+#!/bin/sh
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+cmd="\$1"; [ \$# -gt 0 ] && shift
+exec node "$POTTER_HOME/eval/t1.mjs" "\$cmd" --dir "$WS/state/t1" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" \
+  --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-t1
 step "vault: potter-vault installed ($([ -f "$SECRETS_DIR/vault.env" ] && echo connected || echo "not connected yet: potter-vault-setup"))"
 step "kg tools: potter-kg-eval and potter-kg-import ready"
 

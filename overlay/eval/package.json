@@ -1,0 +1,8 @@
+{
+  "name": "potter-eval",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Potter T1 evaluation: the owner's tasks, v3 vs v2, graded by Jev",
+  "dependencies": {}
+}

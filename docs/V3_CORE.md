@@ -160,6 +160,22 @@ Before the main model thinks, the governor builds its working context instead of
   control), tool_result_persist and before_message_write.
 - Updates reinstall a plugin only when its files changed (each install runs OpenClaw and npm; memory).
 
+## House dry-run and switch-over
+
+- `merrick shadow` (every 30 minutes, read-only): what v3 would hold each zone at (the away hold, only when vacant)
+  and whether it would alert, next to the setpoints the house actually has (the old assistant's decisions).
+  `merrick shadow-report --days 7`: agreement while vacant, every divergence as a merged stretch, alerts v3 would
+  have sent. The `house-cutover` skill runs the switch-over in order: report, the owner lists the old assistant's
+  house plans, the owner stops the old assistant, plans re-created with `merrick intend`, tick switched on.
+
+## T1 evaluation (overlay/eval)
+
+- The owner's own 25-30 tasks (drafted from real requests by the `t1-eval` skill, approved by the owner), each with
+  2-4 checkable criteria. `potter-t1 run` asks v3 each one in an isolated `t1-eval-` session, where potter-core
+  blocks everything but reading. v2's answers are collected by the owner (`v2-sheet`, `v2-answer`); v2 is never
+  contacted. `grade`: one Jev request per answer, one yes/no per criterion plus "dodges" and "invented specifics",
+  composed in code (0-100, pass at 70). `report`: averages, per category, head to head.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.

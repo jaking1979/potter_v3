@@ -45,3 +45,8 @@ export function decide(cls, trust, cfg = {}) {
   if (cfg.mode === "shadow" && out.action !== "allow") return { ...out, would: out.action, action: "allow" };
   return out;
 }
+
+/** T1 evaluation turns run in sessions named "t1-eval-...": anything beyond reading is blocked there. */
+export function isEvalSession(ctx = {}) {
+  return /(^|:)t1-eval-/.test(String(ctx.sessionKey ?? ""));
+}

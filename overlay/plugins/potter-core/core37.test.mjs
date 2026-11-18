@@ -154,3 +154,10 @@ test("vault tools are gated by potter-vault itself, so potter-core does not ask 
   const { classify } = await import("./lib/classify.js");
   for (const t of ["vault_list", "vault_authorize", "vault_send_to_owner"]) assert.equal(classify(t, {}).risk, "read", t);
 });
+
+test("evaluation sessions are recognised by name, so their actions can be blocked", async () => {
+  const { isEvalSession } = await import("./lib/control.js");
+  assert.ok(isEvalSession({ sessionKey: "agent:potter:t1-eval-202611181500-brief1" }));
+  assert.ok(!isEvalSession({ sessionKey: "agent:potter:main" }));
+  assert.ok(!isEvalSession({}));
+});
