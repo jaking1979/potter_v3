@@ -56,7 +56,8 @@ import json, os, sys
 owner, state, ws, secrets, out = sys.argv[1:6]
 cfg = {"workspace": ws, "timezone": os.environ.get("POTTER_TZ", "UTC"), "brain": {"enabled": True, "budget": 7000},
        "kg": {"enabled": True, "dbPath": os.path.join(state, "potter-kg", "potter-kg.sqlite"), "budget": 2500,
-              "capture": True, "queuePath": os.path.join(state, "potter-core", "kg-capture-queue.jsonl")}, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"], "ownerIds": [owner],
+              "capture": True, "queuePath": os.path.join(state, "potter-core", "kg-capture-queue.jsonl"),
+              "usagePath": os.path.join(state, "potter-core", "kg-usage.jsonl")}, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"], "ownerIds": [owner],
        "standingGrants": [], "stateDir": os.path.join(state, "potter-core"),
        "jevEnvFile": os.path.join(secrets, "jev.env"), "policyPath": os.path.join(ws, "state", "model-policy.json"),
        "governor": {"enabled": True, "jev": True, "timeoutMs": 2500}, "fastPath": {"enabled": True, "merrick": "merrick"},
@@ -165,6 +166,13 @@ exec node "$POTTER_HOME/plugins/potter-kg/scripts/kg-capture.mjs" --queue "$C/po
   --staged "$WS/state/kg-staged.jsonl" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-capture
+cat > /usr/local/bin/potter-kg-freshness <<WRAP
+#!/bin/sh
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+exec node "$POTTER_HOME/plugins/potter-kg/scripts/kg-freshness.mjs" --db "$C/potter-kg/potter-kg.sqlite" --review "$WS/state/kg-review.jsonl" \
+  --usage "$C/potter-core/kg-usage.jsonl" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-kg-freshness
 step "kg tools: potter-kg-eval and potter-kg-import ready"
 
 # 2b. memory search, with the key already saved for Jev (no key is re-entered)

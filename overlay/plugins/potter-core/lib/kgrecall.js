@@ -95,8 +95,21 @@ export function match(graph, text, { max = 5, owner = graph.owner } = {}) {
   return out;
 }
 
-/** Candidate facts about the matched entities, strongest first. */
-export function candidates(graph, matched, { perEntity = 10, total = 30 } = {}) {
+// Tags the capture path writes into provenance (see potter-kg lib/freshness.js).
+function factTags(prov = []) {
+  let until = null, kind = null, since = null;
+  for (const p of prov) {
+    const x = String(p);
+    until = x.match(/\buntil:(\d{4}-\d{2}-\d{2})/)?.[1] ?? until;
+    kind = x.match(/\bkind:(situational|preference|durable)/)?.[1] ?? kind;
+    const d = x.match(/^(?:chat|confirmed:?) ?(\d{4}-\d{2}-\d{2})/)?.[1];
+    if (d && (!since || d > since)) since = d;
+  }
+  return { until, kind, since };
+}
+
+/** Candidate facts about the matched entities, strongest first. Expired facts never; old temporary ones flagged. */
+export function candidates(graph, matched, { perEntity = 10, total = 30, today = new Date().toISOString().slice(0, 10) } = {}) {
   const name = (id) => graph.entities.get(id)?.name ?? id;
   const facts = [];
   const seen = new Set();
@@ -111,8 +124,12 @@ export function candidates(graph, matched, { perEntity = 10, total = 30 } = {}) 
       const k = `${r.source_id}|${r.predicate}|${r.target_id}`;
       if (seen.has(k)) continue;
       seen.add(k);
-      facts.push({ text: `${name(r.source_id)} ${PHRASE[r.predicate] ?? r.predicate.replace(/_/g, " ")} ${name(r.target_id)}.`,
-        confidence: r.confidence || "medium", kind: "relation", about: m.id, source: r.provenance[0] ?? null });
+      const t = factTags(r.provenance);
+      if (t.until && t.until < today) continue;
+      const old = t.kind === "situational" && t.since && (Date.parse(today) - Date.parse(t.since)) / 86400000 > 90;
+      facts.push({ text: `${name(r.source_id)} ${PHRASE[r.predicate] ?? r.predicate.replace(/_/g, " ")} ${name(r.target_id)}.` +
+        (old ? ` (as of ${t.since}; may have changed)` : ""),
+        confidence: r.confidence || "medium", kind: "relation", about: m.id, source: r.provenance[0] ?? null, key: k });
       if (++n >= perEntity) break;
     }
   }

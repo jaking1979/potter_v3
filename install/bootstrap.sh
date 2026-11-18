@@ -260,7 +260,7 @@ install_plugin "$cdir" potter-core --force
 pcp="$(mktemp --suffix=.json5)"
 OWNER_TELEGRAM_ID="$OWNER_TELEGRAM_ID" KG_DB="$KG_DB" WS="$WS" TIMEZONE="$TIMEZONE" SECRETS_DIR="$SECRETS_DIR" STATE_DIR="$STATE_DIR" python3 -c '
 import json, os, sys
-cfg = {"workspace": os.environ["WS"], "timezone": os.environ.get("TIMEZONE", "UTC"), "brain": {"enabled": True, "budget": 7000}, "kg": {"enabled": True, "dbPath": os.environ["KG_DB"], "budget": 2500, "capture": True, "queuePath": os.path.join(os.environ["STATE_DIR"], "potter-core", "kg-capture-queue.jsonl")}, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"],
+cfg = {"workspace": os.environ["WS"], "timezone": os.environ.get("TIMEZONE", "UTC"), "brain": {"enabled": True, "budget": 7000}, "kg": {"enabled": True, "dbPath": os.environ["KG_DB"], "budget": 2500, "capture": True, "queuePath": os.path.join(os.environ["STATE_DIR"], "potter-core", "kg-capture-queue.jsonl"), "usagePath": os.path.join(os.environ["STATE_DIR"], "potter-core", "kg-usage.jsonl")}, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"],
        "ownerIds": [os.environ["OWNER_TELEGRAM_ID"]], "standingGrants": [],
        "stateDir": os.path.join(os.environ["STATE_DIR"], "potter-core"),
        "jevEnvFile": os.path.join(os.environ["SECRETS_DIR"], "jev.env"),
@@ -331,6 +331,13 @@ exec node "$POTTER_HOME/plugins/potter-kg/scripts/kg-capture.mjs" --queue "$STAT
   --staged "$WS/state/kg-staged.jsonl" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-capture
+cat > /usr/local/bin/potter-kg-freshness <<WRAP
+#!/bin/sh
+set -a; . "$SECRETS_DIR/jev.env"; set +a
+exec node "$POTTER_HOME/plugins/potter-kg/scripts/kg-freshness.mjs" --db "$KG_DB" --review "$WS/state/kg-review.jsonl" \
+  --usage "$STATE_DIR/potter-core/kg-usage.jsonl" --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-kg-freshness
 read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then

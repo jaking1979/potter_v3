@@ -115,6 +115,18 @@ Before the main model thinks, the governor builds its working context instead of
 - `capability-map` (daily): TOOLS.md gets a live map of reachable tools and Composio-connected apps.
 - `mail-observe` (every 30 minutes, on): reads the shared inbox without changing it while v2 owns it.
 
+## v3.9 Staleness (potter-kg 3.3.0, potter-core 3.9.0)
+
+- `potter-kg-freshness` (daily 03:37): facts whose "until" date has passed are archived (never deleted).
+  "Still true?" questions, at most five a week, never re-asked within 60 days, chosen in code: temporary facts
+  older than 90 days, preferences older than a year, and facts Potter actually used in the last 30 days that Jev
+  judges time-bound (imported v2 facts carry no kind, so Jev decides). Facts confirmed in the last 180 days are left.
+- The weekly memory review shows them; keep = confirmed at high confidence; archive = gone; "what changed" is a new
+  fact through the capture path.
+- Recall never injects an expired fact and marks old temporary ones "(as of <date>; may have changed)". Kept facts
+  are logged to `kg-usage.jsonl` so freshness knows what is used.
+- Broker log fields renamed: `escalation_today_usd` (what the cap counts), `escalation_cap_usd`, `day_total_usd`.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.

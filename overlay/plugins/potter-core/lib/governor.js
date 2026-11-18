@@ -20,7 +20,7 @@ export const DOMAINS = [
     servers: [], skills: [], rules: ["global/memory.md"] },
   { id: "verify", re: /\b(did you|have you|is it done|are you sure|status of|follow(ed)? up)\b/i,
     servers: [], skills: [], rules: ["global/verification.md"] },
-  { id: "local", recall: ["events", "family", "location", "weekend", "concert"], re: /\b(this weekend|concerts?|shows?|what'?s on|things to do|events (near|around|in)|margaretville|catskills)\b/i,
+  { id: "local", recall: ["events", "family", "location", "weekend", "concert"], re: /\b(this weekend|concerts?|(?:any|good|live|a|the) shows? (?:on|tonight|this|near|in)|broadway|what'?s on|things to do|events (near|around|in)|margaretville|catskills)\b/i,
     servers: [], skills: ["events-digest", "local-monitor"], rules: [] },
   { id: "food", recall: ["food", "wine", "restaurant", "cuisine", "meal", "cook", "dinner", "diet"], re: /\b(dinner|lunch|breakfast|eat|eating|restaurants?|takeout|take-out|delivery|order (food|in|out)|cook(ing)?|recipes?|meal ?plan|meals?|groceries|grocery|wine)\b/i,
     servers: ["composio", "notion"], skills: ["meal-plan"], rules: [],

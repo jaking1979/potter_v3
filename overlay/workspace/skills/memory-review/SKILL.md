@@ -17,3 +17,11 @@ description: The owner's weekly review of what Potter proposes to remember (appr
    memory list stopped, each with the quote. "Nothing waiting." means skip this section.
 6. On the owner's answer: `potter-kg-capture --approve <id,id>` for approved ones (written at high confidence),
    `potter-kg-capture --reject <id,id>` for rejected ones. Report the one-line result.
+
+## Still true? (graph freshness)
+7. Also run `potter-kg-freshness --list`. Each line is a fact that may have changed (a temporary fact that is
+   months old, an old preference, or something you used recently that tends to change). Send them as "Still true?"
+   numbered after the others, with the reason in brackets. "Nothing waiting." means skip.
+8. On the owner's answer: `potter-kg-freshness --keep <id,id>` (still true: confirmed, high confidence),
+   `potter-kg-freshness --archive <id,id>` (no longer true). If the owner says what changed instead ("she's on
+   the U16 team now"), archive the old one and treat their sentence as a new fact (it is captured automatically).

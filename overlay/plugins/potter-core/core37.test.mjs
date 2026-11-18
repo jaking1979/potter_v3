@@ -134,3 +134,18 @@ test("only the owner's own messages are queued for the graph; jobs, strangers an
   assert.equal(JSON.parse(readFileSync(path, "utf8")).text, msg);
   assert.equal(statSync(path).mode & 0o777, 0o600);
 });
+
+test("expired facts are never recalled; old temporary ones are flagged; facts carry a key for usage", async () => {
+  const path = graphFile();
+  const db = new DatabaseSync(path);
+  db.prepare("UPDATE relations SET provenance=? WHERE predicate='interested_in' AND target_id='interest:skiing' AND source_id='person:mia'")
+    .run(JSON.stringify(['chat 2026-01-01: "on the ski team until March" until:2026-03-01 kind:situational']));
+  db.prepare("UPDATE relations SET provenance=? WHERE predicate='interested_in' AND target_id='resource:cake'")
+    .run(JSON.stringify(['chat 2026-01-01: "loves that cake" kind:situational']));
+  db.close();
+  const g = loadGraph(path);
+  const f = candidates(g, match(g, "Mia"), { today: "2026-11-18" });
+  assert.ok(!f.some((x) => x.text.includes("Skiing")));
+  assert.ok(f.some((x) => x.text.includes("Lemon Cake") && x.text.includes("(as of 2026-01-01; may have changed)")));
+  assert.ok(f.filter((x) => x.kind === "relation").every((x) => /\|/.test(x.key)));
+});

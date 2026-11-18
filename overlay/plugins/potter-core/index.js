@@ -161,7 +161,9 @@ export default definePluginEntry({
         const overCount = escalationsToday(govLog) >= (cfg.broker?.escalationDailyMax ?? 20);
         const pick = chooseClass(text, { domains: tableDomains(text), escalationSpentUsd: overCount ? capUsd : spentUsd, escalationCapUsd: capUsd });
         if (ctx?.runId) runClass.set(ctx.runId, pick.cls);
-        log(govLog, { kind: "broker", cls: pick.cls, reason: pick.reason, spentUsd: Number(spentUsd.toFixed(4)) });
+        // escalation_today is what the daily escalation cap counts; day_total is every model call recorded today.
+        log(govLog, { kind: "broker", cls: pick.cls, reason: pick.reason, escalation_today_usd: Number(spentUsd.toFixed(4)),
+          escalation_cap_usd: capUsd, day_total_usd: Number(spentToday(spend).toFixed(4)) });
         if (pick.cls === "chat" || cfg.broker?.mode === "shadow") return;
         return toOverride(classes[pick.cls]) ?? undefined;
       });
@@ -247,6 +249,12 @@ export default definePluginEntry({
           kg_entities: kg.entities, kg_considered: kg.considered, kg_kept: kg.kept.length, kg_source: kg.source, kg_ms: kg.ms,
           files_considered: shortlist.length, files_kept: kg.passagesKept?.length ?? 0, kg_queued: queued, sender_known: Boolean(ctx?.senderId),
           kg_error: kg.error ?? null });
+        // Which graph facts were used: the freshness job asks about used facts that may have changed.
+        if (cfg.kg?.usagePath && kg.kept.some((f) => f.key)) {
+          try {
+            appendFileSync(cfg.kg.usagePath, kg.kept.filter((f) => f.key).map((f) => JSON.stringify({ ts: new Date().toISOString(), key: f.key })).join("\n") + "\n", { mode: 0o600 });
+          } catch { /* usage is a hint, never a blocker */ }
+        }
         const out = [p.context, kg.context, wc.context].filter(Boolean).join("\n\n");
         return out ? { prependContext: out } : undefined;
       });

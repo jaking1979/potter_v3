@@ -255,6 +255,16 @@
    "standby": false,
    "command": "potter-kg-capture",
    "purpose": "turns what the owner tells Potter into knowledge-graph facts (Jev-checked; unsure ones wait for review)"
+  },
+  {
+   "name": "potter-kg-freshness",
+   "cron": "37 3 * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 600,
+   "standby": false,
+   "command": "potter-kg-freshness",
+   "purpose": "archives expired graph facts and picks a few 'still true?' questions for the weekly review"
   }
  ]
 }
