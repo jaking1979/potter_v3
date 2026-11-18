@@ -175,6 +175,10 @@ Before the main model thinks, the governor builds its working context instead of
   blocks everything but reading. v2's answers are collected by the owner (`v2-sheet`, `v2-answer`); v2 is never
   contacted. `grade`: one Jev request per answer, one yes/no per criterion plus "dodges" and "invented specifics",
   composed in code (0-100, pass at 70). `report`: averages, per category, head to head.
+- No hand copying: `potter-t1 run` asks v3 (agent `potter`) and a v2 baseline (agent `potter-v2ref`, built at
+  install and update by `install/v2ref_workspace.py` from v2's own files in `reference/v2` plus the owner's personal
+  files; no channel reaches it; live v2 is never contacted). A real v2 answer can still replace one for a spot check.
+  The owner's only step is one reply approving the task set.
 
 ## House insights
 

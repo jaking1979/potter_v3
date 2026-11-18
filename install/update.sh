@@ -261,6 +261,14 @@ exec node "$POTTER_HOME/eval/t1.mjs" "\$cmd" --dir "$WS/state/t1" --decider "$PO
   --openclaw "openclaw ${OC_PROFILE_FLAG[*]:-}" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-t1
+# T1's v2 baseline: an agent built from v2's own files (from the import), asked by potter-t1; no channel reaches it.
+if [ -d "$WS/reference/v2" ]; then
+  V2REF="$(dirname "$WS")/workspace-v2ref"
+  python3 "$REPO/install/v2ref_workspace.py" --from "$WS" --to "$V2REF" >/dev/null 2>&1 \
+    && { oc agents list 2>/dev/null | grep -q "potter-v2ref" || q oc agents add potter-v2ref --workspace "$V2REF" --non-interactive; } \
+    && V2REF_OK=1
+fi
+step "T1: v2 baseline agent $([ -n "${V2REF_OK:-}" ] && echo ready || echo "not built (no v2 import)")"
 cat > /usr/local/bin/potter-house-ideas <<WRAP
 #!/bin/sh
 # Filter the week's house ideas with Jev (stdin: evidence, existing, ideas as JSON). Prints kept and dropped.

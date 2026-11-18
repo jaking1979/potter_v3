@@ -38,7 +38,8 @@ export async function main(argv, env = process.env, io = { out: (s) => process.s
   let a;
   try {
     a = parseArgs({ args: rest, allowPositionals: true, options: { dir: { type: "string" }, decider: { type: "string" }, policy: { type: "string" },
-      openclaw: { type: "string", default: "openclaw" }, only: { type: "string" }, json: { type: "boolean", default: false } } });
+      openclaw: { type: "string", default: "openclaw" }, only: { type: "string" }, json: { type: "boolean", default: false },
+      "v2-agent": { type: "string", default: "potter-v2ref" }, "no-v2": { type: "boolean", default: false } } });
   } catch (e) { io.err(`potter-t1: ${e.message}\n`); return 2; }
   const o = a.values, pos = a.positionals;
   if (!o.dir) { io.err("potter-t1: --dir is required\n"); return 2; }
@@ -67,15 +68,20 @@ export async function main(argv, env = process.env, io = { out: (s) => process.s
     const only = o.only ? new Set(o.only.split(",")) : null;
     const ask = deps.askV3 ?? askV3;
     let n = 0;
+    // v3 (agent "potter") and the v2 baseline (an agent built from v2's own files: no hand copying, live v2 untouched).
+    const systems = [["v3", "potter"], ...(o["no-v2"] ? [] : [["v2", o["v2-agent"]]])];
     for (const t of tasks) {
       if (only && !only.has(t.id)) continue;
-      const r = await ask({ openclaw: o.openclaw, runId, task: t });
-      const rs = rows(resultsPath).filter((x) => !(x.system === "v3" && x.task === t.id));
-      rs.push({ system: "v3", task: t.id, answer: r.answer, ms: r.ms, error: r.error, at: new Date().toISOString(), run: runId });
-      save(resultsPath, rs);
+      for (const [system, agent] of systems) {
+        const r = await ask({ openclaw: o.openclaw, runId, task: t, agent });
+        const rs = rows(resultsPath).filter((x) => !(x.system === system && x.task === t.id));
+        rs.push({ system, task: t.id, answer: r.answer, ms: r.ms, error: r.error, at: new Date().toISOString(), run: runId,
+          source: system === "v2" ? "baseline agent" : "potter" });
+        save(resultsPath, rs);
+      }
       n++;
     }
-    io.out(`Ran ${n} tasks against v3. Next: potter-t1 grade\n`);
+    io.out(`Ran ${n} tasks against ${systems.map(([s]) => s).join(" and ")}. Next: potter-t1 grade\n`);
     return 0;
   }
   if (cmd === "grade") {

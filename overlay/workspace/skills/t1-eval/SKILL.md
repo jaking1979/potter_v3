@@ -1,37 +1,36 @@
 ---
 name: t1-eval
-description: The T1 evaluation of Potter v3 against v2 on the owner's own tasks (drafting the task set with the owner, running it, collecting v2's answers, grading, the report). Use when the owner says "T1", "run the eval", "compare v3 and v2", or forwards a v2 answer for the eval.
+description: The T1 evaluation of Potter v3 against v2 on the owner's own tasks (drafting the task set, running it, grading, the report). Use when the owner says "T1", "run the eval", "compare v3 and v2", or "how does v3 compare with v2 now".
 ---
 # T1 evaluation
 
-The task set is the owner's, approved once; grading is Jev, one narrow question per criterion; actions are
-blocked during runs (potter-core blocks everything but reading in `t1-eval-` sessions).
+The owner does almost nothing: one reply to approve the tasks. You run v3 AND the v2 baseline yourself (an agent
+built from v2's own files: its AGENTS.md, SOUL.md, rules, memory, prompts and the owner's preferences, as of the
+import; live v2 is never contacted). Grading is Jev; actions are blocked during runs.
 
-## 1. Draft the task set (once, with the owner)
-Draft 25 to 30 tasks from what the owner actually asks for: look at recent conversations, the compiling doc,
-the morning briefs and the knowledge graph. Spread them over these categories, 3 to 5 each: brief (today and
-tomorrow), calendar and logistics, email and follow-ups, house, family and people, food and wine, money and
-tasks, local events, memory ("what do you know about..."), judgment (a decision with trade-offs).
-Also 3 to 5 tasks at the competitor bar (Instinct, Muse, Dots): web errands ("book dinner Friday for 4",
-"cancel the subscription I don't use"), travel ("when do I check in for my flight"), and a background task that
-reports only when it matters. In an evaluation run they stop before any committing click: grade the plan and how
-far it got.
-Each task: `id` (short), `category`, `prompt` (the owner's own words, as they would ask), and 2 to 4 `criteria`:
-checkable statements a good answer meets ("names the Friday 6:30 soccer game", "says the brief source it could
-not read"). Criteria about substance, never about style.
-Send the list to the owner in batches of 10 and apply their edits. Only after they approve: write
-`state/t1/tasks.json` as `{"tasks": [...]}`. Never add tasks they did not approve.
+## 1. The task set (once; one message from the owner)
+Draft 25 to 30 tasks from what the owner actually asks for (recent conversations, the compiling doc, briefs, the
+knowledge graph), 3 to 5 per category: brief (today and tomorrow), calendar and logistics, email and follow-ups,
+house, family and people, food and wine, money and tasks, local events, memory ("what do you know about..."),
+judgment (a decision with trade-offs). Also 3 to 5 at the competitor bar (Instinct, Muse, Dots, Duet): web errands
+("book dinner Friday for 4", "cancel the subscription I don't use"), travel, and background work that reports only
+when it matters. In a run they stop before any committing click: grade the plan and how far it got.
+Each task: `id`, `category`, `prompt` (the owner's own words), 2 to 4 `criteria` (checkable statements about
+substance, never style).
+Send ALL of them in ONE message, grouped by category, numbered, criteria in short form. End with:
+"Reply 'ok', or 'drop 4 9', or 'change 12: <new wording>'." Apply the reply, write `state/t1/tasks.json` as
+`{"tasks": [...]}`, and confirm in one line. Never add tasks the owner did not see.
 
-## 2. Run against v3
-`potter-t1 run` (about 30 seconds per task; tell the owner it runs in the background and you will report). Then
-`potter-t1 grade`, then `potter-t1 report` and send the report.
+## 2. Run, grade, report (no owner involvement)
+Tell the owner it runs in the background (about a minute per task), then: `potter-t1 run`, `potter-t1 grade`,
+`potter-t1 report`. Send the report as it is, then at most three lines: where v3 clearly beats v2, where it
+loses, and the one fix that would move the score most.
 
-## 3. v2's answers (the owner collects them; you never contact v2)
-`potter-t1 v2-sheet` prints the numbered prompts: send them to the owner to ask v2 one by one, in v2's chat.
-When the owner forwards a v2 answer ("v2 answer brief1: ..."), save the text to a temporary file and run
-`potter-t1 v2-answer <id> <file>`, then delete the file. After the last one: `potter-t1 grade` and
-`potter-t1 report`.
+## Optional: a real v2 answer
+The baseline is v2's files with today's model, not live v2's runtime. If the owner wants to spot-check one task
+against real v2, they forward v2's answer ("v2 answer brief1: ..."): save it to a temporary file, run
+`potter-t1 v2-answer <id> <file>`, delete the file, re-grade. Never ask the owner to do this for every task.
 
-## Reporting
-Send the report as it is, then at most three lines: where v3 clearly beats v2, where it loses, and the one fix
-that would move the score most. Never edit or re-grade an answer by hand.
+## Re-runs
+"Run T1 again" re-runs both systems on the same tasks, so progress over time is comparable. Never edit or
+re-grade an answer by hand.

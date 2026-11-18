@@ -86,7 +86,7 @@ export function report(tasks, results) {
 
 export function render(rep) {
   const s = (x) => (x ? `${x.avgScore}/100 avg, ${x.passed}/${x.n} passed${x.avgSeconds != null ? `, ${x.avgSeconds}s avg` : ""}` : "not run");
-  const lines = [`T1 evaluation. v3: ${s(rep.v3)}. v2: ${s(rep.v2)}.`];
+  const lines = [`T1 evaluation. v3: ${s(rep.v3)}. v2 (baseline from v2's own files): ${s(rep.v2)}.`];
   if (rep.headToHead) lines.push(`Head to head on ${rep.headToHead.tasks} tasks: v3 better ${rep.headToHead.v3Better}, v2 better ${rep.headToHead.v2Better}, even ${rep.headToHead.even}.`);
   for (const c of rep.perCategory) lines.push(`- ${c.category}: v3 ${c.v3 ?? "-"}, v2 ${c.v2 ?? "-"}`);
   return lines.join("\n");
