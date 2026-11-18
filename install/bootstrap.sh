@@ -319,6 +319,11 @@ cat > /usr/local/bin/potter-kg-import <<WRAP
 exec node "$REPO/overlay/plugins/potter-kg/scripts/kg-import.mjs" --into "$KG_DB" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-import
+cat > /usr/local/bin/potter-update <<WRAP
+#!/bin/sh
+exec bash "$REPO/install/self_update.sh" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-update
 read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then

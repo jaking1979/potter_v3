@@ -152,6 +152,11 @@ cat > /usr/local/bin/potter-kg-import <<WRAP
 exec node "$REPO/overlay/plugins/potter-kg/scripts/kg-import.mjs" --into "$C/potter-kg/potter-kg.sqlite" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-kg-import
+cat > /usr/local/bin/potter-update <<WRAP
+#!/bin/sh
+exec bash "$REPO/install/self_update.sh" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-update
 step "kg tools: potter-kg-eval and potter-kg-import ready"
 
 # 2b. memory search, with the key already saved for Jev (no key is re-entered)
