@@ -17,7 +17,8 @@ Manual Captures. `[not yet captured]` means unknown. Unknown is never "quiet".
   read failed, say the calendar was unavailable.
 - **Tasks** (Todoist through Composio: `composio__COMPOSIO_SEARCH_TOOLS` once for Todoist, keep its
   `session_id`, then `composio__COMPOSIO_MULTI_EXECUTE_TOOL` with the slugs it returns, e.g. a filter of
-  `overdue | today | 2 days`; say "not connected" only if the search finds no Todoist connection): overdue, due today, due within 2 days. Up to 5 undated tasks, oldest
+  `overdue | today | 2 days`; say "not connected" only if the search finds no Todoist connection; TOOLS.md's "What I can reach" lists
+  connected apps): overdue, due today, due within 2 days. Up to 5 undated tasks, oldest
   first, never one asked in the last 7 days (record asked ids with dates in the compiling doc). Recently completed
   (last 2 days): count and notable names. Lists the owner's rules mark as seasonal or excluded are never itemized:
   at most one grouped line, in season.

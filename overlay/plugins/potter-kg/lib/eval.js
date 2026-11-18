@@ -34,6 +34,10 @@ export const PREDICATE_GUIDE = {
   monitors: { what: "a watches b and reports on it", examples: ["a sensor monitors a leak point"] },
   married_to: { what: "two people are spouses", examples: [] },
   parent_of: { what: "person a is a parent of person b", examples: [] },
+  prefers: { what: "a person likes, enjoys or prefers b (a food, place, brand, way of doing things)", not_for: "a hobby the person does",
+    examples: ["the owner prefers Pinot Noir", "a child prefers the window seat"] },
+  avoids: { what: "a person dislikes, avoids or cannot have b", examples: ["a family member avoids shellfish"] },
+  responsible_for: { what: "a person handles or owns b (a chore, a system, a duty)", examples: ["the owner is responsible for winterizing the cabin"] },
 };
 
 // ---------- sampling (deterministic: a seed, not Math.random) ----------

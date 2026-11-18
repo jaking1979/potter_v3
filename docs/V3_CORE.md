@@ -99,6 +99,22 @@ Before the main model thinks, the governor builds its working context instead of
 - `potter-kg-import`: adds another graph (v2's copy) to the live one; never overwrites; tags the source; skips
   clinical material.
 
+## v3.8 The graph learns (KG write path; potter-kg 3.2.0, potter-core 3.8.0)
+
+- potter-core queues each message the OWNER writes (sender matched to the owner ids; jobs, heartbeats and other
+  senders never) to a root-only queue. Logged per turn: `kg_queued`, `sender_known`.
+- `potter-kg-capture` (every 20 minutes) per message: one Jev screen (lasting fact? kind: durable / preference /
+  situational / one-off? the owner's own words? clinical?), stop unless worth remembering; a cheap model extracts
+  facts in the controlled vocabulary with an exact source quote (a quote not in the message is discarded); per fact
+  one Jev request (supported by the quote? structured link-type Choice + "any fits"? replaces an existing fact?);
+  entities matched by exact name first, near matches by a 3-level Jev Score; code routes: write (high if the owner
+  said it, else medium), stage for the weekly review, or drop. A move (lives_at, located_in, runs_on) archives the
+  old link. Provenance keeps the quote, the date, the kind and any "until" date.
+- New predicates: prefers, avoids, responsible_for.
+- The weekly memory review lists staged graph facts; approve writes them at high confidence.
+- `capability-map` (daily): TOOLS.md gets a live map of reachable tools and Composio-connected apps.
+- `mail-observe` (every 30 minutes, on): reads the shared inbox without changing it while v2 owns it.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.

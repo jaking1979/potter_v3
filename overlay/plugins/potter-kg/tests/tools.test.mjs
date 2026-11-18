@@ -95,12 +95,12 @@ test("kg_stats carries the controlled vocabulary", async () => {
   assert.deepEqual(s.predicates, PREDICATES);
 });
 
-test("connection rubric: a yes/no 'related' plus a 25-way predicate choice; the yes/no type is selectable", () => {
+test("connection rubric: a yes/no 'related' plus a 28-way predicate choice; the yes/no type is selectable", () => {
   const q = buildConnectionQuestions();
   assert.equal(q.related.type, "boolean");
   assert.deepEqual(Object.keys(q.related.criteria), ["true", "false"]);
   assert.equal(q.predicate.type, "choice");
-  assert.equal(Object.keys(q.predicate.criteria).length, 25);
+  assert.equal(Object.keys(q.predicate.criteria).length, 28);
   assert.ok(q.predicate.criteria.none);
   assert.equal(buildConnectionQuestions({ booleanType: "noul" }).related.type, "noul");
 });

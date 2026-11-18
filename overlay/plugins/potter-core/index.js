@@ -20,6 +20,7 @@ import { alreadyDone, effectKey, enqueue, inDoubt, isOutboxRetry } from "./lib/d
 import { buildTools } from "./lib/tools.js";
 import { assemble, buildIndex, fresh } from "./lib/context.js";
 import { loadGraph, recall, stale } from "./lib/kgrecall.js";
+import { enqueueMessage, shouldQueue } from "./lib/capturequeue.js";
 import { DOMAINS } from "./lib/governor.js";
 
 function escalationsToday(path) {
@@ -218,6 +219,8 @@ export default definePluginEntry({
       api.on("before_prompt_build", async (event, ctx) => {
         if (ctx?.agentId && !agents.has(ctx.agentId)) return;
         const text = requestText(event);
+        // The graph learns from what the owner says (processed by the potter-kg capture job).
+        const queued = cfg.kg?.capture !== false && Boolean(cfg.kg?.queuePath) && shouldQueue(text, ctx, ownerIds) && enqueueMessage(cfg.kg.queuePath, text, ctx ?? {});
         // File search shortlist (keyword table domains only: the Jev plan is not back yet), judged by Jev in the
         // same request as the graph facts. The plan and that request run at the same time: no added wait.
         let shortlist = [];
@@ -242,7 +245,7 @@ export default definePluginEntry({
         log(govLog, { kind: "plan", domains: p.domains, source: p.source, ms: p.latencyMs, chars: text.length, error: p.error ?? null,
           context_chars: wc.chars, recalled: wc.sources.map((x) => x.path), build_ms: Date.now() - t0,
           kg_entities: kg.entities, kg_considered: kg.considered, kg_kept: kg.kept.length, kg_source: kg.source, kg_ms: kg.ms,
-          files_considered: shortlist.length, files_kept: kg.passagesKept?.length ?? 0,
+          files_considered: shortlist.length, files_kept: kg.passagesKept?.length ?? 0, kg_queued: queued, sender_known: Boolean(ctx?.senderId),
           kg_error: kg.error ?? null });
         const out = [p.context, kg.context, wc.context].filter(Boolean).join("\n\n");
         return out ? { prependContext: out } : undefined;

@@ -115,3 +115,22 @@ test("file passages are judged in the same request: irrelevant ones are dropped;
   const noJev = await recall({ graph: g, text: "When is Mia's race?", passages });
   assert.equal(noJev.passagesKept.length, 2);
 });
+
+test("only the owner's own messages are queued for the graph; jobs, strangers and chit-chat never", async () => {
+  const { shouldQueue, enqueueMessage } = await import("./lib/capturequeue.js");
+  const owner = ["12345"];
+  const msg = "Mia is moving to the U14 team in January.";
+  assert.ok(shouldQueue(msg, { senderId: "12345" }, owner));
+  assert.ok(shouldQueue(msg, { senderId: "telegram:12345" }, owner));
+  assert.ok(!shouldQueue(msg, { senderId: "999" }, owner));
+  assert.ok(!shouldQueue(msg, {}, owner));                                        // unknown sender
+  assert.ok(!shouldQueue(msg, { senderId: "12345", jobId: "j1" }, owner));
+  assert.ok(!shouldQueue(msg, { senderId: "12345", trigger: "heartbeat" }, owner));
+  assert.ok(!shouldQueue("thanks!", { senderId: "12345" }, owner));
+  assert.ok(!shouldQueue("Run the morning-brief skill now.", { senderId: "12345" }, owner));
+  const path = join(mkdtempSync(join(tmpdir(), "q-")), "q.jsonl");
+  assert.ok(enqueueMessage(path, msg, { sessionKey: "s1" }));
+  const { readFileSync, statSync } = await import("node:fs");
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).text, msg);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+});

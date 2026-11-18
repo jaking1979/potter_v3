@@ -10,3 +10,10 @@ description: The owner's weekly review of what Potter proposes to remember (appr
 3. When the owner answers ("approve 1 3, reject 2, edit 4: <text>, downgrade 5"), turn it into decisions and call
    `memory_review_apply` with exactly those. Never decide for the owner, never approve what was not named.
 4. Report in one line what was written to MEMORY.md and what was dropped.
+
+## Graph facts waiting (knowledge graph)
+5. Also run `potter-kg-capture --list`. Each line is a fact Potter heard but Jev was not sure of, with its id and
+   the owner's own words. Send them after the memory list as "Facts for the graph:" numbered from where the
+   memory list stopped, each with the quote. "Nothing waiting." means skip this section.
+6. On the owner's answer: `potter-kg-capture --approve <id,id>` for approved ones (written at high confidence),
+   `potter-kg-capture --reject <id,id>` for rejected ones. Report the one-line result.

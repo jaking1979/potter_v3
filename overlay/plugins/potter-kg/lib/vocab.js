@@ -32,6 +32,9 @@ export const PREDICATE_DEFINITIONS = {
   monitors: "a monitors b",
   married_to: "a is married to b",
   parent_of: "a is parent of b",
+  prefers: "a (a person) likes or prefers b",
+  avoids: "a (a person) dislikes, avoids or cannot have b",
+  responsible_for: "a (a person) is responsible for b (a chore, system or duty)",
 };
 
 export const PREDICATES = Object.keys(PREDICATE_DEFINITIONS);

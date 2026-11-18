@@ -234,6 +234,27 @@
    "deliver": false,
    "message": "Run the mail-observe skill. Output nothing.",
    "purpose": "reads the shared inbox without changing it (another assistant owns it) so the brief sees deadlines"
+  },
+  {
+   "name": "potter-capability-map",
+   "cron": "23 5 * * *",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 300,
+   "standby": false,
+   "deliver": false,
+   "message": "Run the capability-map skill. Output nothing.",
+   "purpose": "rebuilds TOOLS.md's map of reachable tools and Composio apps"
+  },
+  {
+   "name": "potter-kg-capture",
+   "cron": "4,24,44 * * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 600,
+   "standby": false,
+   "command": "potter-kg-capture",
+   "purpose": "turns what the owner tells Potter into knowledge-graph facts (Jev-checked; unsure ones wait for review)"
   }
  ]
 }

@@ -4,9 +4,9 @@ import * as v from "../lib/vocab.js";
 import * as a from "../lib/alias.js";
 import { resolveDbPath } from "../lib/paths.js";
 
-test("vocabulary: 24 predicates, each with a definition, plus 'none' for the decision rubric", () => {
-  assert.equal(v.PREDICATES.length, 24);
-  assert.equal(Object.keys(v.PREDICATE_CRITERIA).length, 25);
+test("vocabulary: 27 predicates, each with a definition, plus 'none' for the decision rubric", () => {
+  assert.equal(v.PREDICATES.length, 27);
+  assert.equal(Object.keys(v.PREDICATE_CRITERIA).length, 28);
   assert.ok(v.PREDICATE_CRITERIA.none);
   assert.ok(!v.PREDICATES.includes("none"));
   for (const p of v.PREDICATES) assert.ok(v.PREDICATE_CRITERIA[p].length > 5, p);
