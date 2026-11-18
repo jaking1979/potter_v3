@@ -54,6 +54,21 @@ class Shadow(unittest.TestCase):
             self.assertIn("agreed with the house 75%", text)
             self.assertIn("family_room: house at 66 F, v3 would hold 62 F", text)
 
+    def test_a_switched_off_zone_is_off_not_unreadable_and_the_report_names_zones(self):
+        self.set(True, 62, 62, 45)
+        self.fake.states["climate.family_room"]["state"] = "off"
+        self.fake.states["climate.family_room"]["attributes"].pop("temperature", None)
+        rec = shadow.observe(self.home, self.house, 1000.0)
+        self.assertEqual({z["zone"]: z["verdict"] for z in rec["zones"]}, {"main": "agrees", "family_room": "off"})
+        del self.fake.states["climate.main_house"]
+        rec2 = shadow.observe(self.home, self.house, 2000.0)
+        rep = shadow.report([rec, rec2])
+        self.assertEqual(rep["off_zones"], {"family_room": 2})
+        self.assertEqual(rep["unreadable_zones"], {"main": 1})
+        text = shadow.render(rep, 1)
+        self.assertIn("Switched off: family_room (2 readings).", text)
+        self.assertIn("Could not read: main (1 readings).", text)
+
     def test_nothing_recorded_says_so(self):
         self.assertIn("no observations", shadow.render(shadow.report([]), 7))
 

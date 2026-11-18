@@ -30,7 +30,11 @@ def observe(home, house: dict, now_ts: Optional[float] = None) -> dict:
             if d is not None:
                 would = d["target_f"]
         verdict = "no-opinion"
-        if not z.get("reachable") or z.get("setpoint_f") is None:
+        if not z.get("reachable"):
+            verdict = "unreadable"
+        elif str(z.get("mode") or "").lower() == "off":
+            verdict = "off"                                  # switched off: no setpoint to compare (not a read failure)
+        elif z.get("setpoint_f") is None:
             verdict = "unreadable"
         elif would is not None:
             verdict = "agrees" if abs(z["setpoint_f"] - would) <= TOL_F else "differs"
@@ -66,13 +70,19 @@ def read(path: Path, since_ts: float = 0) -> list[dict]:
 
 def report(recs: list[dict]) -> dict:
     """Agreement while vacant, every divergence (merged into stretches), alerts v3 would have sent."""
-    counts = {"agrees": 0, "differs": 0, "occupied": 0, "unreadable": 0, "no-opinion": 0}
+    counts = {"agrees": 0, "differs": 0, "occupied": 0, "unreadable": 0, "off": 0, "no-opinion": 0}
+    unreadable_by: dict[str, int] = {}
+    off_by: dict[str, int] = {}
     stretches: dict[str, list[dict]] = {}
     open_: dict[str, dict] = {}
     for r in sorted(recs, key=lambda x: x["ts"]):
         for z in r.get("zones", []):
             counts[z["verdict"]] = counts.get(z["verdict"], 0) + 1
             zid = z["zone"]
+            if z["verdict"] == "unreadable":
+                unreadable_by[zid] = unreadable_by.get(zid, 0) + 1
+            if z["verdict"] == "off":
+                off_by[zid] = off_by.get(zid, 0) + 1
             if z["verdict"] == "differs":
                 cur = open_.get(zid)
                 if cur and cur["actual_f"] == z["setpoint_f"] and cur["v3_f"] == z["v3_would_hold_f"]:
@@ -90,7 +100,8 @@ def report(recs: list[dict]) -> dict:
             alerts[a] = alerts.get(a, 0) + 1
     return {"observations": len(recs), "counts": counts,
             "agreement_pct": round(100 * counts["agrees"] / judged) if judged else None,
-            "divergences": [s for v in stretches.values() for s in v], "would_alert": alerts}
+            "divergences": [s for v in stretches.values() for s in v], "would_alert": alerts,
+            "unreadable_zones": unreadable_by, "off_zones": off_by}
 
 
 def render(rep: dict, days: int) -> str:
@@ -103,6 +114,11 @@ def render(rep: dict, days: int) -> str:
     else:
         lines.append(f"While vacant, v3's hold agreed with the house {rep['agreement_pct']}% of the time "
                      f"({c['agrees']} agree, {c['differs']} differ; {c['unreadable']} unreadable).")
+    if rep.get("off_zones"):
+        lines.append("Switched off: " + ", ".join(f"{z} ({n} readings)" for z, n in rep["off_zones"].items()) + ".")
+    if rep.get("unreadable_zones"):
+        lines.append("Could not read: " + ", ".join(f"{z} ({n} readings)" for z, n in rep["unreadable_zones"].items()) +
+                     ". Check that zone's thermostat in Home Assistant.")
     for s in rep["divergences"][:8]:
         hrs = max(0.5, (s["to"] - s["from"]) / 3600 + 0.5)
         when = time.strftime("%a %d %b %H:%M", time.localtime(s["from"]))
