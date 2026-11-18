@@ -51,10 +51,10 @@ fi
 d="$(mktemp -d)"; cp -r "$REPO/overlay/plugins/potter-core/"{index.js,lib,openclaw.plugin.json,package.json} "$d/"
 install_plugin "$d" potter-core --force; rm -rf "$d"
 p="$(mktemp --suffix=.json5)"
-python3 - "$id" "$C" "$WS" "$SECRETS_DIR" "$p" <<'PY'
+POTTER_TZ="$(oc config get agents.defaults.userTimezone 2>/dev/null | tr -d '"' || echo UTC)" python3 - "$id" "$C" "$WS" "$SECRETS_DIR" "$p" <<'PY'
 import json, os, sys
 owner, state, ws, secrets, out = sys.argv[1:6]
-cfg = {"workspace": ws, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"], "ownerIds": [owner],
+cfg = {"workspace": ws, "timezone": os.environ.get("POTTER_TZ", "UTC"), "brain": {"enabled": True, "budget": 7000}, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"], "ownerIds": [owner],
        "standingGrants": [], "stateDir": os.path.join(state, "potter-core"),
        "jevEnvFile": os.path.join(secrets, "jev.env"), "policyPath": os.path.join(ws, "state", "model-policy.json"),
        "governor": {"enabled": True, "jev": True, "timeoutMs": 2500}, "fastPath": {"enabled": True, "merrick": "merrick"},
@@ -73,6 +73,8 @@ except ValueError:
     old = {}
 new["standingGrants"] = old.get("standingGrants") or []
 new["mode"] = old.get("mode", new["mode"])
+if isinstance(old.get("brain"), dict):
+    new["brain"] = {**new["brain"], **old["brain"]}
 if isinstance(old.get("broker"), dict):
     new["broker"] = {**new["broker"], **old["broker"]}      # the owner's broker settings win
 json.dump({"plugins": {"entries": {"potter-core": {"config": new}}}}, open(sys.argv[1], "w"))

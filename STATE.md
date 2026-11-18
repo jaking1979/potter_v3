@@ -53,7 +53,9 @@ loads with 4 hooks + command; house request answered by the fast path in 1.9 s w
 LIVE v3.1/v3.2 on CT 211 (2d2b68b): fast path, governor + Jev, receipts, board 3/3, memory search 168/168 (ZDR model).
 v3.3-3.5 (docs/V3_CORE.md): broker + spend ledger, staged memory + weekly review + responsibilities, once-only
 effects + in-doubt list + Notion outbox. Sandbox: 6 hooks, 8 tools, 2 new jobs, no duplicates, fast path 2 s.
-NEXT: deploy 3.3-3.5 to CT 211; Mac node; device-approve button; scheduled away hold; trading-gate fixes.
+v3.6 Brain v1 (docs/V3_CORE.md): working context assembled per request (local recall + domain rules + state,
+7000-char budget). 7 node tests; recall checked against the real v2 export (wine, events, family, house, trading).
+NEXT: deploy 3.3-3.6 to CT 211; v3.7 chief-of-staff loop; v3.8 T1 eval vs v2; Mac node; device-approve button.
 
 # STATE (150 lines max: package, head SHA, status, open blocking findings)
 

@@ -17,6 +17,8 @@ import { append, recent, verify } from "./lib/receipts.js";
 import { chooseClass, costOf, loadClasses, recordSpend, spentToday, toOverride } from "./lib/broker.js";
 import { alreadyDone, effectKey, enqueue, inDoubt, isOutboxRetry } from "./lib/durable.js";
 import { buildTools } from "./lib/tools.js";
+import { assemble, buildIndex, fresh } from "./lib/context.js";
+import { DOMAINS } from "./lib/governor.js";
 
 function escalationsToday(path) {
   if (!existsSync(path)) return 0;
@@ -191,12 +193,31 @@ export default definePluginEntry({
 
     // ---- v3.2 Brain: Context Governor --------------------------------------------------------------------------
     if (cfg.governor?.enabled !== false) {
+      // v3.6 Brain v1: the owner's files indexed once, rebuilt only when one changes (checked at most every 30 s).
+      let index = null, checked = 0;
+      const getIndex = () => {
+        if (!ws || cfg.brain?.enabled === false) return null;
+        const t = Date.now();
+        if (!index || (t - checked > 30000 && !fresh(index))) index = buildIndex(ws);
+        if (t - checked > 30000) checked = t;
+        return index;
+      };
       api.on("before_prompt_build", async (event, ctx) => {
         if (ctx?.agentId && !agents.has(ctx.agentId)) return;
         const text = requestText(event);
         const p = await plan(text, { decide: decider, timeoutMs: cfg.governor?.timeoutMs ?? 2500 });
-        log(govLog, { kind: "plan", domains: p.domains, source: p.source, ms: p.latencyMs, chars: text.length, error: p.error ?? null });
-        return p.context ? { prependContext: p.context } : undefined;
+        let wc = { context: "", sources: [], chars: 0 };
+        const t0 = Date.now();
+        try {
+          const doms = p.domains.map((id) => DOMAINS.find((d) => d.id === id)).filter(Boolean);
+          const rules = [...new Set(doms.flatMap((d) => d.rules ?? []))];
+          const expand = [...new Set(doms.flatMap((d) => d.recall ?? []))];
+          wc = assemble({ text, rules, expand, index: getIndex(), ws, tz: cfg.timezone || "UTC", budget: cfg.brain?.budget ?? 7000 });
+        } catch { /* a failure means no working context, never a blocked turn */ }
+        log(govLog, { kind: "plan", domains: p.domains, source: p.source, ms: p.latencyMs, chars: text.length, error: p.error ?? null,
+          context_chars: wc.chars, recalled: wc.sources.map((x) => x.path), build_ms: Date.now() - t0 });
+        const out = [p.context, wc.context].filter(Boolean).join("\n\n");
+        return out ? { prependContext: out } : undefined;
       });
     }
 

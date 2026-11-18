@@ -258,9 +258,9 @@ say "Installing Potter Core (v3.1 control: approvals and receipts; v3.2 brain: c
 cdir="$(mktemp -d)"; cp -r "$REPO/overlay/plugins/potter-core/"{index.js,lib,openclaw.plugin.json,package.json} "$cdir/"
 install_plugin "$cdir" potter-core --force
 pcp="$(mktemp --suffix=.json5)"
-OWNER_TELEGRAM_ID="$OWNER_TELEGRAM_ID" WS="$WS" SECRETS_DIR="$SECRETS_DIR" STATE_DIR="$STATE_DIR" python3 -c '
+OWNER_TELEGRAM_ID="$OWNER_TELEGRAM_ID" WS="$WS" TIMEZONE="$TIMEZONE" SECRETS_DIR="$SECRETS_DIR" STATE_DIR="$STATE_DIR" python3 -c '
 import json, os, sys
-cfg = {"workspace": os.environ["WS"], "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"],
+cfg = {"workspace": os.environ["WS"], "timezone": os.environ.get("TIMEZONE", "UTC"), "brain": {"enabled": True, "budget": 7000}, "mode": os.environ.get("POTTER_CONTROL_MODE", "enforce"), "agents": ["potter"],
        "ownerIds": [os.environ["OWNER_TELEGRAM_ID"]], "standingGrants": [],
        "stateDir": os.path.join(os.environ["STATE_DIR"], "potter-core"),
        "jevEnvFile": os.path.join(os.environ["SECRETS_DIR"], "jev.env"),

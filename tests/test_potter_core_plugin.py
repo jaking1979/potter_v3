@@ -23,8 +23,8 @@ class PotterCore(unittest.TestCase):
         for k in ("mode", "ownerIds", "standingGrants", "governor", "fastPath", "jevEnvFile", "policyPath"):
             self.assertIn(k, props)
 
-    def test_node_tests_for_v33_to_v35_pass(self):
-        r = subprocess.run(["node", "--test", "core35.test.mjs"], cwd=D, capture_output=True, text=True, timeout=120)
+    def test_node_tests_for_v33_to_v36_pass(self):
+        r = subprocess.run(["node", "--test", "core35.test.mjs", "core36.test.mjs"], cwd=D, capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-800:])
         self.assertIn("fail 0", r.stdout)
 
@@ -51,6 +51,7 @@ class PotterCore(unittest.TestCase):
         self.assertNotIn("/home/", src)
         self.assertNotRegex(src, r"[0-9a-f]{32}")
         self.assertNotRegex(src, r"\b\d{9,10}\b")                         # no Telegram ids
+        self.assertNotRegex(src, r"(?i)\b(josh|christie|molly|edie)\b")      # no family names in code
 
     def test_installer_wires_it_with_conversation_access_and_merrick_uses_jev(self):
         boot = (ROOT / "install/bootstrap.sh").read_text()

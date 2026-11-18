@@ -67,6 +67,21 @@ choice without applying it.
   `potter-notion-outbox`; a retry is the same decision and is not asked again; after 6 failures it is given up and
   the owner is told once.
 
+## v3.6 Brain v1: working context (00 Brain Architecture; Context Governor)
+
+Before the main model thinks, the governor builds its working context instead of telling it "go read X"
+(`lib/context.js`, wired in `before_prompt_build`):
+- Recall: a local BM25 index over the owner's own files (MEMORY.md, preferences, rules, learnings, memory),
+  skipping files the harness injects every turn, machinery (global rules, skills, state) and v2 reference copies.
+  Keyword-list sections never match; code and tool syntax rank low; a named person in the request boosts passages
+  that mention them. No network, a few milliseconds; rebuilt only when a file changes (checked every 30 s).
+- Rules: the full text of the global rules the request's domains need.
+- State: local date and time, responsibilities due in 3 days, proposed memories waiting, today's working notes.
+- A hard budget (default 7000 characters); a passage that does not fit is left out, never cut. Nothing relevant: only
+  the state line. A failure means no working context, never a blocked turn.
+- Logged per turn in governor.jsonl: `context_chars`, `recalled` (paths), `build_ms`.
+- Config: `brain.enabled`, `brain.budget`, `timezone` (from `agents.defaults.userTimezone`).
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.
