@@ -22,6 +22,8 @@ class Cos(unittest.TestCase):
         jobs = (ROOT / "install/jobs.json").read_text()
         self.assertIn('"potter-cos-score"', jobs)
         self.assertIn('"potter-week-review"', jobs)
+        self.assertIn('"potter-mail-watch"', jobs)
+        self.assertNotIn('"potter-mail-observe"', jobs)
 
     def test_nothing_personal(self):
         for f in COS.glob("*.js"):

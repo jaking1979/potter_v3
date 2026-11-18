@@ -132,6 +132,9 @@ cp "$REPO/overlay/workspace/avatar.svg" "$WS/avatar.svg"
 mkdir -p "$WS/skills"; cp -r "$REPO/overlay/workspace/skills/." "$WS/skills/"
 
 if [ -n "${AGENTMAIL_API_KEY:-}" ]; then
+  # The inbox watcher (a command job, outside the gateway) reads its key from a root-only file.
+  mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"; umask 077
+  printf 'AGENTMAIL_API_KEY=%s\nAGENTMAIL_INBOX=%s\n' "$AGENTMAIL_API_KEY" "${AGENTMAIL_INBOX:-}" > "$SECRETS_DIR/agentmail.env"; umask 022
   say "Installing the official AgentMail plugin (Potter's own inbox)"
   install_plugin clawhub:@agentmail/agentmail agentmail
   am="$(mktemp --suffix=.json5)"
@@ -346,6 +349,14 @@ exec node "$POTTER_HOME/cos/score.mjs" --forecasts "$WS/state/forecasts" --db "$
   --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-cos-score
+cat > /usr/local/bin/potter-mail-watch <<WRAP
+#!/bin/sh
+[ -f "$SECRETS_DIR/agentmail.env" ] || { echo "potter-mail-watch: AgentMail is not configured" >&2; exit 3; }
+set -a; . "$SECRETS_DIR/jev.env"; . "$SECRETS_DIR/agentmail.env"; set +a
+exec node "$POTTER_HOME/cos/mail-watch.mjs" --doc "$WS/state/compiling-doc.md" --state "$WS/state/mail-watch.json" \
+  --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-mail-watch
 read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then

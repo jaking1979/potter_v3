@@ -188,6 +188,39 @@ exec node "$POTTER_HOME/cos/score.mjs" --forecasts "$WS/state/forecasts" --db "$
   --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-cos-score
+# AgentMail key for the inbox watcher: from the gateway's own config, once (root-only file; never printed).
+if [ ! -f "$SECRETS_DIR/agentmail.env" ]; then
+  python3 - "$(oc config file)" "$SECRETS_DIR/agentmail.env" <<'PY' && step "mail watch: AgentMail key found" || step "mail watch: no AgentMail key in the config (watcher stays off)"
+import json, os, re, sys
+try:
+    cfg = json.loads(re.sub(r"(?m)^\s*//.*$", "", open(sys.argv[1]).read()))
+except Exception:
+    sys.exit(1)
+def val(v):
+    if isinstance(v, dict) and v.get("source") == "file":
+        path = v.get("path") or (((cfg.get("secrets") or {}).get("providers") or {}).get(v.get("provider")) or {}).get("path")
+        try:
+            return open(path).read().strip() if path else ""
+        except OSError:
+            return ""
+    return v if isinstance(v, str) else ""
+ch = (cfg.get("channels") or {}).get("agentmail") or {}
+key = val(ch.get("apiKey")) or val((((cfg.get("plugins") or {}).get("entries") or {}).get("agentmail") or {}).get("config", {}).get("apiKey"))
+inbox = ch.get("inboxId") or ""
+if not key or not inbox:
+    sys.exit(1)
+os.umask(0o077)
+open(sys.argv[2], "w").write(f"AGENTMAIL_API_KEY={key}\nAGENTMAIL_INBOX={inbox}\n")
+PY
+fi
+cat > /usr/local/bin/potter-mail-watch <<WRAP
+#!/bin/sh
+[ -f "$SECRETS_DIR/agentmail.env" ] || { echo "potter-mail-watch: AgentMail is not configured" >&2; exit 3; }
+set -a; . "$SECRETS_DIR/jev.env"; . "$SECRETS_DIR/agentmail.env"; set +a
+exec node "$POTTER_HOME/cos/mail-watch.mjs" --doc "$WS/state/compiling-doc.md" --state "$WS/state/mail-watch.json" \
+  --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-mail-watch
 step "kg tools: potter-kg-eval and potter-kg-import ready"
 
 # 2b. memory search, with the key already saved for Jev (no key is re-entered)
@@ -232,6 +265,7 @@ if [ -n "$SYSTEMD" ]; then
   for _ in $(seq 1 60); do oc health >/dev/null 2>&1 && break; sleep 2; done
   trap - ERR
   add_new_jobs
+  potter-cron off potter-mail-observe >/dev/null 2>&1 || true   # replaced by the potter-mail-watch command job
   hooks="$(oc plugins inspect potter-core --runtime --json 2>/dev/null | grep -o '"name": *"[a-z_]*"' | wc -l)"
   vh="$("$HERE/verify_host.sh" 2>/dev/null || true)"
   health="$(grep -c '^PASS' <<<"$vh" || true)/$(grep -c -E '^(PASS|FAIL)' <<<"$vh" || true)"

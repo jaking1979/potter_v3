@@ -225,17 +225,6 @@
    "purpose": "retries Notion writes that failed"
   },
   {
-   "name": "potter-mail-observe",
-   "cron": "13,43 * * * *",
-   "tz": "{TZ}",
-   "kind": "agent",
-   "timeout": 300,
-   "standby": false,
-   "deliver": false,
-   "message": "Run the mail-observe skill. Output nothing.",
-   "purpose": "reads the shared inbox without changing it (another assistant owns it) so the brief sees deadlines"
-  },
-  {
    "name": "potter-capability-map",
    "cron": "23 5 * * *",
    "tz": "{TZ}",
@@ -286,6 +275,16 @@
    "deliver": true,
    "message": "Run the week-review skill.",
    "purpose": "Sunday week in review: forecasts vs reality, what slipped, patterns"
+  },
+  {
+   "name": "potter-mail-watch",
+   "cron": "13,43 * * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 180,
+   "standby": false,
+   "command": "potter-mail-watch",
+   "purpose": "lists the shared inbox without changing it (another assistant owns it); Jev flags what needs the owner for the brief"
   }
  ]
 }

@@ -113,7 +113,9 @@ Before the main model thinks, the governor builds its working context instead of
 - New predicates: prefers, avoids, responsible_for.
 - The weekly memory review lists staged graph facts; approve writes them at high confidence.
 - `capability-map` (daily): TOOLS.md gets a live map of reachable tools and Composio-connected apps.
-- `mail-observe` (every 30 minutes, on): reads the shared inbox without changing it while v2 owns it.
+- `potter-mail-watch` (command job, every 30 minutes): lists the shared inbox through AgentMail's API without
+  changing it while v2 owns it; Jev flags what needs the owner (one yes/no per message, 20 per request); those become
+  dated Open Loops for the brief. Replaced the agent-turn `mail-observe`, which timed out reading mail into the model.
 
 ## v3.9 Staleness (potter-kg 3.3.0, potter-core 3.9.0)
 
