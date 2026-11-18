@@ -10,6 +10,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import { classify } from "./lib/classify.js";
 import { createGuard } from "./lib/browserguard.js";
+import { check as outboundCheck, isOutgoing, outgoingText } from "./lib/outbound.js";
 import { decide, isEvalSession, trustOf } from "./lib/control.js";
 import { tryHouse } from "./lib/fastpath.js";
 import { plan, requestText, tableDomains } from "./lib/governor.js";
@@ -115,6 +116,20 @@ export default definePluginEntry({
       }
       const trust = trustOf(ctx);
       let d = decide(cls, trust, cfg);
+      // v3.14: nothing sensitive leaves for someone else unless the owner says so, seeing what kind of thing it is.
+      if (cfg.outbound?.enabled !== false && d.action !== "block" && isOutgoing(event?.toolName, event?.params, cls)) {
+        const o = await outboundCheck(outgoingText(event?.params), { decide: decider, timeoutMs: cfg.outbound?.timeoutMs ?? 2500 });
+        log(govLog, { kind: "outbound", tool: event?.toolName, found: o.kinds, error: o.error ?? null });
+        if (o.kinds.length) {
+          const what = o.kinds.join(", ");
+          const to = cls.target ? ` to ${String(cls.target).slice(0, 60)}` : "";
+          const next = trust === "owner"
+            ? { action: "approve", reason: `this would send what looks like a ${what}${to}; send it anyway?`, receipt: true }
+            : { action: "block", reason: `blocked: an outgoing message${to} contains what looks like a ${what}, and this turn was not started by the owner`, receipt: true };
+          d = cfg.mode === "shadow" ? { ...d, would: next.action, reason: next.reason, receipt: true } : next;
+          cls.severity = "high";
+        }
+      }
       const effect = cls.risk === "consequential" ? effectKey(event?.toolName, event?.params) : null;
       if (effect && isOutboxRetry(outbox, effect)) {
         d = { action: "allow", reason: "retry of a queued Notion write (already decided)", receipt: true };   // v3.5

@@ -181,3 +181,25 @@ test("browser: reading and typing pass; a click on a committing label needs appr
   g2.observe("s", { action: "snapshot", targetId: "t2" }, '- button "Cancel subscription" [ref=e3]');
   assert.equal(g2.classify("s", { action: "act", targetId: "t2", kind: "click", ref: "e3" }).risk, "consequential");
 });
+
+test("outgoing filter: card and SSN by code, the fuzzy kinds by Jev; vault references exempt; values never reported", async () => {
+  const { check, detect, isOutgoing, luhn, outgoingText } = await import("./lib/outbound.js");
+  assert.ok(luhn("4111111111111111") && !luhn("4111111111111112"));
+  assert.deepEqual(detect("card 4111 1111 1111 1111 exp 04/28"), ["card number"]);
+  assert.deepEqual(detect("order #1234567890123 shipped, call 212-555-0100"), []);           // not Luhn-valid, not an SSN
+  assert.deepEqual(detect("SSN 123-45-6789"), ["Social Security number"]);
+  assert.deepEqual(detect("pay with {{vault:Amex Virtual#number}}"), []);
+  const jev = async ({ state, questions }) => ({ ok: true, answers: Object.fromEntries(Object.keys(questions).map((k) => [k, { noul: k === "health" && /diagnosed/.test(state.text) ? 0.9 : 0.05 }])) });
+  assert.deepEqual((await check("FYI she was diagnosed with ADHD last week", { decide: jev })).kinds, ["health or clinical information"]);
+  assert.deepEqual((await check("Dinner at 7 on Friday?", { decide: jev })).kinds, []);
+  const slow = () => new Promise(() => {});
+  const r = await check("card 4111111111111111", { decide: slow, timeoutMs: 20 });
+  assert.deepEqual([r.kinds, r.error], [["card number"], "timeout"]);                     // Jev down: code still catches cards
+  assert.equal(outgoingText({ to: "+15555550100", message: "hello", nested: { body: "world" } }), "hello\nworld");
+  assert.ok(isOutgoing("message", { action: "send" }, { risk: "consequential" }));
+  assert.ok(!isOutgoing("message", { action: "send" }, { risk: "reversible" }));          // to the owner
+  assert.ok(isOutgoing("composio__COMPOSIO_MULTI_EXECUTE_TOOL", { tools: [{ tool_slug: "GMAIL_SEND_EMAIL" }] }, {}));
+  assert.ok(!isOutgoing("composio__COMPOSIO_MULTI_EXECUTE_TOOL", { tools: [{ tool_slug: "GMAIL_CREATE_EMAIL_DRAFT" }] }, {}));
+  assert.ok(isOutgoing("browser", { action: "act", kind: "type", text: "x" }, {}));
+  assert.ok(!isOutgoing("browser", { action: "act", kind: "click" }, {}));
+});

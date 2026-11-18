@@ -215,6 +215,16 @@ Before the main model thinks, the governor builds its working context instead of
   cancellation, delays of 20 minutes or more, gate. Trips are forgotten three days after.
 - The brief lists trips in the next three days. `travel` skill: list, add a forwarded booking, check in as a web task.
 
+## v3.14 Outgoing-message filter (potter-core lib/outbound.js)
+
+- Before a message, email, post (Composio send/reply/post slugs, AgentMail send) or text typed into a website leaves
+  for anyone but the owner: code checks for card numbers (Luhn-valid) and Social Security numbers; one Jev request
+  asks four narrow yes/no questions (government ID, bank account or routing number, password or one-time code,
+  someone's health or clinical information). Vault references are exempt (already approved for that use).
+- Found on a turn the owner started: the owner approves or not, told what KIND of thing was found (never the
+  value). Found on any other turn (a schedule, an email, a web page): blocked. Jev unavailable: code still checks.
+  Logged in governor.jsonl as `kind: "outbound"` with the kinds found.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.
