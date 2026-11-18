@@ -11,6 +11,13 @@
 #   update.sh --check              say what would change, change nothing
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
+# One way in: when GitHub updates are set up, a direct run fetches first (through potter-update), so a stale
+# local copy is never installed by mistake. potter-update sets POTTER_PULLED; the detached run sets POTTER_UPDATE_RUN.
+if [ -z "${POTTER_PULLED:-}" ] && [ -z "${POTTER_UPDATE_RUN:-}" ] && [ -f "${POTTER_GITHUB_CONF:-/etc/potter/github}" ] \
+   && [ -f "$HERE/self_update.sh" ] && [ "${1:-}" != "--check" ]; then
+  echo "GitHub updates are set up: fetching the latest code first (potter-update)."
+  exec bash "$HERE/self_update.sh" "$@"
+fi
 . "$HERE/lib.sh"
 export PATH="$POTTER_HOME/openclaw/bin:$POTTER_HOME/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 CHECK=""; PROFILE_ZIP=""

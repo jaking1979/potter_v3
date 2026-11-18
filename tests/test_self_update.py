@@ -81,6 +81,23 @@ class SelfUpdate(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("rewritten", r.stderr)
 
+    def test_help_and_unknown_words_never_start_an_update(self):
+        r = self.run_update("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("potter-update --setup", r.stdout)
+        self.assertNotIn("update.sh ran", r.stdout)
+        self.assertFalse((self.src / ".git").exists())
+        r = self.run_update("please")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown argument", r.stderr)
+        self.assertFalse((self.src / ".git").exists())
+
+    def test_a_direct_update_run_fetches_first_when_github_is_set_up(self):
+        upd = (ROOT / "install/update.sh").read_text()
+        self.assertIn('exec bash "$HERE/self_update.sh" "$@"', upd)
+        self.assertIn("POTTER_PULLED", upd)
+        self.assertIn('POTTER_PULLED=1 exec bash "$SRC/install/update.sh"', SCRIPT.read_text())
+
     def test_not_set_up_says_so(self):
         env = {**self.env, "POTTER_GITHUB_CONF": str(self.tmp / "missing")}
         r = sh("bash", str(SCRIPT), env=env)

@@ -10,9 +10,21 @@
 set -euo pipefail
 # This file is replaced by the pull; run from a private copy so bash never reads a half-new script.
 if [ -z "${POTTER_SELF_COPY:-}" ]; then
-  t="$(mktemp)"; cp "$0" "$t"; chmod 700 "$t"; POTTER_SELF_COPY="$t" exec bash "$t" "$@"
+  t="$(mktemp)"; cp "$0" "$t"; chmod 700 "$t"; POTTER_SELF_ORIG="$0" POTTER_SELF_COPY="$t" exec bash "$t" "$@"
 fi
 trap 'rm -f "$POTTER_SELF_COPY"' EXIT
+
+usage() { sed -n '2,8p' "${POTTER_SELF_ORIG:-$0}" | sed 's/^# \{0,1\}//'; }
+# Strict arguments: anything unknown stops here, so a stray word can never start an update.
+MODE=run; PASS=()
+case "${1:-}" in
+  -h|--help|help) usage; exit 0;;
+  --setup) MODE=setup;;
+  --check) MODE=check; [ $# -eq 1 ] || { echo "potter-update: --check takes no other arguments" >&2; exit 2; };;
+  "") ;;
+  --profile) [ -n "${2:-}" ] && [ $# -eq 2 ] || { echo "potter-update: --profile needs one file" >&2; exit 2; }; PASS=(--profile "$2");;
+  *) echo "potter-update: unknown argument '$1' (try --help)" >&2; exit 2;;
+esac
 
 SRC="${POTTER_SRC:-/opt/potter/src}"
 SECRETS_DIR="${POTTER_SECRETS_DIR:-/etc/potter/secrets}"
@@ -32,7 +44,7 @@ need_tools() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git openssh-client >/dev/null || die "could not install git and ssh"
 }
 
-if [ "${1:-}" = "--setup" ]; then
+if [ "$MODE" = setup ]; then
   slug="${2:-}"; branch="${3:-v3-core}"
   [[ "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "usage: potter-update --setup <owner/repo> [branch]"
   need_tools
@@ -76,7 +88,7 @@ if [ ! -d "$SRC/.git" ]; then
   new_dir="$SRC.new"; rm -rf "$new_dir"; mkdir -p "$new_dir"; git -C "$new_dir" init -q
   fetch "$new_dir"
   git -C "$new_dir" checkout -q -B "$BRANCH" FETCH_HEAD
-  if [ "${1:-}" = "--check" ]; then
+  if [ "$MODE" = check ]; then
     say "Current: $old (a copy without history). Available: $(git -C "$new_dir" log -1 --format='%h %s')"
     rm -rf "$new_dir"; exit 0
   fi
@@ -88,11 +100,11 @@ else
   git -C "$SRC" merge-base --is-ancestor "$head" "$next" || die "the branch was rewritten on GitHub; not taking it (ask the owner)"
   say "New since $(git -C "$SRC" rev-parse --short "$head"):"
   git -C "$SRC" log --format='  %h %s' "$head..$next" | head -n 20
-  [ "${1:-}" = "--check" ] && exit 0
+  [ "$MODE" = check ] && exit 0
   [ -z "$(git -C "$SRC" status --porcelain --untracked-files=no)" ] || die "files in $SRC were edited by hand; not overwriting them"
   rm -rf "$SRC.prev"; cp -a "$SRC" "$SRC.prev"
   git -C "$SRC" merge -q --ff-only FETCH_HEAD
 fi
 git -C "$SRC" log -1 --format=%h > "$SRC/.potter-rev"
 say "Code: $old -> $(cat "$SRC/.potter-rev"). Previous code kept at $SRC.prev."
-exec bash "$SRC/install/update.sh" "$@"
+POTTER_PULLED=1 exec bash "$SRC/install/update.sh" "${PASS[@]}"
