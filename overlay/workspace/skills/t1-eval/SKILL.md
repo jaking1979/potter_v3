@@ -12,6 +12,10 @@ Draft 25 to 30 tasks from what the owner actually asks for: look at recent conve
 the morning briefs and the knowledge graph. Spread them over these categories, 3 to 5 each: brief (today and
 tomorrow), calendar and logistics, email and follow-ups, house, family and people, food and wine, money and
 tasks, local events, memory ("what do you know about..."), judgment (a decision with trade-offs).
+Also 3 to 5 tasks at the competitor bar (Instinct, Muse, Dots): web errands ("book dinner Friday for 4",
+"cancel the subscription I don't use"), travel ("when do I check in for my flight"), and a background task that
+reports only when it matters. In an evaluation run they stop before any committing click: grade the plan and how
+far it got.
 Each task: `id` (short), `category`, `prompt` (the owner's own words, as they would ask), and 2 to 4 `criteria`:
 checkable statements a good answer meets ("names the Friday 6:30 soccer game", "says the brief source it could
 not read"). Criteria about substance, never about style.

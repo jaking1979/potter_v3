@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import { classify } from "./lib/classify.js";
+import { createGuard } from "./lib/browserguard.js";
 import { decide, isEvalSession, trustOf } from "./lib/control.js";
 import { tryHouse } from "./lib/fastpath.js";
 import { plan, requestText, tableDomains } from "./lib/governor.js";
@@ -105,8 +106,10 @@ export default definePluginEntry({
     }
 
     // ---- v3.1 Control ----------------------------------------------------------------------------------------
+    const browser = createGuard();                 // v3.12: which browser clicks commit the owner to something
     api.on("before_tool_call", async (event, ctx) => {
-      const cls = classify(event?.toolName, event?.params, { ownerIds });
+      const cls = event?.toolName === "browser" ? browser.classify(ctx?.sessionKey, event?.params)
+        : classify(event?.toolName, event?.params, { ownerIds });
       if (isEvalSession(ctx) && cls.risk !== "read") {
         return { block: true, blockReason: "evaluation run: only reading is allowed; describe what you would do instead (potter-core)" };
       }
@@ -140,7 +143,8 @@ export default definePluginEntry({
       return undefined;
     }, { priority: 90 });
 
-    api.on("after_tool_call", async (event) => {
+    api.on("after_tool_call", async (event, ctx) => {
+      if (event?.toolName === "browser") browser.observe(ctx?.sessionKey, event.params, event.result);
       const intent = event?.toolCallId ? pending.get(event.toolCallId) : undefined;
       if (!intent) return;
       pending.delete(event.toolCallId);

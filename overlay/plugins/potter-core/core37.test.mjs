@@ -161,3 +161,23 @@ test("evaluation sessions are recognised by name, so their actions can be blocke
   assert.ok(!isEvalSession({ sessionKey: "agent:potter:main" }));
   assert.ok(!isEvalSession({}));
 });
+
+test("browser: reading and typing pass; a click on a committing label needs approval, with the label and the page", async () => {
+  const { createGuard, labels } = await import("./lib/browserguard.js");
+  const snap = '- heading "Checkout" [ref=e1]\n- textbox "Card number" [ref=e5]\n- button "Place order" [ref=e12]\n- link "Back to cart" [ref=e13]';
+  assert.equal(labels(snap).get("e12").label, "Place order");
+  const g = createGuard();
+  assert.equal(g.classify("s", { action: "snapshot", targetId: "t1" }).risk, "read");
+  g.observe("s", { action: "navigate", targetId: "t1", url: "https://shop.example.com/checkout" }, { content: [{ type: "text", text: "url: https://shop.example.com/checkout\n" + snap }] });
+  assert.equal(g.classify("s", { action: "act", targetId: "t1", kind: "type", ref: "e5", text: "{{vault:Amex Virtual#number}}" }).risk, "reversible");
+  const commit = g.classify("s", { action: "act", targetId: "t1", kind: "click", ref: "e12" });
+  assert.equal(commit.risk, "consequential");
+  assert.equal(commit.severity, "high");
+  assert.match(commit.target, /button "Place order" on shop\.example\.com\/checkout/);
+  assert.equal(g.classify("s", { action: "act", targetId: "t1", kind: "click", ref: "e13" }).risk, "reversible");
+  assert.equal(g.classify("s", { action: "act", targetId: "t1", kind: "click", ref: "e99" }).risk, "consequential");   // unknown, after a vault value
+  const g2 = createGuard();
+  assert.equal(g2.classify("s", { action: "act", targetId: "t2", kind: "click", ref: "e99" }).risk, "reversible");   // unknown, no vault value
+  g2.observe("s", { action: "snapshot", targetId: "t2" }, '- button "Cancel subscription" [ref=e3]');
+  assert.equal(g2.classify("s", { action: "act", targetId: "t2", kind: "click", ref: "e3" }).risk, "consequential");
+});

@@ -192,6 +192,17 @@ Before the main model thinks, the governor builds its working context instead of
   sending to anyone but the owner asks the owner (potter-core). `messaging` skill: channel choice and contacts.
   docs/IMESSAGE_SETUP.md.
 
+## v3.12 Web tasks (browser)
+
+- Headless Chromium on the Gateway host (OpenClaw's managed `openclaw` profile, isolated from the owner's browser).
+- `lib/browserguard.js`: the control layer learns element labels from browser snapshots, so it knows what a click
+  is on. Reading, navigating and typing pass; a click on a committing label (book, reserve, pay, place order,
+  confirm, cancel subscription, sign up, ...) is high-stakes and the owner approves it seeing the label and the
+  site. A click on an unlabelled control after a vault value was typed on that tab is treated the same way.
+- `web-tasks` skill: plan first, logins and cards only from the vault, check the terms before the committing click,
+  screenshot the confirmation, close the tab; stop at CAPTCHAs and unknown 2FA; never poll a site faster than once
+  a minute. T1 gains competitor-bar tasks (web errands, travel, background work).
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.

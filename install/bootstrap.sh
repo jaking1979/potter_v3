@@ -399,6 +399,16 @@ cat > /usr/local/bin/potter-imessage-setup <<WRAP
 OPENCLAW="openclaw ${OC_PROFILE_FLAG[*]:-}" exec bash "$POTTER_HOME/tools/imessage_setup.sh" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-imessage-setup
+# The browser (v3.12): headless Chromium for web tasks; clicks that commit the owner need approval (potter-core).
+if ! command -v chromium >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chromium >/dev/null 2>&1 || true
+fi
+if command -v chromium >/dev/null 2>&1; then
+  bp="$(mktemp --suffix=.json)"
+  python3 -c 'import json,sys; json.dump({"plugins":{"entries":{"browser":{"enabled":True}}},"browser":{"enabled":True,"headless":True,"noSandbox":True,"executablePath":"/usr/bin/chromium"}}, open(sys.argv[1],"w"))' "$bp"
+  q oc config patch --file "$bp"; rm -f "$bp"
+  BROWSER_OK=1
+fi
 read -r -a JOB_MODEL_ARGS <<< "$(python3 "$HERE/apply_models.py" "$WS/state/model-policy.json" --job-args 2>/dev/null)"
 MONITORS_READY=""
 if [ -n "${POTTER_V2_BUNDLE:-}" ] && [ -f "$POTTER_V2_BUNDLE" ] && [ ! -f "$WS/state/monitors/config.json" ]; then
