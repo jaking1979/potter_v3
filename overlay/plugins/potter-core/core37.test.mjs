@@ -224,3 +224,13 @@ test("sealed benchmark agents may only read their own workspace", async () => {
     assert.match(sealedRefusal(t, {}, root), /not available/, t);
   }
 });
+
+test("Home Assistant is read-only for Potter until the switch-over; locks and valves are never allowed", async () => {
+  const { classify } = await import("./lib/classify.js");
+  assert.equal(classify("homeassistant__GetLiveContext", {}).risk, "read");
+  assert.equal(classify("homeassistant__HassClimateSetTemperature", { temperature: 66 }).risk, "forbidden");
+  assert.equal(classify("homeassistant__HassTurnOn", { name: "porch light" }).risk, "forbidden");
+  const after = classify("homeassistant__HassClimateSetTemperature", { temperature: 66 }, { houseReadOnly: false });
+  assert.notEqual(after.risk, "forbidden");                                              // after "take over the house"
+  assert.equal(classify("homeassistant__HassTurnOn", { name: "front door lock" }, { houseReadOnly: false }).risk, "forbidden");
+});

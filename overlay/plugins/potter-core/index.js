@@ -118,7 +118,7 @@ export default definePluginEntry({
     const browser = createGuard();                 // v3.12: which browser clicks commit the owner to something
     api.on("before_tool_call", async (event, ctx) => {
       const cls = event?.toolName === "browser" ? browser.classify(ctx?.sessionKey, event?.params)
-        : classify(event?.toolName, event?.params, { ownerIds });
+        : classify(event?.toolName, event?.params, { ownerIds, houseReadOnly: cfg.house?.readOnly });
       const SP = profileOf(ctx?.agentId);
       if (SP.sealed) {
         const why = sealedRefusal(event?.toolName, event?.params, SP.ws);
@@ -177,12 +177,12 @@ export default definePluginEntry({
       if (!intent) return;
       pending.delete(event.toolCallId);
       const ok = event.error ? false : (event.result !== undefined ? true : "unknown");
-      const c = classify(event.toolName, event.params, { ownerIds });
+      const c = classify(event.toolName, event.params, { ownerIds, houseReadOnly: cfg.house?.readOnly });
       if (ok === false && c.risk === "consequential" && /^mcp:notion/i.test(c.capability)) {
         enqueue(outbox, { tool: event.toolName, params: event.params, error: event.error });              // v3.5 outbox
       }
       append(receipts, { phase: "result", tool: event.toolName, intent, ok, error: event.error ? String(event.error).slice(0, 160) : null,
-        ms: event.durationMs ?? null, capability: classify(event.toolName, event.params, { ownerIds }).capability, target: "" });
+        ms: event.durationMs ?? null, capability: classify(event.toolName, event.params, { ownerIds, houseReadOnly: cfg.house?.readOnly }).capability, target: "" });
     });
 
     // ---- v3.3 model broker -----------------------------------------------------------------------------------------
