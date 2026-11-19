@@ -31,7 +31,7 @@ export function grantCovers(grants, capability) {
 export function decide(cls, trust, cfg = {}) {
   const { risk, severity, capability } = cls;
   let out;
-  if (risk === "forbidden") out = { action: "block", reason: cls.reason ? `blocked: ${cls.reason}` : "forbidden: locks, alarms and water valves are never operated by a tool call" };
+  if (risk === "forbidden") out = { action: "block", reason: "forbidden: locks, alarms and water valves are never operated by a tool call" };
   else if (risk === "read") out = { action: "allow", reason: "read", receipt: false };
   // Receipts are for actions on the outside world (Decision Log 17); Potter's own reversible housekeeping is not
   // receipted when the owner or a scheduled job started it, only when its origin is not proven.

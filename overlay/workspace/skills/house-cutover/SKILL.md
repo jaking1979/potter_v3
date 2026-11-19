@@ -24,14 +24,10 @@ Do these in order; stop and say so if any step fails.
 4. Re-create each plan in Merrick: `merrick intend --description "<plan>" --due <ISO time with zone> --zone <zone>
    --temperature <F>` (with `--until` and `--revert-temperature` for a period). Read them back with
    `merrick intentions` and send the owner the list to confirm.
-5. Let Potter control the house through Home Assistant's MCP integration (until now it could only read):
-   `openclaw config set plugins.entries.potter-core.config.house.readOnly false --strict-json`, then
-   `systemd-run --on-active=5 --collect systemctl restart potter-gateway`. Locks, alarms and water valves stay
-   refused either way.
-6. Switch on: `potter-cron on potter-merrick-tick` (the job that carries out plans). The cold watch and the
+5. Switch on: `potter-cron on potter-merrick-tick` (the job that carries out plans). The cold watch and the
    readings collector are already on. Leave `potter-merrick-shadow` on for a week as a check, then
    `potter-cron off potter-merrick-shadow`.
-7. Tell the owner, in one line: "I'm running the house now. Tell me, not the old assistant, about anything
+6. Tell the owner, in one line: "I'm running the house now. Tell me, not the old assistant, about anything
    house-related from here on."
 
 ## Never

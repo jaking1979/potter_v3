@@ -128,12 +128,6 @@ export function classify(toolName, params = {}, opts = {}) {
         && !toolWords.some((x) => READ_WORDS.has(x))) {
       return { ...base, risk: "forbidden", severity: "high" };     // locks, alarms and valves: never by tool call
     }
-    // Before the house switch-over the other assistant runs the house: Potter may only READ Home Assistant.
-    if (/home.?assistant/i.test(server) && opts.houseReadOnly !== false) {
-      const v = byVerb(tool, base);
-      if (!v || v.risk !== "read") return { ...base, risk: "forbidden", severity: "high", reason: "house is read-only until the switch-over" };
-      return v;
-    }
     // A meta-tool that runs other tools (Composio): judge by the slugs it carries, worst first.
     const slugs = slugsIn(params).filter((s) => s !== tool.toUpperCase());
     if (slugs.length) {

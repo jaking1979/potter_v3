@@ -66,7 +66,7 @@ test("local plugin tools are reversible unless they reach outside or move money"
 test("locks, alarms and valves through Home Assistant tools are forbidden; climate is not", () => {
   assert.equal(classify("homeassistant__HassTurnOn", { name: "front door lock" }).risk, "forbidden");
   assert.equal(classify("homeassistant__HassLock", {}).risk, "forbidden");
-  assert.equal(classify("homeassistant__HassClimateSetTemperature", { temperature: 68 }, { houseReadOnly: false }).risk, "consequential");
+  assert.equal(classify("homeassistant__HassClimateSetTemperature", { temperature: 68 }).risk, "consequential");
   assert.equal(classify("homeassistant__GetLiveContext", {}).risk, "read");
 });
 
