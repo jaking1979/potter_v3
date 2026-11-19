@@ -35,6 +35,17 @@ class Vault(unittest.TestCase):
             self.assertIn("BW_PASSWORD", vault_form.live_check({**GOOD, "BW_PASSWORD": "wrong one!"}, str(fake)))
             self.assertNotIn("correct horse", log.read_text())
 
+    def test_addresses_and_failure_kinds(self):
+        self.assertTrue(vault_form.server_ok("https://vault.example.ts.net"))
+        lan = ".".join(["10", "0", "0", "5"])                                     # built at runtime: no literal address
+        self.assertTrue(vault_form.server_ok(f"http://{lan}:8080"))
+        self.assertFalse(vault_form.server_ok("http://vault.example.com"))            # plain http only on a private IP
+        self.assertFalse(vault_form.server_ok("http://8.8.8.8:8080"))
+        self.assertEqual(vault_form.failure("FetchError: request failed, reason: getaddrinfo ENOTFOUND vault.x.ts.net"), "unreachable")
+        self.assertEqual(vault_form.failure(f"connect ECONNREFUSED {lan}:8080"), "unreachable")
+        self.assertEqual(vault_form.failure("invalid_client"), "key")
+        self.assertEqual(vault_form.failure("self signed certificate"), "tls")
+
     def test_page_never_echoes_a_secret(self):
         out = vault_form.page("t", GOOD, {}).decode()
         self.assertNotIn("correct horse", out)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import html
 import http.server
+import ipaddress
 import os
 import re
 import secrets
@@ -21,17 +22,41 @@ import threading
 import urllib.parse
 
 FIELDS = [
-    ("BW_SERVER", "Vault address", "Your Vaultwarden address, like https://vault.your-tailnet.ts.net", False),
+    ("BW_SERVER", "Vault address", "The vault's address on your home network as Potter reaches it, like http://<vault container IP>:8080 (or an https address Potter can reach).", False),
     ("BW_CLIENTID", "Potter's API key: client_id", "In the web vault, signed in as POTTER: Account settings > Security > Keys > View API key. Starts with user.", False),
     ("BW_CLIENTSECRET", "Potter's API key: client_secret", "Same page.", True),
     ("BW_PASSWORD", "Potter's master password", "The master password of Potter's account (not yours).", True),
 ]
 
 
+def server_ok(url: str) -> bool:
+    m = re.match(r"^(https?)://([A-Za-z0-9.-]+)(:\d+)?/?$", url or "")
+    if not m:
+        return False
+    if m.group(1) == "https":
+        return True
+    try:
+        return ipaddress.ip_address(m.group(2)).is_private        # plain http only inside the home network
+    except ValueError:
+        return False
+
+
+def failure(stderr: str) -> str:
+    """Which step failed, from the Bitwarden CLI's own error text."""
+    e = (stderr or "").lower()
+    if any(k in e for k in ("econnrefused", "enotfound", "getaddrinfo", "etimedout", "fetch failed", "network", "socket", "ehostunreach")):
+        return "unreachable"
+    if any(k in e for k in ("certificate", "self signed", "ssl", "tls")):
+        return "tls"
+    if any(k in e for k in ("invalid_client", "client_id", "client_secret", "invalid client")):
+        return "key"
+    return "other"
+
+
 def validate(v: dict) -> dict:
     err = {}
-    if not re.match(r"^https://[A-Za-z0-9.-]+(:\d+)?/?$", v.get("BW_SERVER", "")):
-        err["BW_SERVER"] = "Use the https address of your vault, like https://vault.your-tailnet.ts.net"
+    if not server_ok(v.get("BW_SERVER", "")):
+        err["BW_SERVER"] = "Use https://<name>, or http://<home-network IP>:<port> (plain http only on a private address)."
     if not re.match(r"^user\.[0-9a-fA-F-]{36}$", v.get("BW_CLIENTID", "")):
         err["BW_CLIENTID"] = "That does not look like a client_id (it starts with user. and a long id)."
     if len(v.get("BW_CLIENTSECRET", "")) < 20:
@@ -52,7 +77,15 @@ def live_check(v: dict, bw: str = "bw") -> dict:
         except (OSError, subprocess.TimeoutExpired):
             return {"BW_SERVER": "Could not run the Bitwarden CLI or reach the vault. Is the address right?"}
         if li.returncode != 0:
-            return {"BW_CLIENTSECRET": "The vault refused this API key. Check client_id and client_secret (Potter's account)."}
+            why = failure(li.stderr + li.stdout)
+            host = v["BW_SERVER"]
+            if why == "unreachable":
+                return {"BW_SERVER": f"Potter could not reach {host} at all (not a key problem). Use the vault's home-network address."}
+            if why == "tls":
+                return {"BW_SERVER": f"{host} answered, but its certificate is not trusted here. Use its http home-network address instead."}
+            if why == "key":
+                return {"BW_CLIENTSECRET": "The vault reached, but it refused this API key. Copy client_id and client_secret again from Potter's account (not yours)."}
+            return {"BW_SERVER": "Login failed: " + (li.stderr or li.stdout).strip().splitlines()[-1][:160]}
         un = run("unlock", "--passwordenv", "BW_PASSWORD", "--raw")
         if un.returncode != 0 or not un.stdout.strip():
             return {"BW_PASSWORD": "The key worked but this master password did not unlock Potter's vault."}
