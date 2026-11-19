@@ -32,6 +32,9 @@ client_id, client_secret and master password. The form checks them and tells you
 
 ## 4. Use
 
+- People: one Identity item each (name, phone, SSN, passport, license; address left blank). Places: one Identity
+  item each ("Bay Ridge — Home", "Catskills — House") with the address; extras like a gate code as custom fields.
+  SSN, passport, license and date of birth always ask you, one use at a time, even inside an approved item.
 - Add only what Potter should have: in the Bitwarden app (pointed at your vault address), save the item into the
   "Potter" collection. Cards: virtual card numbers only, locked to a merchant, with a limit.
 - Optional: put `potter:auto` in a login's notes to let Potter use it without asking each time. Cards always ask.

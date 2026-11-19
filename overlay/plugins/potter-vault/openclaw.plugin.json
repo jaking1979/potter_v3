@@ -2,21 +2,50 @@
   "id": "potter-vault",
   "name": "Potter Vault",
   "description": "Uses the owner's chosen logins and cards (self-hosted Vaultwarden, Potter's own scoped account) without the model ever seeing a value.",
-  "version": "1.0.0",
-  "contracts": { "tools": ["vault_list", "vault_authorize", "vault_send_to_owner"] },
-  "activation": { "onStartup": true },
+  "version": "1.1.0",
+  "contracts": {
+    "tools": [
+      "vault_list",
+      "vault_authorize",
+      "vault_send_to_owner"
+    ]
+  },
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "envFile": { "type": "string", "description": "Root-only file with BW_CLIENTID, BW_CLIENTSECRET, BW_PASSWORD, BW_SERVER." },
-      "stateDir": { "type": "string" },
-      "appDataDir": { "type": "string" },
-      "bwPath": { "type": "string" },
-      "openclawBin": { "type": "string" },
-      "ownerTarget": { "type": "string", "description": "The owner's Telegram chat id, for vault_send_to_owner." },
-      "authorizeMinutes": { "type": "integer", "minimum": 1, "maximum": 120 },
-      "approvalTimeoutMs": { "type": "integer", "minimum": 10000 }
+      "envFile": {
+        "type": "string",
+        "description": "Root-only file with BW_CLIENTID, BW_CLIENTSECRET, BW_PASSWORD, BW_SERVER."
+      },
+      "stateDir": {
+        "type": "string"
+      },
+      "appDataDir": {
+        "type": "string"
+      },
+      "bwPath": {
+        "type": "string"
+      },
+      "openclawBin": {
+        "type": "string"
+      },
+      "ownerTarget": {
+        "type": "string",
+        "description": "The owner's Telegram chat id, for vault_send_to_owner."
+      },
+      "authorizeMinutes": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 120
+      },
+      "approvalTimeoutMs": {
+        "type": "integer",
+        "minimum": 10000
+      }
     }
   }
 }

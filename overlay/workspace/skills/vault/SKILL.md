@@ -12,7 +12,12 @@ You never see a value, and you never ask the owner to type a password or card nu
 2. `vault_authorize` with the item and a plain purpose. Cards always go to the owner for approval; logins too,
    unless the owner marked them `potter:auto` in the item's notes. Approval lasts 15 minutes.
 3. In the browser, type `{{vault:<item name>#<field>}}` where the value goes (fields: username, password, totp,
-   number, expiry, exp_month, exp_year, code, cardholder, or a custom field name). The real value is filled in
+   number, expiry, exp_month, exp_year, code, cardholder; for identities full_name, first_name, last_name, address1,
+   address2, city, state, postal_code, country, phone, email, company; or a custom field name).
+   Sensitive fields (ssn, passport_number, license_number, dob and the like) are approved one use at a time: call
+   `vault_authorize` with `fields: ["ssn"]` for exactly the use at hand, never "just in case".
+   Addresses come from the place items ("Bay Ridge — Home", "Catskills — House"); the default is the one the owner
+   named. People's identity items hold their documents, not addresses. The real value is filled in
    at the last moment and removed from anything you see back.
 4. The owner asks for a value itself (a passport number, a membership number): `vault_send_to_owner`. It goes
    straight to their chat; you learn only that it was sent.

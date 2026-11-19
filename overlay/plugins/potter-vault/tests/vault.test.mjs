@@ -95,3 +95,36 @@ test("backend: logs in with the API key, unlocks with the password from the envi
   assert.ok(!calls.some((c) => c.includes("master")));
   assert.equal(describe(ITEMS[1]).kind, "card");
 });
+
+const PERSON = { id: "9", name: "Josh ID", type: 4, notes: "", identity: { firstName: "Sam", lastName: "Owner", phone: "555-0100",
+  ssn: "123-45-6789", passportNumber: "X1234567", licenseNumber: "D7654321" }, fields: [{ name: "dob", value: "1980-01-02" }] };
+const HOUSE = { id: "10", name: "Bay Ridge — Home", type: 4, notes: "", identity: { address1: "1 Example St", city: "Springfield", state: "NY", postalCode: "11209" },
+  fields: [{ name: "gate_code", value: "4321" }] };
+const idBackend = { items: async () => ({ ok: true, items: [PERSON, HOUSE] }), totp: async () => null };
+
+test("identity items are read natively; the list shows which fields are sensitive, never a value", async () => {
+  const v = createVault({ backend: idBackend, audit: () => {}, send: async () => true, now: () => 0 });
+  const out = (await v.list()).items;
+  const p = out.find((x) => x.name === "Josh ID");
+  assert.equal(p.kind, "identity");
+  assert.ok(p.fields.includes("full_name") && p.fields.includes("phone") && p.fields.includes("ssn"));
+  assert.deepEqual(p.sensitive.sort(), ["dob", "license_number", "passport_number", "ssn"]);
+  assert.ok(out.find((x) => x.name === "Bay Ridge — Home").fields.includes("postal_code"));
+  assert.ok(!JSON.stringify(out).includes("123-45-6789") && !JSON.stringify(out).includes("1 Example St"));
+});
+
+test("an approved identity fills ordinary fields; each sensitive field needs its own approval, for one use", async () => {
+  const log = [];
+  const v = createVault({ backend: idBackend, audit: (r) => log.push(r), send: async () => true, now: () => 0 });
+  assert.equal((await v.needsApproval("Josh ID")).approval, true);
+  assert.deepEqual((await v.needsApproval("Josh ID", ["ssn", "phone"])).sensitive, ["ssn"]);
+  await v.authorize("Josh ID", "shipping form");
+  assert.equal((await v.prepare("browser", { text: "{{vault:Josh ID#full_name}} {{vault:Josh ID#phone}}" })).params.text, "Sam Owner 555-0100");
+  assert.match((await v.prepare("browser", { text: "{{vault:Josh ID#ssn}}" })).reason, /needs its own approval/);
+  await v.authorize("Josh ID", "tax form", ["ssn"]);
+  assert.equal((await v.prepare("browser", { text: "{{vault:Josh ID#ssn}}" })).params.text, "123-45-6789");
+  assert.match((await v.prepare("browser", { text: "{{vault:Josh ID#ssn}}" })).reason, /needs its own approval/);   // used once
+  await v.authorize("Bay Ridge — Home", "delivery address");
+  assert.equal((await v.prepare("browser", { text: "{{vault:Bay Ridge — Home#postal_code}}" })).params.text, "11209");
+  assert.ok(!JSON.stringify(log).includes("123-45-6789"));
+});

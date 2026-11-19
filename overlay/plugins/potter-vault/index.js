@@ -59,8 +59,9 @@ export default definePluginEntry({
       parameters: obj({}), async execute() { return text(await vault.list()); } });
     api.registerTool({ name: "vault_authorize",
       description: "Ask to use one vault item for the next few minutes (the owner approves cards always, logins unless marked potter:auto). Then write {{vault:<item name>#<field>}} in a browser form field; the real value is filled in for you and you never see it.",
-      parameters: obj({ item: { type: "string" }, purpose: { type: "string", description: "Why, in a few plain words (recorded; no secrets)." } }, ["item", "purpose"]),
-      async execute(_id, p) { return text(await vault.authorize(p.item, p.purpose)); } });
+      parameters: obj({ item: { type: "string" }, purpose: { type: "string", description: "Why, in a few plain words (recorded; no secrets)." },
+        fields: { type: "array", items: { type: "string" }, description: "Sensitive fields this use needs (ssn, passport_number, license_number, dob...): each is approved for one use only." } }, ["item", "purpose"]),
+      async execute(_id, p) { return text(await vault.authorize(p.item, p.purpose, p.fields)); } });
     api.registerTool({ name: "vault_send_to_owner",
       description: "Send one field of an authorized vault item straight to the owner's chat (for example a passport number they asked for). You only learn that it was sent.",
       parameters: obj({ item: { type: "string" }, field: { type: "string" } }, ["item", "field"]),
@@ -70,15 +71,16 @@ export default definePluginEntry({
     api.on("before_tool_call", async (event) => {
       const name = event?.toolName;
       if (name === "vault_authorize" || name === "vault_send_to_owner") {
-        const n = await vault.needsApproval(event.params?.item ?? "");
+        const n = await vault.needsApproval(event.params?.item ?? "", name === "vault_send_to_owner" ? [event.params?.field] : event.params?.fields);
         if (n.error) return { block: true, blockReason: n.error };
-        if (name === "vault_send_to_owner" && vault._authorized.has(String(event.params.item).trim().toLowerCase())) return undefined;
+        if (name === "vault_send_to_owner" && !n.sensitive.length && vault._authorized.has(String(event.params.item).trim().toLowerCase())) return undefined;
         if (!n.approval) return undefined;
         return { requireApproval: {
           title: `Use from the vault: ${n.describe.name}`,
-          description: `${n.describe.kind === "card" ? "A payment card" : "A login"}${n.describe.site ? " for " + n.describe.site : ""}. ` +
+          description: `${n.describe.kind === "card" ? "A payment card" : n.describe.kind === "identity" ? "An identity" : "A login"}${n.describe.site ? " for " + n.describe.site : ""}. ` +
+            (n.sensitive.length ? `Including, for one use: ${n.sensitive.join(", ")}. ` : "") +
             `Why: ${String(event.params?.purpose ?? "send it to you").slice(0, 120)}. Potter will not see the value.`,
-          severity: n.describe.kind === "card" ? "critical" : "warning",
+          severity: n.describe.kind === "card" || n.sensitive.length ? "critical" : "warning",
           timeoutMs: cfg.approvalTimeoutMs ?? 10 * 60 * 1000,
           allowedDecisions: ["allow-once", "deny"],
           onResolution: (decision) => audit({ action: "approval", item: n.describe.name, decision }),

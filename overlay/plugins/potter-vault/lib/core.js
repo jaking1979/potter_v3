@@ -5,11 +5,12 @@
 //   {{vault:item#field}}  substituted into an allowed tool's parameters at the last moment, for authorized items only
 //   vault_send_to_owner   the value goes straight to the owner's chat; the model only learns "sent"
 // Every value that passes through is scrubbed from tool results and the model's own messages.
-import { describe, fieldValue } from "./bw.js";
+import { describe, fieldValue, isSensitive } from "./bw.js";
 import { findRefs, isCardRef, mayReceive, scrub, substitute } from "./refs.js";
 
 export function createVault({ backend, audit = () => {}, send, now = () => Date.now(), minutes = 15 }) {
   const authorized = new Map();          // item name (lower case) -> expiry ms
+  const once = new Map();                // "item#field" -> expiry ms: a sensitive field, approved for one use
   const seen = new Map();                // secret value -> "{{vault:item#field}}" (for scrubbing), most recent 200
   const key = (s) => String(s).trim().toLowerCase();
   const remember = (v, label) => { if (typeof v === "string" && v) { seen.delete(v); seen.set(v, label); while (seen.size > 200) seen.delete(seen.keys().next().value); } };
@@ -29,19 +30,21 @@ export function createVault({ backend, audit = () => {}, send, now = () => Date.
       return { ok: true, items: r.items.map(describe) };
     },
 
-    /** Does using this item need the owner's approval right now? */
-    async needsApproval(name) {
+    /** Does using this item need the owner's approval right now? Sensitive fields always do. */
+    async needsApproval(name, fields = []) {
       const f = await find(name);
       if (f.error) return { error: f.error };
       const d = describe(f.item);
-      return { approval: !(d.auto && d.kind === "login"), describe: d };
+      const sensitive = (fields ?? []).filter(isSensitive);
+      return { approval: sensitive.length > 0 || !(d.auto && d.kind === "login"), describe: d, sensitive };
     },
 
-    async authorize(name, purpose) {
+    async authorize(name, purpose, fields = []) {
       const f = await find(name);
       if (f.error) return { ok: false, error: f.error };
       authorized.set(key(f.item.name), now() + minutes * 60000);
-      audit({ action: "authorize", item: f.item.name, purpose: String(purpose ?? "").slice(0, 120) });
+      for (const fl of (fields ?? []).filter(isSensitive)) once.set(`${key(f.item.name)}#${fl}`, now() + minutes * 60000);
+      audit({ action: "authorize", item: f.item.name, purpose: String(purpose ?? "").slice(0, 120), sensitive: (fields ?? []).filter(isSensitive) });
       return { ok: true, item: f.item.name, minutes,
         use: `Write {{vault:${f.item.name}#<field>}} in a browser form field; fields: ${describe(f.item).fields.join(", ")}` };
     },
@@ -58,6 +61,10 @@ export function createVault({ backend, audit = () => {}, send, now = () => Date.
       for (const r of refs) {
         const exp = authorized.get(key(r.item));
         if (!exp || exp < now()) return { block: true, reason: `"${r.item}" is not authorized right now: call vault_authorize first${isCardRef(r) ? " (a card always asks the owner)" : ""}` };
+        if (isSensitive(r.field)) {
+          const k = `${key(r.item)}#${r.field}`;
+          if (!(once.get(k) > now())) return { block: true, reason: `the ${r.field} of "${r.item}" needs its own approval: call vault_authorize with fields ["${r.field}"]` };
+        }
         const f = await find(r.item);
         if (f.error) return { block: true, reason: f.error };
         const v = await fieldValue(backend, f.item, r.field);
@@ -65,6 +72,7 @@ export function createVault({ backend, audit = () => {}, send, now = () => Date.
         values.set(`${key(r.item)}#${r.field}`, String(v));
         remember(String(v), r.raw);
       }
+      for (const r of refs) if (isSensitive(r.field)) once.delete(`${key(r.item)}#${r.field}`);   // one use each
       audit({ action: "fill", tool: toolName, call: toolCallId ?? null, refs: refs.map((r) => `${r.item}#${r.field}`) });
       return { params: substitute(params, (item, field) => values.get(`${key(item)}#${field}`)) };
     },
@@ -74,6 +82,11 @@ export function createVault({ backend, audit = () => {}, send, now = () => Date.
       if (f.error) return { ok: false, error: f.error };
       const exp = authorized.get(key(f.item.name));
       if (!exp || exp < now()) return { ok: false, error: `"${f.item.name}" is not authorized right now: call vault_authorize first` };
+      if (isSensitive(field)) {
+        const k = `${key(f.item.name)}#${field}`;
+        if (!(once.get(k) > now())) return { ok: false, error: `the ${field} of "${f.item.name}" needs its own approval: call vault_authorize with fields ["${field}"]` };
+        once.delete(k);
+      }
       const v = await fieldValue(backend, f.item, field);
       if (!v) return { ok: false, error: `"${f.item.name}" has no ${field}` };
       remember(String(v), `{{vault:${f.item.name}#${field}}}`);
