@@ -6,7 +6,7 @@
 //   vault_send_to_owner   the value goes straight to the owner's chat; the model only learns "sent"
 // Every value that passes through is scrubbed from tool results and the model's own messages.
 import { describe, fieldValue, isSensitive } from "./bw.js";
-import { findRefs, isCardRef, mayReceive, scrub, substitute } from "./refs.js";
+import { findRefs, isCardRef, isWrapper, mayReceive, scrub, substitute } from "./refs.js";
 
 export function createVault({ backend, audit = () => {}, send, now = () => Date.now(), minutes = 15 }) {
   const authorized = new Map();          // item name (lower case) -> expiry ms
@@ -53,6 +53,10 @@ export function createVault({ backend, audit = () => {}, send, now = () => Date.
     async prepare(toolName, params, toolCallId) {
       const refs = findRefs(params);
       if (!refs.length) return undefined;
+      if (isWrapper(toolName)) {                     // judged and filled at the inner call (refs.js isWrapper)
+        audit({ action: "deferred", tool: toolName, inner: String(params?.id ?? params?.name ?? ""), items: [...new Set(refs.map((r) => r.item))] });
+        return undefined;
+      }
       if (!mayReceive(toolName)) {
         audit({ action: "refused", tool: toolName, items: [...new Set(refs.map((r) => r.item))] });
         return { block: true, reason: "vault values can only be typed into a browser form or a request, never into a shell, a message or a file" };

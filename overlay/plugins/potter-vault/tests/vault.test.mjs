@@ -128,3 +128,17 @@ test("an approved identity fills ordinary fields; each sensitive field needs its
   assert.equal((await v.prepare("browser", { text: "{{vault:Bay Ridge — Home#postal_code}}" })).params.text, "11209");
   assert.ok(!JSON.stringify(log).includes("123-45-6789"));
 });
+
+test("the deferred-tool wrapper is left alone; the value is filled at the inner browser call, never at the wrapper", async () => {
+  const { v, log } = vault();
+  await v.authorize("Con Ed", "log in");
+  const wrapped = { id: "browser", args: { action: "act", request: { kind: "type", ref: "e3", text: "{{vault:Con Ed#password}}" } } };
+  assert.equal(await v.prepare("dispatch_action", wrapped), undefined);            // passes through untouched
+  assert.equal(wrapped.args.request.text, "{{vault:Con Ed#password}}");
+  assert.equal(log.at(-1).action, "deferred");
+  assert.equal(log.at(-1).inner, "browser");
+  const inner = await v.prepare("browser", wrapped.args);                         // the harness re-runs the hook here
+  assert.equal(inner.params.request.text, "S3cret-Pass!");
+  assert.ok((await v.prepare("exec", { command: "echo {{vault:Con Ed#password}}" })).block);   // a wrapped shell is still refused
+  assert.ok(!JSON.stringify(log).includes("S3cret-Pass!"));
+});

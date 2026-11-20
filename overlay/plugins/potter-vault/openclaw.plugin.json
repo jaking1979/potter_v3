@@ -2,7 +2,7 @@
   "id": "potter-vault",
   "name": "Potter Vault",
   "description": "Uses the owner's chosen logins and cards (self-hosted Vaultwarden, Potter's own scoped account) without the model ever seeing a value.",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "contracts": {
     "tools": [
       "vault_list",

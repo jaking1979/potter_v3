@@ -38,4 +38,9 @@ export function mayReceive(toolName, allow = /^(browser|web_?form|playwright|com
   return allow.test(n);
 }
 
+/** OpenClaw's wrapper for deferred tools (`dispatch_action {id, args}`). The harness runs the same before_tool_call
+ *  hooks again on the inner call, under the inner tool's own name, so the vault leaves the wrapper alone and fills the
+ *  value at the inner call: there mayReceive applies, and the browser guard still sees the reference. */
+export const isWrapper = (toolName) => /^(dispatch_action|tool_call)$/i.test(String(toolName ?? ""));
+
 export const isCardRef = (r) => CARD_FIELDS.has(r.field);
