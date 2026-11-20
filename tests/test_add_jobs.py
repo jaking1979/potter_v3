@@ -52,6 +52,27 @@ class Table(unittest.TestCase):
         skill = (ROOT / "overlay/workspace/skills/trading-run/SKILL.md").read_text()
         self.assertIn("trading_precheck", skill)
 
+    def test_a_job_can_carry_its_tool_list_and_a_failure_alert_to_the_owner(self):
+        lm = next(j for j in JOBS if j["name"] == "potter-local-monitor")
+        a = aj.argv_for(lm, VALUES)
+        self.assertEqual(a[a.index("--tools") + 1].split(","), lm["tools"])
+        self.assertNotIn("--tools", aj.argv_for(next(j for j in JOBS if j["name"] == "potter-fetch-local"), VALUES))
+        e = aj.alert_argv(lm, VALUES, "abc")
+        self.assertEqual(e[:3], ["cron", "edit", "abc"])
+        self.assertEqual(e[e.index("--failure-alert-to") + 1], "42")
+        self.assertEqual(e[e.index("--failure-alert-after") + 1], "1")
+        with tempfile.TemporaryDirectory() as t:
+            log = Path(t) / "calls"
+            fake = Path(t) / "oc"
+            fake.write_text("#!/bin/sh\necho \"$*\" >> " + str(log) + "\n"
+                            "case \"$*\" in *\"cron list\"*) echo '{\"jobs\":[{\"name\":\"potter-local-monitor\",\"id\":\"j1\"}]}';; esac\n")
+            fake.chmod(0o755)
+            jobs = Path(t) / "jobs.json"
+            jobs.write_text(json.dumps({"jobs": [lm]}))
+            args = ["--jobs", str(jobs), "--openclaw", str(fake)] + [x for k, v in VALUES.items() for x in ("--set", f"{k}={v}")]
+            self.assertEqual(aj.main(args), 0)
+            self.assertIn("cron edit j1 --failure-alert", log.read_text())
+
     def test_bad_definitions_are_refused(self):
         for bad in ({"name": "x", "cron": "0 * * * *", "kind": "command", "timeout": 1, "command": "c"},
                     {"name": "potter-a", "cron": "every hour", "kind": "command", "timeout": 1, "command": "c"},

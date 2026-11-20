@@ -46,9 +46,28 @@ def argv_for(job: dict, values: dict, agent: str = "potter") -> list[str]:
         a += (["--channel", "telegram", "--to", values["TO"], "--announce"] if job.get("deliver") else ["--no-deliver"])
     else:
         raise ValueError(f"{job['name']}: unknown kind")
+    if "tools" in job:                                 # the job's own tool allow-list (agent jobs)
+        a += ["--tools", ",".join(job["tools"])]
     if job.get("standby"):
         a.append("--disabled")
     return a
+
+
+def alert_argv(job: dict, values: dict, job_id: str) -> list[str]:
+    """Failure alerts can only be set on an existing job, so they are a second step after `cron add`."""
+    fa = job["failure_alert"]
+    return ["cron", "edit", job_id, "--failure-alert", "--failure-alert-after", str(int(fa.get("after", 1))),
+            "--failure-alert-channel", fa.get("channel", "telegram"), "--failure-alert-to", values["TO"],
+            "--failure-alert-mode", fa.get("mode", "announce")]
+
+
+def job_ids(openclaw: str) -> dict:
+    r = subprocess.run(shlex.split(openclaw) + ["cron", "list", "--all", "--json"], capture_output=True, text=True)
+    try:
+        listed = json.loads(r.stdout[r.stdout.index("{"):])
+    except ValueError:
+        return {}
+    return {j.get("name"): j.get("id") for j in listed.get("jobs", [])}
 
 
 def main(argv: list[str]) -> int:
@@ -78,9 +97,15 @@ def main(argv: list[str]) -> int:
         a = shlex.split(ns.openclaw) + argv_for(job, values)
         if ns.dry_run:
             print(" ".join(shlex.quote(x) for x in a))
+            if job.get("failure_alert"):
+                print(" ".join(shlex.quote(x) for x in shlex.split(ns.openclaw) + alert_argv(job, values, "<id>")))
             continue
         r = subprocess.run(a, capture_output=True, text=True)
         ok = r.returncode == 0
+        if ok and job.get("failure_alert"):
+            jid = job_ids(ns.openclaw).get(job["name"])
+            ok = bool(jid) and subprocess.run(shlex.split(ns.openclaw) + alert_argv(job, values, jid),
+                                              capture_output=True, text=True).returncode == 0
         failed += not ok
         print(f"{job['name']}: {'standby' if job.get('standby') else 'on'}, {'ok' if ok else 'FAILED'}")
         if job.get("standby"):

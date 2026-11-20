@@ -14,6 +14,7 @@ index points to and delete the other.
 | How email is run: Potter's inbox, conversations, intake, urgent items, sending | `global/email-pipeline.md` |
 | Creating, changing or debugging any scheduled job, monitor or reminder | `global/schedules.md` |
 | Claims of finished work, the nightly checks, follow-ups the checker opened | `global/quality-control.md` |
+| Taking initiative on a curation, monitoring, list or coverage task ("follow", "watch", "keep track of", "find all") | `global/initiative.md` |
 
 ## Stores outside rules/
 Files marked *(first use)* do not exist until the program that writes them first runs; their absence is normal.
