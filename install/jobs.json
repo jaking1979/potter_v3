@@ -117,6 +117,28 @@
    }
   },
   {
+   "name": "potter-shipped-report",
+   "cron": "40 17 * * 0",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 120,
+   "command": "potter-shipped --report",
+   "purpose": "lists Potter's local changes to shipped skills and rules"
+  },
+  {
+   "name": "potter-local-changes",
+   "cron": "50 17 * * 0",
+   "tz": "{TZ}",
+   "kind": "agent",
+   "timeout": 300,
+   "deliver": true,
+   "tools": [
+    "read"
+   ],
+   "message": "Run the local-changes skill (weekly job). Reply with the message only, or nothing.",
+   "purpose": "weekly note when Potter's own changes are waiting to go back to the repo"
+  },
+  {
    "name": "potter-wine-watch",
    "cron": "0 10 1 * *",
    "tz": "{TZ}",

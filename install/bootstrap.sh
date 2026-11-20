@@ -129,7 +129,16 @@ for f in IDENTITY.md SOUL.md USER.md; do
 done
 rm -f "$WS/BOOTSTRAP.md"
 cp "$REPO/overlay/workspace/avatar.svg" "$WS/avatar.svg"
-mkdir -p "$WS/skills"; cp -r "$REPO/overlay/workspace/skills/." "$WS/skills/"
+mkdir -p "$WS/skills" "$POTTER_HOME/tools"
+python3 "$HERE/sync_shipped.py" --repo "$REPO" --ws "$WS" >/dev/null   # records what was installed, so later edits are kept
+cp "$HERE/sync_shipped.py" "$POTTER_HOME/tools/"
+cat > /usr/local/bin/potter-shipped <<WRAP
+#!/bin/sh
+# Local changes to Potter's shipped skills and rules: --report rebuilds state/shipped/DRIFT.md;
+# --accept <path> takes the repo's version (the local copy is archived first).
+exec python3 "$POTTER_HOME/tools/sync_shipped.py" --repo "$REPO" --ws "$WS" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-shipped
 
 if [ -n "${AGENTMAIL_API_KEY:-}" ]; then
   # The inbox watcher (a command job, outside the gateway) reads its key from a root-only file.

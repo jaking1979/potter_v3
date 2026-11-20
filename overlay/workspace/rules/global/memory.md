@@ -13,6 +13,10 @@
 2. **Route before writing:** look the subject up in `rules/INDEX.md`, read what is already there, and write to the
    one file that owns that kind of information. If nothing owns it, create the file and add its trigger to the
    index in the same change.
+2a. **Shipped files** (`skills/`, `rules/global/`) come from the repo. Put the owner's specifics (places, sources,
+   tiers, people, wording preferences) in the owner's own files (`rules/domains/`, `rules/personal/`, `preferences/`,
+   `state/`) and point to them. Change a shipped file only for a better method, and then append one line to
+   `state/shipped/notes.md`: `<date> | <path> | <why>`. Updates keep the edited file; skill `local-changes`.
 3. Write the distilled rule, not the transcript. One short rule beats a paragraph.
 4. **One fact, one file.** Do not copy a fact into a second file; point to it. If you find a duplicate, remove it.
 5. When a rule replaces an older one, delete the older text in the same change and note the date beside the new one.

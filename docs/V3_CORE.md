@@ -243,6 +243,18 @@ Before the main model thinks, the governor builds its working context instead of
   (plus dodge and invented-specifics checks). Every run is kept: `potter-bench leaderboard` shows scores by code
   version. Owner effort: `potter-bench setup` once, then "run the benchmark".
 
+## Local changes survive updates (install/sync_shipped.py, skill local-changes)
+Potter evolves his own skills in conversation while the repo keeps changing them too. Updates and installs no longer
+copy shipped skills and global rules over the workspace. `state/shipped/manifest.json` records the git blob of
+each file as installed; a file that is neither that nor the new version was changed here, so it is **kept** and the
+repo's version goes beside it as `<file>.upstream` (before a manifest existed, any version in the repo's history
+counts as unchanged). `potter-shipped --report` writes `state/shipped/DRIFT.md`: each edited file's diff, files
+Potter added under `skills/` or `rules/global/`, and his reasons from `state/shipped/notes.md`. Weekly jobs
+`potter-shipped-report` and `potter-local-changes` tell the owner when changes are waiting; "publish my local
+changes" puts DRIFT.md on a Notion page, which the developer reads to fold them in ("sync Potter's changes").
+When the repo matches, the file is managed again; `potter-shipped --accept <path>` takes the repo's version and
+archives the local one. Rule `memory.md` 2a: owner specifics go in the owner's files, not in shipped ones.
+
 ## Not yet
 Tool-surface narrowing (`toolsAllow`, needs the host's tool list), the Mac as a paired node, durable multi-step
 task execution beyond the resumable-execution files.

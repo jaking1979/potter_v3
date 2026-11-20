@@ -337,9 +337,16 @@ TO="$id" python3 "$HERE/add_jobs.py" --jobs "$HERE/jobs.json" --openclaw "opencl
 }
 
 # 3. shipped skills and global rules (personal rules and the index's personal rows are not touched)
-for s in "$REPO/overlay/workspace/skills/"*/; do n="$(basename "$s")"; mkdir -p "$WS/skills/$n"; cp -r "$s". "$WS/skills/$n/"; done
-cp "$REPO/overlay/workspace/rules/global/"*.md "$WS/rules/global/"
-step "skills and global rules: refreshed"
+# Files Potter changed here are kept; the repo's version goes beside each as .upstream (sync_shipped.py).
+step "skills and global rules: $(python3 "$HERE/sync_shipped.py" --repo "$REPO" --ws "$WS" 2>&1 | tail -n1)"
+cp "$HERE/sync_shipped.py" "$POTTER_HOME/tools/"
+cat > /usr/local/bin/potter-shipped <<WRAP
+#!/bin/sh
+# Local changes to Potter's shipped skills and rules: --report rebuilds state/shipped/DRIFT.md;
+# --accept <path> takes the repo's version (the local copy is archived first).
+exec python3 "$POTTER_HOME/tools/sync_shipped.py" --repo "$REPO" --ws "$WS" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-shipped
 # USER.md still the empty template, but v2's profile is in the workspace as reference (an install from before the
 # importer made it live): promote it, without the reference banner. An owner-edited USER.md is never replaced.
 if [ -z "$PROFILE_ZIP" ] && [ -f "$WS/reference/v2/USER.md" ] && [ "$(grep -c . "$WS/USER.md" 2>/dev/null || echo 0)" -le 3 ]; then
