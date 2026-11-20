@@ -73,7 +73,7 @@ export function isOutgoing(toolName, params = {}, cls = {}) {
     const slugs = JSON.stringify(params).match(/[A-Z][A-Z0-9]+_[A-Z0-9_]+/g) ?? [];
     return slugs.some((s) => /_(SEND|REPLY|FORWARD|POST|PUBLISH|SHARE|INVITE)(_|$)/.test(s) && !/DRAFT/.test(s));
   }
-  if (n === "browser") return params.action === "act" && /^(type|fill)$/.test(String(params.kind ?? ""));
+  if (n === "browser") return params.action === "act" && /^(type|fill)$/.test(String(params.request?.kind ?? params.kind ?? ""));
   return false;
 }
 
