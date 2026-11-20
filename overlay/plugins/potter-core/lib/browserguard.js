@@ -49,18 +49,18 @@ export function createGuard() {
       const action = String(params.action ?? "");
       if (READ.has(action)) return { capability: `browser:${action}`, risk: "read", severity: "normal", target: String(params.url ?? "").slice(0, 120) };
       if (action !== "act") return { capability: `browser:${action || "other"}`, risk: "reversible", severity: "normal", target: "" };
-      const kind = String(params.kind ?? params.type ?? "");
+      // OpenClaw act calls can carry the operation inside request. Use that shape when present.\n      const act = params.request && typeof params.request === "object" ? params.request : params;\n      const kind = String(act.kind ?? act.type ?? "");
       // Seen before the vault substitutes the value (potter-core runs first), so the placeholder is still here.
       if (/\{\{vault:/.test(JSON.stringify(params))) tab(session, params.targetId).vaultTyped = true;
-      if (["wait", "hover", "scroll", "type", "fill", "select", "check", "uncheck", "drag", "resize"].includes(kind) && !COMMIT.test(String(params.text ?? ""))) {
+      if (["wait", "hover", "scroll", "type", "fill", "select", "check", "uncheck", "drag", "resize"].includes(kind) && !COMMIT.test(String(act.text ?? ""))) {
         return { capability: `browser:act:${kind}`, risk: "reversible", severity: "normal", target: "" };
       }
       const t = tab(session, params.targetId);
-      const refs = [params.ref, ...(Array.isArray(params.refs) ? params.refs : [])].filter(Boolean);
+      const refs = [act.ref, ...(Array.isArray(act.refs) ? act.refs : [])].filter(Boolean);
       const named = refs.map((r) => t.refs.get(String(r))).filter(Boolean);
       const label = named.map((n) => `${n.role} "${n.label}"`).join(", ");
       const where = t.url ? ` on ${t.url.replace(/^https?:\/\//, "").slice(0, 80)}` : "";
-      if (named.some((n) => COMMIT.test(n.label)) || (kind === "press" && /enter/i.test(String(params.key ?? "")) && t.vaultTyped)) {
+      if (named.some((n) => COMMIT.test(n.label)) || (kind === "press" && /enter/i.test(String(act.key ?? "")) && t.vaultTyped)) {
         return { capability: "browser:commit", risk: "consequential", severity: "high", target: `${label || "Enter"}${where}` };
       }
       if (!named.length && t.vaultTyped) {
