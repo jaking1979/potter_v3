@@ -49,7 +49,9 @@ export function createGuard() {
       const action = String(params.action ?? "");
       if (READ.has(action)) return { capability: `browser:${action}`, risk: "read", severity: "normal", target: String(params.url ?? "").slice(0, 120) };
       if (action !== "act") return { capability: `browser:${action || "other"}`, risk: "reversible", severity: "normal", target: "" };
-      // OpenClaw act calls can carry the operation inside request. Use that shape when present.\n      const act = params.request && typeof params.request === "object" ? params.request : params;\n      const kind = String(act.kind ?? act.type ?? "");
+      // OpenClaw act calls can carry the operation inside request. Use that shape when present.
+      const act = params.request && typeof params.request === "object" ? params.request : params;
+      const kind = String(act.kind ?? act.type ?? "");
       // Seen before the vault substitutes the value (potter-core runs first), so the placeholder is still here.
       if (/\{\{vault:/.test(JSON.stringify(params))) tab(session, params.targetId).vaultTyped = true;
       if (["wait", "hover", "scroll", "type", "fill", "select", "check", "uncheck", "drag", "resize"].includes(kind) && !COMMIT.test(String(act.text ?? ""))) {
