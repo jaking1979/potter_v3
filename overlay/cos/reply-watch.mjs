@@ -85,7 +85,21 @@ export function cleanFacts(watch, json) {
   return want.map((name) => ({ name: clean(name, 40), value: got.get(name.toLowerCase().trim()) ?? "not stated" }));
 }
 
-export async function run({ apiKey, inbox, watchPath, docPath, queuePath, facts, fetchImpl, now = new Date() }) {
+/** Proof of every check, written on every run (state/reply-watch-status.json): a silent monitor must be able to show
+ *  that it read the inbox, and when. */
+export function writeStatus(path, rec, now) {
+  if (!path) return;
+  const t = `${path}.tmp`;
+  writeFileSync(t, JSON.stringify({ checked: now.toISOString(), ...rec }, null, 1)); renameSync(t, path);
+}
+
+export async function run(o) {
+  const rec = await scan(o);
+  writeStatus(o.statusPath, rec, o.now ?? new Date());
+  return rec;
+}
+
+async function scan({ apiKey, inbox, watchPath, docPath, queuePath, facts, fetchImpl, now = new Date() }) {
   if (!existsSync(watchPath)) return { ok: true, watches: 0, replies: 0 };
   const file = JSON.parse(readFileSync(watchPath, "utf8"));
   const watches = (file.watches ?? []).filter((w) => active(w, now));
@@ -131,8 +145,9 @@ export async function main(argv, env = process.env, io = { out: (s) => process.s
   let model = "";
   try { model = String(JSON.parse(readFileSync(a.policy, "utf8")).classes?.[a.class]?.model ?? "").replace(/^openrouter\//, ""); } catch { /* facts become "arrived" */ }
   const facts = deps.facts ?? createFacts({ apiKey: env.OPENROUTER_API_KEY, model });
-  const rec = await run({ apiKey: env.AGENTMAIL_API_KEY, inbox: env.AGENTMAIL_INBOX, watchPath: resolve(a.watch), docPath: resolve(a.doc),
-    queuePath: resolve(a.queue), facts, fetchImpl: deps.fetchImpl });
+  const watchPath = resolve(a.watch);
+  const rec = await run({ apiKey: env.AGENTMAIL_API_KEY, inbox: env.AGENTMAIL_INBOX, watchPath, docPath: resolve(a.doc),
+    queuePath: resolve(a.queue), facts, fetchImpl: deps.fetchImpl, statusPath: watchPath.replace(/\.json$/, "") + "-status.json" });
   if (!rec.ok) { io.err(`potter-reply-watch: AgentMail ${rec.reason}\n`); return 4; }
   if (a.report) io.out(JSON.stringify(rec) + "\n");
   return 0;

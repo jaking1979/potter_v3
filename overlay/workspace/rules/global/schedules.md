@@ -15,3 +15,8 @@ These exist because jobs that silently did not run were the old system's biggest
 6. Create and change jobs only with OpenClaw's own commands, after reading its docs for that payload kind.
 7. After creating or changing a job: list it, confirm the next run time, and run it once where that is safe.
 8. The schedule watchdog reports every failed, missed or undelivered job. Do not silence it; fix the job.
+9. **In a scheduled turn, run every command in the foreground** with its own timeout, and wait for its result.
+   Never start it in the background: a result that arrives after the turn ends is dropped, and the run still
+   reads "ok". Never run the `openclaw` CLI from inside a turn (it is heavy and gets killed); use the tool, or a
+   command job. A step that needs the owner's approval is refused in a scheduled turn: skip it and say what
+   needed the owner.

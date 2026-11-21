@@ -56,6 +56,9 @@ test("end to end: one notice per reply in the urgent queue, digest lines, watch 
   assert.equal(await main(args, env, io, { facts, fetchImpl: fakeFetch(calls) }), 0);
   assert.equal(JSON.parse(out.pop()).replies, 0);
   assert.equal(readFileSync(queue, "utf8").trim().split("\n").length, 2);
+  const st = JSON.parse(readFileSync(join(d, "reply-watch-status.json"), "utf8"));     // proof of the quiet run too
+  assert.deepEqual([st.ok, st.watches, st.listed, st.replies], [true, 1, 5, 0]);
+  assert.match(st.checked, /^\d{4}-\d\d-\d\dT/);
 });
 
 test("no watches -> nothing is fetched; a failed extraction still tells the owner it arrived; outages exit 4", async () => {
