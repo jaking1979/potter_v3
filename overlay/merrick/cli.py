@@ -159,7 +159,7 @@ def cmd_cold_watch(ns) -> int:
     saved = _load(state / "cold-watch.json", {})
     findings = coldwatch.evaluate(readings, coldwatch.Thresholds.from_house(house), saved.get("previous"))
     report, seen = coldwatch.new_findings(findings, saved.get("seen") or {}, readings["ts"])
-    if report and not _send(ns, coldwatch.render(report, readings)):
+    if report and not _send(ns, coldwatch.render(report, readings, str(house.get("name") or ""))):
         return 1                                             # keep the old state so the next run tries again
     if not ns.dry_run:
         prev = {"ts": readings["ts"], "basement_f": readings["basement_f"]} \

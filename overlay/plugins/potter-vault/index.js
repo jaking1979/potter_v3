@@ -68,13 +68,15 @@ export default definePluginEntry({
       async execute(_id, p) { return text(await vault.sendToOwner(p.item, p.field)); } });
 
     // Approval for authorize and send-to-owner; substitution for everything else. Runs after potter-core's control.
-    api.on("before_tool_call", async (event) => {
+    api.on("before_tool_call", async (event, ctx) => {
       const name = event?.toolName;
       if (name === "vault_authorize" || name === "vault_send_to_owner") {
         const n = await vault.needsApproval(event.params?.item ?? "", name === "vault_send_to_owner" ? [event.params?.field] : event.params?.fields);
         if (n.error) return { block: true, blockReason: n.error };
         if (name === "vault_send_to_owner" && !n.sensitive.length && vault._authorized.has(String(event.params.item).trim().toLowerCase())) return undefined;
         if (!n.approval) return undefined;
+        // A scheduled turn cannot wait for the owner's tap (the request would outlive the job): refuse at once.
+        if (ctx?.trigger === "cron") return { block: true, blockReason: `scheduled job: using "${n.describe.name}" needs the owner's approval, and nobody can approve during an unattended run; skip this step and say what needed the owner (potter-vault)` };
         return { requireApproval: {
           title: `Use from the vault: ${n.describe.name}`,
           description: `${n.describe.kind === "card" ? "A payment card" : n.describe.kind === "identity" ? "An identity" : "A login"}${n.describe.site ? " for " + n.describe.site : ""}. ` +

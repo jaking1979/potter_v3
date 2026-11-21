@@ -1,6 +1,6 @@
 {
   "name": "potter-vault",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Potter v3 vault: use the owner's chosen secrets without the model seeing them.",
   "type": "module",
   "private": true,

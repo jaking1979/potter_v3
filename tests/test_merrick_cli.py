@@ -96,7 +96,7 @@ class Cli(unittest.TestCase):
         self.fake.states["sensor.basement_temperature"]["state"] = "38.0"
         code, out, _ = self.run_cli("cold-watch")
         self.assertEqual(code, 0)
-        self.assertIn("basement 38.0 F (below the 40 F line)", out)
+        self.assertIn("basement 38.0 F, below the 40 F pipe-safety line", out)
         self.assertEqual(self.run_cli("cold-watch"), (0, "", ""))
 
     def test_cold_watch_fails_the_job_quietly_when_the_basement_cannot_be_read(self):

@@ -46,6 +46,15 @@ export function decide(cls, trust, cfg = {}) {
   return out;
 }
 
+/** A scheduled turn cannot wait for an approval: nobody is there to tap it, and the request outlives the job's own
+ *  timeout (the brief hung twice for 10 minutes). Turn "approve" into an immediate block with a reason the model can
+ *  act on: skip the step and say in the result what needed the owner. Shadow mode is left as it is. */
+export function unattended(d, trust) {
+  if (trust !== "schedule" || d.action !== "approve") return d;
+  return { ...d, action: "block",
+    reason: `scheduled job: this needs the owner's approval (${d.reason}), and nobody can approve during an unattended run; skip this step and say in your result what needed the owner` };
+}
+
 /** T1 evaluation turns run in sessions named "t1-eval-...": anything beyond reading is blocked there. */
 export function isEvalSession(ctx = {}) {
   return /(^|:)t1-eval-/.test(String(ctx.sessionKey ?? ""));

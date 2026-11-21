@@ -175,3 +175,16 @@ test("confirm departure runs only for a proven owner", async () => {
   assert.equal((await tryHouse("confirm departure", { runner, isOwner: true })).text, "Confirmed: locked.");
   assert.deepEqual(seen, ["confirm-departure"]);
 });
+
+test("3.16: a scheduled turn never waits for an approval; it is told to skip the step and say what needed the owner", async () => {
+  const { unattended } = await import("./lib/control.js");
+  const c = (risk, severity = "normal", capability = "x") => ({ risk, severity, capability });
+  const d = unattended(decide(c("consequential"), "schedule"), "schedule");
+  assert.equal(d.action, "block");
+  assert.match(d.reason, /nobody can approve during an unattended run; skip this step/);
+  assert.equal(unattended(decide(c("consequential"), "owner"), "owner").action, "allow");
+  assert.equal(unattended(decide(c("consequential", "high"), "owner"), "owner").action, "approve");     // the owner still gets asked
+  assert.equal(unattended(decide(c("consequential"), "other"), "other").action, "approve");
+  const shadow = unattended(decide(c("consequential"), "schedule", { mode: "shadow" }), "schedule");
+  assert.equal(shadow.action, "allow");
+});

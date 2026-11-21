@@ -11,7 +11,7 @@ import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import { classify } from "./lib/classify.js";
 import { createGuard } from "./lib/browserguard.js";
 import { check as outboundCheck, isOutgoing, outgoingText } from "./lib/outbound.js";
-import { decide, isEvalSession, sealedRefusal, trustOf } from "./lib/control.js";
+import { decide, isEvalSession, sealedRefusal, trustOf, unattended } from "./lib/control.js";
 import { tryHouse } from "./lib/fastpath.js";
 import { plan, requestText, tableDomains } from "./lib/governor.js";
 import { names, search } from "./lib/context.js";
@@ -150,6 +150,7 @@ export default definePluginEntry({
         const prior = alreadyDone(receipts, effect);
         if (prior) d = { action: "approve", reason: `this exact action already succeeded on ${prior.ts.slice(0, 16).replace("T", " ")} UTC; do it again?`, receipt: true };
       }
+      d = unattended(d, trust);                     // 3.16: never hang a scheduled turn on an approval
       if (d.receipt) {
         const rec = append(receipts, { phase: "intent", tool: event?.toolName, capability: cls.capability, risk: cls.risk,
           severity: cls.severity, trust, decision: d.would ? `shadow:${d.would}` : d.action, reason: d.reason, target: cls.target,

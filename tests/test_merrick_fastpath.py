@@ -145,7 +145,7 @@ class Reads(Base):
         self.assertNotIn("Attention", calm)
         self.assertIn("Observed: basement 52.0 F.", calm)
         self.fake.states["sensor.basement_temperature"]["state"] = "38.5"
-        self.assertIn("Attention: basement 38.5 F (below the 40 F line) (observed).", self.ask("is the house ok")["reply"])
+        self.assertIn("Attention: basement 38.5 F, below the 40 F pipe-safety line (observed).", self.ask("is the house ok")["reply"])
 
     def test_heating_estimate_is_labelled_and_uses_learned_rates_when_there_are_any(self):
         out = self.ask("how long to heat the family room to 68")

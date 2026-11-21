@@ -32,16 +32,23 @@ class Evaluate(unittest.TestCase):
         self.assertEqual(kinds(reading(basement_f=35.9)), [("basement_cold", "urgent")])
 
     def test_hold_drift_is_checked_when_vacant_or_unknown_and_skipped_when_occupied(self):
-        self.assertEqual(kinds(reading(zone_target_f=62.5)), [])                       # within tolerance
-        self.assertEqual(kinds(reading(zone_target_f=68.0)), [("hold_drift", "alert")])
-        self.assertEqual(kinds(reading(zone_target_f=68.0, vacant=None)), [("hold_drift", "alert")])
-        self.assertEqual(kinds(reading(zone_target_f=68.0, vacant=False)), [])         # someone is home
-        self.assertEqual(kinds(reading(zone_target_f=68.0), th=cw.Thresholds(vacancy_hold_f=None)), [])
+        self.assertEqual(kinds(reading(zone_target_f=61.5)), [])                       # within tolerance
+        self.assertEqual(kinds(reading(zone_target_f=58.0)), [("hold_drift", "alert")])
+        self.assertEqual(kinds(reading(zone_target_f=58.0, vacant=None)), [("hold_drift", "alert")])
+        self.assertEqual(kinds(reading(zone_target_f=58.0, vacant=False)), [])         # someone is home
+        self.assertEqual(kinds(reading(zone_target_f=58.0), th=cw.Thresholds(vacancy_hold_f=None)), [])
+
+    def test_a_hold_set_warmer_than_needed_is_a_note_never_a_message(self):
+        f = cw.evaluate(reading(basement_f=57.4, zone_target_f=64.0, zone_current_f=64.0))
+        self.assertEqual([(x["kind"], x["severity"]) for x in f], [("hold_above", "note")])
+        self.assertEqual(cw.reportable(f), [])
+        self.assertEqual(cw.render(f, reading(zone_target_f=64.0)), "")
+        self.assertEqual(cw.new_findings(f, {}, NOW), ([], {}))
 
     def test_a_main_zone_that_is_not_keeping_up_is_found(self):
         f = cw.evaluate(reading(zone_current_f=57.9, zone_action="heating"))
         self.assertEqual([(x["kind"], x["label"]) for x in f], [("zone_underheat", "observed")])
-        self.assertIn("heating: heating", f[0]["text"])
+        self.assertIn("(heat: heating)", f[0]["text"])
         self.assertEqual(kinds(reading(zone_current_f=58.0)), [])
 
     def test_an_unreadable_basement_is_a_finding_but_not_a_chat_message(self):
@@ -57,7 +64,7 @@ class Evaluate(unittest.TestCase):
         self.assertEqual(kinds(reading(zone_target_f=None, zone_current_f=None)), [])
 
     def test_several_problems_are_all_reported(self):
-        f = kinds(reading(basement_f=35.0, zone_target_f=55.0, zone_current_f=54.0))
+        f = kinds(reading(basement_f=35.0, zone_target_f=55.0, zone_current_f=54.0))   # 55 is below the hold
         self.assertEqual(f, [("basement_cold", "urgent"), ("hold_drift", "alert"), ("zone_underheat", "alert")])
 
     def test_freeze_trajectory_uses_the_previous_sample_and_is_labelled_estimated(self):
@@ -100,12 +107,16 @@ class Dedupe(unittest.TestCase):
 
 class Render(unittest.TestCase):
     def test_message_is_plain_and_labelled(self):
-        r = reading(basement_f=35.2, zone_target_f=66.0)
-        text = cw.render(cw.evaluate(r), r)
-        self.assertEqual(text.splitlines()[0], "Cold-weather watch: basement 35.2 F; main zone target 66 F, reads 62 F")
-        self.assertIn("- URGENT: basement 35.2 F (below 36 F) (observed)", text)
-        self.assertIn("vacancy hold should be 62 F", text)
+        r = reading(basement_f=35.2, zone_target_f=60.0)
+        text = cw.render(cw.evaluate(r), r, "Lake house")
+        self.assertEqual(text.splitlines(), ["URGENT house alert, Lake house",
+                                             "- URGENT: basement 35.2 F, below 36 F: pipes are at risk",
+                                             "- heat is set to 60 F, below the 62 F away setting",
+                                             "Now: basement 35 F; heat set to 60 F, main zone 62 F."])
+        self.assertNotIn("(observed)", text)
         self.assertTrue(text.isascii())
+        r = reading(basement_f=39.0)
+        self.assertEqual(cw.render(cw.evaluate(r), r).splitlines()[0], "House alert")
 
 
 if __name__ == "__main__":

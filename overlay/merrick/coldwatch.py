@@ -56,10 +56,10 @@ def evaluate(readings: dict, th: Thresholds = Thresholds(), previous: Optional[d
                     "text": "the basement temperature could not be read"})
     elif basement < th.basement_urgent_f:
         out.append({"kind": "basement_cold", "severity": "urgent", "label": "observed",
-                    "text": f"URGENT: basement {basement:.1f} F (below {th.basement_urgent_f:.0f} F)"})
+                    "text": f"URGENT: basement {basement:.1f} F, below {th.basement_urgent_f:.0f} F: pipes are at risk"})
     elif basement < th.basement_alert_f:
         out.append({"kind": "basement_cold", "severity": "alert", "label": "observed",
-                    "text": f"basement {basement:.1f} F (below the {th.basement_alert_f:.0f} F line)"})
+                    "text": f"basement {basement:.1f} F, below the {th.basement_alert_f:.0f} F pipe-safety line"})
     if basement is not None and previous and _n(previous.get("basement_f")) is not None \
             and _n(previous.get("ts")) is not None and _n(r.get("ts")) is not None \
             and r["ts"] - previous["ts"] <= th.max_slope_gap_s:
@@ -67,22 +67,27 @@ def evaluate(readings: dict, th: Thresholds = Thresholds(), previous: Optional[d
         hrs = hours_to_freeze(basement, slope)
         if hrs is not None and hrs < th.freeze_hours_alert:
             out.append({"kind": "freeze_trajectory", "severity": "alert", "label": "estimated",
-                        "text": f"basement falling {abs(slope):.1f} F per hour; at this rate it reaches freezing in "
-                                f"about {hrs:.0f} hours"})
+                        "text": f"basement falling {abs(slope):.1f} F an hour; at this rate it freezes in "
+                                f"about {hrs:.0f} hours (estimate)"})
     # The hold is checked when the house is known to be empty, and also when occupancy is unknown (as v2 did).
     # It is skipped only when the house is known to be occupied: a person changing the heat is not drift.
     # The expected hold is decided from the data (see hold.py) when the caller supplies it.
     want = _n(r.get("expected_hold_f"))
     expected = want if want is not None else th.vacancy_hold_f
-    if expected is not None and target is not None and r.get("vacant") is not False \
-            and abs(target - expected) > th.hold_tolerance_f:
-        why = f"; {r['expected_hold_reason']}" if want is not None and r.get("expected_hold_reason") else ""
-        out.append({"kind": "hold_drift", "severity": "alert", "label": "observed",
-                    "text": f"main zone target is {target:.0f} F (the vacancy hold should be {expected:.0f} F{why})"})
+    # Only a setting BELOW the hold is a cold-weather problem (pipe risk). A setting above it is safe and only costs
+    # money: it is a "note" (never a chat message), left for the weekly house insights. (Owner, 2026-11-21.)
+    if expected is not None and target is not None and r.get("vacant") is not False:
+        why = f" ({r['expected_hold_reason']})" if want is not None and r.get("expected_hold_reason") else ""
+        if target < expected - th.hold_tolerance_f:
+            out.append({"kind": "hold_drift", "severity": "alert", "label": "observed",
+                        "text": f"heat is set to {target:.0f} F, below the {expected:.0f} F away setting{why}"})
+        elif target > expected + th.hold_tolerance_f:
+            out.append({"kind": "hold_above", "severity": "note", "label": "observed",
+                        "text": f"heat is set to {target:.0f} F, above the {expected:.0f} F away setting (safe; costs more)"})
     if current is not None and current < th.zone_min_current_f:
         action = r.get("zone_action") or "state unknown"
         out.append({"kind": "zone_underheat", "severity": "alert", "label": "observed",
-                    "text": f"main zone reads {current:.1f} F (below {th.zone_min_current_f:.0f} F; heating: {action})"})
+                    "text": f"main zone only {current:.1f} F, below {th.zone_min_current_f:.0f} F (heat: {action})"})
     return out
 
 
@@ -106,19 +111,22 @@ def new_findings(findings: list[dict], seen: dict, now: float, repeat_after_s: f
     return report, nxt
 
 
-def render(findings: list[dict], readings: dict) -> str:
-    """Plain text for the owner. Empty string when there is nothing to report (silence is the result)."""
+def render(findings: list[dict], readings: dict, place: str = "") -> str:
+    """Plain text for the owner: the problem first, then what the house reads now. Empty string when there is nothing
+    to report (silence is the result)."""
     fs = reportable(findings)
     if not fs:
         return ""
     r = readings or {}
-    detail = []
+    head = ("URGENT house alert" if any(f["severity"] == "urgent" for f in fs) else "House alert") + (f", {place}" if place else "")
+    now = []
     if _n(r.get("basement_f")) is not None:
-        detail.append(f"basement {float(r['basement_f']):.1f} F")
+        now.append(f"basement {float(r['basement_f']):.0f} F")
     if _n(r.get("zone_target_f")) is not None:
         cur = _n(r.get("zone_current_f"))
-        detail.append(f"main zone target {float(r['zone_target_f']):.0f} F, reads "
-                      f"{'unknown' if cur is None else f'{cur:.0f} F'}")
-    lines = ["Cold-weather watch" + (": " + "; ".join(detail) if detail else "")]
-    lines += [f"- {f['text']} ({f['label']})" for f in fs]
+        now.append(f"heat set to {float(r['zone_target_f']):.0f} F, main zone "
+                   f"{'unknown' if cur is None else f'{cur:.0f} F'}")
+    lines = [head] + [f"- {f['text']}" for f in fs]
+    if now:
+        lines.append("Now: " + "; ".join(now) + ".")
     return "\n".join(lines)

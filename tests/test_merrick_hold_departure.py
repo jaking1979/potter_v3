@@ -63,7 +63,7 @@ class Hold(unittest.TestCase):
         self.assertEqual([f["kind"] for f in coldwatch.evaluate(raised, th)], ["basement_cold"])   # 64 is not drift
         not_raised = {**raised, "zone_target_f": 62.0}
         drift = [f for f in coldwatch.evaluate(not_raised, th) if f["kind"] == "hold_drift"]
-        self.assertIn("should be 64 F", drift[0]["text"])
+        self.assertIn("below the 64 F away setting", drift[0]["text"])
 
     def test_the_away_hold_request_sets_the_decided_value_and_says_why(self):
         fake = FakeHome(states())
