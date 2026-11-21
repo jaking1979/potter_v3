@@ -28,7 +28,7 @@ class Table(unittest.TestCase):
 
     def test_jobs_that_message_the_owner_or_touch_shared_accounts_start_in_standby(self):
         by = {j["name"]: j for j in JOBS}
-        for n in ("potter-daily-trading", "potter-financial-digest", "potter-weekend-digest", "potter-reply-monitor",
+        for n in ("potter-daily-trading", "potter-financial-digest", "potter-weekend-digest",
                   "potter-fetch-city-events", "potter-llm-monthly-status"):
             self.assertTrue(by[n]["standby"], n)
             self.assertIn("--disabled", aj.argv_for(by[n], VALUES), n)

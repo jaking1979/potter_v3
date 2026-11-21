@@ -150,15 +150,14 @@
    "purpose": "monthly wine price check"
   },
   {
-   "name": "potter-reply-monitor",
-   "cron": "0 */2 * * *",
+   "name": "potter-reply-watch",
+   "cron": "17,47 * * * *",
    "tz": "{TZ}",
-   "kind": "agent",
-   "timeout": 300,
-   "standby": true,
-   "deliver": true,
-   "message": "Run the reply-monitor skill. Reply only if an awaited reply arrived.",
-   "purpose": "watches for an awaited email reply"
+   "kind": "command",
+   "timeout": 120,
+   "standby": false,
+   "command": "potter-reply-watch",
+   "purpose": "checks Potter's inbox for replies the owner is waiting on (read only); notices go through the urgent queue"
   },
   {
    "name": "potter-financial-scan",

@@ -366,6 +366,15 @@ exec node "$POTTER_HOME/cos/mail-watch.mjs" --doc "$WS/state/compiling-doc.md" -
   --decider "$POTTER_HOME/jev/index.js" --policy "$WS/state/model-policy.json" "\$@"
 WRAP
 chmod 755 /usr/local/bin/potter-mail-watch
+cat > /usr/local/bin/potter-reply-watch <<WRAP
+#!/bin/sh
+# Replies the owner is waiting on (state/reply-watch.json): read-only inbox listing; notices via the urgent queue.
+[ -f "$SECRETS_DIR/agentmail.env" ] || { echo "potter-reply-watch: AgentMail is not configured" >&2; exit 3; }
+set -a; . "$SECRETS_DIR/jev.env"; . "$SECRETS_DIR/agentmail.env"; set +a
+exec node "$POTTER_HOME/cos/reply-watch.mjs" --watch "$WS/state/reply-watch.json" --doc "$WS/state/compiling-doc.md" \
+  --queue "$WS/state/urgent-mail-queue.jsonl" --policy "$WS/state/model-policy.json" "\$@"
+WRAP
+chmod 755 /usr/local/bin/potter-reply-watch
 mkdir -p "$WS/state/travel"; chmod 700 "$WS/state/travel"
 cat > /usr/local/bin/potter-travel <<WRAP
 #!/bin/sh
