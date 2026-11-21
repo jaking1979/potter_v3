@@ -18,6 +18,10 @@ export const INTENTS = {
   heating_estimate: "Ask how long heating to a temperature will take",
   close_up: "Close up or leave the house (departure check)",
   refuse_protected: "Operate a lock, alarm, water valve or garage",
+  bedtime: "The owner is going to bed (the bedtime routine)",
+  coming_up: "The owner is coming up to the house at some time",
+  arrived: "The owner has just arrived at the house",
+  night_report: "Ask how last night went in the house",
   not_home: "Not about the house at all",
 };
 

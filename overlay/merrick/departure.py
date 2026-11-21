@@ -12,7 +12,8 @@ House file:  "departure": {"locks": ["lock.front_door"], "alarm": "alarm_control
 """
 from __future__ import annotations
 
-from typing import Optional
+import re
+from typing import Iterable, Optional
 
 from .ha import SafeHome
 
@@ -28,9 +29,25 @@ def devices(house: dict) -> dict:
     return {"locks": locks, "alarm": alarm, "arm_mode": mode}
 
 
-def perimeter(home: SafeHome, house: dict) -> dict:
+def assured(text: str, house: dict) -> list[str]:
+    """Doors and windows the owner vouches for in this request ("the living room window is closed"). The owner's
+    word stands in for a sensor that reads open or cannot be read (owner's decision, 2026-11-21)."""
+    t = str(text or "").lower()
+    out = []
+    for name in ((house or {}).get("perimeter") or {}):
+        n = re.escape(str(name).lower())
+        if re.search(n + r"\W{0,3}(?:\w+\W+){0,3}?(is |are |'s )?(closed|shut|fine|ok|okay|good|locked)\b", t):
+            out.append(name)
+    return out
+
+
+def perimeter(home: SafeHome, house: dict, trusted: Iterable[str] = ()) -> dict:
     open_, unknown, closed = [], [], []
+    trusted = set(trusted or ())
     for name, eid in ((house or {}).get("perimeter") or {}).items():
+        if name in trusted:
+            closed.append(name)
+            continue
         st = home.read(eid)
         s = str((st or {}).get("state", "")).lower()
         if st is None or s in ("", "unknown", "unavailable"):
@@ -51,9 +68,10 @@ def _blockers(p: dict) -> str:
     return "; ".join(bits)
 
 
-def prepare(home: SafeHome, house: dict, now: float) -> tuple[str, str, Optional[dict]]:
+def prepare(home: SafeHome, house: dict, now: float, trusted: Iterable[str] = ()) -> tuple[str, str, Optional[dict]]:
     """-> (status, text, pending). status: "stopped" | "not_configured" | "needs_confirmation"."""
-    p = perimeter(home, house)
+    trusted = list(trusted or ())
+    p = perimeter(home, house, trusted)
     if p["open"] or p["unknown"]:
         return "stopped", f"Departure stopped ({_blockers(p)}). Nothing was locked or armed.", None
     if not p["closed"]:
@@ -69,8 +87,9 @@ def prepare(home: SafeHome, house: dict, now: float) -> tuple[str, str, Optional
     if d["alarm"]:
         what.append("arm the alarm (" + ("away" if d["arm_mode"] == "arm_away" else "home") + ")")
     pending = {"created": now, "expires": now + PENDING_TTL_S, "locks": d["locks"], "alarm": d["alarm"],
-               "arm_mode": d["arm_mode"]}
-    return "needs_confirmation", (f"Observed: all {len(p['closed'])} doors and windows read closed. Ready to "
+               "arm_mode": d["arm_mode"], "trusted": trusted}
+    word = f" ({', '.join(trusted)} on your word)" if trusted else ""
+    return "needs_confirmation", (f"Observed: all {len(p['closed'])} doors and windows read closed{word}. Ready to "
                                   f"{' and '.join(what)}. Nothing is done yet: say \"confirm departure\" within 10 "
                                   "minutes to go ahead."), pending
 
@@ -81,7 +100,7 @@ def confirm(home: SafeHome, house: dict, pending: Optional[dict], now: float) ->
         return "refused", "Refused: there is no departure waiting for confirmation. Ask to close up the house first."
     if now > pending["expires"]:
         return "refused", "Refused: that confirmation window has passed. Ask to close up the house again."
-    p = perimeter(home, house)                                 # things may have changed since prepare()
+    p = perimeter(home, house, pending.get("trusted") or ())   # things may have changed since prepare()
     if p["open"] or p["unknown"] or not p["closed"]:
         return "stopped", f"Departure stopped ({_blockers(p) or 'no doors or windows listed'}). Nothing was locked or armed."
     d = devices(house)                                         # act on the house file, never on stored ids alone

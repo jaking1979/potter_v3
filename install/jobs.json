@@ -332,6 +332,17 @@
    "purpose": "house dry-run: records what v3 would hold each zone at (read-only), for the switch-over decision"
   },
   {
+   "name": "potter-merrick-watch",
+   "cron": "*/5 * * * *",
+   "tz": "{TZ}",
+   "kind": "command",
+   "timeout": 120,
+   "standby": false,
+   "command": "merrick --openclaw '{OC}' watch --to {TO}",
+   "requires_cmd": "merrick",
+   "purpose": "house routines: warm-up plans, lights when the room is free, humidity and fan, fireplace and arrival triggers (records only while the routines are in shadow mode)"
+  },
+  {
    "name": "potter-house-insights",
    "cron": "41 10 * * 6",
    "tz": "{TZ}",

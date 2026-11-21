@@ -10,6 +10,7 @@ Outcomes: ok (read done, or action confirmed by read-back) | unverified | refuse
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
 from . import coldwatch, departure, hold, pathlog
@@ -141,8 +142,40 @@ def _execute(r: Route, home: SafeHome, house: dict, model: dict) -> tuple[str, s
     return "error", f"No handler for intent {r.intent}."
 
 
+def _routine(r: Route, text: str, home: SafeHome, house: dict, model: dict, state_dir) -> tuple[str, str]:
+    """Bedtime, coming up, arrival and the night report. Plans and watches go to state/routines.json for the
+    watcher job; every run is recorded in state/routines-log.jsonl (the night report reads it)."""
+    from datetime import datetime, timezone
+    from . import routines
+    if state_dir is None:
+        return "error", "Not done: no state directory, so the routine could not be recorded."
+    now = datetime.now(timezone.utc)
+    logp = Path(state_dir) / "routines-log.jsonl"
+    if r.intent == "night_report":
+        return "ok", routines.night_report(routines.records(state_dir), house, now)
+    if r.intent == "coming_up":
+        when, ask = routines.arrival_time(text.lower(), house, now)
+        if when is None:
+            return "needs_input", ask
+        results, lines, add = routines.coming_up(home, house, model, when)
+    elif r.intent == "arrived":
+        results, lines = routines.arrival(home, house, "you said you are here")
+        add = {"plans": [], "watches": []}
+    else:
+        results, lines, add = routines.bedtime(home, house, model, text.lower(), now)
+    routines.update(state_dir, lambda st: {**st, "plans": st.get("plans", []) + add["plans"],
+                                           "watches": st.get("watches", []) + add["watches"]})
+    shadow = not routines.live(house)
+    routines.log(logp, {"ts": now.isoformat(), "kind": r.intent, "shadow": shadow, "request": text[:200],
+                        "results": [x["text"] for x in results], "notes": lines})
+    head = "Shadow run (v2 still runs the house; nothing was changed):" if shadow else \
+        ("Done:" if all(x["ok"] for x in results) else "Partly done:")
+    body = [f"- {x['text']}" for x in results] + [f"- {x}" for x in lines]
+    return ("ok" if all(x["ok"] for x in results) else "partial"), "\n".join([head] + body)
+
+
 def handle(text: str, home: SafeHome, house: dict, log_path, decide: Optional[Callable] = None,
-           model: Optional[dict] = None, clock: Callable[[], float] = time.monotonic) -> dict:
+           model: Optional[dict] = None, clock: Callable[[], float] = time.monotonic, state_dir=None) -> dict:
     t0 = clock()
     rid = pathlog.new_id()
     r = route(text, house, decide)
@@ -152,10 +185,15 @@ def handle(text: str, home: SafeHome, house: dict, log_path, decide: Optional[Ca
     elif r.intent == "close_up":
         # Lock and arm happen only after the owner confirms: this step checks the perimeter and asks.
         try:
-            status, reply, pending = departure.prepare(home, house, time.time())
+            status, reply, pending = departure.prepare(home, house, time.time(), departure.assured(text, house))
             outcome = {"needs_confirmation": "needs_confirmation", "stopped": "refused"}.get(status, "ok")
         except Exception as e:                       # noqa: BLE001
             outcome, reply = "error", f"Not done: the departure check failed ({type(e).__name__}). Nothing was locked."
+    elif r.intent in ("bedtime", "coming_up", "arrived", "night_report"):
+        try:
+            outcome, reply = _routine(r, text, home, house, model or {}, state_dir)
+        except Exception as e:                       # noqa: BLE001
+            outcome, reply = "error", f"Not done: the {r.intent} routine failed ({type(e).__name__}). Nothing is assumed."
     else:
         try:
             outcome, reply = _execute(r, home, house, model or {})

@@ -45,6 +45,9 @@ class FakeHome:
         st.setdefault("attributes", {})
         if service == "set_temperature":
             st["attributes"]["temperature"] = data["temperature"]
+        elif service == "set_percentage":
+            st["attributes"]["percentage"] = data["percentage"]
+            st["state"] = "on" if data["percentage"] else "off"
         elif service == "set_hvac_mode":
             st["state"] = data["hvac_mode"]
         elif service in ("alarm_arm_away", "alarm_arm_home"):

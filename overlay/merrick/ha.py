@@ -165,6 +165,25 @@ class SafeHome:
                            lambda st: (st or {}).get("state"), lambda seen: seen == want,
                            requested=want, applied=want)
 
+    def fan_percentage(self, entity_id: str, percentage: Any) -> ActionResult:
+        """Fan speed. Many RF fans only echo what was sent (assumed_state): that is said, never called observed."""
+        why = refusal(entity_id, self.house)
+        if why is None and not str(entity_id).lower().startswith("fan."):
+            why = "not a fan"
+        try:
+            pct = max(0, min(100, int(round(float(percentage)))))
+        except (TypeError, ValueError):
+            why = why or "that is not a speed"
+            pct = None
+        if why:
+            return ActionResult(False, "refused", str(entity_id), f"Refused: {why}.", requested=percentage)
+        r = self._write(entity_id, "fan", "set_percentage", {"percentage": pct},
+                        lambda st: num(((st or {}).get("attributes") or {}).get("percentage")),
+                        lambda seen: seen is not None and abs(seen - pct) <= 1, requested=pct, applied=pct)
+        if r.ok and ((self.read(entity_id) or {}).get("attributes") or {}).get("assumed_state"):
+            r.message = f"Sent: {entity_id} set to {pct}% (this fan cannot report back, so it is not confirmed)."
+        return r
+
     # ---- departure: the ONLY protected writes, and only with the owner's explicit confirmation ---------------
     def _departure_refusal(self, entity_id: Any, domain: str, confirmed: bool) -> Optional[str]:
         if confirmed is not True:

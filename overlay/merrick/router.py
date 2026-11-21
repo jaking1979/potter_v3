@@ -14,7 +14,8 @@ from typing import Callable, Optional
 
 # Intents the fast path can execute. Adding one here means adding a handler in fastpath.py and tests for both.
 INTENTS = ("set_temperature", "turn_off", "hold_away", "check_temperature", "check_perimeter", "house_status",
-           "heating_estimate", "close_up", "refuse_protected", "not_home")
+           "heating_estimate", "close_up", "refuse_protected", "not_home", "bedtime", "coming_up", "arrived",
+           "night_report")
 MODEL_MIN_CONFIDENCE = 0.7
 
 _QUESTION = re.compile(r"^(is|are|was|were|did|do|does|what|what's|which|how|how's|any|has|have|"
@@ -26,6 +27,14 @@ _PROTECTED = re.compile(r"\b(un)?lock(s|ed|ing)?\b|\b(dis)?arm(s|ed|ing)?\b|\bal
 _CLOSE_UP = re.compile(r"\bclose (up|down) (the )?(house|cabin|place|home)\b|\bclosing up\b|"
                        r"\b(secure|button up) the (house|cabin|place|home)\b|\bdeparture (sequence|routine)\b|"
                        r"^(please |can you |could you )?lock (it |everything |the (house|cabin|place|home) )?up\b")
+_BEDTIME = re.compile(r"\b(going to bed|go(ing)? to sleep|heading to bed|off to bed|bedtime|turning in|"
+                      r"good ?night|sleep program|wind (the house )?down|put the house to bed)\b")
+_COMING_UP = re.compile(r"\b(coming up|heading up|driving up|going up|on (our|my) way( up)?|we'?ll be (up|there)|"
+                        r"(we|i)'?m coming|(we|i) arrive|arriving)\b")
+_ARRIVED = re.compile(r"\b(we'?re here|we are here|i'?m here|i am here|(we|i) (just )?(got|arrived|made it) "
+                      r"(here|in|up|to the house)|just arrived)\b")
+_NIGHT_REPORT = re.compile(r"\bhow did (the|last) night go\b|\b(rate|grade|score) (the |last |how )?night\b|"
+                           r"\bhow was (the|last) night\b|\bnight report\b")
 _REASONING = re.compile(r"\b(why|investigate|diagnos\w*|explain|analy[sz]e\w*|compare|trend|history|"
                         r"should (i|we)|what if|recommend\w*|optimi[sz]e\w*|figure out|look into|plan)\b")
 _LATER = re.compile(r"\bat (1?\d|2[0-4])(:\d{2})?\b(?! ?(degrees|deg|f)\b)|\b(by|before|after|until|till) \d|\b\d{1,2}(:\d{2})? ?(am|pm)\b|\b(tonight|tomorrow|"
@@ -130,6 +139,14 @@ def _table(t: str, house: dict) -> Route:
     for word in house.get("unsupported_location_words") or []:
         if re.search(r"\b" + re.escape(_norm(word)) + r"\b", t):
             return _fallback("other_location")
+    if _NIGHT_REPORT.search(t):
+        return Route("night_report", "fast", "table")
+    routine = "bedtime" if _BEDTIME.search(t) else "arrived" if _ARRIVED.search(t) else \
+        "coming_up" if _COMING_UP.search(t) else None
+    if routine and (house.get("routines") or {}):
+        if question or re.search(r"\b(what (would|do|will) you do|what happens|if i (say|tell))\b", t):
+            return _fallback("question_about_a_routine")   # a hypothetical is answered, never run
+        return Route(routine, "fast", "table")
     if _AUTOMATION.search(t):
         return _fallback("automation_or_schedule")     # never built on the fast path; the owner must ask explicitly
     if _CLOSE_UP.search(t):
@@ -196,6 +213,8 @@ def _from_model(answer, t: str, house: dict) -> Route:
         conf = 0.0
     if intent not in INTENTS or conf < MODEL_MIN_CONFIDENCE:
         return _fallback("model_unsure", "model")
+    if intent in ("bedtime", "coming_up", "arrived"):
+        return _fallback("routine_needs_clear_words", "model")   # many devices at once: only the table's phrases run one
     zones = house.get("zones") or {}
     zone = answer.get("zone") if answer.get("zone") in zones else None
     slots = {"zone": zone or house.get("default_zone"), "zone_named": bool(zone)}

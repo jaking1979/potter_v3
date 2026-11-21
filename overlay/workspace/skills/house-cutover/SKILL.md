@@ -24,7 +24,8 @@ Do these in order; stop and say so if any step fails.
 4. Re-create each plan in Merrick: `merrick intend --description "<plan>" --due <ISO time with zone> --zone <zone>
    --temperature <F>` (with `--until` and `--revert-temperature` for a period). Read them back with
    `merrick intentions` and send the owner the list to confirm.
-5. Switch on: `potter-cron on potter-merrick-tick` (the job that carries out plans). The cold watch and the
+5. Switch on: `potter-cron on potter-merrick-tick` (the job that carries out plans), and set `"mode": "live"` in
+   the house file's `routines` block (bedtime, wake, arrival and the rest stop being shadow runs). The cold watch and the
    readings collector are already on. Leave `potter-merrick-shadow` on for a week as a check, then
    `potter-cron off potter-merrick-shadow`.
 6. Tell the owner, in one line: "I'm running the house now. Tell me, not the old assistant, about anything

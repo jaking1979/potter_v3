@@ -9,6 +9,8 @@
   merrick collect                             hourly: room snapshot, thermal episodes, rate calibration
   merrick tick [--to ID]                      run due one-shot intentions (changes devices)
   merrick intend / intentions / cancel        register, list and cancel one-shot intentions
+  merrick watch [--to ID]                     every 5 min: routine plans, watches, comfort and triggers (routines.py)
+  merrick routines-check                      check the house file's routines block
 
 Settings (flags or environment): --house / MERRICK_HOUSE (house file), --state-dir / MERRICK_STATE_DIR,
 --ha-cmd / MERRICK_HA_CMD (the Home Assistant bridge command; see habridge.py). No address or token is handled here.
@@ -27,7 +29,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import budget, coldwatch, departure, fastpath, intentions, pathlog, thermal
+from . import budget, coldwatch, departure, fastpath, intentions, pathlog, routines, thermal
 from .ha import SafeHome, num
 from .habridge import BridgeHomeAssistant
 
@@ -99,7 +101,7 @@ def cmd_ask(ns) -> int:
     home = SafeHome(_client(ns), house)
     out = fastpath.handle(ns.text, home, house, state / "path-log.jsonl",
                           decide=_decider(ns.decide_cmd or os.environ.get("MERRICK_DECIDE_CMD", "")) if (ns.decide_cmd or os.environ.get("MERRICK_DECIDE_CMD")) else None,
-                          model=_load(state / "model.json", {}))
+                          model=_load(state / "model.json", {}), state_dir=state)
     if out.get("pending_departure"):
         with _locked(state):
             _save(state / "departure-pending.json", out.pop("pending_departure"))
@@ -118,7 +120,22 @@ def cmd_confirm_departure(ns) -> int:
     state, house = _state(ns), _house(ns)
     with _locked(state):
         pending = _load(state / "departure-pending.json", None)
-        status, text = departure.confirm(SafeHome(_client(ns), house), house, pending, time.time())
+        home = SafeHome(_client(ns), house)
+        status, text = departure.confirm(home, house, pending, time.time())
+        if status in ("done", "partial") and routines.cfg(house).get("close_up"):
+            # The rest of closing up: loads off, climate to the away hold, the house flagged closed, plans cancelled.
+            holder = {}
+
+            def _close(st):
+                res, lines = routines.close_up(home, house, st)
+                holder["res"], holder["lines"] = res, lines
+                return st
+            routines.update(state, _close)
+            text += "\n" + "\n".join([("Confirmed: " if x["ok"] else "NOT confirmed: ") + x["text"]
+                                       for x in holder["res"]] + holder["lines"])
+            routines.log(state / "routines-log.jsonl", {"ts": datetime.now(timezone.utc).isoformat(), "kind": "close_up",
+                                                         "shadow": not routines.live(house),
+                                                         "results": [x["text"] for x in holder["res"]]})
         if status != "stopped":                                # a used or refused confirmation cannot be replayed
             try:
                 (state / "departure-pending.json").unlink()
@@ -257,6 +274,34 @@ def cmd_tick(ns) -> int:
     return 1 if any(e["status"] == "failed" for e in events) else 0
 
 
+def cmd_watch(ns) -> int:
+    """Every few minutes: warm-up plans, the lights-when-free and overnight watches, comfort (humidity, fan) and the
+    triggers (fireplace fan, arrival). Silent unless something failed; in shadow mode it only records."""
+    state, house = _state(ns), _house(ns)
+    if not routines.cfg(house):
+        return 0
+    home = SafeHome(_client(ns), house)
+    now = datetime.now(timezone.utc)
+    out = {}
+
+    def _tick(st):
+        new, msgs, recs = routines.tick(home, house, _load(state / "model.json", {}), st, now)
+        out["msgs"], out["recs"] = msgs, recs
+        return new
+    routines.update(state, _tick)
+    for r in out["recs"]:
+        routines.log(state / "routines-log.jsonl", r)
+    if out["msgs"] and not _send(ns, "\n".join(out["msgs"])):
+        return 1
+    return 0
+
+
+def cmd_routines_check(ns) -> int:
+    problems = routines.check(_house(ns))
+    print("\n".join(problems) if problems else "routines: ok")
+    return 1 if problems else 0
+
+
 def cmd_intend(ns) -> int:
     state, house = _state(ns), _house(ns)
     entity = ((house["zones"].get(ns.zone) or {}).get("climate_entity"))
@@ -311,10 +356,11 @@ def main(argv: list[str]) -> int:
     p.set_defaults(fn=cmd_fallback_end)
     p = sub.add_parser("report"); p.add_argument("--days", type=int, default=7)
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_report)
-    for name, fn in (("cold-watch", cmd_cold_watch), ("tick", cmd_tick)):
+    for name, fn in (("cold-watch", cmd_cold_watch), ("tick", cmd_tick), ("watch", cmd_watch)):
         p = sub.add_parser(name); p.add_argument("--to"); p.add_argument("--dry-run", action="store_true")
         p.set_defaults(fn=fn)
     sub.add_parser("collect").set_defaults(fn=cmd_collect)
+    sub.add_parser("routines-check").set_defaults(fn=cmd_routines_check)
     sub.add_parser("shadow").set_defaults(fn=cmd_shadow)
     p = sub.add_parser("insights"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_insights)
     p = sub.add_parser("shadow-report"); p.add_argument("--days", type=int, default=7)
